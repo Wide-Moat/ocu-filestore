@@ -1,0 +1,22 @@
+# ─── private planning artefacts — local only ───
+.planning/
+
+# ─── OS / editor ───
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ─── language build/runtime ───
+*.bin
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+.env
+.env.*
+!.env.example
+
+# ─── local-only Claude Code instructions ───
+CLAUDE.local.md
