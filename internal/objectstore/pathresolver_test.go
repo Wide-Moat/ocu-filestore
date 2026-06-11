@@ -67,8 +67,11 @@ func TestValidatePath(t *testing.T) {
 // never string-path compare — t.TempDir sits under the /var → /private/var
 // symlink on darwin); an intra-scope symlink IS followed (the invariant is
 // "no escape", not "no symlinks"); symlinks pointing outside the scope are
-// refused with the os.Root escape error, which stays distinct from the
-// lexical sentinel ErrInvalidPath.
+// refused with the os.Root escape error, which stays distinct from both the
+// lexical sentinel ErrInvalidPath and plain ENOENT. Escape topologies pinned
+// deterministically: direct link-out (absolute target), link in the middle
+// of a traversed path, chained link-out (link → link → outside), and a
+// relative-target escape ("../../outside/secret").
 func TestScopeRootContainment(t *testing.T) {
 	base := t.TempDir()
 	scope := filepath.Join(base, "fs_alpha")
@@ -103,6 +106,19 @@ func TestScopeRootContainment(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("sub/data.txt", filepath.Join(scope, "intra")); err != nil {
+		t.Fatal(err)
+	}
+	// Chained link-out: chain1 -> chain2 (relative, stays in scope) -> outside.
+	if err := os.Symlink("chain2", filepath.Join(scope, "chain1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(scope, "chain2")); err != nil {
+		t.Fatal(err)
+	}
+	// Relative-target escape: sub/rel_escape -> ../../outside/secret walks up
+	// past the scope root with ".." in the link TARGET (the path itself is
+	// lexically clean, so only the symlink stage can catch it).
+	if err := os.Symlink("../../outside/secret", filepath.Join(scope, "sub", "rel_escape")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,9 +160,12 @@ func TestScopeRootContainment(t *testing.T) {
 		t.Fatalf("Open(intra): fd does not resolve to the intra-scope target")
 	}
 
-	// Escapes: refused, distinct from the lexical sentinel, and never an
-	// fd that matches the outside secret.
-	for _, name := range []string{"escape_file", "escape_dir/secret"} {
+	// Escapes: refused with the os.Root escape class — distinct from the
+	// lexical sentinel, never ENOENT (the links all exist; an ENOENT would
+	// mean the case tests nothing), and never an fd that matches the
+	// outside secret. Covers direct link-out, link-in-the-middle, chained
+	// link-out, and a relative-target escape.
+	for _, name := range []string{"escape_file", "escape_dir/secret", "chain1", "sub/rel_escape"} {
 		ef, err := sr.Open(name)
 		if err == nil {
 			efi, statErr := ef.Stat()
@@ -158,6 +177,9 @@ func TestScopeRootContainment(t *testing.T) {
 		}
 		if errors.Is(err, ErrInvalidPath) {
 			t.Fatalf("Open(%q): symlink-stage escape must not be ErrInvalidPath (classes stay distinct), got %v", name, err)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Open(%q): escape refused with ENOENT — link not built, case is vacuous: %v", name, err)
 		}
 		var pe *fs.PathError
 		if !errors.As(err, &pe) {
