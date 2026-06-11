@@ -16,6 +16,39 @@ func tagReturning(dl bool, err error) StoredTagFunc {
 	}
 }
 
+// TestNewNilTagPanics pins fail-closed construction: wiring the resolver
+// without a stored-tag lookup is surfaced as an immediate, named panic at
+// New, never a latent nil-deref on the read path.
+func TestNewNilTagPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("New(nil) did not panic")
+		}
+		msg, ok := r.(string)
+		if !ok || msg != "authz: New requires a non-nil StoredTagFunc" {
+			t.Fatalf("New(nil) panic: got %v, want named message", r)
+		}
+	}()
+	New(nil)
+}
+
+// TestEmptyAttestedScopeDenies pins AUTHZ-01 / NFR-SEC-43 fail-closed: an
+// empty host-attested Scope authorizes nothing, even when the request hint
+// is equally empty and pure equality would otherwise hold.
+func TestEmptyAttestedScopeDenies(t *testing.T) {
+	r := New(tagReturning(true, nil))
+	ev := CallerEvidence{Scope: "", GrantedIntents: allIntents}
+	_, err := r.Resolve(context.Background(), ev, Request{
+		Filesystem: "",
+		Path:       "a.txt",
+		Intent:     IntentRead,
+	})
+	if !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("Resolve: got %v, want ErrScopeMismatch", err)
+	}
+}
+
 // TestScopeMismatch pins AUTHZ-01 / NFR-SEC-43: a request whose Filesystem
 // hint differs from the evidence Scope denies ErrScopeMismatch; the hint
 // never widens scope.

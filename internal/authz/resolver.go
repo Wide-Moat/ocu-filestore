@@ -35,9 +35,13 @@ type policyResolver struct {
 }
 
 // New returns a Resolver backed by the given stored-tag lookup function.
-// tag must be non-nil; it is called only for IntentRead after scope and
-// intent checks pass (NFR-SEC-73).
+// tag must be non-nil — New panics otherwise, surfacing a wiring mistake at
+// construction instead of a latent nil-deref on the read path. The tag is
+// called only for IntentRead after scope and intent checks pass (NFR-SEC-73).
 func New(tag StoredTagFunc) Resolver {
+	if tag == nil {
+		panic("authz: New requires a non-nil StoredTagFunc")
+	}
 	return &policyResolver{tag: tag}
 }
 
@@ -51,7 +55,13 @@ func (r *policyResolver) Resolve(ctx context.Context, caller any, req Request) (
 		return Grant{}, ErrScopeMismatch
 	}
 
-	// Axis 1: scope — the request hint is never authoritative (NFR-SEC-43).
+	// Axis 1: scope. An empty host-attested Scope authorizes nothing — it is
+	// a face bug, never a grant; denying here keeps equal-empty values from
+	// satisfying the equality check below (fail-closed).
+	if ev.Scope == "" {
+		return Grant{}, ErrScopeMismatch
+	}
+	// The request hint is never authoritative (NFR-SEC-43).
 	if req.Filesystem != ev.Scope {
 		return Grant{}, ErrScopeMismatch
 	}
