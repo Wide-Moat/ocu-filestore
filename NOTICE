@@ -19,3 +19,16 @@ organization is explicitly permitted and is not considered competition.
 
 LICENSE-APACHE and LICENSE-MIT are included as reference texts for dependency
 licenses; they are not the license of this Software.
+
+## Third-Party Notices
+
+### pgregory.net/rapid
+
+Source: https://github.com/flyingmutant/rapid
+License: Mozilla Public License Version 2.0 (MPL-2.0)
+Used by: test binaries only (resolver_prop_test.go)
+
+The rapid library is used under the terms of the Mozilla Public License
+Version 2.0. MPL-2.0 is a weak copyleft license (file-level); it does not
+extend to the rest of this codebase. A copy of the MPL-2.0 is available at
+https://www.mozilla.org/en-US/MPL/2.0/.
