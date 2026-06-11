@@ -10,9 +10,10 @@
 // event.
 //
 // The event field set is pinned by the file-artifact-api contract
-// (FileActivityEvent); the scaffold keeps the event opaque rather than
-// duplicating the contract's shape in Go until the audit-pipeline
-// implementation PR freezes the encoding.
+// (FileActivityEvent); the frozen Go encoding lives in event.go. The seam
+// keeps the event parameter opaque so callers depend on the Guard
+// behaviour, not a concrete sink; FileSink type-asserts and fails closed
+// on a mismatch.
 package auditgate
 
 import (
