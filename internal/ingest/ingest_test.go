@@ -4,12 +4,73 @@
 package ingest
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"testing"
 )
+
+// failer is the assertion surface shared by *testing.T and *rapid.T, so
+// the in-memory archive builders work from both the unit corpus and the
+// properties.
+type failer interface {
+	Fatalf(format string, args ...any)
+}
+
+// zipEntry describes one in-memory archive entry. The zero mode leaves the
+// writer's default (regular file); a body on a "/"-suffixed name is a
+// builder error.
+type zipEntry struct {
+	name    string
+	body    []byte
+	comment string
+	mode    fs.FileMode
+	deflate bool
+}
+
+// buildZip assembles an archive fully in memory — no testdata binaries are
+// ever committed; every adversarial shape is constructed per run.
+func buildZip(t failer, entries ...zipEntry) []byte {
+	buf := &bytes.Buffer{}
+	w := zip.NewWriter(buf)
+	for _, e := range entries {
+		fh := &zip.FileHeader{Name: e.name, Comment: e.comment}
+		if e.deflate {
+			fh.Method = zip.Deflate
+		}
+		if e.mode != 0 {
+			fh.SetMode(e.mode)
+		}
+		fw, err := w.CreateHeader(fh)
+		if err != nil {
+			t.Fatalf("create header %q: %v", e.name, err)
+		}
+		if len(e.body) > 0 {
+			if _, err := fw.Write(e.body); err != nil {
+				t.Fatalf("write entry %q: %v", e.name, err)
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// testConfig returns the canonical-default config with the lexical
+// destination anchor the symlink checks need; the path is never opened.
+func testConfig() Config {
+	return Config{
+		TotalUncompressedCeiling: DefaultTotalUncompressedCeiling,
+		EntryCeiling:             DefaultEntryCeiling,
+		DestDir:                  "/var/broker/scope",
+	}
+}
 
 // elfBytes is a realistic ELF header prefix: magic plus the NUL-bearing
 // ident padding that forces http.DetectContentType to octet-stream, so the
@@ -96,57 +157,312 @@ func TestTraversalEntry(t *testing.T) {
 		}
 	}
 
-	t.Fatal("unimplemented: traversal entry rejected before sink via ValidateZip (ARC-02)")
+	// Full path: the traversal entry never reaches the sink.
+	data := buildZip(t, zipEntry{name: "../../../etc/passwd", body: []byte("pwned")})
+	sink := &recordingSink{}
+	err := ValidateZip(context.Background(), data, testConfig(), sink)
+	if !errors.Is(err, ErrInvalidEntry) {
+		t.Fatalf("ValidateZip: got %v, want ErrInvalidEntry", err)
+	}
+	if len(sink.staged) != 0 || len(sink.dirs) != 0 || len(sink.symlinks) != 0 {
+		t.Fatalf("sink saw entries from a rejected archive: staged=%v dirs=%v symlinks=%v",
+			sink.staged, sink.dirs, sink.symlinks)
+	}
+	if !sink.aborted || sink.committed {
+		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
 }
 
 // TestSymlinkEscape pins ARC-02: a symlink entry whose target resolves
 // outside the destination rejects with ErrSymlinkEscape — a typed reason
 // distinct from the traversal reject.
 func TestSymlinkEscape(t *testing.T) {
-	t.Fatal("unimplemented: symlink escape rejected with distinct sentinel (ARC-02)")
+	// Lexical layer: absolute targets reject first and unconditionally;
+	// NUL rejects; an inside-resolving relative target passes this check.
+	dest := "/var/broker/scope"
+	for _, tc := range []struct{ name, entry, target string }{
+		{"absolute target", "link", "/etc/passwd"},
+		{"relative escape", "link", "../outside"},
+		{"nul target", "link", "bad\x00target"},
+		{"deep relative escape", "dir/link", "../../../outside"},
+	} {
+		t.Run("lexical "+tc.name, func(t *testing.T) {
+			if err := validateSymlinkTarget(tc.entry, tc.target, dest); !errors.Is(err, ErrSymlinkEscape) {
+				t.Fatalf("validateSymlinkTarget(%q, %q): got %v, want ErrSymlinkEscape", tc.entry, tc.target, err)
+			}
+		})
+	}
+	if err := validateSymlinkTarget("dir/link", "../sibling.txt", dest); err != nil {
+		t.Fatalf("inside-resolving target: got %v, want nil from the lexical check", err)
+	}
+
+	// Full path: the escaping symlink entry rejects, the sink stays empty.
+	for _, tc := range []struct{ name, target string }{
+		{"relative escape", "../outside"},
+		{"absolute target", "/etc/passwd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildZip(t, zipEntry{name: "link", body: []byte(tc.target), mode: fs.ModeSymlink | 0o777})
+			sink := &recordingSink{}
+			err := ValidateZip(context.Background(), data, testConfig(), sink)
+			if !errors.Is(err, ErrSymlinkEscape) {
+				t.Fatalf("ValidateZip: got %v, want ErrSymlinkEscape", err)
+			}
+			if errors.Is(err, ErrInvalidEntry) {
+				t.Fatal("symlink reject must stay distinct from the traversal sentinel")
+			}
+			if len(sink.staged) != 0 || len(sink.symlinks) != 0 {
+				t.Fatalf("sink saw the symlink entry: staged=%v symlinks=%v", sink.staged, sink.symlinks)
+			}
+			if !sink.aborted || sink.committed {
+				t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+			}
+		})
+	}
 }
 
 // TestSymlinkInsideUnsupported pins the shelf boundary: an inside-resolving
 // symlink target rejects with ErrSymlinkUnsupported; no symlink entry is
-// ever staged on this shelf.
+// ever staged on this shelf — staging the target text as file content
+// would silently change semantics.
 func TestSymlinkInsideUnsupported(t *testing.T) {
-	t.Fatal("unimplemented: inside-resolving symlink rejected, nothing staged (ARC-02)")
+	data := buildZip(t, zipEntry{name: "link", body: []byte("inside.txt"), mode: fs.ModeSymlink | 0o777})
+	sink := &recordingSink{}
+	err := ValidateZip(context.Background(), data, testConfig(), sink)
+	if !errors.Is(err, ErrSymlinkUnsupported) {
+		t.Fatalf("ValidateZip: got %v, want ErrSymlinkUnsupported", err)
+	}
+	if errors.Is(err, ErrSymlinkEscape) {
+		t.Fatal("inside-resolving target must not report an escape")
+	}
+	if len(sink.staged) != 0 || len(sink.symlinks) != 0 || len(sink.dirs) != 0 {
+		t.Fatalf("sink saw the symlink entry: staged=%v symlinks=%v dirs=%v", sink.staged, sink.symlinks, sink.dirs)
+	}
+	if !sink.aborted || sink.committed {
+		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
 }
 
 // TestEntryCountCeiling pins ARC-01: more entries than the ceiling rejects
 // immediately after the central directory parse, before any entry byte.
 func TestEntryCountCeiling(t *testing.T) {
-	t.Fatal("unimplemented: entry-count ceiling rejects pre-read (ARC-01)")
+	entries := make([]zipEntry, 6)
+	for i := range entries {
+		entries[i] = zipEntry{name: fmt.Sprintf("f%d.txt", i), body: []byte("x")}
+	}
+	cfg := testConfig()
+	cfg.EntryCeiling = 5
+	sink := &recordingSink{}
+	err := ValidateZip(context.Background(), buildZip(t, entries...), cfg, sink)
+	if !errors.Is(err, ErrEntryCountExceeded) {
+		t.Fatalf("ValidateZip: got %v, want ErrEntryCountExceeded", err)
+	}
+	var ae *ArchiveError
+	if !errors.As(err, &ae) {
+		t.Fatalf("ValidateZip: %v is not an *ArchiveError", err)
+	}
+	if ae.Count != 6 || ae.Ceiling != 5 {
+		t.Fatalf("ArchiveError arithmetic: count=%d ceiling=%d, want 6 > 5", ae.Count, ae.Ceiling)
+	}
+	if len(sink.staged) != 0 || len(sink.dirs) != 0 {
+		t.Fatal("entry bytes reached the sink before the count check")
+	}
+	if !sink.aborted || sink.committed {
+		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
 }
 
 // TestTotalCeilingStreaming pins ARC-01: the cross-entry decompressed
-// total halts extraction mid-stream at the ceiling.
+// total halts extraction mid-stream at the ceiling; the count is shared
+// across entries, not per entry.
 func TestTotalCeilingStreaming(t *testing.T) {
-	t.Fatal("unimplemented: streaming total ceiling halts mid-extract (ARC-01)")
+	t.Run("single oversize entry", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.TotalUncompressedCeiling = 512 << 10
+		data := buildZip(t, zipEntry{name: "bomb.bin", body: make([]byte, 2<<20), deflate: true})
+		sink := &recordingSink{}
+		err := ValidateZip(context.Background(), data, cfg, sink)
+		if !errors.Is(err, ErrTotalExceeded) {
+			t.Fatalf("ValidateZip: got %v, want ErrTotalExceeded", err)
+		}
+		if len(sink.staged) != 0 {
+			t.Fatal("over-ceiling entry recorded as staged")
+		}
+		if !sink.aborted || sink.committed {
+			t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+		}
+	})
+	t.Run("cross-entry running total", func(t *testing.T) {
+		// Each entry is under the ceiling alone; together they cross it.
+		cfg := testConfig()
+		cfg.TotalUncompressedCeiling = 512 << 10
+		data := buildZip(t,
+			zipEntry{name: "a.bin", body: make([]byte, 384<<10), deflate: true},
+			zipEntry{name: "b.bin", body: make([]byte, 384<<10), deflate: true},
+		)
+		sink := &recordingSink{}
+		err := ValidateZip(context.Background(), data, cfg, sink)
+		if !errors.Is(err, ErrTotalExceeded) {
+			t.Fatalf("ValidateZip: got %v, want ErrTotalExceeded from the shared total", err)
+		}
+		if !sink.aborted || sink.committed {
+			t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+		}
+	})
 }
 
 // TestHeaderLies pins ARC-01: the streaming count, never the header-claimed
-// size, governs the ceiling.
+// size, governs the ceiling. The corpus patches the central-directory
+// UncompressedSize and clears the data-descriptor flag, in both lying
+// directions.
 func TestHeaderLies(t *testing.T) {
-	t.Fatal("unimplemented: header-claimed size never governs (ARC-01)")
+	centralDirSig := []byte{0x50, 0x4b, 0x01, 0x02}
+	patch := func(t *testing.T, data []byte, claim uint32) {
+		cidx := bytes.Index(data, centralDirSig)
+		if cidx < 0 {
+			t.Fatal("central directory signature not found")
+		}
+		binary.LittleEndian.PutUint32(data[cidx+24:], claim)
+		flags := binary.LittleEndian.Uint16(data[cidx+8:])
+		binary.LittleEndian.PutUint16(data[cidx+8:], flags&^uint16(0x8))
+	}
+
+	t.Run("huge claim small body never trips the ceiling", func(t *testing.T) {
+		data := buildZip(t, zipEntry{name: "liar.txt", body: []byte("actual tiny content"), deflate: true})
+		patch(t, data, 2<<30) // claim 2 GiB; actual bytes: 19
+		cfg := testConfig()
+		cfg.TotalUncompressedCeiling = 1 << 20 // far below the claim
+		sink := &recordingSink{}
+		err := ValidateZip(context.Background(), data, cfg, sink)
+		if errors.Is(err, ErrTotalExceeded) {
+			t.Fatalf("the header claim governed the ceiling: %v", err)
+		}
+		if err == nil {
+			t.Fatal("patched archive read cleanly; want the reader's size-mismatch error")
+		}
+		if !sink.aborted || sink.committed {
+			t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+		}
+	})
+
+	t.Run("tiny claim real bomb still rejected", func(t *testing.T) {
+		// A small claim cannot raise the budget either: the stdlib
+		// reader bounds reads by the claimed size and rejects the
+		// overrun as a format error before the streaming count would
+		// cross the ceiling. Whichever control fires first, the bomb
+		// never reaches a commit — the claim only ever shrinks what
+		// streams, it never bypasses the ceiling.
+		data := buildZip(t, zipEntry{name: "bomb.bin", body: make([]byte, 2<<20), deflate: true})
+		patch(t, data, 10) // claim 10 bytes; actual: 2 MiB
+		cfg := testConfig()
+		cfg.TotalUncompressedCeiling = 512 << 10
+		sink := &recordingSink{}
+		err := ValidateZip(context.Background(), data, cfg, sink)
+		if err == nil {
+			t.Fatal("lying bomb accepted")
+		}
+		if len(sink.staged) != 0 {
+			t.Fatalf("lying bomb staged: %v", sink.staged)
+		}
+		if !sink.aborted || sink.committed {
+			t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+		}
+	})
 }
 
 // TestPolyglotMismatch pins ARC-03: declared-vs-resolved disagreement is
 // recorded; under the empty policy nothing is rejected.
 func TestPolyglotMismatch(t *testing.T) {
-	t.Fatal("unimplemented: polyglot mismatch recorded (ARC-03)")
+	// GIF magic over zip-shaped bytes: the sniff window resolves the
+	// first-bytes identity; the declared type disagrees.
+	body := append([]byte("GIF89a"), 0x50, 0x4b, 0x03, 0x04)
+	body = append(body, make([]byte, 64)...)
+
+	var recorded []ClassificationResult
+	cfg := testConfig()
+	cfg.Record = func(_ string, res ClassificationResult) { recorded = append(recorded, res) }
+
+	data := buildZip(t, zipEntry{name: "image.gif", body: body, comment: "application/zip"})
+	sink := &recordingSink{}
+	if err := ValidateZip(context.Background(), data, cfg, sink); err != nil {
+		t.Fatalf("empty policy must record, never reject: %v", err)
+	}
+	if !sink.committed || sink.aborted {
+		t.Fatalf("sink state: aborted=%v committed=%v, want committed only", sink.aborted, sink.committed)
+	}
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %d classifications, want 1", len(recorded))
+	}
+	got := recorded[0]
+	if got.Declared != "application/zip" || got.Resolved != "image/gif" || !got.Mismatch {
+		t.Fatalf("classification: %+v, want declared application/zip, resolved image/gif, mismatch", got)
+	}
 }
 
 // TestDeniedTypeReject pins ARC-03: a policy-denied resolved type rejects
-// pre-stage with ErrTypeDenied and the sink aborts.
+// pre-stage with ErrTypeDenied and the sink aborts; classification is
+// still recorded for the denied entry.
 func TestDeniedTypeReject(t *testing.T) {
-	t.Fatal("unimplemented: denied type rejects pre-stage (ARC-03)")
+	var recorded []ClassificationResult
+	cfg := testConfig()
+	cfg.TypePolicy = DenyTypes("application/x-elf")
+	cfg.Record = func(_ string, res ClassificationResult) { recorded = append(recorded, res) }
+
+	data := buildZip(t, zipEntry{name: "innocent.txt", body: elfBytes()})
+	sink := &recordingSink{}
+	err := ValidateZip(context.Background(), data, cfg, sink)
+	if !errors.Is(err, ErrTypeDenied) {
+		t.Fatalf("ValidateZip: got %v, want ErrTypeDenied", err)
+	}
+	var ae *ArchiveError
+	if !errors.As(err, &ae) || ae.Type != "application/x-elf" {
+		t.Fatalf("ArchiveError type field: %+v, want application/x-elf", ae)
+	}
+	if len(sink.staged) != 0 {
+		t.Fatal("denied entry bytes reached the sink")
+	}
+	if !sink.aborted || sink.committed {
+		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
+	if len(recorded) != 1 || recorded[0].Resolved != "application/x-elf" {
+		t.Fatalf("denied entry classification not recorded: %+v", recorded)
+	}
 }
 
 // TestEmptyPolicyRecord pins ARC-03: the zero policy denies nothing —
-// classification is recorded, the entry stages, the archive commits.
+// classification is recorded, the entry stages byte-complete (the
+// classification window is replayed to the sink), the archive commits.
 func TestEmptyPolicyRecord(t *testing.T) {
-	t.Fatal("unimplemented: empty policy classifies and records only (ARC-03)")
+	var recorded []ClassificationResult
+	cfg := testConfig()
+	cfg.Record = func(_ string, res ClassificationResult) { recorded = append(recorded, res) }
+
+	// Body longer than the 512-byte sniff window, so a lost window would
+	// surface as truncated staged content.
+	body := append(elfBytes(), make([]byte, 600)...)
+	data := buildZip(t,
+		zipEntry{name: "sub/"},
+		zipEntry{name: "bin/tool", body: body, deflate: true},
+	)
+	sink := &recordingSink{}
+	if err := ValidateZip(context.Background(), data, cfg, sink); err != nil {
+		t.Fatalf("empty policy must classify and record only: %v", err)
+	}
+	if !sink.committed || sink.aborted {
+		t.Fatalf("sink state: aborted=%v committed=%v, want committed only", sink.aborted, sink.committed)
+	}
+	if len(sink.dirs) != 1 || sink.dirs[0] != "sub" {
+		t.Fatalf("dirs: %v, want [sub]", sink.dirs)
+	}
+	if len(sink.staged) != 1 || sink.staged[0] != "bin/tool" {
+		t.Fatalf("staged: %v, want [bin/tool]", sink.staged)
+	}
+	if !bytes.Equal(sink.contents["bin/tool"], body) {
+		t.Fatalf("staged content truncated: got %d bytes, want %d", len(sink.contents["bin/tool"]), len(body))
+	}
+	if len(recorded) != 1 || recorded[0].Resolved != "application/x-elf" || recorded[0].Mismatch {
+		t.Fatalf("classification: %+v, want resolved application/x-elf, no mismatch", recorded)
+	}
 }
 
 // TestSupplementalMagic pins ARC-03: the supplemental table resolves the
