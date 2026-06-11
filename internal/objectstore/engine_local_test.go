@@ -393,8 +393,10 @@ func TestLocalEngine_EscapeRejected(t *testing.T) {
 	}
 
 	// Rename escape: MUST be the *os.LinkError wrapper, normalized by
-	// isPathEscape into the same caller-visible class.
-	err := eng.MoveFile(ctx, scope, "f.txt", "esc/out.txt", false)
+	// isPathEscape into the same caller-visible class. overwrite=true so
+	// the destination pre-check (which would refuse earlier with the
+	// *fs.PathError class) is skipped and Rename itself is exercised.
+	err := eng.MoveFile(ctx, scope, "f.txt", "esc/out.txt", true)
 	if err == nil {
 		t.Fatal("MoveFile into symlinked-out dir: got nil error")
 	}
