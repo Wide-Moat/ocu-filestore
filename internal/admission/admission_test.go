@@ -62,3 +62,68 @@ func TestAdmitExhaustiveTable(t *testing.T) {
 		t.Errorf("long-lived admit cells = %d, want exactly 1 (NFR-SEC-60)", longLivedAdmits)
 	}
 }
+
+// TestAdmitUnknownValues asserts that off-enum values on any axis — empty
+// strings, wrong case, wrong separator, NUL bytes, arbitrary text — refuse
+// with ErrAdmissionRefused; no default-admit path exists (NFR-SEC-60).
+func TestAdmitUnknownValues(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		profile  WorkloadTrustProfile
+		tenancy  Tenancy
+		credKind CredentialKind
+	}{
+		{"all empty", "", "", ""},
+		{"empty profile", "", TenancySingleTenant, CredHostLocalLongLived},
+		{"empty tenancy", ProfileTrustedOperator, "", CredHostLocalLongLived},
+		{"empty credential kind", ProfileTrustedOperator, TenancySingleTenant, ""},
+		{"wrong-case profile", "TRUSTED_OPERATOR", TenancySingleTenant, CredHostLocalLongLived},
+		{"wrong-separator profile", "trusted-operator", TenancySingleTenant, CredHostLocalLongLived},
+		{"NUL profile", "\x00", TenancySingleTenant, CredHostLocalLongLived},
+		{"NUL-suffixed profile", WorkloadTrustProfile(string(ProfileTrustedOperator) + "\x00"), TenancySingleTenant, CredHostLocalLongLived},
+		{"arbitrary profile", "admin", TenancySingleTenant, CredHostLocalLongLived},
+		{"arbitrary tenancy", ProfileTrustedOperator, "no_tenant", CredHostLocalLongLived},
+		{"arbitrary credential kind", ProfileTrustedOperator, TenancySingleTenant, "root_credential"},
+		{"wrong-case credential kind", ProfileTrustedOperator, TenancySingleTenant, "STS_PER_SESSION"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Admit(tc.profile, tc.tenancy, tc.credKind)
+			if !errors.Is(err, ErrAdmissionRefused) {
+				t.Fatalf("Admit(%q, %q, %q) = %v, want ErrAdmissionRefused", tc.profile, tc.tenancy, tc.credKind, err)
+			}
+		})
+	}
+}
+
+// TestAdmitBrokerModeTable iterates every (profile, tenancy) cell — 3 x 2 = 6
+// — and asserts a multiplexed broker is admitted only on trusted_operator +
+// single_tenant; every other cell refuses with ErrTenancyRefused, and exactly
+// one cell admits (NFR-SEC-76).
+func TestAdmitBrokerModeTable(t *testing.T) {
+	allProfiles := []WorkloadTrustProfile{
+		ProfileTrustedOperator,
+		ProfileInternalWorkforce,
+		ProfileUntrusted,
+	}
+	allTenancies := []Tenancy{TenancySingleTenant, TenancyMultiTenant}
+
+	var admits int
+	for _, p := range allProfiles {
+		for _, tn := range allTenancies {
+			err := AdmitBrokerMode(p, tn)
+			want := p == ProfileTrustedOperator && tn == TenancySingleTenant
+			if want && err != nil {
+				t.Errorf("AdmitBrokerMode(%q, %q) = %v, want nil", p, tn, err)
+			}
+			if !want && !errors.Is(err, ErrTenancyRefused) {
+				t.Errorf("AdmitBrokerMode(%q, %q) = %v, want ErrTenancyRefused", p, tn, err)
+			}
+			if err == nil {
+				admits++
+			}
+		}
+	}
+	if admits != 1 {
+		t.Errorf("broker-mode admit cells = %d, want exactly 1 (NFR-SEC-76)", admits)
+	}
+}
