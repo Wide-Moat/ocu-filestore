@@ -47,7 +47,8 @@ func (e *localVolumeEngine) openScope(id ScopeID) (*ScopeRoot, error) {
 
 // scopePath derives the scope directory from the TRUSTED ScopeID only —
 // never from any caller-supplied path (NFR-SEC-43). It is used exclusively
-// by the lifecycle verbs; data verbs go through the ScopeRoot.
+// by the lifecycle verbs; data verbs go through the ScopeRoot. Every caller
+// runs validateScopeID before this join (defense-in-depth on the id shape).
 func (e *localVolumeEngine) scopePath(id ScopeID) string {
 	return filepath.Join(e.baseDir, string(id))
 }
@@ -66,6 +67,9 @@ func toFileInfo(fi os.FileInfo) FileInfo {
 // refuses an absent directory, so this must run before any data verb on a
 // fresh scope. Provisioning an existing scope is a no-op.
 func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) error {
+	if err := validateScopeID(scope); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(e.scopePath(scope), 0o700); err != nil {
 		return fmt.Errorf("objectstore: provision scope %q: %w", scope, err)
 	}
@@ -87,6 +91,9 @@ func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) err
 // os.RemoveAll(scopePath) — os.Root.RemoveAll(".") is platform-unreliable
 // for removing a root's own contents and is deliberately not used.
 func (e *localVolumeEngine) TeardownScope(_ context.Context, scope ScopeID) error {
+	if err := validateScopeID(scope); err != nil {
+		return err
+	}
 	scopePath := e.scopePath(scope)
 
 	info, err := os.Lstat(scopePath)

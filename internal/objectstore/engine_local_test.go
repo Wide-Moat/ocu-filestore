@@ -526,3 +526,117 @@ func TestProvisionTeardownCycle(t *testing.T) {
 		t.Fatalf("TeardownScope on plain file: got %v, want ErrNotADirectory", err)
 	}
 }
+
+// TestScopeIDGuard pins the validateScopeID defense-in-depth: a ScopeID
+// whose bytes could change the directory the baseDir join resolves to is
+// refused with ErrInvalidScopeID on BOTH lifecycle verbs and on a data verb
+// (which routes through OpenScopeRoot), before any filesystem effect. The
+// blast-radius case is concrete: TeardownScope(ScopeID("..")) must never
+// reach RemoveAll on baseDir's parent. The id stays host-attested input
+// (NFR-SEC-43) — this guard is shape validation, not authorization.
+//
+// A plain single-element name like "scopes" is the accept control: the
+// guard refuses only ids that can alter the join, never a legitimate name.
+func TestScopeIDGuard(t *testing.T) {
+	ctx := context.Background()
+
+	// baseDir as a child of the temp root, with a sibling marker file whose
+	// survival proves Teardown("..") never touched baseDir's parent.
+	parent := t.TempDir()
+	base := filepath.Join(parent, "scope-base")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatalf("mkdir base: %v", err)
+	}
+	sibling := filepath.Join(parent, "sibling.txt")
+	if err := os.WriteFile(sibling, []byte("must survive"), 0o644); err != nil {
+		t.Fatalf("write sibling: %v", err)
+	}
+	eng := NewLocalVolumeEngine(base)
+
+	for _, hostile := range []string{
+		"",
+		".",
+		"..",
+		"a/b",
+		`a\b`,
+		"x\x00",
+		"../x",
+		"x/",
+		"./x",
+	} {
+		t.Run("hostile_"+hostile, func(t *testing.T) {
+			if err := eng.ProvisionScope(ctx, ScopeID(hostile)); !errors.Is(err, ErrInvalidScopeID) {
+				t.Fatalf("ProvisionScope(%q): got %v, want ErrInvalidScopeID", hostile, err)
+			}
+			if err := eng.TeardownScope(ctx, ScopeID(hostile)); !errors.Is(err, ErrInvalidScopeID) {
+				t.Fatalf("TeardownScope(%q): got %v, want ErrInvalidScopeID", hostile, err)
+			}
+			if _, err := eng.Stat(ctx, ScopeID(hostile), "any.txt"); !errors.Is(err, ErrInvalidScopeID) {
+				t.Fatalf("Stat under scope %q: got %v, want ErrInvalidScopeID", hostile, err)
+			}
+		})
+	}
+
+	// Blast radius: baseDir's parent is untouched after every refusal above.
+	if got, err := os.ReadFile(sibling); err != nil || string(got) != "must survive" {
+		t.Fatalf("baseDir parent mutated by refused teardown: content=%q err=%v", got, err)
+	}
+	if fi, err := os.Stat(base); err != nil || !fi.IsDir() {
+		t.Fatalf("baseDir mutated by refused teardown: fi=%v err=%v", fi, err)
+	}
+
+	// A legitimate single-element id still works end to end.
+	legit := ScopeID("scopes")
+	if err := eng.ProvisionScope(ctx, legit); err != nil {
+		t.Fatalf("ProvisionScope legit: %v", err)
+	}
+	if err := eng.WriteStream(ctx, legit, "ok.txt", strings.NewReader("fine"), false); err != nil {
+		t.Fatalf("WriteStream legit: %v", err)
+	}
+	if got := readBack(t, eng, legit, "ok.txt", 16); string(got) != "fine" {
+		t.Fatalf("readback legit: got %q, want fine", got)
+	}
+	if err := eng.TeardownScope(ctx, legit); err != nil {
+		t.Fatalf("TeardownScope legit: %v", err)
+	}
+}
+
+// TestLexicalStagePinnedPerVerb pins that ValidatePath runs in EVERY data
+// verb, on EVERY path argument, independently of the containment root: a
+// NUL-byte path is a class ValidatePath rejects pre-syscall with
+// ErrInvalidPath, while a verb that skipped the lexical stage would surface
+// the NUL from the syscall layer as a *fs.PathError — failing the errors.Is
+// assertion here. This makes a per-verb ValidatePath regression visible
+// even though os.Root containment would still hold.
+func TestLexicalStagePinnedPerVerb(t *testing.T) {
+	ctx := context.Background()
+	eng, _, scope := newLocalEngine(t)
+
+	const bad = "x\x00y"
+	var sink bytes.Buffer
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"List", func() error { _, err := eng.List(ctx, scope, bad); return err }},
+		{"Stat", func() error { _, err := eng.Stat(ctx, scope, bad); return err }},
+		{"MakeDir", func() error { return eng.MakeDir(ctx, scope, bad) }},
+		{"MoveDir_src", func() error { return eng.MoveDir(ctx, scope, bad, "ok", false) }},
+		{"MoveDir_dst", func() error { return eng.MoveDir(ctx, scope, "ok", bad, false) }},
+		{"MoveFile_src", func() error { return eng.MoveFile(ctx, scope, bad, "ok", false) }},
+		{"MoveFile_dst", func() error { return eng.MoveFile(ctx, scope, "ok", bad, false) }},
+		{"RemoveDir", func() error { return eng.RemoveDir(ctx, scope, bad) }},
+		{"RemoveFile", func() error { return eng.RemoveFile(ctx, scope, bad) }},
+		{"CopyFile_src", func() error { return eng.CopyFile(ctx, scope, bad, "ok", false) }},
+		{"CopyFile_dst", func() error { return eng.CopyFile(ctx, scope, "ok", bad, false) }},
+		{"ReadRange", func() error { return eng.ReadRange(ctx, scope, bad, 0, 1, &sink) }},
+		{"WriteStream", func() error { return eng.WriteStream(ctx, scope, bad, strings.NewReader("x"), false) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); !errors.Is(err, ErrInvalidPath) {
+				t.Fatalf("%s with NUL-byte path: got %v, want ErrInvalidPath (lexical stage bypassed?)", tc.name, err)
+			}
+		})
+	}
+}

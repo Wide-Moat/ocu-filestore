@@ -21,6 +21,30 @@ type ScopeID string
 // absolute path, ".." escape, or empty path). Match it with errors.Is.
 var ErrInvalidPath = errors.New("objectstore: invalid or unsafe path")
 
+// ErrInvalidScopeID is the scope-shape sentinel: the scope id is refused
+// before any baseDir join because its bytes could change which directory
+// the join resolves to (empty, "." / "..", a path separator, a NUL byte,
+// or a non-clean form). Match it with errors.Is.
+var ErrInvalidScopeID = errors.New("objectstore: invalid scope id")
+
+// validateScopeID refuses any ScopeID that is not a single, clean path
+// element. The ScopeID remains host-attested and trusted (NFR-SEC-43);
+// this guard is defense-in-depth on the baseDir join, not a trust change:
+// without it, TeardownScope(ScopeID("..")) would resolve to baseDir's
+// parent and erase every scope at once.
+func validateScopeID(id ScopeID) error {
+	s := string(id)
+	switch {
+	case s == "" || s == "." || s == "..":
+		return fmt.Errorf("%w: %q", ErrInvalidScopeID, s)
+	case strings.ContainsAny(s, "/\\\x00"):
+		return fmt.Errorf("%w: %q", ErrInvalidScopeID, s)
+	case filepath.Clean(s) != s:
+		return fmt.Errorf("%w: %q", ErrInvalidScopeID, s)
+	}
+	return nil
+}
+
 func isAlpha(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
@@ -101,9 +125,14 @@ type ScopeRoot struct {
 
 // OpenScopeRoot opens the directory at baseDir/<id> and returns a ScopeRoot
 // confined to it. The id is the host-attested scope supplied by the caller
-// — never derived from any path later passed to Open (PATH-02, NFR-SEC-43).
-// It fails if the directory does not exist or is not a directory.
+// — never derived from any path later passed to Open (PATH-02, NFR-SEC-43)
+// — and its shape is still guarded by validateScopeID before the join
+// (defense-in-depth). It fails if the directory does not exist or is not a
+// directory.
 func OpenScopeRoot(baseDir string, id ScopeID) (*ScopeRoot, error) {
+	if err := validateScopeID(id); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(baseDir, string(id))
 	r, err := os.OpenRoot(dir)
 	if err != nil {
