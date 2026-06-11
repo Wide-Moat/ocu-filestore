@@ -97,7 +97,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Check out the canonical architecture repo so the byte-identity gate
+      # actually enforces in CI; without this the script's skip branch would
+      # make the gate dead on every runner.
+      - uses: actions/checkout@v4
+        with:
+          repository: Wide-Moat/open-computer-use
+          path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
-      - name: vendored contract identity (when the canon checkout is present)
+      - name: vendored contract identity
+        env:
+          OCU_CANON_DIR: canon
         run: bash scripts/check-contract-identity.sh

@@ -21,6 +21,14 @@ readonly CANON_SCHEMA="$CANON_DIR/contracts/storage/file-ops.schema.json"
 readonly VENDORED_SCHEMA='contracts/storage/file-ops.schema.json'
 
 if [ ! -f "$CANON_SCHEMA" ]; then
+  # An explicitly named canon dir that lacks the schema is an error (CI
+  # checks the canon out and must never skip-pass); only the implicit
+  # local-default path may be absent (developer machine without the
+  # sibling checkout).
+  if [ -n "${OCU_CANON_DIR:-}" ]; then
+    echo "::error::OCU_CANON_DIR is set but $CANON_SCHEMA is missing"
+    exit 1
+  fi
   echo "::notice::canon checkout not present ($CANON_SCHEMA); skipping identity check"
   exit 0
 fi

@@ -5,6 +5,10 @@ name: security
 on:
   push:
     branches: [main]
+    # Tag refs do not match a branches: filter; without this a v* tag would
+    # release from a ref these gates never scanned. release.yml waits for
+    # this workflow's check runs on the tagged commit.
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -36,8 +40,17 @@ jobs:
             echo "::notice::LEXICON_DENYLIST not configured in this context; skipping"
             exit 0
           fi
-          hits=$(grep -rniE "$DENYLIST" --exclude-dir='.git' . || true)
-          if [ -n "$hits" ]; then
+          # grep exit codes: 0 = hit (fail the gate), 1 = clean, >=2 = grep
+          # itself errored (malformed pattern, read error) — a broken gate
+          # must fail loud, never pass as clean.
+          rc=0
+          hits=$(grep -rniE "$DENYLIST" --exclude-dir='.git' . 2>/tmp/grep-err) || rc=$?
+          if [ "$rc" -ge 2 ]; then
+            cat /tmp/grep-err >&2
+            echo "::error::lexicon grep failed (rc=$rc) — fix the denylist pattern; failing closed"
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
             echo "$hits" | sed -E 's/^([^:]+:[0-9]+).*/\1: denied term/'
             echo "::error::denied term found — see the project lexicon policy"
             exit 1

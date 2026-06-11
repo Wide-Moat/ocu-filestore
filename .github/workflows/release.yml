@@ -10,10 +10,79 @@ permissions:
   contents: write
 
 jobs:
+  # tag-format gates the whole pipeline: only well-formed SemVer release
+  # tags proceed. The v* trigger glob is permissive; an arbitrary or
+  # malformed tag must fail loud here, never fall through to a stable
+  # "Latest" release.
+  tag-format:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.classify.outputs.is_prerelease }}
+    steps:
+      - name: validate the tag and classify pre-release
+        id: classify
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          # SemVer: MAJOR.MINOR.PATCH with an optional pre-release suffix
+          # whose identifiers may contain hyphens (rc-1, alpha.2, dev-x.3).
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not a SemVer release tag (vMAJOR.MINOR.PATCH[-prerelease])"
+            exit 1
+          fi
+          if echo "$v" | grep -qE '-'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # security-gates blocks the release until this tag's own security run
+  # (security.yml also triggers on v* tags) completes green. A release
+  # never ships from a ref the secrets/SAST/SCA/lexicon gates never
+  # scanned, and never on cached green from an earlier branch run.
+  security-gates:
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: wait for the security workflow on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          required="lexicon secrets-gitleaks secrets-trufflehog sast-semgrep sca-trivy-fs"
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | {name, status, conclusion}]')
+            ok=true
+            for job in $required; do
+              status=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .status // "absent"')
+              concl=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .conclusion // ""')
+              if [ "$status" != "completed" ]; then
+                ok=false
+              elif [ "$concl" != "success" ] && [ "$concl" != "skipped" ]; then
+                echo "::error::security gate '$job' concluded '$concl' on ${GITHUB_SHA}"
+                exit 1
+              fi
+            done
+            if [ "$ok" = true ]; then
+              echo "all security gates green on ${GITHUB_SHA}"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for the security gates on ${GITHUB_SHA}"
+              exit 1
+            fi
+            sleep 20
+          done
+
   # verify re-runs the full test suite and the real-binary e2e smoke IN THIS
   # RUN — a release never ships on cached green from an earlier commit.
   verify:
     runs-on: ubuntu-latest
+    needs: [tag-format]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -41,7 +110,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: verify
+    needs: [tag-format, security-gates, verify]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,24 +145,10 @@ jobs:
           echo "$CHANGES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: detect a pre-release tag
-        id: prerelease
-        run: |
-          # Strip the leading v; any SemVer pre-release suffix (-rc.1,
-          # -alpha.2, -beta.0, -dev.X) marks the GitHub Release as a
-          # pre-release so the "Latest release" badge keeps pointing at the
-          # most recent stable version.
-          v="${GITHUB_REF_NAME#v}"
-          if echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9.]+$'; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
+          prerelease: ${{ needs.tag-format.outputs.is_prerelease == 'true' }}
           files: |
             dist/ocu-filestored_linux_amd64
             dist/ocu-filestored_linux_arm64
