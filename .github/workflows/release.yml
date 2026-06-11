@@ -27,8 +27,8 @@ jobs:
         run: |
           set -uo pipefail
           CGO_ENABLED=0 go build -trimpath -o ocu-filestored ./cmd/ocu-filestored
-          out=$(./ocu-filestored -engine local-volume 2>&1)
-          code=$?
+          code=0
+          out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
           echo "$out"
           [ "$code" -eq 1 ] || { echo "::error::expected exit 1, got $code"; exit 1; }
       - name: run the Integration + E2E slice

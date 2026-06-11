@@ -60,10 +60,12 @@ jobs:
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
       - name: smoke — the real binary refuses with the scaffold sentinel
+        # The runner's default shell is bash -e; capture the expected non-zero
+        # exit with || so the assertion below judges it, not -e.
         run: |
           set -uo pipefail
-          out=$(./ocu-filestored -engine local-volume 2>&1)
-          code=$?
+          code=0
+          out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
           echo "$out"
           if [ "$code" -ne 1 ]; then
             echo "::error::expected exit 1 from the scaffold build, got $code"
@@ -76,8 +78,8 @@ jobs:
       - name: smoke — unknown engine is refused, never silently defaulted
         run: |
           set -uo pipefail
-          out=$(./ocu-filestored -engine bogus 2>&1)
-          code=$?
+          code=0
+          out=$(./ocu-filestored -engine bogus 2>&1) || code=$?
           echo "$out"
           if [ "$code" -ne 1 ]; then
             echo "::error::expected exit 1 on unknown engine, got $code"
