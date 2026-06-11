@@ -126,6 +126,40 @@ func TestGaugeRoundTrip(t *testing.T) {
 	mustPanic(t, "ReleaseBytes beyond current", func() { sess.ReleaseBytes(1) })
 }
 
+// TestNilClockPanics pins the clock-seam purity contract: this package
+// never reads the wall clock itself, so a Registry constructed without an
+// injected clock is a wiring error and fails loud, never a silent fallback.
+func TestNilClockPanics(t *testing.T) {
+	mustPanic(t, "NewRegistry with nil Clock", func() {
+		NewRegistry(Config{
+			OpsPerSecond:         1,
+			OpsBurst:             1,
+			InFlightBytesCeiling: 1,
+			FDCeiling:            1,
+		})
+	})
+}
+
+// TestNopRegistryAdmitsEverything pins the non-enforcing constructor for
+// downstream wiring: ops, bytes, and fd admission all succeed repeatedly —
+// it must never throttle a phase 8-11 test harness.
+func TestNopRegistryAdmitsEverything(t *testing.T) {
+	sess := NewNopRegistry().Session("nop-session")
+	for i := 0; i < 1000; i++ {
+		if err := sess.TryConsumeOp(); err != nil {
+			t.Fatalf("nop TryConsumeOp #%d: got %v, want nil", i+1, err)
+		}
+		if err := sess.AcquireBytes(1 << 30); err != nil {
+			t.Fatalf("nop AcquireBytes #%d: got %v, want nil", i+1, err)
+		}
+		sess.ReleaseBytes(1 << 30)
+		if err := sess.TryAcquireFD(); err != nil {
+			t.Fatalf("nop TryAcquireFD #%d: got %v, want nil", i+1, err)
+		}
+		sess.ReleaseFD()
+	}
+}
+
 // TestSizeLimitsParity asserts DefaultSizeLimits matches the vendored
 // file-ops contract defaults byte-for-byte, and that the broker file-size
 // ceiling has no constant default (deployment policy, zero means unset).

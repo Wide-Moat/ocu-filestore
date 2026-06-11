@@ -28,8 +28,10 @@ import (
 // opaque — no authorization meaning is attached to it.
 type SessionKey string
 
-// ClockFunc supplies the current time for rate-limiter arithmetic. Pass
-// time.Now in production; pass a fake in tests (no sleeps, no tickers).
+// ClockFunc supplies the current time for rate-limiter arithmetic. The
+// wiring layer injects the runtime wall clock in production; tests inject a
+// fake (no sleeps, no tickers). This package never reads the wall clock
+// itself — every instant flows through this seam.
 type ClockFunc func() time.Time
 
 // ErrSizeExceeded — the declared inbound size exceeds the ceiling. The
@@ -154,8 +156,7 @@ func (g *ByteGauge) ReleaseBytes(n int64) {
 }
 
 // Config holds the per-session ceiling values a Registry stamps onto each
-// new Session. Callers validate the values before constructing a Registry;
-// a nil Clock defaults to time.Now.
+// new Session. Callers validate the values before constructing a Registry.
 type Config struct {
 	// OpsPerSecond is the token-bucket refill rate (file ops per second).
 	OpsPerSecond float64
@@ -167,7 +168,8 @@ type Config struct {
 	InFlightBytesCeiling int64
 	// FDCeiling bounds one session's concurrently open file descriptors.
 	FDCeiling int32
-	// Clock supplies the bucket's notion of now. nil means time.Now.
+	// Clock supplies the bucket's notion of now. It must be non-nil: the
+	// wiring layer injects the runtime wall clock, tests inject a fake.
 	Clock ClockFunc
 }
 
@@ -250,10 +252,12 @@ type Registry struct {
 }
 
 // NewRegistry creates a Registry that stamps cfg onto every session it
-// creates. A nil cfg.Clock defaults to time.Now.
+// creates. cfg.Clock must be non-nil — a nil clock is a wiring error and
+// panics (fail-loud, never a silent fallback): this package keeps the wall
+// clock behind the injected seam, so the caller decides what "now" means.
 func NewRegistry(cfg Config) *Registry {
 	if cfg.Clock == nil {
-		cfg.Clock = time.Now
+		panic("ceilings: NewRegistry: Config.Clock is nil (the wiring layer must inject a clock)")
 	}
 	return &Registry{
 		sessions: make(map[SessionKey]*Session),
@@ -295,15 +299,18 @@ func (r *Registry) Release(key SessionKey) {
 // wiring use ONLY (the phase 8-11 consumers): every limiter call succeeds.
 // The bucket's burst is math.MaxFloat64 (consuming one token cannot dent
 // it), the bytes ceiling is math.MaxInt64, and the fd ceiling is
-// math.MaxInt32. Broken acquire/release pairings still panic — the no-op
+// math.MaxInt32; the clock is a fixed instant because no limiter here ever
+// depends on time. Broken acquire/release pairings still panic — the no-op
 // property covers admission only, never accounting bugs. Never deploy it:
 // a production Registry comes from NewRegistry with validated ceilings.
 func NewNopRegistry() *Registry {
+	fixed := time.Unix(0, 0)
 	return NewRegistry(Config{
 		OpsPerSecond:         0,
 		OpsBurst:             math.MaxFloat64,
 		InFlightBytesCeiling: math.MaxInt64,
 		FDCeiling:            math.MaxInt32,
+		Clock:                func() time.Time { return fixed },
 	})
 }
 
