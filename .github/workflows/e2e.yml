@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # build-broker builds the static broker daemon and publishes it as a
+  # same-run artifact. The e2e job consumes it via needs: +
+  # download-artifact@v4 IN THE SAME RUN — no run-id/token cross-workflow
+  # mode (that is the race-prone anti-pattern and is NOT used).
+  build-broker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: static build of ocu-filestored
+        run: CGO_ENABLED=0 go build -trimpath -o ocu-filestored ./cmd/ocu-filestored
+      - name: upload the broker binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocu-filestored
+          path: ocu-filestored
+          if-no-files-found: error
+          retention-days: 1
+
+  # e2e is the RELEASE-GATING job: it exercises the REAL daemon binary —
+  # no mocks. It is a REQUIRED check — no continue-on-error. Today the
+  # daemon is a wiring scaffold that validates its flag surface and refuses
+  # with a typed error; the smoke below asserts exactly that observable
+  # behaviour. The Integration|E2E test slice grows with the south-face
+  # implementation PRs (real unix socket, real peer-cred drop, real
+  # audit-deny) and runs under this same job.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: build-broker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: download the broker binary (same run)
+        uses: actions/download-artifact@v4
+        with:
+          name: ocu-filestored
+      - name: make the broker binary executable
+        run: chmod +x ocu-filestored
+      - name: smoke — the real binary refuses with the scaffold sentinel
+        run: |
+          set -uo pipefail
+          out=$(./ocu-filestored -engine local-volume 2>&1)
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 from the scaffold build, got $code"
+            exit 1
+          fi
+          echo "$out" | grep -q "not implemented in this build" || {
+            echo "::error::scaffold refusal sentinel missing from output"
+            exit 1
+          }
+      - name: smoke — unknown engine is refused, never silently defaulted
+        run: |
+          set -uo pipefail
+          out=$(./ocu-filestored -engine bogus 2>&1)
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 on unknown engine, got $code"
+            exit 1
+          fi
+          echo "$out" | grep -q "unknown backend engine" || {
+            echo "::error::unknown-engine sentinel missing from output"
+            exit 1
+          }
+      - name: run the Integration + E2E slice
+        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
