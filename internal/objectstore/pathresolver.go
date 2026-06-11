@@ -5,6 +5,7 @@ package objectstore
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,24 +84,57 @@ func ValidatePath(p string) (string, error) {
 }
 
 // ScopeRoot holds a containment root for one host-attested filesystem_id
-// scope. Stub: implemented against the failing tests.
+// scope. Every path passed to its methods is run through ValidatePath
+// first; the underlying os.Root then enforces symlink containment at open
+// time by resolving each path component with O_NOFOLLOW from the root fd
+// (PATH-01, NFR-SEC-25 symlink stage).
+//
+// ScopeRoot does not authorize — three-axis authorization is the resolver's
+// job and runs before any call here — and it implements no file verb; the
+// engine builds verbs on this seam. The caller decides the handle's
+// lifetime: it may hold one ScopeRoot across many operations in a session
+// or open per request; Close releases the root fd either way.
 type ScopeRoot struct {
 	id   ScopeID
 	root *os.Root
 }
 
-// OpenScopeRoot opens baseDir/<id> as a containment root. Stub.
+// OpenScopeRoot opens the directory at baseDir/<id> and returns a ScopeRoot
+// confined to it. The id is the host-attested scope supplied by the caller
+// — never derived from any path later passed to Open (PATH-02, NFR-SEC-43).
+// It fails if the directory does not exist or is not a directory.
 func OpenScopeRoot(baseDir string, id ScopeID) (*ScopeRoot, error) {
-	return nil, ErrNotImplemented
+	dir := filepath.Join(baseDir, string(id))
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("objectstore: open scope root %q: %w", id, err)
+	}
+	return &ScopeRoot{id: id, root: r}, nil
 }
 
-// ID returns the host-attested scope this root was opened for. Stub.
+// ID returns the host-attested scope this root was opened for — always the
+// constructor argument, never parsed from an opened path (PATH-02).
 func (s *ScopeRoot) ID() ScopeID { return s.id }
 
-// Close releases the root handle. Stub.
-func (s *ScopeRoot) Close() error { return nil }
+// Close releases the root handle. After Close, Open fails.
+func (s *ScopeRoot) Close() error { return s.root.Close() }
 
-// Open opens the named file inside the scope. Stub.
+// Open opens the named file inside the scope for reading. The raw name goes
+// through ValidatePath (lexical class → ErrInvalidPath, pre-syscall); the
+// cleaned form is then opened by os.Root, which refuses any resolution that
+// escapes the scope with an *fs.PathError ("path escapes from parent") —
+// a class kept deliberately distinct from ErrInvalidPath so the consumer
+// maps the two rejections separately.
+//
+// Symlinks that stay inside the scope ARE followed — the invariant is "no
+// escape outside the prefix", not "no symlinks". os.Root does not block
+// /proc special files, Linux bind mounts, or device files reachable inside
+// the prefix; that is the operator's host posture and the broker's seccomp
+// profile's job (NFR-SEC-02), out of scope for this package.
 func (s *ScopeRoot) Open(name string) (*os.File, error) {
-	return nil, ErrNotImplemented
+	clean, err := ValidatePath(name)
+	if err != nil {
+		return nil, err
+	}
+	return s.root.Open(clean)
 }
