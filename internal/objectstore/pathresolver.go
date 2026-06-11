@@ -5,6 +5,7 @@ package objectstore
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -79,4 +80,27 @@ func ValidatePath(p string) (string, error) {
 		return "", ErrInvalidPath
 	}
 	return clean, nil
+}
+
+// ScopeRoot holds a containment root for one host-attested filesystem_id
+// scope. Stub: implemented against the failing tests.
+type ScopeRoot struct {
+	id   ScopeID
+	root *os.Root
+}
+
+// OpenScopeRoot opens baseDir/<id> as a containment root. Stub.
+func OpenScopeRoot(baseDir string, id ScopeID) (*ScopeRoot, error) {
+	return nil, ErrNotImplemented
+}
+
+// ID returns the host-attested scope this root was opened for. Stub.
+func (s *ScopeRoot) ID() ScopeID { return s.id }
+
+// Close releases the root handle. Stub.
+func (s *ScopeRoot) Close() error { return nil }
+
+// Open opens the named file inside the scope. Stub.
+func (s *ScopeRoot) Open(name string) (*os.File, error) {
+	return nil, ErrNotImplemented
 }
