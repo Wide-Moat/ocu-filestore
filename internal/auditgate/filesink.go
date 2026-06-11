@@ -9,11 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -34,13 +36,33 @@ func genesisHash() [sha256.Size]byte {
 	return sha256.Sum256([]byte(genesisInput))
 }
 
+// writeSyncer is the sink's append seam: the durable-write pair Mandate
+// depends on. The real *os.File satisfies it; tests substitute a faulting
+// implementation to exercise the failure latch.
+type writeSyncer interface {
+	io.Writer
+	Sync() error
+}
+
 // FileSink is the minimal-shelf Guard implementation: an append-only,
 // hash-chained JSONL file. Mandate returns nil only after the record is on
 // stable storage (O_APPEND write + fsync); any failure returns
 // ErrAuditUnavailable and the caller must deny the operation (NFR-SEC-79).
+//
+// A write or sync failure latches the sink permanently failed: after a
+// fault, file state and in-memory chain state can no longer be trusted to
+// agree (a partial write leaves a fragment a later append would merge
+// into; a failed sync may still have reached the platter), so every
+// subsequent Mandate is refused without writing. Recovery is a restart —
+// NewFileSink re-scans the chain from genesis.
 type FileSink struct {
 	mu sync.Mutex
 	f  *os.File
+	// w is the durable-write seam; always the underlying *os.File in
+	// production.
+	w writeSyncer
+	// failed latches true after any write or sync error; it never resets.
+	failed bool
 	// prevLineHash is the SHA-256 of the exact bytes of the last written
 	// line, including its trailing newline; genesis when no line exists.
 	prevLineHash [sha256.Size]byte
@@ -76,15 +98,18 @@ func NewFileSink(path string) (*FileSink, error) {
 	switch {
 	case isNew:
 		// Two-fsync creation: the file, then the parent directory so the
-		// new directory entry is durable (POSIX). The directory sync is
-		// best-effort — some platforms refuse fsync on a directory fd.
+		// new directory entry is durable (POSIX). The only tolerated
+		// directory-fsync failures are EINVAL and ENOTSUP — platforms or
+		// filesystems that refuse fsync on a directory fd; any other
+		// error fails construction (a lost directory entry could vanish
+		// an entire first-boot file of acked records on crash).
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("auditgate: sync new sink: %w", err)
 		}
-		if dir, derr := os.Open(filepath.Dir(path)); derr == nil {
-			_ = dir.Sync()
-			_ = dir.Close()
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			_ = f.Close()
+			return nil, err
 		}
 	case info.Size() > 0:
 		rf, err := os.Open(path)
@@ -113,7 +138,27 @@ func NewFileSink(path string) (*FileSink, error) {
 		prev = last
 	}
 
-	return &FileSink{f: f, prevLineHash: prev}, nil
+	return &FileSink{f: f, w: f, prevLineHash: prev}, nil
+}
+
+// syncDir fsyncs the directory at dir so a new entry inside it is durable.
+// EINVAL and ENOTSUP — from open or sync — are tolerated as the
+// platform/filesystem refusing directory fsync; any other error is
+// returned and must fail construction.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+			return nil
+		}
+		return fmt.Errorf("auditgate: open sink directory: %w", err)
+	}
+	serr := d.Sync()
+	_ = d.Close()
+	if serr != nil && !errors.Is(serr, syscall.EINVAL) && !errors.Is(serr, syscall.ENOTSUP) {
+		return fmt.Errorf("auditgate: sync sink directory: %w", serr)
+	}
+	return nil
 }
 
 // Mandate durably records the event and only then returns nil. The event
@@ -123,6 +168,14 @@ func NewFileSink(path string) (*FileSink, error) {
 // failure — unknown event type, marshal, write, or sync — returns
 // ErrAuditUnavailable so the caller denies the operation (fail-closed,
 // NFR-SEC-79).
+//
+// A write or sync error additionally latches the sink failed for its
+// remaining lifetime: file bytes and the in-memory chain may have
+// diverged, and acking further records into an unverifiable chain would
+// turn a fault detected at the next restart into records silently lost to
+// Verify. Every Mandate after the latch returns ErrAuditUnavailable
+// without touching the file; restarting the broker (NewFileSink) re-scans
+// and recovers.
 func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	ev, ok := event.(FileActivityEvent)
 	if !ok {
@@ -131,6 +184,10 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.failed {
+		return ErrAuditUnavailable
+	}
 
 	ev.Time = time.Now().UnixMilli()
 	if ev.Metadata.Version == "" {
@@ -147,12 +204,15 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	}
 	line = append(line, '\n')
 
-	// Write directly to the *os.File — never through a buffered writer,
-	// which could hold bytes a file Sync does not flush.
-	if _, err := s.f.Write(line); err != nil {
+	// Write directly to the file seam — never through a buffered writer,
+	// which could hold bytes a file Sync does not flush. Either fault
+	// latches the sink: see the method comment.
+	if _, err := s.w.Write(line); err != nil {
+		s.failed = true
 		return ErrAuditUnavailable
 	}
-	if err := s.f.Sync(); err != nil {
+	if err := s.w.Sync(); err != nil {
+		s.failed = true
 		return ErrAuditUnavailable
 	}
 
@@ -167,6 +227,13 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 // chain, and an error naming the broken line on any tamper or truncation
 // that breaks a recorded continuation. A trailing partial line with no
 // newline is ignored: it is a torn write that was never acked (AUD-02).
+//
+// Offline scope: the most recent record is not protected by the chain
+// alone. No successor records its hash, so removing the final complete
+// line — or mutating its body while leaving its prev_hash field intact —
+// is undetectable to this scan. Closing that window requires anchoring
+// the chain head outside the file, which is full-shelf scope; until then,
+// treat Verify as proving the integrity of every record except the last.
 func Verify(path string) error {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {

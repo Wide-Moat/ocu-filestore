@@ -134,6 +134,83 @@ func TestMandateUnavailable(t *testing.T) {
 	}
 }
 
+// faultSyncer wraps the sink's write seam, failing Write or Sync on
+// demand while delegating the other call to the real implementation.
+type faultSyncer struct {
+	ws        writeSyncer
+	failWrite bool
+	failSync  bool
+}
+
+func (f *faultSyncer) Write(p []byte) (int, error) {
+	if f.failWrite {
+		return 0, errors.New("injected write fault")
+	}
+	return f.ws.Write(p)
+}
+
+func (f *faultSyncer) Sync() error {
+	if f.failSync {
+		return errors.New("injected sync fault")
+	}
+	return f.ws.Sync()
+}
+
+// TestMandateLatchesAfterFault pins the post-error latch: any write or
+// sync fault permanently fails the sink — every later Mandate returns
+// ErrAuditUnavailable without writing, even after the underlying fault is
+// gone. Recovery is a restart: NewFileSink re-scans the chain and serves.
+func TestMandateLatchesAfterFault(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault faultSyncer
+	}{
+		{"write fault", faultSyncer{failWrite: true}},
+		{"sync fault", faultSyncer{failSync: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, s := newTestSink(t)
+			if err := s.Mandate(context.Background(), testEvent()); err != nil {
+				t.Fatalf("baseline Mandate: %v", err)
+			}
+
+			fault := tc.fault
+			fault.ws = s.f
+			s.w = &fault
+			if err := s.Mandate(context.Background(), testEvent()); !errors.Is(err, ErrAuditUnavailable) {
+				t.Fatalf("Mandate under fault: got %v, want ErrAuditUnavailable", err)
+			}
+			linesAfterFault := len(completeLines(t, path))
+
+			// The underlying problem is fixed — the latch must still refuse,
+			// and must not touch the file.
+			s.w = s.f
+			if err := s.Mandate(context.Background(), testEvent()); !errors.Is(err, ErrAuditUnavailable) {
+				t.Fatalf("Mandate after fault cleared: got %v, want ErrAuditUnavailable (latched)", err)
+			}
+			if got := len(completeLines(t, path)); got != linesAfterFault {
+				t.Fatalf("latched Mandate wrote to the file: %d lines, want %d", got, linesAfterFault)
+			}
+
+			// Restart recovers: a fresh sink re-scans from genesis, adopts
+			// every complete line, and the continued chain verifies.
+			if err := s.f.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			s2, err := NewFileSink(path)
+			if err != nil {
+				t.Fatalf("NewFileSink restart: %v", err)
+			}
+			if err := s2.Mandate(context.Background(), testEvent()); err != nil {
+				t.Fatalf("Mandate after restart: %v", err)
+			}
+			if err := Verify(path); err != nil {
+				t.Fatalf("Verify after restart recovery: got %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestMandateUnknownType pins the type-assert fail-closed path: anything
 // that is not a FileActivityEvent value returns ErrAuditUnavailable.
 func TestMandateUnknownType(t *testing.T) {
