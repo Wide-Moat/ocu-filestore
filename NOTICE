@@ -32,3 +32,32 @@ The rapid library is used under the terms of the Mozilla Public License
 Version 2.0. MPL-2.0 is a weak copyleft license (file-level); it does not
 extend to the rest of this codebase. A copy of the MPL-2.0 is available at
 https://www.mozilla.org/en-US/MPL/2.0/.
+
+### github.com/aws/aws-sdk-go-v2 (and submodules)
+
+Source: https://github.com/aws/aws-sdk-go-v2
+License: Apache License 2.0 (Apache-2.0)
+Used by: the s3 backend engine (service/s3, service/sts, credentials, core)
+
+The AWS SDK for Go v2 and its service submodules are used under the terms of
+the Apache License 2.0. A copy of the Apache-2.0 text is included in this
+repository as LICENSE-APACHE.
+
+### github.com/aws/smithy-go
+
+Source: https://github.com/aws/smithy-go
+License: Apache License 2.0 (Apache-2.0)
+Used by: transitive dependency of the AWS SDK for Go v2 (error taxonomy types)
+
+smithy-go is used under the terms of the Apache License 2.0 (see
+LICENSE-APACHE).
+
+### golang.org/x/text
+
+Source: https://cs.opensource.google/go/x/text
+License: BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
+Used by: the s3 key validator (unicode/norm, NFC normalization checks)
+
+The x/text module is used under the terms of the Go project's BSD-3-Clause
+license; its license text is available at
+https://cs.opensource.google/go/x/text/+/master:LICENSE.
