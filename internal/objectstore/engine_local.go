@@ -217,12 +217,21 @@ func (e *localVolumeEngine) MoveFile(_ context.Context, scope ScopeID, src, dst 
 }
 
 // renameWithin is the shared move verb: both paths validate lexically, then
-// os.Root.Rename confines BOTH ends — an escaping end surfaces as
+// the os.Root verbs confine BOTH ends — an escaping end surfaces as
 // *os.LinkError, which isPathEscape normalizes into the one caller-visible
-// escape class (T-03-04). With overwrite false an existing destination
-// refuses with ErrAlreadyExists; with overwrite true a file destination is
+// escape class (T-03-04). With overwrite true a file destination is
 // replaced (a non-empty directory destination still refuses at the OS
 // layer, per rename(2)).
+//
+// With overwrite FALSE the no-replace commit is ATOMIC for files: the
+// source is link(2)-ed under the destination name — link fails EEXIST if
+// the destination exists, with no stat-then-rename TOCTOU window for a
+// concurrent writer to slip into — then the source name is unlinked.
+// Directories cannot be hard-linked, so a directory move keeps the
+// existence pre-check + rename; rename(2) onto a NON-EMPTY directory still
+// refuses at the OS layer, leaving only an empty-directory destination
+// replaceable in that residual window (the wire moveDirectory op carries no
+// overwrite knob and always runs overwrite=false).
 func (e *localVolumeEngine) renameWithin(scope ScopeID, src, dst string, overwrite bool) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
@@ -239,16 +248,44 @@ func (e *localVolumeEngine) renameWithin(scope ScopeID, src, dst string, overwri
 		return err
 	}
 
-	if !overwrite {
+	if overwrite {
+		if err := sr.root.Rename(cleanSrc, cleanDst); err != nil {
+			return fmt.Errorf("objectstore: rename: %w", err)
+		}
+		return nil
+	}
+
+	info, err := sr.root.Lstat(cleanSrc)
+	if err != nil {
+		return fmt.Errorf("objectstore: stat source: %w", err)
+	}
+	if info.IsDir() {
+		// Directory no-replace: pre-check + rename (see the verb comment for
+		// the residual empty-directory window).
 		if _, err := sr.root.Stat(cleanDst); err == nil {
 			return ErrAlreadyExists
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("objectstore: stat destination: %w", err)
 		}
+		if err := sr.root.Rename(cleanSrc, cleanDst); err != nil {
+			return fmt.Errorf("objectstore: rename: %w", err)
+		}
+		return nil
 	}
 
-	if err := sr.root.Rename(cleanSrc, cleanDst); err != nil {
-		return fmt.Errorf("objectstore: rename: %w", err)
+	// File no-replace: atomic link-then-unlink. EEXIST is the loser of a
+	// concurrent race and maps to the typed collision sentinel.
+	if err := sr.root.Link(cleanSrc, cleanDst); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return ErrAlreadyExists
+		}
+		return fmt.Errorf("objectstore: link: %w", err)
+	}
+	if err := sr.root.Remove(cleanSrc); err != nil {
+		// The destination link landed but the source could not be unlinked:
+		// roll the link back so the move is never half-applied.
+		_ = sr.root.Remove(cleanDst)
+		return fmt.Errorf("objectstore: unlink source after link: %w", err)
 	}
 	return nil
 }
@@ -294,9 +331,11 @@ func (e *localVolumeEngine) RemoveFile(_ context.Context, scope ScopeID, path st
 
 // CopyFile duplicates a file's bytes within the scope as a composed stream
 // (no native copy verb exists on the containment root): open source, write
-// into a unique temp name, rename into place. The destination is therefore
+// into a unique temp name, commit into place. The destination is therefore
 // atomic exactly like WriteStream. With overwrite false an existing
-// destination refuses with ErrAlreadyExists.
+// destination refuses with ErrAlreadyExists — enforced ATOMICALLY at the
+// link commit (no stat-then-rename TOCTOU); the early Stat is a fast-path
+// reject only, sparing the byte copy.
 func (e *localVolumeEngine) CopyFile(_ context.Context, scope ScopeID, src, dst string, overwrite bool) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
@@ -322,7 +361,7 @@ func (e *localVolumeEngine) CopyFile(_ context.Context, scope ScopeID, src, dst 
 	}
 	defer srcF.Close()
 
-	return writeTempAndRename(sr, cleanDst, srcF)
+	return writeTempAndCommit(sr, cleanDst, srcF, overwrite)
 }
 
 // ReadRange streams the half-open byte range [offset, offset+length) of the
@@ -355,10 +394,13 @@ func (e *localVolumeEngine) ReadRange(_ context.Context, scope ScopeID, path str
 
 // WriteStream consumes r into the named file without whole-object buffering
 // — size ceilings are the caller's layer, never re-implemented here. The
-// bytes land in a unique temp name and rename into place, so a partial
+// bytes land in a unique temp name and commit into place, so a partial
 // write is invisible at the destination and removed on any error path
 // (T-03-03). With overwrite false an existing destination refuses with
-// ErrAlreadyExists.
+// ErrAlreadyExists — enforced ATOMICALLY at the link commit (no
+// stat-then-rename TOCTOU: of two concurrent overwrite=false writers
+// exactly one wins); the early Stat is a fast-path reject only, sparing the
+// stream consumption.
 func (e *localVolumeEngine) WriteStream(_ context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
@@ -379,18 +421,25 @@ func (e *localVolumeEngine) WriteStream(_ context.Context, scope ScopeID, path s
 		}
 	}
 
-	return writeTempAndRename(sr, cleanPath, r)
+	return writeTempAndCommit(sr, cleanPath, r, overwrite)
 }
 
-// writeTempAndRename is the shared atomic-write tail for WriteStream and
+// writeTempAndCommit is the shared atomic-write tail for WriteStream and
 // CopyFile: stream into cleanDst+".tmp."+<process-unique suffix> in the
-// destination's own directory (same-dir rename is atomic), fsync, then
-// rename into place. The suffix prevents temp-name collision under
+// destination's own directory (same-dir commit is atomic), fsync, then
+// commit into place. The suffix prevents temp-name collision under
 // concurrent writes to the same destination (T-03-06). On ANY error the
 // temp is removed; on success no temp remains. cleanDst has already passed
 // ValidatePath — containment of the temp name itself is still enforced by
 // the root on open.
-func writeTempAndRename(sr *ScopeRoot, cleanDst string, r io.Reader) error {
+//
+// The commit is replace-aware: with replace true the temp RENAMES into
+// place (replacing an existing destination); with replace false the temp is
+// LINK(2)-ed under the destination name — link fails EEXIST if the
+// destination exists, making the no-replace decision atomic at the kernel
+// (no stat-then-rename TOCTOU) — and the temp name is then removed by the
+// deferred cleanup.
+func writeTempAndCommit(sr *ScopeRoot, cleanDst string, r io.Reader, replace bool) error {
 	tmpName := cleanDst + ".tmp." + strconv.FormatUint(rand.Uint64(), 36)
 
 	f, err := sr.root.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
@@ -414,6 +463,20 @@ func writeTempAndRename(sr *ScopeRoot, cleanDst string, r io.Reader) error {
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("objectstore: close temp: %w", err)
+	}
+
+	if !replace {
+		// Atomic no-replace commit: exactly one concurrent writer's link
+		// lands; every loser observes EEXIST -> the typed collision
+		// sentinel. cleanup stays true — the temp NAME is removed either
+		// way (on success the bytes now live under cleanDst).
+		if err := sr.root.Link(tmpName, cleanDst); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return ErrAlreadyExists
+			}
+			return fmt.Errorf("objectstore: link into place: %w", err)
+		}
+		return nil
 	}
 
 	if err := sr.root.Rename(tmpName, cleanDst); err != nil {
