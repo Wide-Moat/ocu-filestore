@@ -305,9 +305,10 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 			return
 		}
 
-		var cf uploadChunkFrame
-		if json.Unmarshal(payload, &cf) != nil {
-			// Undecodable data frame: HARD ABORT (WIRE-LESSONS #1).
+		cf, cerr := decodeChunkFrame(payload)
+		if cerr != nil {
+			// Undecodable / unknown-field / chunk-less data frame: HARD ABORT
+			// (WIRE-LESSONS #1).
 			denyTrailer(denyMalformed, wireCodeInvalidArgument, "malformed chunk frame")
 			pw.CloseWithError(errMalformedFrame)
 			<-writeErrCh
@@ -362,6 +363,31 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 
 	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.
 	_ = writeEndStream(sc.w, nil)
+}
+
+// decodeChunkFrame strict-decodes one chunk data frame: unknown fields are
+// rejected (DisallowUnknownFields), a trailing second JSON value is rejected
+// (single-value enforcement, the same discipline as the params frame and
+// every unary body), and an ABSENT or null chunk member is rejected — {} and
+// {"chunk":null} are not 0-byte chunks, they are malformed frames. A present
+// empty chunk ({"chunk":""}) decodes to a non-nil empty slice and is a legal
+// 0-byte chunk. The contract-named numChunks member is accepted (see
+// uploadChunkFrame) but never read.
+func decodeChunkFrame(payload []byte) (uploadChunkFrame, error) {
+	var cf uploadChunkFrame
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cf); err != nil {
+		return uploadChunkFrame{}, errMalformedFrame
+	}
+	var extra json.RawMessage
+	if dec.Decode(&extra) == nil {
+		return uploadChunkFrame{}, errMalformedFrame
+	}
+	if cf.Chunk == nil {
+		return uploadChunkFrame{}, errMalformedFrame
+	}
+	return cf, nil
 }
 
 // readParamsFrame reads the first frame and strict-decodes the params. A

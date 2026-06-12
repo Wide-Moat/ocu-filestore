@@ -177,7 +177,20 @@ type uploadParamsFrame struct {
 // uploadChunkFrame is a fileUpload data frame carrying one chunk of object
 // bytes. Go marshals/unmarshals a []byte field as standard base64, which is
 // byte-identical to the guest framer's chunk encoding (the golden chunk
-// {"chunk":"QUJDREVGR0g="} round-trips to raw "ABCDEFGH").
+// {"chunk":"QUJDREVGR0g="} round-trips to raw "ABCDEFGH"). It is
+// STRICT-decoded (decodeChunkFrame): unknown fields and trailing values
+// reject, and an absent/null chunk member rejects — a data frame MUST carry
+// the chunk.
 type uploadChunkFrame struct {
 	Chunk []byte `json:"chunk"`
+	// NumChunks is ACCEPTED-UNUSED. The frozen contract names it required on
+	// the chunk sub-message, but the shipped guest framer never sends it and
+	// the authoritative end-of-stream is the client half-close, with
+	// declared_size_bytes carrying the size authority (both directions of a
+	// mismatch reject). The field is declared so a contract-conformant
+	// sender is not refused by the strict decode; its value is never read —
+	// enforcing a count the shipped peer does not send would invent
+	// semantics the wire does not exercise. omitempty keeps the OUTBOUND
+	// marshal byte-identical to the golden {"chunk":"..."} frame.
+	NumChunks int64 `json:"numChunks,omitempty"`
 }
