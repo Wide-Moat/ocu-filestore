@@ -4,18 +4,24 @@
 package objectstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -319,5 +325,349 @@ func TestS3_EngineKindAndScaffold(t *testing.T) {
 	}
 	if err := eng.MakeDir(context.Background(), "fs1", "d"); !errors.Is(err, ErrNotImplemented) {
 		t.Fatalf("MakeDir scaffold error = %v, want ErrNotImplemented until 13-07", err)
+	}
+}
+
+// --- Live S3 leg (real MinIO; gated, never mocked) -------------------------
+
+// liveSkipNotice names the exact local invocation, so a skip is always loud
+// and actionable.
+const liveSkipNotice = `OCU_S3_TEST_ENDPOINT not set - live S3 leg SKIPPED (it never runs against a mock).
+Boot the rig and re-run:
+  docker compose -f deploy/docker-compose.test.yml up -d --wait minio
+  docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
+  OCU_S3_TEST_ENDPOINT=http://127.0.0.1:9000 OCU_S3_TEST_BUCKET=ocu-conformance \
+  OCU_S3_TEST_ACCESS_KEY=ocu-test-root OCU_S3_TEST_SECRET_KEY=ocu-test-secret-key \
+  go test ./internal/objectstore/ -run 'Conformance|S3Live' -count=1`
+
+// liveS3Engine returns an engine bound to the real rig (skipping loudly when
+// the env gate is unset) plus a unique scope; cleanup sweeps the scope's
+// prefix with the raw client so test runs never bleed into each other.
+func liveS3Engine(t *testing.T) (*s3Engine, ScopeID) {
+	t.Helper()
+	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip(liveSkipNotice)
+	}
+	bucket := os.Getenv("OCU_S3_TEST_BUCKET")
+	if bucket == "" {
+		bucket = "ocu-conformance"
+	}
+	eng, err := NewS3Engine(S3Config{
+		Endpoint:     endpoint,
+		Region:       "us-east-1",
+		Bucket:       bucket,
+		UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider(
+			os.Getenv("OCU_S3_TEST_ACCESS_KEY"), os.Getenv("OCU_S3_TEST_SECRET_KEY"), ""),
+	})
+	if err != nil {
+		t.Fatalf("NewS3Engine(live): %v", err)
+	}
+	e := eng.(*s3Engine)
+
+	scope := ScopeID(fmt.Sprintf("%s-%d",
+		strings.ToLower(strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())),
+		time.Now().UnixNano()))
+	t.Cleanup(func() { liveSweepScope(t, e, scope) })
+	return e, scope
+}
+
+// liveSweepScope erases every key under the scope prefix with the raw
+// client (paginated list + batched delete) — the test-side hygiene sweep
+// until TeardownScope lands.
+func liveSweepScope(t *testing.T, e *s3Engine, scope ScopeID) {
+	t.Helper()
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	var token *string
+	for {
+		out, err := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(e.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+		})
+		if err != nil {
+			t.Logf("live sweep list: %v", err)
+			return
+		}
+		if len(out.Contents) > 0 {
+			ids := make([]types.ObjectIdentifier, 0, len(out.Contents))
+			for _, obj := range out.Contents {
+				ids = append(ids, types.ObjectIdentifier{Key: obj.Key})
+			}
+			if _, err := e.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(e.bucket), Delete: &types.Delete{Objects: ids},
+			}); err != nil {
+				t.Logf("live sweep delete: %v", err)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return
+		}
+		token = out.NextContinuationToken
+	}
+}
+
+// liveSeed PUTs a raw object with the raw client — test arrangement only;
+// every assertion still runs through the engine against the real backend.
+func liveSeed(t *testing.T, e *s3Engine, key string, body []byte) {
+	t.Helper()
+	if _, err := e.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key), Body: bytes.NewReader(body),
+	}); err != nil {
+		t.Fatalf("liveSeed(%q): %v", key, err)
+	}
+}
+
+// --- 13-06: read verbs -----------------------------------------------------
+
+// TestS3_RangeHeaderFormat pins the single-range header shape: half-open
+// [offset, offset+length) becomes the inclusive "bytes=start-end" — exactly
+// one range, never multi-range (which the backend ignores with a 200).
+func TestS3_RangeHeaderFormat(t *testing.T) {
+	for _, tc := range []struct {
+		offset, length int64
+		want           string
+	}{
+		{0, 1, "bytes=0-0"},
+		{0, 10, "bytes=0-9"},
+		{5, 100, "bytes=5-104"},
+		{1 << 30, 1 << 20, "bytes=1073741824-1074790399"},
+	} {
+		if got := rangeHeader(tc.offset, tc.length); got != tc.want {
+			t.Fatalf("rangeHeader(%d, %d) = %q, want %q", tc.offset, tc.length, got, tc.want)
+		}
+	}
+}
+
+// TestS3_ReopenOffsetArithmetic pins the mid-stream reopen window math: a
+// reopen continues from the last good offset for the remaining bytes —
+// never a whole-transfer restart, never a byte-discard seek.
+func TestS3_ReopenOffsetArithmetic(t *testing.T) {
+	for _, tc := range []struct {
+		offset, length, delivered int64
+		wantOffset, wantLength    int64
+	}{
+		{0, 100, 0, 0, 100},
+		{0, 100, 40, 40, 60},
+		{10, 100, 30, 40, 70},
+		{10, 100, 100, 110, 0},
+	} {
+		gotOff, gotLen := reopenWindow(tc.offset, tc.length, tc.delivered)
+		if gotOff != tc.wantOffset || gotLen != tc.wantLength {
+			t.Fatalf("reopenWindow(%d, %d, %d) = (%d, %d), want (%d, %d)",
+				tc.offset, tc.length, tc.delivered, gotOff, gotLen, tc.wantOffset, tc.wantLength)
+		}
+	}
+	// The re-issued header continues exactly where delivery stopped.
+	off, ln := reopenWindow(10, 100, 30)
+	if got := rangeHeader(off, ln); got != "bytes=40-109" {
+		t.Fatalf("reopened range header = %q, want bytes=40-109", got)
+	}
+}
+
+// TestS3Live_Stat_FileDirMissing pins the three-step Stat resolution against
+// the real backend: object key -> file; dir marker -> directory; lost marker
+// with children -> still a directory; nothing -> fs.ErrNotExist.
+func TestS3Live_Stat_FileDirMissing(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+
+	liveSeed(t, e, prefix+"f.txt", []byte("hello stat"))
+	liveSeed(t, e, prefix+"d/", nil)             // marker directory
+	liveSeed(t, e, prefix+"lost/child.txt", nil) // children, no marker
+
+	fi, err := e.Stat(ctx, scope, "f.txt")
+	if err != nil {
+		t.Fatalf("Stat(file): %v", err)
+	}
+	if fi.IsDir || fi.Size != int64(len("hello stat")) || fi.Name != "f.txt" {
+		t.Fatalf("Stat(file) = %+v, want file f.txt size %d", fi, len("hello stat"))
+	}
+	if fi.ModTime.IsZero() {
+		t.Fatal("Stat(file).ModTime is zero")
+	}
+
+	di, err := e.Stat(ctx, scope, "d")
+	if err != nil {
+		t.Fatalf("Stat(marker dir): %v", err)
+	}
+	if !di.IsDir {
+		t.Fatalf("Stat(marker dir) = %+v, want IsDir", di)
+	}
+
+	li, err := e.Stat(ctx, scope, "lost")
+	if err != nil {
+		t.Fatalf("Stat(lost-marker dir): %v", err)
+	}
+	if !li.IsDir {
+		t.Fatalf("Stat(lost-marker dir) = %+v, want IsDir (children prove the dir)", li)
+	}
+
+	if _, err := e.Stat(ctx, scope, "missing.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(missing) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_List_OneLevel pins one-level listing semantics: files and
+// subdirectories of the listed level only, nested entries invisible, the
+// directory's own marker never an entry, and a missing directory refusing
+// with fs.ErrNotExist.
+func TestS3Live_List_OneLevel(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+
+	liveSeed(t, e, prefix+"top.txt", []byte("1"))
+	liveSeed(t, e, prefix+"d/", nil)
+	liveSeed(t, e, prefix+"d/inner.txt", []byte("22"))
+	liveSeed(t, e, prefix+"d/sub/", nil)
+	liveSeed(t, e, prefix+"d/sub/deep.txt", []byte("333"))
+	liveSeed(t, e, prefix+"empty/", nil)
+
+	root, err := e.List(ctx, scope, ".")
+	if err != nil {
+		t.Fatalf("List(.): %v", err)
+	}
+	got := map[string]bool{}
+	for _, fi := range root {
+		got[fi.Name] = fi.IsDir
+	}
+	want := map[string]bool{"top.txt": false, "d": true, "empty": true}
+	if len(got) != len(want) {
+		t.Fatalf("List(.) = %v, want exactly %v", got, want)
+	}
+	for name, isDir := range want {
+		gotDir, ok := got[name]
+		if !ok || gotDir != isDir {
+			t.Fatalf("List(.) missing/wrong entry %q: got %v want isDir=%v", name, got, isDir)
+		}
+	}
+
+	d, err := e.List(ctx, scope, "d")
+	if err != nil {
+		t.Fatalf("List(d): %v", err)
+	}
+	got = map[string]bool{}
+	for _, fi := range d {
+		got[fi.Name] = fi.IsDir
+	}
+	if len(got) != 2 || got["inner.txt"] != false || got["sub"] != true {
+		t.Fatalf("List(d) = %v, want inner.txt(file) + sub(dir) only", got)
+	}
+
+	empty, err := e.List(ctx, scope, "empty")
+	if err != nil {
+		t.Fatalf("List(empty): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("List(empty) = %v, want no entries (marker excluded)", empty)
+	}
+
+	if _, err := e.List(ctx, scope, "no-such-dir"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("List(missing dir) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_List_Pagination proves the listing walks EVERY page: more than
+// 1000 keys (the backend's page cap) under one directory all surface.
+func TestS3Live_List_Pagination(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping the >1000-key pagination seed")
+	}
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	const n = 1100
+
+	liveSeed(t, e, prefix+"big/", nil)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			key := fmt.Sprintf("%sbig/k-%04d", prefix, i)
+			if _, err := e.client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(e.bucket), Key: aws.String(key), Body: bytes.NewReader([]byte{byte(i)}),
+			}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("pagination seed: %v", err)
+	}
+
+	entries, err := e.List(ctx, scope, "big")
+	if err != nil {
+		t.Fatalf("List(big): %v", err)
+	}
+	if len(entries) != n {
+		t.Fatalf("List(big) returned %d entries, want %d (pagination under-report)", len(entries), n)
+	}
+}
+
+// TestS3Live_ReadRange_PastEOF pins the 416 contract: an offset exactly at
+// EOF and an offset past EOF both yield ZERO bytes and nil error.
+func TestS3Live_ReadRange_PastEOF(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	body := []byte("0123456789")
+	liveSeed(t, e, string(scope)+"/r.bin", body)
+
+	for _, offset := range []int64{int64(len(body)), int64(len(body)) + 7} {
+		var buf bytes.Buffer
+		if err := e.ReadRange(ctx, scope, "r.bin", offset, 5, &buf); err != nil {
+			t.Fatalf("ReadRange(offset=%d past EOF): %v, want nil", offset, err)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("ReadRange(offset=%d past EOF) wrote %d bytes, want 0", offset, buf.Len())
+		}
+	}
+
+	// Missing object: fs.ErrNotExist, including the zero-length window.
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "missing.bin", 0, 5, &buf); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ReadRange(missing) = %v, want fs.ErrNotExist", err)
+	}
+	if err := e.ReadRange(ctx, scope, "missing.bin", 0, 0, &buf); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ReadRange(missing, zero length) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_ReadRange_TailClamp pins the 206 clamp: a window extending past
+// EOF short-reads to EOF without error; interior windows are byte-exact;
+// zero-length windows return immediately with nil.
+func TestS3Live_ReadRange_TailClamp(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	body := []byte("abcdefghij")
+	liveSeed(t, e, string(scope)+"/r.bin", body)
+
+	for _, tc := range []struct {
+		name           string
+		offset, length int64
+		want           string
+	}{
+		{"tail clamped", 5, 100, "fghij"},
+		{"interior window", 2, 5, "cdefg"},
+		{"whole object", 0, 10, "abcdefghij"},
+		{"zero length", 3, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := e.ReadRange(ctx, scope, "r.bin", tc.offset, tc.length, &buf); err != nil {
+				t.Fatalf("ReadRange(%d, %d): %v", tc.offset, tc.length, err)
+			}
+			if buf.String() != tc.want {
+				t.Fatalf("ReadRange(%d, %d) = %q, want %q", tc.offset, tc.length, buf.String(), tc.want)
+			}
+		})
 	}
 }

@@ -344,12 +344,120 @@ func (e *s3Engine) ProvisionScope(_ context.Context, _ ScopeID) error { return E
 
 func (e *s3Engine) TeardownScope(_ context.Context, _ ScopeID) error { return ErrNotImplemented }
 
-func (e *s3Engine) List(_ context.Context, _ ScopeID, _ string) ([]FileInfo, error) {
-	return nil, ErrNotImplemented
+// List returns ONE level of entries under path ("." = scope root):
+// ListObjectsV2 with Prefix + Delimiter="/", FULLY paginated via
+// ContinuationToken (a page-1-only listing is the classic under-report bug).
+// CommonPrefixes are the subdirectories (an empty subdir appears through its
+// marker rolling into a CommonPrefix), Contents are the files; the
+// directory's OWN marker is excluded from the entries. A non-existent
+// directory — no marker, no keys — refuses with fs.ErrNotExist, mirroring
+// the local engine; the scope root always lists (possibly empty: prefixes
+// are virtual and provisioning creates no key).
+func (e *s3Engine) List(ctx context.Context, scope ScopeID, p string) ([]FileInfo, error) {
+	var prefix string
+	if p == "." {
+		pref, err := e.scopePrefix(scope)
+		if err != nil {
+			return nil, err
+		}
+		prefix = pref
+	} else {
+		key, err := e.objectKey(scope, p)
+		if err != nil {
+			return nil, err
+		}
+		prefix = dirMarkerKey(key)
+	}
+
+	infos := make([]FileInfo, 0, 16)
+	sawAny := false
+	var token *string
+	for {
+		out, err := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(e.bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, mapS3Err("list", err)
+		}
+		for _, cp := range out.CommonPrefixes {
+			sawAny = true
+			name := strings.TrimSuffix(strings.TrimPrefix(aws.ToString(cp.Prefix), prefix), "/")
+			if name == "" {
+				continue
+			}
+			infos = append(infos, FileInfo{Name: name, IsDir: true})
+		}
+		for _, obj := range out.Contents {
+			sawAny = true
+			k := aws.ToString(obj.Key)
+			if k == prefix {
+				continue // the directory's own marker is never an entry
+			}
+			infos = append(infos, FileInfo{
+				Name:    path.Base(k),
+				Size:    aws.ToInt64(obj.Size),
+				ModTime: aws.ToTime(obj.LastModified),
+			})
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	if p != "." && !sawAny {
+		return nil, fmt.Errorf("objectstore: s3 list %q: %w", p, fs.ErrNotExist)
+	}
+	return infos, nil
 }
 
-func (e *s3Engine) Stat(_ context.Context, _ ScopeID, _ string) (FileInfo, error) {
-	return FileInfo{}, ErrNotImplemented
+// Stat resolves the named path: the object key first; on 404, the directory
+// marker; on 404 again, a one-key prefix probe (a directory with children
+// but a lost marker is still a directory); otherwise fs.ErrNotExist.
+func (e *s3Engine) Stat(ctx context.Context, scope ScopeID, p string) (FileInfo, error) {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return FileInfo{}, err
+	}
+
+	head, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err == nil {
+		return FileInfo{
+			Name:    path.Base(key),
+			Size:    aws.ToInt64(head.ContentLength),
+			ModTime: aws.ToTime(head.LastModified),
+		}, nil
+	}
+	if mapped := mapS3Err("stat", err); !errors.Is(mapped, fs.ErrNotExist) {
+		return FileInfo{}, mapped
+	}
+
+	marker := dirMarkerKey(key)
+	mhead, merr := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(marker),
+	})
+	if merr == nil {
+		return FileInfo{Name: path.Base(key), ModTime: aws.ToTime(mhead.LastModified), IsDir: true}, nil
+	}
+	if mapped := mapS3Err("stat", merr); !errors.Is(mapped, fs.ErrNotExist) {
+		return FileInfo{}, mapped
+	}
+
+	probe, perr := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(marker), MaxKeys: aws.Int32(1),
+	})
+	if perr != nil {
+		return FileInfo{}, mapS3Err("stat", perr)
+	}
+	if len(probe.Contents) > 0 {
+		return FileInfo{Name: path.Base(key), IsDir: true}, nil
+	}
+	return FileInfo{}, fmt.Errorf("objectstore: s3 stat %q: %w", p, fs.ErrNotExist)
 }
 
 func (e *s3Engine) MakeDir(_ context.Context, _ ScopeID, _ string) error { return ErrNotImplemented }
@@ -374,8 +482,102 @@ func (e *s3Engine) RemoveFile(_ context.Context, _ ScopeID, _ string) error {
 	return ErrNotImplemented
 }
 
-func (e *s3Engine) ReadRange(_ context.Context, _ ScopeID, _ string, _, _ int64, _ io.Writer) error {
-	return ErrNotImplemented
+// s3ReadReopenAttempts bounds the mid-stream reopen retries in ReadRange: a
+// failed body read re-issues the range from the last good offset (never a
+// whole-transfer restart, never byte-discard seek emulation) at most this
+// many times before surfacing ErrTransient.
+const s3ReadReopenAttempts = 3
+
+// rangeHeader formats the single half-open window [offset, offset+length)
+// as the inclusive byte-range header "bytes=start-end". Exactly ONE range
+// per GET — the backend ignores multi-range and would return the whole
+// object with a 200.
+func rangeHeader(offset, length int64) string {
+	return fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+}
+
+// reopenWindow returns the remaining window after `delivered` bytes of
+// [offset, offset+length) reached the writer — the arithmetic a mid-stream
+// reopen re-issues.
+func reopenWindow(offset, length, delivered int64) (nextOffset, nextLength int64) {
+	return offset + delivered, length - delivered
+}
+
+// isInvalidRange reports whether err is the backend's 416 range refusal —
+// the start-past-EOF case the Engine contract maps to a zero-byte success.
+func isInvalidRange(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange" {
+		return true
+	}
+	var respErr *awshttp.ResponseError
+	return errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
+}
+
+// ReadRange streams the half-open window [offset, offset+length) into w
+// with exactly one bytes=start-end range per GET. An offset at or past EOF
+// surfaces as the backend's 416 and returns zero bytes with nil error (the
+// contract's past-EOF short read); a window merely extending past EOF is
+// clamped by the backend and the short 206 streams through unchanged. A
+// mid-stream body failure re-opens the range from the last good offset with
+// bounded attempts. The body copy is cancellation-aware.
+func (e *s3Engine) ReadRange(ctx context.Context, scope ScopeID, p string, offset, length int64, w io.Writer) error {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return err
+	}
+	if offset < 0 || length < 0 {
+		return fmt.Errorf("objectstore: s3 readrange: negative offset or length")
+	}
+	if length == 0 {
+		// Zero-length window: no GET, but existence still asserted — the
+		// local engine opens the file before copying zero bytes, and the
+		// missing-object refusal must agree across engines.
+		_, herr := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key),
+		})
+		if herr != nil {
+			return mapS3Err("readrange", herr)
+		}
+		return nil
+	}
+
+	cur, remaining := offset, length
+	for attempt := 1; ; attempt++ {
+		rng := rangeHeader(cur, remaining)
+		out, gerr := e.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key), Range: aws.String(rng),
+		})
+		if gerr != nil {
+			if isInvalidRange(gerr) {
+				if cur != offset {
+					// A reopen mid-transfer hit 416: the object shrank under
+					// the read (replaced) — the delivered bytes are torn.
+					return fmt.Errorf("objectstore: s3 readrange: %w (object changed mid-read)", ErrTransient)
+				}
+				return nil // start at/past EOF -> zero bytes, no error
+			}
+			return mapS3Err("readrange", gerr)
+		}
+		n, copyErr := io.Copy(w, ctxReader{ctx: ctx, r: out.Body})
+		out.Body.Close()
+		cur, remaining = reopenWindow(cur, remaining, n)
+		if copyErr == nil {
+			// Clean EOF: the backend delivered its full response — the whole
+			// window, or the tail-clamped remainder. Done either way.
+			return nil
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("objectstore: s3 readrange: %w", cerr)
+		}
+		if remaining <= 0 {
+			return nil
+		}
+		if attempt >= s3ReadReopenAttempts {
+			return fmt.Errorf("objectstore: s3 readrange: %w after %d reopen attempts (%v)", ErrTransient, attempt, copyErr)
+		}
+		// Mid-stream failure: loop re-opens [cur, cur+remaining).
+	}
 }
 
 func (e *s3Engine) WriteStream(_ context.Context, _ ScopeID, _ string, _ io.Reader, _ bool) error {
