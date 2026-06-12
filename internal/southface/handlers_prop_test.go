@@ -248,7 +248,20 @@ func TestPropSizeMismatch(t *testing.T) {
 
 	rapid.Check(t, func(rt *rapid.T) {
 		declared := int64(rapid.IntRange(1, 32).Draw(rt, "declared"))
-		actual := rapid.IntRange(0, 40).Draw(rt, "actual")
+		// Draw the relation explicitly so every case lands in a chosen branch;
+		// deriving actual from declared makes the A==D positive control and both
+		// mismatch directions deterministic rather than relying on the random
+		// co-occurrence of two independent draws (which left the match/over/under
+		// non-vacuity guards flaky across runs).
+		var actual int
+		switch rapid.SampledFrom([]string{"match", "over", "under"}).Draw(rt, "relation") {
+		case "match":
+			actual = int(declared)
+		case "over":
+			actual = int(declared) + rapid.IntRange(1, 8).Draw(rt, "excess")
+		case "under":
+			actual = int(declared) - 1 - rapid.IntRange(0, int(declared)-1).Draw(rt, "deficit")
+		}
 
 		eng := newFakeEngine()
 		sess := &recordingCeilingsSession{}
