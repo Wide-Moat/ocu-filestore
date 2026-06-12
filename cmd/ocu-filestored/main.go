@@ -120,19 +120,20 @@ func main() {
 
 // brokerConfig holds the validated, flag-derived inputs the composition needs.
 type brokerConfig struct {
-	engineKind     objectstore.EngineKind
-	engineRoot     string
-	auditSink      string
-	socketDir      string
-	filesystemID   string
-	maxFileSize    int64
-	maxRequestByte int64
-	opsPerSecond   float64
-	opsBurst       float64
-	grantedIntents []southface.Intent
-	dlPrefixes     []string
-	profile        admission.WorkloadTrustProfile
-	tenancy        admission.Tenancy
+	engineKind       objectstore.EngineKind
+	engineRoot       string
+	s3CredentialFile string
+	auditSink        string
+	socketDir        string
+	filesystemID     string
+	maxFileSize      int64
+	maxRequestByte   int64
+	opsPerSecond     float64
+	opsBurst         float64
+	grantedIntents   []southface.Intent
+	dlPrefixes       []string
+	profile          admission.WorkloadTrustProfile
+	tenancy          admission.Tenancy
 }
 
 // run parses and validates the frozen flag surface, then composes and serves
@@ -158,6 +159,8 @@ func run(args []string) error {
 		"tenancy mode: single-tenant | multi-tenant")
 	engineRoot := fs.String("engine-root", "",
 		"REQUIRED local-volume engine root: the customer workspace volume directory")
+	s3CredentialFile := fs.String("s3-credential-file", "",
+		"s3 engine only: PATH to a 0600 daemon-owned file holding access_key_id=/secret_access_key= lines; the secret itself NEVER arrives as a flag value (T1-7). Env fallback: "+objectstore.EnvS3AccessKeyID+"/"+objectstore.EnvS3SecretAccessKey)
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
@@ -180,7 +183,7 @@ func run(args []string) error {
 
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
-		*opsPerSecond, *opsBurst)
+		*opsPerSecond, *opsBurst, *s3CredentialFile)
 	if err != nil {
 		return err
 	}
@@ -202,12 +205,19 @@ func run(args []string) error {
 // error.
 func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
-	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64) (brokerConfig, error) {
+	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
+	s3CredentialFile string) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	kind, err := objectstore.ParseEngine(engine)
 	if err != nil {
 		return cfg, err
+	}
+
+	// An s3-only flag on a non-s3 engine refuses — a silently inert flag
+	// would lie about the deployment's credential posture.
+	if s3CredentialFile != "" && kind != objectstore.S3 {
+		return cfg, fmt.Errorf("%w: -s3-credential-file is only valid with -engine s3", errMissingRequiredFlag)
 	}
 
 	prof, ok := profileAdmission[profile]
@@ -244,19 +254,20 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	}
 
 	cfg = brokerConfig{
-		engineKind:     kind,
-		engineRoot:     engineRoot,
-		auditSink:      auditSink,
-		socketDir:      socketDir,
-		filesystemID:   filesystemID,
-		maxFileSize:    maxFileSize,
-		maxRequestByte: maxRequestBytes,
-		opsPerSecond:   opsPerSecond,
-		opsBurst:       opsBurst,
-		grantedIntents: intents,
-		dlPrefixes:     splitNonEmpty(downloadablePrefixes),
-		profile:        prof,
-		tenancy:        ten,
+		engineKind:       kind,
+		engineRoot:       engineRoot,
+		s3CredentialFile: s3CredentialFile,
+		auditSink:        auditSink,
+		socketDir:        socketDir,
+		filesystemID:     filesystemID,
+		maxFileSize:      maxFileSize,
+		maxRequestByte:   maxRequestBytes,
+		opsPerSecond:     opsPerSecond,
+		opsBurst:         opsBurst,
+		grantedIntents:   intents,
+		dlPrefixes:       splitNonEmpty(downloadablePrefixes),
+		profile:          prof,
+		tenancy:          ten,
 	}
 	return cfg, nil
 }

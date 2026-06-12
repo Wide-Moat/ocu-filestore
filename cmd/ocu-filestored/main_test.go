@@ -160,7 +160,7 @@ func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst)
+		defaultOpsPerSecond, defaultOpsBurst, "")
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -169,12 +169,35 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	}
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst)
+		defaultOpsPerSecond, defaultOpsBurst, "")
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
 	if cfg.engineKind != objectstore.LocalVolume {
 		t.Fatalf("validate(engine=local-volume) stored kind %q, want %q", cfg.engineKind, objectstore.LocalVolume)
+	}
+}
+
+// TestValidateS3CredentialFileFlagGate pins the 13-13 flag discipline: the
+// -s3-credential-file flag carries a PATH (never a secret value), is carried
+// into brokerConfig for the s3 engine, and REFUSES on a non-s3 engine — a
+// silently inert credential flag would lie about the deployment posture.
+func TestValidateS3CredentialFileFlagGate(t *testing.T) {
+	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred")
+	if err != nil {
+		t.Fatalf("validate(s3 + credential file): %v", err)
+	}
+	if cfg.s3CredentialFile != "/etc/ocu/s3.cred" {
+		t.Fatalf("config carries credential file %q, want the flag path", cfg.s3CredentialFile)
+	}
+
+	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred")
+	if !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
 }
 
@@ -258,7 +281,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				tc.rate, tc.brst)
+				tc.rate, tc.brst, "")
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}
