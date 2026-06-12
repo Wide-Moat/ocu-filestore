@@ -303,9 +303,19 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reason) BEFORE the wire deny. The wire reason MAY degrade away from the
 	// truth (D8). The Mandate ordering stays owned by the spine — the handler
 	// only supplies the per-op deny event content.
+	//
+	// A deny-Mandate FAILURE degrades the verdict to audit_down (NFR-SEC-79,
+	// invariant 8): if the deny record did not durably land, the durable
+	// chain's last record would be the STAGE-3 allow — asserting allow for a
+	// refused op — so the wire must say unavailable and carry NO x-deny-reason
+	// (the truth header only ever accompanies a recorded truth), mirroring the
+	// STAGE-3 allow-Mandate failure path above.
 	mandateDeny := func(auditReason, wireClass, message string) {
 		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
-		_ = d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent))
+		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
+			writeConnectError(w, mapDeny(denyAuditDown), "audit gate unavailable")
+			return
+		}
 		writeConnectError(w, mapDenyDegraded(auditReason, wireClass), message)
 	}
 

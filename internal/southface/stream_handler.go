@@ -185,9 +185,17 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		acquired int64 // total bytes AcquireBytes'd, released on every exit
 	)
 
+	// A deny-Mandate FAILURE degrades the trailer to unavailable (NFR-SEC-79,
+	// invariant 8): if the deny record did not durably land, the chain's last
+	// record may be the pre-chunk ALLOW — asserting allow for a refused
+	// upload — so the verdict the guest sees must be audit-down, never the
+	// original refusal. This mirrors the allow-Mandate failure path below.
 	denyTrailer := func(auditReason, wireCode, message string) {
 		ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, auditReason)
-		_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
+			return
+		}
 		_ = writeEndStream(sc.w, &connectError{Code: wireCode, Message: message})
 	}
 	// ReleaseBytes balances AcquireBytes on EVERY exit (Pitfall 6). The
@@ -270,16 +278,13 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	for {
 		flag, payload, ferr := readFrame(sc.body)
 		if ferr != nil {
-			// Truncated / oversize frame: HARD ABORT (WIRE-LESSONS #1). Write
-			// the trailer FIRST, then close intake (WIRE-LESSONS #2).
+			// Truncated / oversize frame: HARD ABORT (WIRE-LESSONS #1). The
+			// deny Mandate runs first and the trailer (possibly degraded to
+			// unavailable) is written BEFORE intake closes (WIRE-LESSONS #2).
 			if errors.Is(ferr, errFrameTooLarge) {
-				_ = writeEndStream(sc.w, &connectError{Code: wireCodeResourceExhausted, Message: "frame exceeds transport ceiling"})
-				ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denyThrottle)
-				_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+				denyTrailer(denyThrottle, wireCodeResourceExhausted, "frame exceeds transport ceiling")
 			} else {
-				_ = writeEndStream(sc.w, &connectError{Code: wireCodeAborted, Message: "malformed inbound frame"})
-				ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denyAborted)
-				_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+				denyTrailer(denyAborted, wireCodeAborted, "malformed inbound frame")
 			}
 			pw.CloseWithError(ferr)
 			<-writeErrCh
@@ -292,9 +297,7 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		var cf uploadChunkFrame
 		if json.Unmarshal(payload, &cf) != nil {
 			// Undecodable data frame: HARD ABORT (WIRE-LESSONS #1).
-			_ = writeEndStream(sc.w, &connectError{Code: wireCodeInvalidArgument, Message: "malformed chunk frame"})
-			ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denyMalformed)
-			_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+			denyTrailer(denyMalformed, wireCodeInvalidArgument, "malformed chunk frame")
 			pw.CloseWithError(errMalformedFrame)
 			<-writeErrCh
 			return
@@ -303,19 +306,16 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		n := int64(len(cf.Chunk))
 		acc += n
 		if acc > declared {
-			// Over-declaration: abort at the ceiling (n2). Trailer first.
-			_ = writeEndStream(sc.w, &connectError{Code: wireCodeInvalidArgument, Message: "accumulated bytes exceed declared size"})
-			ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denySizeExceeded)
-			_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+			// Over-declaration: abort at the ceiling (n2). Deny Mandate then
+			// trailer, before intake closes.
+			denyTrailer(denySizeExceeded, wireCodeInvalidArgument, "accumulated bytes exceed declared size")
 			pw.CloseWithError(errSizeExceeded)
 			<-writeErrCh
 			return
 		}
 
 		if err := sc.sess.AcquireBytes(n); err != nil {
-			_ = writeEndStream(sc.w, &connectError{Code: wireCodeResourceExhausted, Message: "in-flight byte ceiling exceeded"})
-			ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denyThrottle)
-			_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+			denyTrailer(denyThrottle, wireCodeResourceExhausted, "in-flight byte ceiling exceeded")
 			pw.CloseWithError(err)
 			<-writeErrCh
 			return
@@ -326,21 +326,15 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 			// The pipe write failed: the engine rejected (e.g. already_exists,
 			// A1). Drain the engine error and map it.
 			engErr := <-writeErrCh
-			wireClass := denyClassForEngineErr(engErr)
-			auditReason := auditTruthForEngineErr(engErr)
-			v := mapDeny(wireClass)
-			_ = writeEndStream(sc.w, &connectError{Code: v.WireCode, Message: "upload refused"})
-			ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, auditReason)
-			_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+			v := mapDeny(denyClassForEngineErr(engErr))
+			denyTrailer(auditTruthForEngineErr(engErr), v.WireCode, "upload refused")
 			return
 		}
 	}
 
 	// --- half-close: enforce the under-direction (n2) ---
 	if acc != declared {
-		_ = writeEndStream(sc.w, &connectError{Code: wireCodeInvalidArgument, Message: "accumulated bytes do not match declared size"})
-		ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, denySizeExceeded)
-		_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+		denyTrailer(denySizeExceeded, wireCodeInvalidArgument, "accumulated bytes do not match declared size")
 		pw.CloseWithError(errSizeExceeded)
 		<-writeErrCh
 		return
@@ -350,12 +344,8 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	// makes the object visible only now.
 	pw.Close()
 	if werr := <-writeErrCh; werr != nil {
-		wireClass := denyClassForEngineErr(werr)
-		auditReason := auditTruthForEngineErr(werr)
-		v := mapDeny(wireClass)
-		_ = writeEndStream(sc.w, &connectError{Code: v.WireCode, Message: "upload refused"})
-		ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, auditReason)
-		_ = d.guard.Mandate(sc.ctx, mapAuditEvent(ev))
+		v := mapDeny(denyClassForEngineErr(werr))
+		denyTrailer(auditTruthForEngineErr(werr), v.WireCode, "upload refused")
 		return
 	}
 
