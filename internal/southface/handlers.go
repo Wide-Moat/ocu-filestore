@@ -374,6 +374,10 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) {
 		denyEngine(hc, err)
 		return
 	}
+	// The moved-away subtree's uuid records are now stale: evict them so the
+	// session-scoped store stays bounded (N8). The destination subtree mints
+	// fresh ids on its next observation.
+	d.ids.evictTree(hc.ps.FilesystemID, guestPath(src))
 	writeAck(hc.w)
 }
 
@@ -411,6 +415,9 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) {
 		denyEngine(hc, err)
 		return
 	}
+	// Evict the removed subtree's uuid records (N8): the store stays bounded
+	// by the live namespace; the read path re-validates existence anyway.
+	d.ids.evictTree(scope, guestPath(rel))
 	writeAck(hc.w)
 }
 
@@ -449,6 +456,10 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) {
 		denyEngine(hc, err)
 		return
 	}
+	// The source path no longer names an object: evict its uuid record (N8).
+	// The destination keeps any existing record — its (scope, path) pair
+	// still names a live object and identity is re-validated at read.
+	d.ids.evict(hc.ps.FilesystemID, guestPath(src))
 	writeAck(hc.w)
 }
 
@@ -467,6 +478,8 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 		denyEngine(hc, err)
 		return
 	}
+	// Evict the removed object's uuid record (N8).
+	d.ids.evict(hc.ps.FilesystemID, guestPath(rel))
 	writeAck(hc.w)
 }
 

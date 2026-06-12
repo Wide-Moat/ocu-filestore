@@ -6,6 +6,7 @@ package southface
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"sync"
 )
 
@@ -52,9 +53,11 @@ func newObjectIDStore() *objectIDStore {
 // observation and reusing it on every subsequent observation of the same
 // pair. It takes the read lock for the fast path and the write lock with a
 // re-check for the mint, so concurrent observers race-cleanly converge on a
-// single id per pair. Move/remove do NOT eagerly rewrite or delete records
-// this phase — phase 10 re-validates (scope, path) existence at read time
-// (Q5).
+// single id per pair. Remove/move handlers EVICT the records their mutation
+// orphans (evict/evictTree below) so the store stays bounded by the live
+// namespace on a long-lived session; the read path still re-validates
+// (scope, path) existence at resolution time (Q5) — eviction is a memory
+// bound, never the authorization.
 func (s *objectIDStore) idFor(scope, path string) string {
 	k := idKey{scope: scope, path: path}
 	s.mu.RLock()
@@ -73,6 +76,45 @@ func (s *objectIDStore) idFor(scope, path string) string {
 	s.byKey[k] = id
 	s.byID[id] = idVal{scope: scope, path: path}
 	return id
+}
+
+// evict removes the forward AND reverse record for one (scope, path) pair,
+// if present (N8/CONC-04): a removed or moved-away object's record would
+// otherwise live for the whole host_local_long_lived session, growing the
+// store without bound across mutations. A re-created object at the same
+// path mints a FRESH id on its next observation — identity follows the
+// object version, and the read path re-validates existence anyway.
+func (s *objectIDStore) evict(scope, path string) {
+	k := idKey{scope: scope, path: path}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.byKey[k]; ok {
+		delete(s.byKey, k)
+		delete(s.byID, id)
+	}
+}
+
+// evictTree removes every record for scope whose guest path is gp or lies
+// beneath it — the directory-shaped evict for removeDirectory/moveDirectory.
+// Paths are the guest convention the store is keyed by ("/" is the scope
+// root and matches everything). The scan is O(store) under the write lock,
+// bounded by the session's live namespace.
+func (s *objectIDStore) evictTree(scope, gp string) {
+	prefix := gp
+	if prefix != "/" {
+		prefix += "/"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, id := range s.byKey {
+		if k.scope != scope {
+			continue
+		}
+		if k.path == gp || strings.HasPrefix(k.path, prefix) {
+			delete(s.byKey, k)
+			delete(s.byID, id)
+		}
+	}
 }
 
 // lookup resolves a uuid back to its (scope, path) record for phase-10
