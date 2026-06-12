@@ -123,6 +123,8 @@ type brokerConfig struct {
 	engineKind       objectstore.EngineKind
 	engineRoot       string
 	s3CredentialFile string
+	s3STSRoleARN     string
+	s3STSEndpoint    string
 	auditSink        string
 	socketDir        string
 	filesystemID     string
@@ -161,6 +163,10 @@ func run(args []string) error {
 		"REQUIRED local-volume engine root: the customer workspace volume directory")
 	s3CredentialFile := fs.String("s3-credential-file", "",
 		"s3 engine only: PATH to a 0600 daemon-owned file holding access_key_id=/secret_access_key= lines; the secret itself NEVER arrives as a flag value (T1-7). Env fallback: "+objectstore.EnvS3AccessKeyID+"/"+objectstore.EnvS3SecretAccessKey)
+	s3STSRoleARN := fs.String("s3-sts-role-arn", "",
+		"s3 engine only: assume this role per session via STS with a scope-prefix inline policy (sts_per_session credential kind); an ARN is not a secret. Empty = the static host-local credential")
+	s3STSEndpoint := fs.String("s3-sts-endpoint", "",
+		"s3 engine only: STS endpoint override for S3-compatible rigs; requires -s3-sts-role-arn")
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
@@ -183,7 +189,7 @@ func run(args []string) error {
 
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
-		*opsPerSecond, *opsBurst, *s3CredentialFile)
+		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint)
 	if err != nil {
 		return err
 	}
@@ -206,7 +212,7 @@ func run(args []string) error {
 func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
 	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
-	s3CredentialFile string) (brokerConfig, error) {
+	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	kind, err := objectstore.ParseEngine(engine)
@@ -218,6 +224,15 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	// would lie about the deployment's credential posture.
 	if s3CredentialFile != "" && kind != objectstore.S3 {
 		return cfg, fmt.Errorf("%w: -s3-credential-file is only valid with -engine s3", errMissingRequiredFlag)
+	}
+	if s3STSRoleARN != "" && kind != objectstore.S3 {
+		return cfg, fmt.Errorf("%w: -s3-sts-role-arn is only valid with -engine s3", errMissingRequiredFlag)
+	}
+	if s3STSEndpoint != "" && kind != objectstore.S3 {
+		return cfg, fmt.Errorf("%w: -s3-sts-endpoint is only valid with -engine s3", errMissingRequiredFlag)
+	}
+	if s3STSEndpoint != "" && s3STSRoleARN == "" {
+		return cfg, fmt.Errorf("%w: -s3-sts-endpoint requires -s3-sts-role-arn", errMissingRequiredFlag)
 	}
 
 	prof, ok := profileAdmission[profile]
@@ -257,6 +272,8 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		engineKind:       kind,
 		engineRoot:       engineRoot,
 		s3CredentialFile: s3CredentialFile,
+		s3STSRoleARN:     s3STSRoleARN,
+		s3STSEndpoint:    s3STSEndpoint,
 		auditSink:        auditSink,
 		socketDir:        socketDir,
 		filesystemID:     filesystemID,
@@ -298,6 +315,33 @@ func splitNonEmpty(s string) []string {
 		}
 	}
 	return out
+}
+
+// selectCredentialSource picks the s3 backend credential source from the
+// flag surface: with -s3-sts-role-arn set, the static intake becomes the
+// PARENT credential and STS-per-session mints the scope-prefix-confined
+// session credential; otherwise the static host-local source serves
+// directly. The admitted credential KIND flows from the returned source's
+// Kind() — never hard-wired for the s3 engine (the local-volume path keeps
+// the hard-wired host-local kind: it exercises a filesystem permission, not
+// a backend credential). bucket and region arrive from the s3 engine
+// configuration at composition time.
+func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstore.CredentialSource, error) {
+	static, err := objectstore.NewStaticCredentialSource(cfg.s3CredentialFile)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.s3STSRoleARN == "" {
+		return static, nil
+	}
+	return objectstore.NewSTSCredentialSource(objectstore.STSConfig{
+		RoleARN:  cfg.s3STSRoleARN,
+		Endpoint: cfg.s3STSEndpoint,
+		Region:   region,
+		Bucket:   bucket,
+		Scope:    objectstore.ScopeID(cfg.filesystemID),
+		Parent:   static,
+	})
 }
 
 // compose runs the startup admission gate and, on admit, constructs the seams,

@@ -5,6 +5,7 @@ package objectstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -267,5 +268,211 @@ func TestCredentialRedaction(t *testing.T) {
 		if strings.Contains(rendered, testSecret) {
 			t.Fatalf("error path %d leaked the secret: %q", i, rendered)
 		}
+	}
+}
+
+// --- 13-14: STS-per-session source -----------------------------------------
+
+// stsTestConfig returns a valid STSConfig backed by an env static parent.
+func stsTestConfig(t *testing.T) STSConfig {
+	t.Helper()
+	t.Setenv(EnvS3AccessKeyID, "AKIDPARENT")
+	t.Setenv(EnvS3SecretAccessKey, testSecret)
+	parent, err := NewStaticCredentialSource("")
+	if err != nil {
+		t.Fatalf("parent source: %v", err)
+	}
+	return STSConfig{
+		RoleARN: "arn:aws:iam::000000000000:role/ocu-session",
+		Region:  "us-east-1",
+		Bucket:  "ocu-bucket",
+		Scope:   "fs-sts-01",
+		Parent:  parent,
+	}
+}
+
+// TestSTSPolicyDocument table-asserts the inline session policy: every
+// object action confined to the scope prefix resource, bucket-level listing
+// confined by the s3:prefix condition, no wildcard bucket, no
+// unconditioned ListBucket — the least-privilege cell. The single
+// documented exception is ListBucketMultipartUploads (the SEC-54 orphan
+// sweep lists bucket-wide and filters client-side).
+func TestSTSPolicyDocument(t *testing.T) {
+	raw, err := scopePrefixPolicy("ocu-bucket", "fs-sts-01")
+	if err != nil {
+		t.Fatalf("scopePrefixPolicy: %v", err)
+	}
+	var doc stsPolicyDocument
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("policy is not valid JSON: %v", err)
+	}
+	if doc.Version != "2012-10-17" {
+		t.Fatalf("policy version = %q", doc.Version)
+	}
+
+	byID := map[string]stsPolicyStatement{}
+	for _, st := range doc.Statement {
+		if st.Effect != "Allow" {
+			t.Fatalf("statement %q effect = %q, want Allow only", st.Sid, st.Effect)
+		}
+		if st.Resource == "*" || strings.Contains(st.Resource, ":::*") {
+			t.Fatalf("statement %q names a wildcard resource: %q", st.Sid, st.Resource)
+		}
+		for _, a := range st.Action {
+			if a == "*" || a == "s3:*" {
+				t.Fatalf("statement %q carries a wildcard action", st.Sid)
+			}
+		}
+		byID[st.Sid] = st
+	}
+
+	obj, ok := byID["ScopeObjects"]
+	if !ok {
+		t.Fatal("ScopeObjects statement missing")
+	}
+	if obj.Resource != "arn:aws:s3:::ocu-bucket/fs-sts-01/*" {
+		t.Fatalf("ScopeObjects resource = %q, want the scope-prefix cell", obj.Resource)
+	}
+	for _, want := range []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+		"s3:DeleteObjectVersion", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"} {
+		found := false
+		for _, a := range obj.Action {
+			if a == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("ScopeObjects missing action %q", want)
+		}
+	}
+
+	list, ok := byID["ScopeList"]
+	if !ok {
+		t.Fatal("ScopeList statement missing")
+	}
+	if list.Resource != "arn:aws:s3:::ocu-bucket" {
+		t.Fatalf("ScopeList resource = %q, want the bucket ARN", list.Resource)
+	}
+	cond, ok := list.Condition["StringLike"]
+	if !ok || cond["s3:prefix"] != "fs-sts-01/*" {
+		t.Fatalf("ScopeList condition = %v, want StringLike s3:prefix fs-sts-01/*", list.Condition)
+	}
+
+	// The documented exception: the MPU sweep statement is bucket-level
+	// list-only — it must never carry mutating actions.
+	mpu, ok := byID["ScopeMPUSweep"]
+	if !ok {
+		t.Fatal("ScopeMPUSweep statement missing")
+	}
+	if len(mpu.Action) != 1 || mpu.Action[0] != "s3:ListBucketMultipartUploads" {
+		t.Fatalf("ScopeMPUSweep actions = %v, want exactly ListBucketMultipartUploads", mpu.Action)
+	}
+}
+
+// TestSTSHostileScopeNeverBuildsPolicy pins the validation order: a hostile
+// scope id refuses at the constructor AND at the policy builder — policy
+// text for a hostile scope is never constructed.
+func TestSTSHostileScopeNeverBuildsPolicy(t *testing.T) {
+	for _, hostile := range []ScopeID{"", ".", "..", "a/b", `a\b`, "x\x00y", "../escape"} {
+		cfg := stsTestConfig(t)
+		cfg.Scope = hostile
+		if _, err := NewSTSCredentialSource(cfg); !errors.Is(err, ErrInvalidScopeID) {
+			t.Fatalf("NewSTSCredentialSource(scope=%q) = %v, want ErrInvalidScopeID", hostile, err)
+		}
+		if raw, err := scopePrefixPolicy("ocu-bucket", hostile); !errors.Is(err, ErrInvalidScopeID) {
+			t.Fatalf("scopePrefixPolicy(scope=%q) = %q, %v, want ErrInvalidScopeID", hostile, raw, err)
+		}
+	}
+}
+
+// TestSTSConstructorRefusals pins the config gate: every missing field is a
+// typed refusal.
+func TestSTSConstructorRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*STSConfig)
+	}{
+		{"no role arn", func(c *STSConfig) { c.RoleARN = "" }},
+		{"no bucket", func(c *STSConfig) { c.Bucket = "" }},
+		{"no region", func(c *STSConfig) { c.Region = "" }},
+		{"no parent", func(c *STSConfig) { c.Parent = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := stsTestConfig(t)
+			tc.mutate(&cfg)
+			if _, err := NewSTSCredentialSource(cfg); !errors.Is(err, errSTSConfig) {
+				t.Fatalf("NewSTSCredentialSource(%s) = %v, want errSTSConfig", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestSTSKindAndRedaction pins the seam: Kind = sts_per_session, the seam
+// interface compiles, and the source never renders its parent's secret.
+func TestSTSKindAndRedaction(t *testing.T) {
+	src, err := NewSTSCredentialSource(stsTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewSTSCredentialSource: %v", err)
+	}
+	if got := src.Kind(); got != admission.CredSTSPerSession {
+		t.Fatalf("Kind() = %q, want %q", got, admission.CredSTSPerSession)
+	}
+	var _ CredentialSource = src
+
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", src), fmt.Sprintf("%+v", src),
+		fmt.Sprintf("%s", src), fmt.Sprintf("%#v", src),
+	} {
+		if strings.Contains(rendered, testSecret) {
+			t.Fatalf("STS source rendering leaked the parent secret: %q", rendered)
+		}
+	}
+
+	// The provider constructs without any network call (AssumeRole is lazy
+	// — it fires on first Retrieve).
+	prov, err := src.Provider(context.Background())
+	if err != nil {
+		t.Fatalf("Provider: %v", err)
+	}
+	if prov == nil {
+		t.Fatal("Provider returned nil")
+	}
+}
+
+// TestS3Live_STSAssumeRole exercises the real AssumeRole flow against an
+// STS endpoint when the rig exposes one. The MinIO rig's root credential
+// cannot assume roles, so this leg gates on an EXPLICIT
+// OCU_S3_TEST_STS_ENDPOINT (+OCU_S3_TEST_STS_ROLE_ARN) and skips loudly
+// otherwise — the honest gate until the rig grows an STS principal; there
+// is NO mock STS server.
+func TestS3Live_STSAssumeRole(t *testing.T) {
+	endpoint := os.Getenv("OCU_S3_TEST_STS_ENDPOINT")
+	roleARN := os.Getenv("OCU_S3_TEST_STS_ROLE_ARN")
+	if endpoint == "" || roleARN == "" {
+		t.Skip(`OCU_S3_TEST_STS_ENDPOINT / OCU_S3_TEST_STS_ROLE_ARN not set - live STS leg SKIPPED.
+The MinIO rig's root credential cannot AssumeRole; point these at an STS
+endpoint with an assumable role to run the live AssumeRole flow. The call
+shape is covered un-gated by the policy-document and constructor tests.`)
+	}
+	cfg := stsTestConfig(t)
+	cfg.Endpoint = endpoint
+	cfg.RoleARN = roleARN
+	if b := os.Getenv("OCU_S3_TEST_BUCKET"); b != "" {
+		cfg.Bucket = b
+	}
+	src, err := NewSTSCredentialSource(cfg)
+	if err != nil {
+		t.Fatalf("NewSTSCredentialSource: %v", err)
+	}
+	prov, err := src.Provider(context.Background())
+	if err != nil {
+		t.Fatalf("Provider: %v", err)
+	}
+	creds, err := prov.Retrieve(context.Background())
+	if err != nil {
+		t.Fatalf("AssumeRole Retrieve: %v", err)
+	}
+	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" || creds.SessionToken == "" {
+		t.Fatal("AssumeRole returned an incomplete session credential")
 	}
 }

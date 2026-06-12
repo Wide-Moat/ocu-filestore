@@ -160,7 +160,7 @@ func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "")
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "")
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -169,7 +169,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	}
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "")
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "")
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -185,7 +185,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred")
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "")
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -195,9 +195,85 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 
 	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred")
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "")
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
+	}
+}
+
+// TestValidateSTSFlagGate pins the 13-14 flag matrix: the STS flags refuse
+// on a non-s3 engine, -s3-sts-endpoint requires -s3-sts-role-arn, and a
+// valid s3 STS pair is carried into brokerConfig.
+func TestValidateSTSFlagGate(t *testing.T) {
+	const arn = "arn:aws:iam::000000000000:role/ocu-session"
+
+	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000")
+	if err != nil {
+		t.Fatalf("validate(s3 + sts pair): %v", err)
+	}
+	if cfg.s3STSRoleARN != arn || cfg.s3STSEndpoint != "http://sts.local:9000" {
+		t.Fatalf("config carries sts %q/%q, want the flag values", cfg.s3STSRoleARN, cfg.s3STSEndpoint)
+	}
+
+	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, ""); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
+	}
+	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000"); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
+	}
+	if _, err := validate("s3", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000"); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
+	}
+}
+
+// TestSelectCredentialSourceKindFlows pins the 13-14 selection: without a
+// role ARN the static source serves (host_local_long_lived); with one, the
+// STS source serves (sts_per_session) — and BOTH kinds are admitted for the
+// trusted_operator/single-tenant cell, so the credential kind genuinely
+// flows from the source into admission (selection wired, no rows invented).
+// A hostile filesystem id refuses before any policy text exists.
+func TestSelectCredentialSourceKindFlows(t *testing.T) {
+	t.Setenv(objectstore.EnvS3AccessKeyID, "AKIDTEST")
+	t.Setenv(objectstore.EnvS3SecretAccessKey, "test-secret-value")
+	cfg := validBrokerConfig(t)
+	cfg.engineKind = objectstore.S3
+
+	src, err := selectCredentialSource(cfg, "ocu-bucket", "us-east-1")
+	if err != nil {
+		t.Fatalf("selectCredentialSource(static): %v", err)
+	}
+	if got := src.Kind(); got != admission.CredHostLocalLongLived {
+		t.Fatalf("static path Kind() = %q, want %q", got, admission.CredHostLocalLongLived)
+	}
+	if err := admission.Admit(cfg.profile, cfg.tenancy, src.Kind()); err != nil {
+		t.Fatalf("Admit(static kind): %v", err)
+	}
+
+	cfg.s3STSRoleARN = "arn:aws:iam::000000000000:role/ocu-session"
+	src, err = selectCredentialSource(cfg, "ocu-bucket", "us-east-1")
+	if err != nil {
+		t.Fatalf("selectCredentialSource(sts): %v", err)
+	}
+	if got := src.Kind(); got != admission.CredSTSPerSession {
+		t.Fatalf("sts path Kind() = %q, want %q", got, admission.CredSTSPerSession)
+	}
+	if err := admission.Admit(cfg.profile, cfg.tenancy, src.Kind()); err != nil {
+		t.Fatalf("Admit(sts kind): %v", err)
+	}
+
+	// A hostile scope id refuses at source construction — the inline policy
+	// text for it is never built (validateScopeID runs first).
+	cfg.filesystemID = "../escape"
+	if _, err := selectCredentialSource(cfg, "ocu-bucket", "us-east-1"); !errors.Is(err, objectstore.ErrInvalidScopeID) {
+		t.Fatalf("selectCredentialSource(hostile scope) = %v, want ErrInvalidScopeID", err)
 	}
 }
 
@@ -281,7 +357,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				tc.rate, tc.brst, "")
+				tc.rate, tc.brst, "", "", "")
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}

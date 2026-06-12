@@ -5,15 +5,19 @@ package objectstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/admission"
 )
@@ -187,4 +191,200 @@ func readCredentialFile(path string) (staticCredential, error) {
 		return zero, fmt.Errorf("%w: %q must hold access_key_id= and secret_access_key= lines", ErrCredentialMalformed, path)
 	}
 	return cred, nil
+}
+
+// --- STS-per-session source (T1-7, the second admitted credential kind) ----
+
+// errSTSConfig refuses an incomplete STS source configuration. Match it
+// with errors.Is.
+var errSTSConfig = errors.New("objectstore: sts credential source misconfigured")
+
+// STSConfig configures the per-session AssumeRole source. RoleARN and an
+// ARN are deployment identifiers, never secrets; the PARENT credential
+// (used to sign the AssumeRole call) arrives through the same intake
+// discipline as the static source.
+type STSConfig struct {
+	// RoleARN is the role assumed per session.
+	RoleARN string
+	// Endpoint optionally overrides the STS endpoint (an S3-compatible
+	// rig's STS). Empty = the SDK's regional default.
+	Endpoint string
+	// Region is the signing region.
+	Region string
+	// Bucket is the backend bucket the inline session policy is scoped to.
+	Bucket string
+	// Scope is the host-attested session scope: it becomes BOTH the role
+	// session name and the policy's prefix cell. It is validated before
+	// any policy text is built.
+	Scope ScopeID
+	// Parent signs the AssumeRole call.
+	Parent CredentialSource
+	// HTTPClient optionally pins the transport (the storage lane drops in
+	// here). Nil = the SDK default client.
+	HTTPClient *http.Client
+}
+
+// STSCredentialSource mints a short-lived, scope-prefix-confined session
+// credential per session via AssumeRole with an INLINE session policy: even
+// a leaked session credential can touch nothing outside the scope's prefix
+// cell. Kind = sts_per_session (already in the admission table for every
+// admitted profile row; this wires SELECTION, not new rows).
+type STSCredentialSource struct {
+	cfg STSConfig
+}
+
+func (*STSCredentialSource) String() string { return "objectstore.STSCredentialSource[redacted]" }
+func (*STSCredentialSource) GoString() string {
+	return "objectstore.STSCredentialSource[redacted]"
+}
+func (*STSCredentialSource) Format(f fmt.State, _ rune) {
+	io.WriteString(f, "objectstore.STSCredentialSource[redacted]")
+}
+
+// NewSTSCredentialSource validates the configuration. The scope id is
+// validated HERE — before any policy text exists — so a hostile scope can
+// never reach the policy builder.
+func NewSTSCredentialSource(cfg STSConfig) (*STSCredentialSource, error) {
+	if err := validateScopeID(cfg.Scope); err != nil {
+		return nil, err
+	}
+	if cfg.RoleARN == "" {
+		return nil, fmt.Errorf("%w: role ARN is required", errSTSConfig)
+	}
+	if cfg.Bucket == "" {
+		return nil, fmt.Errorf("%w: bucket is required for the scope-prefix policy", errSTSConfig)
+	}
+	if cfg.Region == "" {
+		return nil, fmt.Errorf("%w: region is required", errSTSConfig)
+	}
+	if cfg.Parent == nil {
+		return nil, fmt.Errorf("%w: a parent credential source is required to sign AssumeRole", errSTSConfig)
+	}
+	return &STSCredentialSource{cfg: cfg}, nil
+}
+
+// Provider builds the AssumeRole provider: role session name = the scope
+// id, inline policy = the scope-prefix least-privilege cell, credentials
+// cached and auto-refreshed by the SDK cache.
+func (s *STSCredentialSource) Provider(ctx context.Context) (aws.CredentialsProvider, error) {
+	parent, err := s.cfg.Parent.Provider(ctx)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := scopePrefixPolicy(s.cfg.Bucket, s.cfg.Scope)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := sts.Options{
+		Region:      s.cfg.Region,
+		Credentials: parent,
+	}
+	if s.cfg.Endpoint != "" {
+		opts.BaseEndpoint = aws.String(s.cfg.Endpoint)
+	}
+	if s.cfg.HTTPClient != nil {
+		opts.HTTPClient = s.cfg.HTTPClient
+	}
+	client := sts.New(opts)
+
+	prov := stscreds.NewAssumeRoleProvider(client, s.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
+		o.RoleSessionName = string(s.cfg.Scope)
+		o.Policy = aws.String(policy)
+	})
+	return aws.NewCredentialsCache(prov), nil
+}
+
+// Kind names the short-lived session-scoped cell.
+func (s *STSCredentialSource) Kind() admission.CredentialKind {
+	return admission.CredSTSPerSession
+}
+
+// stsPolicyDocument is the inline session-policy JSON shape.
+type stsPolicyDocument struct {
+	Version   string               `json:"Version"`
+	Statement []stsPolicyStatement `json:"Statement"`
+}
+
+type stsPolicyStatement struct {
+	Sid       string                       `json:"Sid"`
+	Effect    string                       `json:"Effect"`
+	Action    []string                     `json:"Action"`
+	Resource  string                       `json:"Resource"`
+	Condition map[string]map[string]string `json:"Condition,omitempty"`
+}
+
+// scopePrefixPolicy builds the least-privilege inline session policy for
+// one scope: object verbs confined to the scope's key prefix, bucket-level
+// listing confined by an s3:prefix condition. No statement ever names a
+// wildcard bucket or an unconditioned bucket-wide read.
+//
+// One deliberate exception: ListBucketMultipartUploads carries NO prefix
+// condition — the engine's orphan-MPU sweep lists bucket-wide and filters
+// client-side (a directory-style Prefix on that call is not honored by
+// every S3-compatible backend), so a prefix condition would deny the SEC-54
+// sweep. The exposure is upload-key METADATA only; every mutating MPU verb
+// stays prefix-confined.
+func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
+	if err := validateScopeID(scope); err != nil {
+		return "", err
+	}
+	if bucket == "" {
+		return "", fmt.Errorf("%w: bucket is required for the scope-prefix policy", errSTSConfig)
+	}
+	prefix := string(scope) + "/"
+	doc := stsPolicyDocument{
+		Version: "2012-10-17",
+		Statement: []stsPolicyStatement{
+			{
+				Sid:    "ScopeObjects",
+				Effect: "Allow",
+				Action: []string{
+					"s3:GetObject",
+					"s3:GetObjectVersion",
+					"s3:GetObjectTagging",
+					"s3:PutObject",
+					"s3:PutObjectTagging",
+					"s3:DeleteObject",
+					"s3:DeleteObjectVersion",
+					"s3:AbortMultipartUpload",
+					"s3:ListMultipartUploadParts",
+				},
+				Resource: "arn:aws:s3:::" + bucket + "/" + prefix + "*",
+			},
+			{
+				Sid:    "ScopeList",
+				Effect: "Allow",
+				Action: []string{
+					"s3:ListBucket",
+					"s3:ListBucketVersions",
+				},
+				Resource: "arn:aws:s3:::" + bucket,
+				Condition: map[string]map[string]string{
+					"StringLike": {"s3:prefix": prefix + "*"},
+				},
+			},
+			{
+				Sid:    "ScopeMPUSweep",
+				Effect: "Allow",
+				Action: []string{
+					"s3:ListBucketMultipartUploads",
+				},
+				Resource: "arn:aws:s3:::" + bucket,
+			},
+			{
+				Sid:    "BucketVersioningProbe",
+				Effect: "Allow",
+				Action: []string{
+					"s3:GetBucketVersioning",
+				},
+				Resource: "arn:aws:s3:::" + bucket,
+			},
+		},
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("objectstore: marshal scope policy: %w", err)
+	}
+	return string(out), nil
 }
