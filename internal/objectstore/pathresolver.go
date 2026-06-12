@@ -70,6 +70,14 @@ func hasURLScheme(s string) bool {
 	return i+2 < len(s) && s[i] == ':' && s[i+1] == '/' && s[i+2] == '/'
 }
 
+// maxPathComponents caps the number of separator-delimited components a
+// validated path may carry (NFR-SEC-46). A body-ceiling-sized path of
+// millions of components could otherwise drive unbounded tree depth through
+// composed per-component mkdir and unbounded per-component work in every
+// verb; the cap is far above any legitimate workspace path and below the
+// consuming faces' traversal depth caps.
+const maxPathComponents = 255
+
 // ValidatePath returns the cleaned, lexically safe form of p for use under a
 // ScopeRoot, or ErrInvalidPath. It is a pure function: no filesystem access,
 // so every rejection here happens before any backend call (PATH-01,
@@ -88,6 +96,8 @@ func hasURLScheme(s string) bool {
 //     ".", "a/.." ...): filepath.Clean("") returns ".", which IS local, so
 //     IsLocal alone misses it; a path must name an object inside the scope,
 //     never the scope root itself.
+//  4. Component count above maxPathComponents — a depth bomb is refused
+//     lexically before any verb walks or creates it (NFR-SEC-46).
 //
 // Percent-encoded sequences ("%2e%2e") and unicode dot-lookalikes are NOT
 // decoded here and pass through as literal bytes — they are valid filename
@@ -102,6 +112,9 @@ func ValidatePath(p string) (string, error) {
 	}
 	clean := filepath.Clean(p)
 	if clean == "." || !filepath.IsLocal(clean) {
+		return "", ErrInvalidPath
+	}
+	if strings.Count(clean, string(filepath.Separator))+1 > maxPathComponents {
 		return "", ErrInvalidPath
 	}
 	return clean, nil

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,11 @@ func TestValidatePath(t *testing.T) {
 		{"empty", "", "", ErrInvalidPath},
 		{"dot_bare", ".", "", ErrInvalidPath},
 		{"dot_via_clean", "a/..", "", ErrInvalidPath},
+		// Component-count cap (NFR-SEC-46): a depth bomb refuses lexically,
+		// the cap boundary itself is admitted.
+		{"depth_bomb", strings.Repeat("d/", maxPathComponents) + "d", "", ErrInvalidPath},
+		{"at_component_cap", strings.TrimSuffix(strings.Repeat("d/", maxPathComponents), "/"),
+			strings.TrimSuffix(strings.Repeat("d/", maxPathComponents), "/"), nil},
 		// Accept side — cleaned form returned, no error.
 		{"accept_normal", "normal/path", "normal/path", nil},
 		{"accept_dot_segment", "a/./b", "a/b", nil},

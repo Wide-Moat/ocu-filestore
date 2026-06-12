@@ -3,14 +3,19 @@
 
 package southface
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+)
 
 // handlerCtx carries everything a per-op handler needs after the spine's
-// LOCKED pipeline has cleared the request: the response writer, the routed op,
-// the buffered op body the handler strict-decodes (the spine already consumed
-// the network body into the envelope at STAGE 1; the handler re-decodes the
-// SAME bytes for the op-specific fields), the channel-bound PeerScope, the
-// resolved authorization Grant (Downloadable), and the mandateDeny hook.
+// LOCKED pipeline has cleared the request: the request context (so a client
+// disconnect cancels in-flight engine work), the response writer, the routed
+// op, the buffered op body the handler strict-decodes (the spine already
+// consumed the network body into the envelope at STAGE 1; the handler
+// re-decodes the SAME bytes for the op-specific fields), the channel-bound
+// PeerScope, the resolved authorization Grant (Downloadable), and the
+// mandateDeny hook.
 //
 // mandateDeny lets a handler-stage operational refusal emit a SECOND deny
 // audit event through the spine's guard BEFORE the wire deny is written,
@@ -20,12 +25,27 @@ import "net/http"
 // the deny event then writes the Connect error. The handler returns after
 // calling it.
 type handlerCtx struct {
+	// ctx is the REQUEST context: engine calls run under it so a client
+	// disconnect or server shutdown cancels in-flight work (a recursive
+	// listing of a hostile tree must not outlive its caller). A zero
+	// handlerCtx (some unit tests construct one directly) falls back to
+	// context.Background() through the ctxOrBackground accessor.
+	ctx         context.Context
 	w           http.ResponseWriter
 	op          Op
 	body        []byte
 	ps          PeerScope
 	grant       Grant
 	mandateDeny func(auditReason, wireClass, message string)
+}
+
+// ctxOrBackground returns the request context, defaulting to Background for
+// a handlerCtx constructed without one (direct handler unit tests).
+func (hc handlerCtx) ctxOrBackground() context.Context {
+	if hc.ctx != nil {
+		return hc.ctx
+	}
+	return context.Background()
 }
 
 // opHandler is the per-operation handler signature. The seven phase-9 ops bind

@@ -310,6 +310,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h(d.handlerDeps(), handlerCtx{
+		ctx:         r.Context(),
 		w:           w,
 		op:          op,
 		body:        bodyBytes,

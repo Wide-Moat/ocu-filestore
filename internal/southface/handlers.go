@@ -118,12 +118,20 @@ func auditTruthForEngineErr(err error) string {
 // path (a missing parent then surfaces ENOENT). With parents true it creates
 // each prefix in turn, tolerating an intermediate EEXIST as success and
 // surfacing only the FINAL component's EEXIST as the caller-visible
-// already_exists.
+// already_exists. The component count is capped at maxWalkDepth BEFORE any
+// engine call (NFR-SEC-46): a body-ceiling-sized path of millions of
+// components must not drive a per-component engine-call loop or build a tree
+// no later walk can traverse; the real engine's ValidatePath enforces its own
+// component cap, this guard keeps the spine safe independent of the bound
+// engine.
 func (d *handlerDeps) makeDirs(ctx context.Context, scope, rel string, parents bool) error {
 	if !parents {
 		return d.engine.MakeDir(ctx, scope, rel)
 	}
 	parts := strings.Split(rel, "/")
+	if len(parts) > maxWalkDepth {
+		return errInvalidPath
+	}
 	for i := range parts {
 		prefix := strings.Join(parts[:i+1], "/")
 		err := d.engine.MakeDir(ctx, scope, prefix)
@@ -159,51 +167,91 @@ type walkResult struct {
 	info FileInfo
 }
 
-// walk produces the deterministic name-sorted entry order for a listing,
-// one level (recursive=false) or depth-first (recursive=true) over the engine
-// List. A directory is emitted before its children (pre-order) so the keyset
-// cursor over the full relative path strictly advances. The root itself is not
-// emitted; only its contents.
-func (d *handlerDeps) walk(ctx context.Context, scope, rootRel string, recursive bool) ([]walkResult, error) {
-	var out []walkResult
-	var descend func(rel string) error
-	descend = func(rel string) error {
-		entries, err := d.listOneLevel(ctx, scope, rel)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			childRel := e.Name
-			if rel != "." && rel != "" {
-				childRel = rel + "/" + e.Name
-			}
-			out = append(out, walkResult{rel: childRel, info: e})
-			if recursive && e.IsDir {
-				if err := descend(childRel); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+// maxWalkDepth is the HARD depth cap on the recursive listing traversal and
+// the make_parents component count (NFR-SEC-46). The real engine's lexical
+// path validation caps a single path's component count below this, so a
+// legitimately-built tree can never reach the cap; a deeper tree (a hostile
+// or pre-existing layout) refuses cleanly instead of exhausting the stack —
+// the pre-fix recursive descent could hit Go's non-recoverable max-stack
+// fatal and kill the single-session daemon.
+const maxWalkDepth = 256
+
+// errWalkDepthExceeded names a traversal that crossed maxWalkDepth. It maps
+// to the internal deny class (a tree this deep is not reachable through the
+// validated mutation surface).
+var errWalkDepthExceeded = errors.New("southface: directory tree exceeds the maximum walk depth")
+
+// walk streams the deterministic name-sorted entry order for a listing — one
+// level (recursive=false) or depth-first pre-order (recursive=true) over the
+// engine List — to the emit callback. A directory is emitted before its
+// children so the keyset cursor over the full relative path strictly
+// advances; the root itself is not emitted, only its contents.
+//
+// The traversal is ITERATIVE over an explicit frame stack (no recursion: a
+// hostile tree depth must never translate into goroutine stack depth), hard-
+// capped at maxWalkDepth, and checks ctx between entries so a client
+// disconnect aborts the walk. emit returns false to stop the walk early —
+// the pagination path stops as soon as its page (plus the one look-ahead
+// entry that mints the cursor) is satisfied, visiting O(page) not O(tree).
+func (d *handlerDeps) walk(ctx context.Context, scope, rootRel string, recursive bool, emit func(walkResult) bool) error {
+	type walkFrame struct {
+		rel     string
+		entries []FileInfo
+		next    int
 	}
-	if err := descend(rootRel); err != nil {
-		return nil, err
+
+	rootEntries, err := d.listOneLevel(ctx, scope, rootRel)
+	if err != nil {
+		return err
 	}
-	return out, nil
+	stack := []walkFrame{{rel: rootRel, entries: rootEntries}}
+
+	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err // disconnect/cancel aborts the walk
+		}
+		top := &stack[len(stack)-1]
+		if top.next >= len(top.entries) {
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		e := top.entries[top.next]
+		top.next++
+
+		childRel := e.Name
+		if top.rel != "." && top.rel != "" {
+			childRel = top.rel + "/" + e.Name
+		}
+		if !emit(walkResult{rel: childRel, info: e}) {
+			return nil
+		}
+		if recursive && e.IsDir {
+			if len(stack) >= maxWalkDepth {
+				return errWalkDepthExceeded
+			}
+			children, err := d.listOneLevel(ctx, scope, childRel)
+			if err != nil {
+				return err
+			}
+			stack = append(stack, walkFrame{rel: childRel, entries: children})
+		}
+	}
+	return nil
 }
 
 // handleListDirectory implements OPS-01: the Entry-union listing with the
 // opaque keyset cursor. It strict-decodes the request, translates the guest
-// path, walks the engine deterministically, resumes after the decoded cursor,
-// emits a bounded page in guest-read field names with guest-convention paths,
-// and mints the next cursor from the last emitted entry (empty on the last
-// page).
+// path, walks the engine deterministically under the REQUEST context, resumes
+// after the decoded cursor, emits a bounded page in guest-read field names
+// with guest-convention paths, and mints the next cursor from the last
+// emitted entry (empty on the last page). The walk stops as soon as the page
+// is satisfied — limit+1 emitted entries visited, never the whole subtree.
 func handleListDirectory(d *handlerDeps, hc handlerCtx) {
 	var req listDirectoryRequest
 	if !decodeOp(hc, &req) {
 		return
 	}
-	ctx := context.Background()
+	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
 	rootRel := enginePath(req.Path)
 
@@ -215,30 +263,31 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) {
 		return
 	}
 
-	all, err := d.walk(ctx, scope, rootRel, req.Recursive)
-	if err != nil {
-		denyEngine(hc, err)
-		return
-	}
-
 	limit := req.Limit
 	if limit <= 0 {
 		limit = defaultPageSize
 	}
+	// Clamp the PREALLOCATION only (the page size itself stays limit): a
+	// guest-supplied limit must not size a make() directly.
+	prealloc := limit
+	if prealloc > defaultPageSize {
+		prealloc = defaultPageSize
+	}
 
-	resp := listDirectoryResponse{Entries: make([]entry, 0, limit)}
+	resp := listDirectoryResponse{Entries: make([]entry, 0, prealloc)}
 	var lastEmitted string
 	emitted := 0
-	for _, wr := range all {
+	walkErr := d.walk(ctx, scope, rootRel, req.Recursive, func(wr walkResult) bool {
 		if after != "" && wr.rel <= after {
-			continue // resume strictly after the cursor's keyset position
+			return true // resume strictly after the cursor's keyset position
 		}
 		if emitted >= limit {
 			// More entries remain: mint the next cursor from the last emitted
 			// full relative path (strictly greater than any prior page's
-			// cursor, so the guest progress guard advances).
+			// cursor, so the guest progress guard advances) and STOP the walk
+			// — the page is done, the rest of the tree is never visited.
 			resp.Cursor = encodeCursor(lastEmitted)
-			break
+			return false
 		}
 		gp := guestPath(wr.rel)
 		if wr.info.IsDir {
@@ -257,6 +306,11 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) {
 		}
 		lastEmitted = wr.rel
 		emitted++
+		return true
+	})
+	if walkErr != nil {
+		denyEngine(hc, walkErr)
+		return
 	}
 	writeJSON(hc.w, resp)
 }
@@ -297,7 +351,7 @@ func handleMakeDirectory(d *handlerDeps, hc handlerCtx) {
 		return
 	}
 	rel := enginePath(req.Path)
-	if err := d.makeDirs(context.Background(), hc.ps.FilesystemID, rel, req.MakeParents); err != nil {
+	if err := d.makeDirs(hc.ctxOrBackground(), hc.ps.FilesystemID, rel, req.MakeParents); err != nil {
 		denyEngine(hc, err)
 		return
 	}
@@ -316,7 +370,7 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) {
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
-	if err := d.engine.MoveDir(context.Background(), hc.ps.FilesystemID, src, dst, false); err != nil {
+	if err := d.engine.MoveDir(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, false); err != nil {
 		denyEngine(hc, err)
 		return
 	}
@@ -335,7 +389,7 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) {
 	if !assertWriteGrant(hc) {
 		return
 	}
-	ctx := context.Background()
+	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
 	rel := enginePath(req.Path)
 
@@ -372,7 +426,7 @@ func handleCopyFile(d *handlerDeps, hc handlerCtx) {
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
-	if err := d.engine.CopyFile(context.Background(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
+	if err := d.engine.CopyFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
 		return
 	}
@@ -391,7 +445,7 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) {
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
-	if err := d.engine.MoveFile(context.Background(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
+	if err := d.engine.MoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
 		return
 	}
@@ -409,7 +463,7 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 		return
 	}
 	rel := enginePath(req.Path)
-	if err := d.engine.RemoveFile(context.Background(), hc.ps.FilesystemID, rel); err != nil {
+	if err := d.engine.RemoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, rel); err != nil {
 		denyEngine(hc, err)
 		return
 	}
@@ -447,10 +501,7 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) {
 		return
 	}
 
-	// The committed handlerCtx carries no ctx field; the namespace handlers
-	// use context.Background() (handlers.go convention) for engine calls. The
-	// wiring phase threads the request context here.
-	ctx := context.Background()
+	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
 	rel := enginePath(req.Path)
 
