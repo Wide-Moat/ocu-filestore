@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"syscall"
@@ -54,6 +55,8 @@ const (
 	// s3MaxRetryAttempts caps the SDK retryer's attempts per request; the
 	// adaptive pacer spaces them, the cap stops the spin.
 	s3MaxRetryAttempts = 5
+	// s3DeleteBatchMax is the backend's per-call DeleteObjects key cap.
+	s3DeleteBatchMax = 1000
 )
 
 // Terminal S3-layer error classes (decision 7): neither retryable nor
@@ -574,20 +577,423 @@ func (e *s3Engine) MakeDir(ctx context.Context, scope ScopeID, p string) error {
 	return nil
 }
 
-func (e *s3Engine) MoveDir(_ context.Context, _ ScopeID, _, _ string, _ bool) error {
-	return ErrNotImplemented
+// copySourceFor URL-encodes the x-amz-copy-source value for a key: an
+// unencoded key with spaces or special characters silently targets the
+// wrong object or 404s. Path segments are escaped, separators preserved.
+func (e *s3Engine) copySourceFor(key string) string {
+	u := url.URL{Path: "/" + e.bucket + "/" + key}
+	return strings.TrimPrefix(u.EscapedPath(), "/")
 }
 
-func (e *s3Engine) RemoveDir(_ context.Context, _ ScopeID, _ string) error {
-	return ErrNotImplemented
+// srcTagging returns the source object's tag set in the URL-encoded
+// "k=v&k=v" form for write-time Tagging fields — the digest tag travels
+// with a copy on every path.
+func (e *s3Engine) srcTagging(ctx context.Context, key string) (string, error) {
+	out, err := e.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		return "", mapS3Err("copy tags", err)
+	}
+	vals := url.Values{}
+	for _, tag := range out.TagSet {
+		vals.Set(aws.ToString(tag.Key), aws.ToString(tag.Value))
+	}
+	return vals.Encode(), nil
 }
 
-func (e *s3Engine) CopyFile(_ context.Context, _ ScopeID, _, _ string, _ bool) error {
-	return ErrNotImplemented
+// copyObjectKeys performs the server-side copy of srcKey onto dstKey for a
+// source of size bytes. overwrite=true under the threshold is a plain
+// CopyObject (tags travel via the COPY directive default); anything else —
+// every overwrite=false copy (atomic no-replace via conditional Complete at
+// any size, live-proven) and any copy above the threshold (a plain
+// CopyObject over 5 GiB is refused by the backend) — is a multipart copy
+// via UploadPartCopy. A zero-byte source with overwrite=false is the one
+// special case (an empty multipart copy cannot exist): an empty conditional
+// PutObject carrying the source's tags.
+func (e *s3Engine) copyObjectKeys(ctx context.Context, srcKey, dstKey string, size int64, overwrite bool) error {
+	if overwrite && size <= e.copyThreshold {
+		_, err := e.client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     aws.String(e.bucket),
+			Key:        aws.String(dstKey),
+			CopySource: aws.String(e.copySourceFor(srcKey)),
+		})
+		return mapS3Err("copyfile", err)
+	}
+
+	tagging, terr := e.srcTagging(ctx, srcKey)
+	if terr != nil {
+		return terr
+	}
+
+	if size == 0 {
+		in := &s3.PutObjectInput{
+			Bucket:        aws.String(e.bucket),
+			Key:           aws.String(dstKey),
+			Body:          bytes.NewReader(nil),
+			ContentLength: aws.Int64(0),
+		}
+		if tagging != "" {
+			in.Tagging = aws.String(tagging)
+		}
+		if !overwrite {
+			in.IfNoneMatch = aws.String("*")
+		}
+		_, err := e.client.PutObject(ctx, in)
+		return mapS3Err("copyfile", err)
+	}
+
+	// Part size: the configured part size, grown only when the object would
+	// otherwise exceed the part ceiling.
+	partSize := e.partSize
+	if minPart := (size + s3MaxParts - 1) / s3MaxParts; partSize < minPart {
+		partSize = minPart
+	}
+
+	createIn := &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(dstKey),
+	}
+	if tagging != "" {
+		createIn.Tagging = aws.String(tagging)
+	}
+	create, cerr := e.client.CreateMultipartUpload(ctx, createIn)
+	if cerr != nil {
+		return mapS3Err("copyfile", cerr)
+	}
+	uploadID := create.UploadId
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		actx, cancel := noCancelCtx(ctx)
+		defer cancel()
+		_, _ = e.client.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(dstKey), UploadId: uploadID,
+		})
+	}()
+
+	var parts []types.CompletedPart
+	var partNum int32
+	for off := int64(0); off < size; off += partSize {
+		end := off + partSize - 1
+		if end > size-1 {
+			end = size - 1
+		}
+		partNum++
+		up, uerr := e.client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:          aws.String(e.bucket),
+			Key:             aws.String(dstKey),
+			UploadId:        uploadID,
+			PartNumber:      aws.Int32(partNum),
+			CopySource:      aws.String(e.copySourceFor(srcKey)),
+			CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", off, end)),
+		})
+		if uerr != nil {
+			return mapS3Err("copyfile", uerr)
+		}
+		parts = append(parts, types.CompletedPart{ETag: up.CopyPartResult.ETag, PartNumber: aws.Int32(partNum)})
+	}
+
+	completeIn := &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(e.bucket),
+		Key:             aws.String(dstKey),
+		UploadId:        uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}
+	if !overwrite {
+		completeIn.IfNoneMatch = aws.String("*")
+	}
+	if _, cerr := e.client.CompleteMultipartUpload(ctx, completeIn); cerr != nil {
+		return mapS3Err("copyfile", cerr)
+	}
+	completed = true
+	return nil
 }
 
-func (e *s3Engine) MoveFile(_ context.Context, _ ScopeID, _, _ string, _ bool) error {
-	return ErrNotImplemented
+// CopyFile duplicates a file within the scope. Same-object guard first
+// (src and dst resolving to one key must never proceed — a move built on
+// this copy would otherwise delete its own source); the destination key
+// re-runs the FULL validator and the parent-directory check (a copy
+// destination is not a containment hole). The source's size decides plain
+// CopyObject vs multipart copy.
+func (e *s3Engine) CopyFile(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+	srcKey, err := e.objectKey(scope, src)
+	if err != nil {
+		return err
+	}
+	dstKey, err := e.objectKey(scope, dst)
+	if err != nil {
+		return err
+	}
+
+	head, herr := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(srcKey),
+	})
+	if herr != nil {
+		return mapS3Err("copyfile", herr)
+	}
+	size := aws.ToInt64(head.ContentLength)
+
+	if srcKey == dstKey {
+		// Same object: with overwrite the copy is the identity (a no-op);
+		// without it the destination trivially exists. The source is never
+		// deleted on this path.
+		if overwrite {
+			return nil
+		}
+		return fmt.Errorf("objectstore: s3 copyfile: %w", ErrAlreadyExists)
+	}
+
+	ok, perr := e.parentExists(ctx, dstKey)
+	if perr != nil {
+		return perr
+	}
+	if !ok {
+		return &fs.PathError{Op: "copy", Path: dst, Err: fs.ErrNotExist}
+	}
+
+	return e.copyObjectKeys(ctx, srcKey, dstKey, size, overwrite)
+}
+
+// MoveFile is copy -> verify -> delete-source, in that order: a crash at
+// any point never loses bytes (a surviving duplicate is the acceptable
+// failure mode). The verification compares size and — when the source
+// carries one — the ocu-sha256 digest tag; a failed verification deletes
+// the bad copy and leaves the source untouched.
+func (e *s3Engine) MoveFile(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+	if err := e.CopyFile(ctx, scope, src, dst, overwrite); err != nil {
+		return err
+	}
+	srcKey, err := e.objectKey(scope, src)
+	if err != nil {
+		return err
+	}
+	dstKey, err := e.objectKey(scope, dst)
+	if err != nil {
+		return err
+	}
+	if srcKey == dstKey {
+		return nil // same-object guard already handled by CopyFile
+	}
+
+	verifyErr := e.verifyCopy(ctx, srcKey, dstKey)
+	if verifyErr != nil {
+		cctx, cancel := noCancelCtx(ctx)
+		defer cancel()
+		_, _ = e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(dstKey),
+		})
+		return verifyErr
+	}
+
+	if _, derr := e.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(srcKey),
+	}); derr != nil {
+		return mapS3Err("movefile", derr)
+	}
+	return nil
+}
+
+// verifyCopy asserts dstKey carries the same size as srcKey and — when the
+// source has an ocu-sha256 tag — the same digest.
+func (e *s3Engine) verifyCopy(ctx context.Context, srcKey, dstKey string) error {
+	srcHead, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(srcKey),
+	})
+	if err != nil {
+		return mapS3Err("movefile verify", err)
+	}
+	dstHead, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(dstKey),
+	})
+	if err != nil {
+		return mapS3Err("movefile verify", err)
+	}
+	if aws.ToInt64(srcHead.ContentLength) != aws.ToInt64(dstHead.ContentLength) {
+		return fmt.Errorf("objectstore: s3 movefile: size mismatch after copy (src %d, dst %d); bad copy deleted, source intact",
+			aws.ToInt64(srcHead.ContentLength), aws.ToInt64(dstHead.ContentLength))
+	}
+	srcDigest, serr := e.digestTagOf(ctx, srcKey)
+	if serr != nil {
+		return serr
+	}
+	if srcDigest == "" {
+		return nil // size-only verification when no digest exists; stated.
+	}
+	dstDigest, derr := e.digestTagOf(ctx, dstKey)
+	if derr != nil {
+		return derr
+	}
+	if dstDigest != srcDigest {
+		return fmt.Errorf("objectstore: s3 movefile: digest mismatch after copy; bad copy deleted, source intact")
+	}
+	return nil
+}
+
+// digestTagOf returns the key's ocu-sha256 tag value, "" when absent.
+func (e *s3Engine) digestTagOf(ctx context.Context, key string) (string, error) {
+	out, err := e.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		return "", mapS3Err("digest tag", err)
+	}
+	for _, tag := range out.TagSet {
+		if aws.ToString(tag.Key) == digestTagKey {
+			return aws.ToString(tag.Value), nil
+		}
+	}
+	return "", nil
+}
+
+// MoveDir relocates a directory subtree: a paginated walk of the source
+// prefix with per-object copy-then-delete (markers included), so a crash
+// mid-move leaves duplicates, never losses. NOT atomic — an observer can
+// see both trees mid-move; this is a documented divergence from the local
+// engine's rename. Every destination key re-runs the FULL validator via
+// the joined relative path — a move is not a containment hole.
+func (e *s3Engine) MoveDir(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+	srcKey, err := e.objectKey(scope, src)
+	if err != nil {
+		return err
+	}
+	dstKey, err := e.objectKey(scope, dst)
+	if err != nil {
+		return err
+	}
+	if srcKey == dstKey {
+		return fmt.Errorf("objectstore: s3 movedir: %w", ErrAlreadyExists)
+	}
+
+	srcExists, err := e.dirExists(ctx, srcKey)
+	if err != nil {
+		return err
+	}
+	if !srcExists {
+		return fmt.Errorf("objectstore: s3 movedir %q: %w", src, fs.ErrNotExist)
+	}
+	if !overwrite {
+		dstExists, derr := e.dirExists(ctx, dstKey)
+		if derr != nil {
+			return derr
+		}
+		if dstExists {
+			return fmt.Errorf("objectstore: s3 movedir: %w", ErrAlreadyExists)
+		}
+	}
+	if ok, perr := e.parentExists(ctx, dstKey); perr != nil {
+		return perr
+	} else if !ok {
+		return &fs.PathError{Op: "movedir", Path: dst, Err: fs.ErrNotExist}
+	}
+
+	srcPrefix := dirMarkerKey(srcKey)
+	var token *string
+	for {
+		page, lerr := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(e.bucket), Prefix: aws.String(srcPrefix), ContinuationToken: token,
+		})
+		if lerr != nil {
+			return mapS3Err("movedir", lerr)
+		}
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			rel := strings.TrimPrefix(key, srcPrefix)
+			isMarker := rel == "" || strings.HasSuffix(rel, "/")
+
+			// Re-run the FULL validator on the destination path (section 8):
+			// the destination of every moved object must still be a valid,
+			// contained key.
+			relPath := strings.TrimSuffix(rel, "/")
+			dstObjPath := dst
+			if relPath != "" {
+				dstObjPath = dst + "/" + relPath
+			}
+			newKey, verr := e.objectKey(scope, dstObjPath)
+			if verr != nil {
+				return verr
+			}
+			if isMarker {
+				newKey = dirMarkerKey(newKey)
+			}
+
+			if cerr := e.copyObjectKeys(ctx, key, newKey, aws.ToInt64(obj.Size), true); cerr != nil {
+				return cerr
+			}
+			if _, derr := e.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(e.bucket), Key: aws.String(key),
+			}); derr != nil {
+				return mapS3Err("movedir", derr)
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		token = page.NextContinuationToken
+	}
+	return nil
+}
+
+// deleteByPrefix erases every object under prefix: fully paginated listing,
+// DeleteObjects in <=1000-key batches, and the per-key Errors array of
+// every batch inspected — a 200 can carry partial failures. Failures
+// aggregate to a count and the sweep continues; it never aborts on the
+// first error. Returns the deleted and failed counts.
+func (e *s3Engine) deleteByPrefix(ctx context.Context, prefix string) (deleted, failed int, err error) {
+	var token *string
+	for {
+		page, lerr := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(e.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+		})
+		if lerr != nil {
+			return deleted, failed, mapS3Err("delete sweep", lerr)
+		}
+		for start := 0; start < len(page.Contents); start += s3DeleteBatchMax {
+			end := start + s3DeleteBatchMax
+			if end > len(page.Contents) {
+				end = len(page.Contents)
+			}
+			ids := make([]types.ObjectIdentifier, 0, end-start)
+			for _, obj := range page.Contents[start:end] {
+				ids = append(ids, types.ObjectIdentifier{Key: obj.Key})
+			}
+			out, derr := e.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(e.bucket),
+				Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+			})
+			if derr != nil {
+				failed += len(ids)
+				if err == nil {
+					err = mapS3Err("delete sweep", derr)
+				}
+				continue
+			}
+			failed += len(out.Errors)
+			deleted += len(ids) - len(out.Errors)
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		token = page.NextContinuationToken
+	}
+	if failed > 0 && err == nil {
+		err = fmt.Errorf("objectstore: s3 delete sweep under %q: %d of %d deletions failed", prefix, failed, failed+deleted)
+	}
+	return deleted, failed, err
+}
+
+// RemoveDir removes the named directory and its contents recursively: the
+// paginated batch-delete sweep over the prefix, marker included. A missing
+// directory is a NO-OP (the seam contract: removeDirectory of an absent
+// path converges silently).
+func (e *s3Engine) RemoveDir(ctx context.Context, scope ScopeID, p string) error {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return err
+	}
+	_, _, serr := e.deleteByPrefix(ctx, dirMarkerKey(key))
+	return serr
 }
 
 // RemoveFile removes a single object. A directory target mirrors the local

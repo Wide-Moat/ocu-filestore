@@ -326,8 +326,8 @@ func TestS3_EngineKindAndScaffold(t *testing.T) {
 	if eng.Kind() != S3 {
 		t.Fatalf("Kind() = %q, want %q", eng.Kind(), S3)
 	}
-	if err := eng.CopyFile(context.Background(), "fs1", "a", "b", false); !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("CopyFile scaffold error = %v, want ErrNotImplemented until 13-08", err)
+	if err := eng.ProvisionScope(context.Background(), "fs1"); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("ProvisionScope scaffold error = %v, want ErrNotImplemented until 13-09", err)
 	}
 }
 
@@ -1041,5 +1041,351 @@ func TestS3Live_RemoveFile_Parity(t *testing.T) {
 	}
 	if _, serr := e.Stat(ctx, scope, "full-d/child.txt"); serr != nil {
 		t.Fatalf("child vanished after refused dir remove: %v", serr)
+	}
+}
+
+// --- 13-08: copy/move/removedir ---------------------------------------------
+
+// TestS3Live_CopyFile_MissingSource pins the missing-source refusal.
+func TestS3Live_CopyFile_MissingSource(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	if err := e.CopyFile(context.Background(), scope, "ghost.txt", "dst.txt", false); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("CopyFile(missing source) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_CopyFile_NoReplace412 pins the atomic no-replace copy: the
+// overwrite=false path is a multipart copy completed with If-None-Match, so
+// an existing destination refuses ErrAlreadyExists without a read-then-write
+// race, at any size; the destination's prior content survives.
+func TestS3Live_CopyFile_NoReplace412(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.WriteStream(ctx, scope, "src.txt", bytes.NewReader([]byte("source body")), false); err != nil {
+		t.Fatalf("WriteStream(src): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "dst.txt", bytes.NewReader([]byte("existing dst")), false); err != nil {
+		t.Fatalf("WriteStream(dst): %v", err)
+	}
+
+	if err := e.CopyFile(ctx, scope, "src.txt", "dst.txt", false); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("CopyFile(overwrite=false onto existing) = %v, want ErrAlreadyExists", err)
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "dst.txt", 0, 64, &buf); err != nil || buf.String() != "existing dst" {
+		t.Fatalf("dst after refused copy = %q, %v; want untouched %q", buf.String(), err, "existing dst")
+	}
+	if n := liveMPUCount(t, e, scope); n != 0 {
+		t.Fatalf("%d multipart uploads left after refused conditional copy, want 0", n)
+	}
+
+	// Fresh destination: the conditional multipart copy succeeds and the
+	// digest tag travels with the copy.
+	if err := e.CopyFile(ctx, scope, "src.txt", "fresh.txt", false); err != nil {
+		t.Fatalf("CopyFile(fresh dst): %v", err)
+	}
+	want := sha256.Sum256([]byte("source body"))
+	if got := liveDigestTag(t, e, string(scope)+"/fresh.txt"); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("copied digest tag = %q, want %q", got, hex.EncodeToString(want[:]))
+	}
+
+	// Zero-byte source with overwrite=false (the empty-MPU special case).
+	if err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
+		t.Fatalf("WriteStream(empty): %v", err)
+	}
+	if err := e.CopyFile(ctx, scope, "empty.bin", "empty-copy.bin", false); err != nil {
+		t.Fatalf("CopyFile(empty, no-replace): %v", err)
+	}
+	if fi, err := e.Stat(ctx, scope, "empty-copy.bin"); err != nil || fi.Size != 0 {
+		t.Fatalf("Stat(empty-copy) = %+v, %v; want zero-byte file", fi, err)
+	}
+	if err := e.CopyFile(ctx, scope, "empty.bin", "empty-copy.bin", false); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("CopyFile(empty onto existing) = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// TestS3Live_Copy_SameObjectGuard pins the same-object guard: src == dst
+// never destroys the object — overwrite=false refuses, overwrite=true is
+// the identity, and a same-key MoveFile leaves the source in place.
+func TestS3Live_Copy_SameObjectGuard(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	body := []byte("survivor")
+
+	if err := e.WriteStream(ctx, scope, "same.txt", bytes.NewReader(body), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.CopyFile(ctx, scope, "same.txt", "same.txt", false); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("CopyFile(same, overwrite=false) = %v, want ErrAlreadyExists", err)
+	}
+	if err := e.CopyFile(ctx, scope, "same.txt", "same.txt", true); err != nil {
+		t.Fatalf("CopyFile(same, overwrite=true) = %v, want nil identity", err)
+	}
+	if err := e.MoveFile(ctx, scope, "same.txt", "same.txt", true); err != nil {
+		t.Fatalf("MoveFile(same) = %v, want nil with source intact", err)
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "same.txt", 0, 64, &buf); err != nil || !bytes.Equal(buf.Bytes(), body) {
+		t.Fatalf("source after same-object ops = %q, %v; want %q intact", buf.Bytes(), err, body)
+	}
+}
+
+// TestS3Live_Copy_SpecialCharKeys pins the x-amz-copy-source URL-encoding
+// row: keys with spaces, '+', '%', and (NFC) unicode copy byte-exactly — an
+// unencoded copy source would target the wrong object or 404.
+func TestS3Live_Copy_SpecialCharKeys(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	for i, name := range []string{
+		"with space.txt",
+		"plus+sign.txt",
+		"percent%41.txt",
+		"café-ümläut.bin",
+		"mixed +%& name.dat",
+	} {
+		body := []byte(fmt.Sprintf("special body %d", i))
+		if err := e.WriteStream(ctx, scope, name, bytes.NewReader(body), false); err != nil {
+			t.Fatalf("WriteStream(%q): %v", name, err)
+		}
+		dst := fmt.Sprintf("copies/c%d", i)
+		if i == 0 {
+			if err := e.MakeDir(ctx, scope, "copies"); err != nil {
+				t.Fatalf("MakeDir(copies): %v", err)
+			}
+		}
+		if err := e.CopyFile(ctx, scope, name, dst, false); err != nil {
+			t.Fatalf("CopyFile(%q -> %q): %v", name, dst, err)
+		}
+		var buf bytes.Buffer
+		if err := e.ReadRange(ctx, scope, dst, 0, 128, &buf); err != nil {
+			t.Fatalf("ReadRange(%q): %v", dst, err)
+		}
+		if !bytes.Equal(buf.Bytes(), body) {
+			t.Fatalf("copy of %q = %q, want %q (encoding corruption)", name, buf.Bytes(), body)
+		}
+	}
+}
+
+// TestS3Live_CopyThresholdSwitch drives the multipart-copy path end-to-end
+// with a test-lowered threshold (the 5 GiB production switch is a
+// constructor field, never exercised with a 5 GiB object): an
+// overwrite=true copy above the threshold goes UploadPartCopy and lands
+// byte-identical with its digest tag.
+func TestS3Live_CopyThresholdSwitch(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	e.copyThreshold = 1 << 20 // 1 MiB: force the multipart-copy path
+	ctx := context.Background()
+
+	body := make([]byte, 2<<20+17)
+	for i := range body {
+		body[i] = byte(i * 13 / 5)
+	}
+	if err := e.WriteStream(ctx, scope, "big-src.bin", bytes.NewReader(body), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.CopyFile(ctx, scope, "big-src.bin", "big-dst.bin", true); err != nil {
+		t.Fatalf("CopyFile(above threshold, overwrite=true): %v", err)
+	}
+
+	fi, err := e.Stat(ctx, scope, "big-dst.bin")
+	if err != nil || fi.Size != int64(len(body)) {
+		t.Fatalf("Stat(big-dst) = %+v, %v; want size %d", fi, err, len(body))
+	}
+	want := sha256.Sum256(body)
+	if got := liveDigestTag(t, e, string(scope)+"/big-dst.bin"); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("multipart-copy digest tag = %q, want %q", got, hex.EncodeToString(want[:]))
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "big-dst.bin", int64(len(body))-64, 128, &buf); err != nil {
+		t.Fatalf("ReadRange(tail): %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), body[len(body)-64:]) {
+		t.Fatal("multipart-copy tail bytes differ from source")
+	}
+}
+
+// TestS3Live_MoveFile_VerifyThenDelete pins the copy -> verify -> delete
+// ordering: after a move the destination carries the bytes AND the digest
+// tag, the source is gone; a move of a zero-byte file works; a missing
+// source refuses with the source side untouched.
+func TestS3Live_MoveFile_VerifyThenDelete(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	body := []byte("movable bytes")
+
+	if err := e.WriteStream(ctx, scope, "from.txt", bytes.NewReader(body), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.MoveFile(ctx, scope, "from.txt", "to.txt", false); err != nil {
+		t.Fatalf("MoveFile: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "to.txt", 0, 64, &buf); err != nil || !bytes.Equal(buf.Bytes(), body) {
+		t.Fatalf("dst after move = %q, %v; want %q", buf.Bytes(), err, body)
+	}
+	want := sha256.Sum256(body)
+	if got := liveDigestTag(t, e, string(scope)+"/to.txt"); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("digest tag after move = %q, want %q", got, hex.EncodeToString(want[:]))
+	}
+	if _, err := e.Stat(ctx, scope, "from.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("source after move = %v, want fs.ErrNotExist", err)
+	}
+
+	if err := e.WriteStream(ctx, scope, "zero.bin", bytes.NewReader(nil), false); err != nil {
+		t.Fatalf("WriteStream(zero): %v", err)
+	}
+	if err := e.MoveFile(ctx, scope, "zero.bin", "zero-moved.bin", false); err != nil {
+		t.Fatalf("MoveFile(zero-byte): %v", err)
+	}
+	if fi, err := e.Stat(ctx, scope, "zero-moved.bin"); err != nil || fi.Size != 0 {
+		t.Fatalf("Stat(zero-moved) = %+v, %v", fi, err)
+	}
+
+	if err := e.MoveFile(ctx, scope, "ghost.txt", "anywhere.txt", false); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("MoveFile(missing source) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_MoveDest_PathContainment pins section 8 on move/copy
+// destinations: dot-dot and absolute destinations refuse ErrInvalidPath and
+// NOTHING is written — a move is not a containment hole.
+func TestS3Live_MoveDest_PathContainment(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.WriteStream(ctx, scope, "safe.txt", bytes.NewReader([]byte("contained")), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "d"); err != nil {
+		t.Fatalf("MakeDir: %v", err)
+	}
+
+	for _, dst := range []string{"../escape.txt", "/abs.txt", "a/../../up.txt", "s3://bucket/key", "x\x00y"} {
+		if err := e.CopyFile(ctx, scope, "safe.txt", dst, false); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("CopyFile(dst=%q) = %v, want ErrInvalidPath", dst, err)
+		}
+		if err := e.MoveFile(ctx, scope, "safe.txt", dst, false); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("MoveFile(dst=%q) = %v, want ErrInvalidPath", dst, err)
+		}
+		if err := e.MoveDir(ctx, scope, "d", dst, false); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("MoveDir(dst=%q) = %v, want ErrInvalidPath", dst, err)
+		}
+	}
+	// The source survived every refused attempt.
+	if _, err := e.Stat(ctx, scope, "safe.txt"); err != nil {
+		t.Fatalf("source after refused moves: %v", err)
+	}
+}
+
+// TestS3Live_MoveDir_Recursive pins the per-object subtree move: files,
+// nested subdirectories, and empty-directory markers all relocate; the
+// source prefix is left empty; overwrite=false refuses an existing
+// destination directory.
+func TestS3Live_MoveDir_Recursive(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.MakeDir(ctx, scope, "tree"); err != nil {
+		t.Fatalf("MakeDir(tree): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "tree/f1.txt", bytes.NewReader([]byte("one")), false); err != nil {
+		t.Fatalf("WriteStream(f1): %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "tree/sub"); err != nil {
+		t.Fatalf("MakeDir(sub): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "tree/sub/f2.txt", bytes.NewReader([]byte("two")), false); err != nil {
+		t.Fatalf("WriteStream(f2): %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "tree/hollow"); err != nil {
+		t.Fatalf("MakeDir(hollow): %v", err)
+	}
+
+	if err := e.MoveDir(ctx, scope, "tree", "moved", false); err != nil {
+		t.Fatalf("MoveDir: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "moved/f1.txt", 0, 16, &buf); err != nil || buf.String() != "one" {
+		t.Fatalf("moved/f1.txt = %q, %v", buf.String(), err)
+	}
+	buf.Reset()
+	if err := e.ReadRange(ctx, scope, "moved/sub/f2.txt", 0, 16, &buf); err != nil || buf.String() != "two" {
+		t.Fatalf("moved/sub/f2.txt = %q, %v", buf.String(), err)
+	}
+	if fi, err := e.Stat(ctx, scope, "moved/hollow"); err != nil || !fi.IsDir {
+		t.Fatalf("Stat(moved/hollow) = %+v, %v; want empty dir moved", fi, err)
+	}
+	if _, err := e.Stat(ctx, scope, "tree"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(tree after move) = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := e.List(ctx, scope, "tree"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("List(tree after move) = %v, want fs.ErrNotExist", err)
+	}
+
+	// overwrite=false onto an existing destination directory refuses.
+	if err := e.MakeDir(ctx, scope, "tree2"); err != nil {
+		t.Fatalf("MakeDir(tree2): %v", err)
+	}
+	if err := e.MoveDir(ctx, scope, "moved", "tree2", false); !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("MoveDir(onto existing, overwrite=false) = %v, want ErrAlreadyExists", err)
+	}
+	// Missing source refuses.
+	if err := e.MoveDir(ctx, scope, "ghost-dir", "elsewhere", false); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("MoveDir(missing source) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_RemoveDir_Over1000Keys exercises the batch cap: a directory
+// with more keys than one DeleteObjects call allows is swept completely,
+// and a missing directory is a silent no-op.
+func TestS3Live_RemoveDir_Over1000Keys(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping the >1000-key sweep seed")
+	}
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	const n = 1100
+
+	liveSeed(t, e, prefix+"sweep/", nil)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			key := fmt.Sprintf("%ssweep/k-%04d", prefix, i)
+			if _, err := e.client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(e.bucket), Key: aws.String(key), Body: bytes.NewReader([]byte{1}),
+			}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("sweep seed: %v", err)
+	}
+
+	if err := e.RemoveDir(ctx, scope, "sweep"); err != nil {
+		t.Fatalf("RemoveDir(1100 keys): %v", err)
+	}
+	if _, err := e.Stat(ctx, scope, "sweep"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(sweep after remove) = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := e.Stat(ctx, scope, "sweep/k-0500"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(swept key) = %v, want fs.ErrNotExist", err)
+	}
+
+	// Missing directory: silent no-op (the seam contract).
+	if err := e.RemoveDir(ctx, scope, "never-existed"); err != nil {
+		t.Fatalf("RemoveDir(missing) = %v, want nil no-op", err)
 	}
 }
