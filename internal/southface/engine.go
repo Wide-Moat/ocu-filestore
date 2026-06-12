@@ -6,6 +6,7 @@ package southface
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -13,8 +14,8 @@ import (
 )
 
 // Engine is the consumer-side slice of the storage engine the namespace
-// handlers call. It mirrors — byte-for-byte at the method level — the eight
-// verbs the seven phase-9 ops need from the engine that lives on
+// handlers call. It mirrors — byte-for-byte at the method level — the verbs
+// the south-face ops need from the engine that lives on
 // feat/local-volume-engine:internal/objectstore/objectstore.go (the Engine
 // interface there). Following the consumer-seam discipline established by the
 // dispatch spine, this package declares its own narrow view and the wiring
@@ -47,6 +48,23 @@ type Engine interface {
 	MoveFile(ctx context.Context, scope string, src, dst string, overwrite bool) error
 	// RemoveFile removes a single file.
 	RemoveFile(ctx context.Context, scope string, path string) error
+	// ReadRange streams the half-open window [offset, offset+length) of the
+	// object at path into w. The window is half-open; a range past EOF
+	// short-reads to EOF WITHOUT error (the engine owns the EOF contract — the
+	// handler never re-clamps). It mirrors the like-named verb on
+	// feat/local-volume-engine:internal/objectstore/objectstore.go (the Engine
+	// interface there), with the named ScopeID narrowed to a plain string per
+	// the consumer-seam discipline.
+	ReadRange(ctx context.Context, scope string, path string, offset, length int64, w io.Writer) error
+	// WriteStream consumes r into the object at path WITHOUT whole-object
+	// buffering. A partial or aborted write is NEVER visible at the
+	// destination path (temp+rename invisibility); overwrite=false against an
+	// existing destination refuses errAlreadyExists without consuming r. It
+	// mirrors the like-named verb on
+	// feat/local-volume-engine:internal/objectstore/objectstore.go (the Engine
+	// interface there), with the named ScopeID narrowed to a plain string per
+	// the consumer-seam discipline.
+	WriteStream(ctx context.Context, scope string, path string, r io.Reader, overwrite bool) error
 }
 
 // FileInfo mirrors objectstore.FileInfo: the one-level listing/stat record

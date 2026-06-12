@@ -6,6 +6,7 @@ package southface
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"sort"
 	"strings"
@@ -29,6 +30,11 @@ type node struct {
 	size     int64
 	mtime    time.Time
 	children map[string]*node
+	// data holds the file's bytes (file nodes only). It is kept consistent
+	// with size (len(data) == size for nodes seeded with bytes); a node seeded
+	// by the size-only putFile helper carries nil data with a declared size,
+	// which the phase-9 listing tests never read.
+	data []byte
 }
 
 func newDirNode(name string) *node {
@@ -291,6 +297,114 @@ func (e *fakeEngine) putFile(scope, rel string, size int64) {
 		}
 		cur = next
 	}
+}
+
+// putBytes is a test helper that creates a file at an engine-relative path
+// with the given bytes (and a matching size), creating intermediate
+// directories. It seeds the data path that ReadRange/WriteStream exercise.
+func (e *fakeEngine) putBytes(scope, rel string, b []byte) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	parts, err := splitRel(rel)
+	if err != nil || len(parts) == 0 {
+		panic(fmt.Sprintf("putBytes: bad rel %q", rel))
+	}
+	cur := e.scopeRoot(scope)
+	for i, p := range parts {
+		if i == len(parts)-1 {
+			cur.children[p] = &node{name: p, isDir: false, size: int64(len(b)), mtime: e.nextMtime(), data: append([]byte(nil), b...)}
+			return
+		}
+		next, ok := cur.children[p]
+		if !ok {
+			next = newDirNode(p)
+			cur.children[p] = next
+		}
+		cur = next
+	}
+}
+
+// ReadRange streams the half-open window [offset, offset+length) of the file
+// at path into w. A missing path or a directory is ENOENT. The window clamps
+// against len(data): an offset past EOF yields an empty read, an
+// offset+length past EOF short-reads to EOF — both WITHOUT error, mirroring
+// the engine's past-EOF contract. A non-positive length reads from offset to
+// EOF (the absent-length / full-read convention the handler relies on).
+func (e *fakeEngine) ReadRange(_ context.Context, scope, path string, offset, length int64, w io.Writer) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n, _, _, _, err := e.walk(scope, path)
+	if err != nil {
+		return err
+	}
+	if n == nil || n.isDir {
+		return pathErr("open", path, fs.ErrNotExist)
+	}
+	size := int64(len(n.data))
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > size {
+		offset = size
+	}
+	var end int64
+	if length <= 0 {
+		end = size // full read from offset to EOF
+	} else {
+		end = offset + length
+		if end > size {
+			end = size // short-read past EOF, no error
+		}
+	}
+	_, werr := w.Write(n.data[offset:end])
+	return werr
+}
+
+// WriteStream consumes r into the file at path. If the leaf already exists and
+// overwrite is false it returns errAlreadyExists WITHOUT reading r (A1). It
+// otherwise reads r fully (mirroring temp+rename: a reader error — including a
+// pipe CloseWithError — returns that error and links NO node, so a partial or
+// aborted upload is never namespace-visible). On a clean read it links a new
+// file node with the read bytes.
+func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Reader, overwrite bool) error {
+	e.mu.Lock()
+	n, parent, leaf, _, err := e.walk(scope, path)
+	if err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if parent == nil {
+		e.mu.Unlock()
+		return pathErr("open", path, fs.ErrNotExist) // path names the scope root
+	}
+	if n != nil && !overwrite {
+		e.mu.Unlock()
+		return errAlreadyExists
+	}
+	e.mu.Unlock()
+
+	// Read outside the lock: the producer pipes chunks in and may block, and
+	// a reassembly abort surfaces here as a read error. Nothing is linked
+	// until the read completes cleanly (temp+rename invisibility).
+	buf, rerr := io.ReadAll(r)
+	if rerr != nil {
+		return rerr
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Re-resolve the parent under the lock before linking (the tree may have
+	// changed while reading).
+	_, parent, leaf, _, err = e.walk(scope, path)
+	if err != nil {
+		return err
+	}
+	if parent == nil {
+		return pathErr("open", path, fs.ErrNotExist)
+	}
+	parent.children[leaf] = &node{name: leaf, isDir: false, size: int64(len(buf)), mtime: e.nextMtime(), data: buf}
+	e.recordMut(path)
+	return nil
 }
 
 // mkdirSeed creates a directory (and parents) for seeding a tree.
