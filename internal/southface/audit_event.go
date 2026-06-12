@@ -46,6 +46,7 @@ func mapAuditEvent(e auditEvent) auditgate.FileActivityEvent {
 		Actor: auditgate.ActorSubject{
 			UserUID:    strconv.FormatUint(uint64(e.PeerUID), 10),
 			SessionUID: e.Scope,
+			ProcessPID: e.PeerPID,
 		},
 		FilesystemID: e.Scope,
 		ObjectHandle: e.ObjectHandle,

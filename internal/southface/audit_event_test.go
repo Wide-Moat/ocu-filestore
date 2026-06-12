@@ -46,6 +46,9 @@ func TestMapAuditEventAllowUpload(t *testing.T) {
 	if got.Actor.SessionUID != e.Scope {
 		t.Fatalf("Actor.SessionUID = %q, want %q", got.Actor.SessionUID, e.Scope)
 	}
+	if got.Actor.ProcessPID != e.PeerPID {
+		t.Fatalf("Actor.ProcessPID = %d, want %d (the gate-attested peer pid)", got.Actor.ProcessPID, e.PeerPID)
+	}
 	if got.FilesystemID != e.Scope {
 		t.Fatalf("FilesystemID = %q, want %q", got.FilesystemID, e.Scope)
 	}

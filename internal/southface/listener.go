@@ -71,6 +71,28 @@ func contextWithPeerScope(ctx context.Context, ps PeerScope) context.Context {
 // fake.
 type peerChecker func(net.Conn) (uint32, int32, error)
 
+// credConn is a host-peer connection carrying the kernel-attested peer
+// credentials the accept gate extracted, so ConnContext can stamp the REAL
+// uid/pid into the PeerScope (and from there into every audit record's
+// actor) without a second extraction. Only the gate mints it: a connection
+// reaching ConnContext as anything else is a wiring fault and fails closed
+// (no PeerScope, the dispatch spine denies).
+type credConn struct {
+	net.Conn
+	uid uint32
+	pid int32
+}
+
+// SyscallConn delegates to the inner connection so anything needing the raw
+// fd still reaches the real socket.
+func (c *credConn) SyscallConn() (syscall.RawConn, error) {
+	sc, ok := c.Conn.(syscallConner)
+	if !ok {
+		return nil, errors.New("southface: inner connection does not expose SyscallConn")
+	}
+	return sc.SyscallConn()
+}
+
 // gatedListener is the SEC-76 accept gate: a net.Listener wrapper whose Accept
 // loops, extracting each accepted connection's peer credentials and closing —
 // without reading a single byte — any peer whose uid is not the broker's host
@@ -83,19 +105,22 @@ type gatedListener struct {
 
 // Accept returns the next host-peer connection, closing and skipping any
 // connection whose peer-cred extraction fails or whose uid is not the host
-// uid. No byte is read from a rejected connection (NFR-SEC-76).
+// uid. No byte is read from a rejected connection (NFR-SEC-76). An admitted
+// connection is wrapped in credConn so the attested (uid, pid) survive to
+// ConnContext and into the audit actor — the gate is the ONE extraction
+// point; nothing downstream re-derives identity.
 func (g *gatedListener) Accept() (net.Conn, error) {
 	for {
 		conn, err := g.inner.Accept()
 		if err != nil {
 			return nil, err
 		}
-		uid, _, err := g.checkPeer(conn)
+		uid, pid, err := g.checkPeer(conn)
 		if err != nil || uid != g.hostUID {
 			_ = conn.Close()
 			continue
 		}
-		return conn, nil
+		return &credConn{Conn: conn, uid: uid, pid: pid}, nil
 	}
 }
 
@@ -169,11 +194,19 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 	}
 
 	// HTTP/1.1 only — do NOT set srv.Protocols. ConnContext stashes the
-	// channel-bound scope so every handler reads identity from the context,
-	// never from a request field (NFR-SEC-43).
+	// channel-bound scope AND the gate-attested peer (uid, pid) so every
+	// handler — and every audit record's actor — reads identity from the
+	// context, never from a request field (NFR-SEC-43/76).
 	s.srv = &http.Server{
 		Handler: handler,
-		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			cc, ok := c.(*credConn)
+			if !ok {
+				// The connection did not come through the accept gate: a
+				// wiring fault. Carry no scope; the dispatch spine fails
+				// closed — an audit actor must never default to uid 0.
+				return ctx
+			}
 			bound, ok := reg.Lookup(socketPath)
 			if !ok {
 				// Binding released mid-flight: carry an empty scope; the
@@ -183,6 +216,8 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 			return contextWithPeerScope(ctx, PeerScope{
 				FilesystemID:   bound.FilesystemID,
 				GrantedIntents: bound.GrantedIntents,
+				UID:            cc.uid,
+				PID:            cc.pid,
 			})
 		},
 	}

@@ -33,9 +33,18 @@ const (
 // event. The face that terminates the connection attests these values;
 // this package records what it is given — the attestation boundary is the
 // face, never a caller-supplied claim (NFR-SEC-79).
+//
+// Field declaration order is the JSON marshal order and therefore part of
+// the hash-chain input — append new fields, never reorder. ProcessPID is
+// the kernel-attested peer process id from the south-face accept gate
+// (SO_PEERCRED); zero (omitted) when the platform or face supplies none.
+// It is an OCU record extension beyond the contract's pinned actor
+// {user_uid, session_uid} pair, in the same class as the time/metadata/
+// prev_hash base-event extensions already carried.
 type ActorSubject struct {
 	UserUID    string `json:"user_uid,omitempty"`
 	SessionUID string `json:"session_uid,omitempty"`
+	ProcessPID int32  `json:"process_pid,omitempty"`
 }
 
 // Outcome carries the allow/deny decision. XDenyReason is present iff the

@@ -13,10 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 )
 
 // countingConn counts every byte the server side reads from the wire, so
@@ -301,6 +304,132 @@ func TestProvisionLifecycle(t *testing.T) {
 		t.Fatalf("Get after re-provision: %v", err)
 	}
 	resp2.Body.Close()
+}
+
+// credEchoHandler writes the channel-bound peer uid:pid from the request
+// context, proving the accept gate's extracted credentials survive
+// ConnContext into the PeerScope.
+func credEchoHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ps, ok := peerScopeFromContext(r.Context())
+		if !ok {
+			http.Error(w, "no peer scope", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "%d:%d", ps.UID, ps.PID)
+	})
+}
+
+// TestPeerCredsRetainedThroughConnContext pins COMP-01: the (uid, pid) the
+// accept gate extracts are NOT discarded — they ride the credConn wrapper
+// into ConnContext and land in the PeerScope every handler (and audit
+// record) reads. Before the fix the PeerScope carried zero values and the
+// audit actor read as uid "0".
+func TestPeerCredsRetainedThroughConnContext(t *testing.T) {
+	dir := filepath.Join(shortSocketDir(t), "creds")
+	reg := NewSessionRegistry()
+	entry := SessionEntry{FilesystemID: "fs-creds", GrantedIntents: []Intent{IntentRead}}
+	checker := func(net.Conn) (uint32, int32, error) { return 4242, 99, nil }
+
+	s, err := provisionSession(dir, entry, reg, credEchoHandler(), checker, 4242)
+	if err != nil {
+		t.Fatalf("provisionSession: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+
+	resp, err := unixHTTPClient(s.SocketPath()).Get("http://session/")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "4242:99" {
+		t.Fatalf("PeerScope uid:pid = %q, want %q (gate credentials must survive to the context)", body, "4242:99")
+	}
+}
+
+// TestPeerCredsLinuxReal pins the kernel-real half of COMP-01: with the REAL
+// SO_PEERCRED extractor, a same-process dial yields OUR uid and pid in the
+// PeerScope — the values the audit actor records. darwin loud-skips (no
+// SO_PEERCRED equivalent in this build; Linux CI is the enforcement target).
+func TestPeerCredsLinuxReal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("peer-cred extraction is Linux-real; darwin has no SO_PEERCRED equivalent in this build")
+	}
+	dir := filepath.Join(shortSocketDir(t), "creds-real")
+	reg := NewSessionRegistry()
+	entry := SessionEntry{FilesystemID: "fs-creds-real", GrantedIntents: []Intent{IntentRead}}
+
+	s, err := provisionSession(dir, entry, reg, credEchoHandler(), extractPeerCred, uint32(os.Getuid()))
+	if err != nil {
+		t.Fatalf("provisionSession: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+
+	resp, err := unixHTTPClient(s.SocketPath()).Get("http://session/")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	want := fmt.Sprintf("%d:%d", os.Getuid(), os.Getpid())
+	if string(body) != want {
+		t.Fatalf("kernel-attested uid:pid = %q, want %q", body, want)
+	}
+}
+
+// TestAuditActorCarriesGatePeerCreds drives the REAL dispatcher over a real
+// session socket and pins that the durable audit record's actor carries the
+// gate-attested (uid, pid) — the end-to-end COMP-01 witness: gate ->
+// credConn -> ConnContext -> PeerScope -> auditEvent -> OCSF actor.
+func TestAuditActorCarriesGatePeerCreds(t *testing.T) {
+	dir := filepath.Join(shortSocketDir(t), "creds-audit")
+	reg := NewSessionRegistry()
+	entry := SessionEntry{FilesystemID: "fs-creds-audit", GrantedIntents: []Intent{IntentRead, IntentWrite}}
+	g := &fakeGuard{}
+	d := newDispatcherWithEngine(&fakeResolver{}, g, okCeilings(), 1<<20, newFakeEngine())
+	checker := func(net.Conn) (uint32, int32, error) { return 1717, 4242, nil }
+
+	s, err := provisionSession(dir, entry, reg, d, checker, 1717)
+	if err != nil {
+		t.Fatalf("provisionSession: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+
+	body := `{"filesystem_id":"fs-creds-audit","path":"/x","authorization_metadata":{"intent":"write","downloadable":false}}`
+	req, err := http.NewRequest(http.MethodPost, "http://session"+servicePrefix+"makeDirectory", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+	req.Header.Set("Content-Type", contentTypeJSON)
+	resp, err := unixHTTPClient(s.SocketPath()).Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory status = %d, want 200", resp.StatusCode)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.events) == 0 {
+		t.Fatal("no audit event mandated")
+	}
+	ev, ok := g.events[0].(auditgate.FileActivityEvent)
+	if !ok {
+		t.Fatalf("audit event is %T, want auditgate.FileActivityEvent", g.events[0])
+	}
+	if ev.Actor.UserUID != "1717" {
+		t.Fatalf("audit actor user_uid = %q, want %q (the gate-attested uid, never a zero default)", ev.Actor.UserUID, "1717")
+	}
+	if ev.Actor.ProcessPID != 4242 {
+		t.Fatalf("audit actor process_pid = %d, want 4242 (the gate-attested pid)", ev.Actor.ProcessPID)
+	}
 }
 
 // TestSocketDirMode pins that the session socket directory is created and
