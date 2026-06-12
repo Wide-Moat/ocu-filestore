@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -76,6 +77,11 @@ var (
 	// exceed the backend's part ceiling for the configured part size; the
 	// multipart upload is aborted before refusing.
 	errS3TooManyParts = errors.New("objectstore: stream exceeds the multipart part ceiling")
+	// errS3VersionSweepDenied is the typed teardown refusal for a versioned
+	// bucket whose version listing is denied: a plain delete would leave
+	// every version's bytes readable and billing — the sweep REFUSES rather
+	// than report clean while bytes remain (SEC-54 fail-closed).
+	errS3VersionSweepDenied = errors.New("objectstore: bucket is versioned but version listing is denied; erase refused (bytes would remain)")
 )
 
 // digestTagKey is the object tag carrying the streamed SHA-256 (hex) of the
@@ -136,8 +142,10 @@ type s3Engine struct {
 	// drive the multipart-copy path against small live objects.
 	copyThreshold int64
 
-	// versioningProbed/versioningOn cache the bucket-versioning probe for
-	// the teardown sweep (filled in by the lifecycle verbs).
+	// versMu guards the cached bucket-versioning probe: the erase sweep's
+	// versioned-vs-plain split is decided once per engine, never re-probed
+	// per call. A failed probe is NOT cached — the next sweep re-probes.
+	versMu           sync.Mutex
 	versioningProbed bool
 	versioningOn     bool
 }
@@ -367,9 +375,173 @@ func mapS3Err(verb string, err error) error {
 
 func (e *s3Engine) Kind() EngineKind { return S3 }
 
-func (e *s3Engine) ProvisionScope(_ context.Context, _ ScopeID) error { return ErrNotImplemented }
+// ProvisionScope is erase-at-provision: a dirty prefix left by a crashed
+// prior session is erased before serving (the provision-side analogue of
+// erase-before-reuse, SEC-54). Prefixes are virtual — after the sweep there
+// is nothing to create.
+func (e *s3Engine) ProvisionScope(ctx context.Context, scope ScopeID) error {
+	return e.eraseScope(ctx, scope)
+}
 
-func (e *s3Engine) TeardownScope(_ context.Context, _ ScopeID) error { return ErrNotImplemented }
+// TeardownScope erases EVERY byte under the scope prefix (SEC-54): on a
+// versioned (or suspended) bucket every version and delete-marker is
+// deleted by VersionId — a plain delete writes only a delete-marker and the
+// bytes remain readable via version requests and keep billing; on an
+// unversioned bucket the plain paginated sweep suffices. The same teardown
+// aborts every orphaned in-progress multipart upload under the prefix. A
+// versioned bucket whose version listing is denied REFUSES with a typed
+// error — never a clean report while bytes remain.
+func (e *s3Engine) TeardownScope(ctx context.Context, scope ScopeID) error {
+	return e.eraseScope(ctx, scope)
+}
+
+// bucketVersioned reports (cached) whether the bucket has versioning
+// enabled or suspended — both keep historical versions that a true erase
+// must sweep.
+func (e *s3Engine) bucketVersioned(ctx context.Context) (bool, error) {
+	e.versMu.Lock()
+	defer e.versMu.Unlock()
+	if e.versioningProbed {
+		return e.versioningOn, nil
+	}
+	out, err := e.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+		Bucket: aws.String(e.bucket),
+	})
+	if err != nil {
+		return false, mapS3Err("versioning probe", err)
+	}
+	e.versioningOn = out.Status == types.BucketVersioningStatusEnabled ||
+		out.Status == types.BucketVersioningStatusSuspended
+	e.versioningProbed = true
+	return e.versioningOn, nil
+}
+
+// eraseScope is the shared SEC-54 sweep behind both lifecycle verbs.
+func (e *s3Engine) eraseScope(ctx context.Context, scope ScopeID) error {
+	prefix, err := e.scopePrefix(scope)
+	if err != nil {
+		return err
+	}
+	versioned, verr := e.bucketVersioned(ctx)
+	if verr != nil {
+		return verr
+	}
+	if versioned {
+		if err := e.deleteAllVersions(ctx, prefix); err != nil {
+			return err
+		}
+	} else {
+		if _, _, err := e.deleteByPrefix(ctx, prefix); err != nil {
+			return err
+		}
+	}
+	return e.abortScopeMPUs(ctx, prefix)
+}
+
+// deleteAllVersions erases every version AND delete-marker under prefix:
+// fully paginated ListObjectVersions, <=1000-key DeleteObjects batches with
+// explicit VersionIds, per-key Errors aggregated — never abort-on-first. A
+// denied version listing refuses typed (errS3VersionSweepDenied).
+func (e *s3Engine) deleteAllVersions(ctx context.Context, prefix string) error {
+	var (
+		keyMarker, versionMarker *string
+		deleted, failed          int
+		firstErr                 error
+	)
+	for {
+		page, lerr := e.client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(e.bucket),
+			Prefix:          aws.String(prefix),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if lerr != nil {
+			if mapped := mapS3Err("version sweep", lerr); errors.Is(mapped, errS3AccessDenied) {
+				return fmt.Errorf("%w (%v)", errS3VersionSweepDenied, mapped)
+			} else {
+				return mapped
+			}
+		}
+
+		ids := make([]types.ObjectIdentifier, 0, len(page.Versions)+len(page.DeleteMarkers))
+		for _, v := range page.Versions {
+			ids = append(ids, types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
+		}
+		for _, dm := range page.DeleteMarkers {
+			ids = append(ids, types.ObjectIdentifier{Key: dm.Key, VersionId: dm.VersionId})
+		}
+		for start := 0; start < len(ids); start += s3DeleteBatchMax {
+			end := start + s3DeleteBatchMax
+			if end > len(ids) {
+				end = len(ids)
+			}
+			out, derr := e.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(e.bucket),
+				Delete: &types.Delete{Objects: ids[start:end], Quiet: aws.Bool(true)},
+			})
+			if derr != nil {
+				failed += end - start
+				if firstErr == nil {
+					firstErr = mapS3Err("version sweep", derr)
+				}
+				continue
+			}
+			failed += len(out.Errors)
+			deleted += (end - start) - len(out.Errors)
+		}
+
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		keyMarker = page.NextKeyMarker
+		versionMarker = page.NextVersionIdMarker
+	}
+	if failed > 0 {
+		if firstErr != nil {
+			return fmt.Errorf("objectstore: s3 version sweep under %q: %d of %d deletions failed: %w", prefix, failed, failed+deleted, firstErr)
+		}
+		return fmt.Errorf("objectstore: s3 version sweep under %q: %d of %d deletions failed", prefix, failed, failed+deleted)
+	}
+	return firstErr
+}
+
+// abortScopeMPUs aborts every in-progress multipart upload under prefix
+// (paginated) — orphaned parts never show in listings, bill silently, and
+// would survive a key-only sweep. The listing is bucket-wide with a
+// client-side prefix filter: some S3-compatible backends return an upload
+// for a directory-style Prefix only when it equals the full object key, so
+// a prefix-scoped listing silently under-reports and the sweep would lie.
+func (e *s3Engine) abortScopeMPUs(ctx context.Context, prefix string) error {
+	var keyMarker, uploadMarker *string
+	for {
+		page, lerr := e.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+			Bucket:         aws.String(e.bucket),
+			KeyMarker:      keyMarker,
+			UploadIdMarker: uploadMarker,
+		})
+		if lerr != nil {
+			return mapS3Err("mpu sweep", lerr)
+		}
+		for _, up := range page.Uploads {
+			if !strings.HasPrefix(aws.ToString(up.Key), prefix) {
+				continue
+			}
+			if _, aerr := e.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(e.bucket),
+				Key:      up.Key,
+				UploadId: up.UploadId,
+			}); aerr != nil {
+				return mapS3Err("mpu sweep", aerr)
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		keyMarker = page.NextKeyMarker
+		uploadMarker = page.NextUploadIdMarker
+	}
+	return nil
+}
 
 // List returns ONE level of entries under path ("." = scope root):
 // ListObjectsV2 with Prefix + Delimiter="/", FULLY paginated via
@@ -485,6 +657,30 @@ func (e *s3Engine) Stat(ctx context.Context, scope ScopeID, p string) (FileInfo,
 		return FileInfo{Name: path.Base(key), IsDir: true}, nil
 	}
 	return FileInfo{}, fmt.Errorf("objectstore: s3 stat %q: %w", p, fs.ErrNotExist)
+}
+
+// completeMultipart issues CompleteMultipartUpload with decision-8 retry
+// hardening: Complete is NOT safely retryable after success — a retry of a
+// Complete whose first response was lost surfaces NoSuchUpload. That
+// NoSuchUpload is verified via HEAD: when the key exists with the expected
+// size, the Complete already succeeded and this is success, not failure.
+// CreateMultipartUpload is never blindly retried by engine code (each call
+// mints a new uploadId); the teardown MPU sweep is the orphan backstop.
+func (e *s3Engine) completeMultipart(ctx context.Context, in *s3.CompleteMultipartUploadInput, wantSize int64) error {
+	_, err := e.client.CompleteMultipartUpload(ctx, in)
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+		head, herr := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: in.Bucket, Key: in.Key,
+		})
+		if herr == nil && aws.ToInt64(head.ContentLength) == wantSize {
+			return nil // the earlier Complete landed; the retry saw its wake
+		}
+	}
+	return mapS3Err("complete multipart", err)
 }
 
 // dirExists reports whether the directory named by dirKey exists: marker
@@ -704,8 +900,8 @@ func (e *s3Engine) copyObjectKeys(ctx context.Context, srcKey, dstKey string, si
 	if !overwrite {
 		completeIn.IfNoneMatch = aws.String("*")
 	}
-	if _, cerr := e.client.CompleteMultipartUpload(ctx, completeIn); cerr != nil {
-		return mapS3Err("copyfile", cerr)
+	if cerr := e.completeMultipart(ctx, completeIn, size); cerr != nil {
+		return cerr
 	}
 	completed = true
 	return nil
@@ -1338,8 +1534,8 @@ func (e *s3Engine) writeMultipart(ctx context.Context, key string, src io.Reader
 	if !overwrite {
 		in.IfNoneMatch = aws.String("*")
 	}
-	if _, cerr := e.client.CompleteMultipartUpload(ctx, in); cerr != nil {
-		return 0, mapS3Err("writestream", cerr)
+	if cerr := e.completeMultipart(ctx, in, total); cerr != nil {
+		return 0, cerr
 	}
 	completed = true
 	return total, nil

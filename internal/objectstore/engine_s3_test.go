@@ -315,9 +315,10 @@ func TestS3_MapS3Err_TerminalNeverRetryable(t *testing.T) {
 	}
 }
 
-// TestS3_EngineKindAndScaffold pins that the engine names the S3 kind and
-// that un-landed verbs still refuse with ErrNotImplemented (the wave-by-wave
-// scaffold; this test shrinks as verbs land).
+// TestS3_EngineKindAndScaffold pins that the engine names the S3 kind. The
+// wave-by-wave ErrNotImplemented scaffold has fully shrunk: all 13 Engine
+// verbs are implemented, and a hostile scope id still refuses lexically
+// before any backend dial (the lifecycle verbs validate first).
 func TestS3_EngineKindAndScaffold(t *testing.T) {
 	eng, err := NewS3Engine(testS3Config())
 	if err != nil {
@@ -326,8 +327,12 @@ func TestS3_EngineKindAndScaffold(t *testing.T) {
 	if eng.Kind() != S3 {
 		t.Fatalf("Kind() = %q, want %q", eng.Kind(), S3)
 	}
-	if err := eng.ProvisionScope(context.Background(), "fs1"); !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ProvisionScope scaffold error = %v, want ErrNotImplemented until 13-09", err)
+	// Pure (no network): an invalid scope id refuses before the sweep dials.
+	if err := eng.ProvisionScope(context.Background(), "no/slash allowed"); !errors.Is(err, ErrInvalidScopeID) {
+		t.Fatalf("ProvisionScope(hostile scope) = %v, want ErrInvalidScopeID", err)
+	}
+	if err := eng.TeardownScope(context.Background(), "no/slash allowed"); !errors.Is(err, ErrInvalidScopeID) {
+		t.Fatalf("TeardownScope(hostile scope) = %v, want ErrInvalidScopeID", err)
 	}
 }
 
@@ -695,16 +700,25 @@ func liveDigestTag(t *testing.T, e *s3Engine, key string) string {
 }
 
 // liveMPUCount returns the number of in-progress multipart uploads under the
-// scope prefix — the orphan detector.
+// scope prefix — the orphan detector. Bucket-wide listing with a client-side
+// prefix filter: a directory-style Prefix on ListMultipartUploads is not
+// honored by every S3-compatible backend, and a prefix-scoped probe here
+// would count zero while orphans remain (a vacuous assertion).
 func liveMPUCount(t *testing.T, e *s3Engine, scope ScopeID) int {
 	t.Helper()
 	out, err := e.client.ListMultipartUploads(context.Background(), &s3.ListMultipartUploadsInput{
-		Bucket: aws.String(e.bucket), Prefix: aws.String(string(scope) + "/"),
+		Bucket: aws.String(e.bucket),
 	})
 	if err != nil {
 		t.Fatalf("ListMultipartUploads: %v", err)
 	}
-	return len(out.Uploads)
+	count := 0
+	for _, up := range out.Uploads {
+		if strings.HasPrefix(aws.ToString(up.Key), string(scope)+"/") {
+			count++
+		}
+	}
+	return count
 }
 
 // failAfterReader serves `serve` pattern bytes then fails with err.
@@ -1387,5 +1401,450 @@ func TestS3Live_RemoveDir_Over1000Keys(t *testing.T) {
 	// Missing directory: silent no-op (the seam contract).
 	if err := e.RemoveDir(ctx, scope, "never-existed"); err != nil {
 		t.Fatalf("RemoveDir(missing) = %v, want nil no-op", err)
+	}
+}
+
+// --- 13-09: scope lifecycle (SEC-54 erase sweep) -----------------------------
+
+// liveVersionedS3Engine returns an engine bound to the rig's VERSIONED
+// bucket (skipping loudly when the env gate is unset) plus a unique scope.
+// It fails fast when versioning is not actually enabled — the version-sweep
+// assertions would be vacuous against a plain bucket.
+func liveVersionedS3Engine(t *testing.T) (*s3Engine, ScopeID) {
+	t.Helper()
+	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip(liveSkipNotice)
+	}
+	bucket := os.Getenv("OCU_S3_TEST_VERSIONED_BUCKET")
+	if bucket == "" {
+		bucket = "ocu-conformance-versioned"
+	}
+	eng, err := NewS3Engine(S3Config{
+		Endpoint:     endpoint,
+		Region:       "us-east-1",
+		Bucket:       bucket,
+		UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider(
+			os.Getenv("OCU_S3_TEST_ACCESS_KEY"), os.Getenv("OCU_S3_TEST_SECRET_KEY"), ""),
+	})
+	if err != nil {
+		t.Fatalf("NewS3Engine(versioned live): %v", err)
+	}
+	e := eng.(*s3Engine)
+
+	vout, verr := e.client.GetBucketVersioning(context.Background(), &s3.GetBucketVersioningInput{
+		Bucket: aws.String(e.bucket),
+	})
+	if verr != nil {
+		t.Fatalf("GetBucketVersioning(%q): %v", bucket, verr)
+	}
+	if vout.Status != types.BucketVersioningStatusEnabled {
+		t.Fatalf("bucket %q versioning status = %q, want Enabled (rig bucket-init runs `mc version enable`)", bucket, vout.Status)
+	}
+
+	scope := ScopeID(fmt.Sprintf("%s-%d",
+		strings.ToLower(strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())),
+		time.Now().UnixNano()))
+	t.Cleanup(func() { liveSweepScopeVersions(t, e, scope) })
+	return e, scope
+}
+
+// liveSweepScopeVersions erases every version and delete-marker under the
+// scope prefix with the raw client — test-side hygiene for the versioned
+// bucket so runs never bleed into each other.
+func liveSweepScopeVersions(t *testing.T, e *s3Engine, scope ScopeID) {
+	t.Helper()
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	var keyMarker, versionMarker *string
+	for {
+		out, err := e.client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: aws.String(e.bucket), Prefix: aws.String(prefix),
+			KeyMarker: keyMarker, VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			t.Logf("live version sweep list: %v", err)
+			return
+		}
+		ids := make([]types.ObjectIdentifier, 0, len(out.Versions)+len(out.DeleteMarkers))
+		for _, v := range out.Versions {
+			ids = append(ids, types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
+		}
+		for _, dm := range out.DeleteMarkers {
+			ids = append(ids, types.ObjectIdentifier{Key: dm.Key, VersionId: dm.VersionId})
+		}
+		if len(ids) > 0 {
+			if _, err := e.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(e.bucket), Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+			}); err != nil {
+				t.Logf("live version sweep delete: %v", err)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return
+		}
+		keyMarker = out.NextKeyMarker
+		versionMarker = out.NextVersionIdMarker
+	}
+}
+
+// liveKeyCount returns the raw object count under the scope prefix — the
+// backend-truth probe behind the erase assertions (fully paginated).
+func liveKeyCount(t *testing.T, e *s3Engine, scope ScopeID) int {
+	t.Helper()
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	count := 0
+	var token *string
+	for {
+		out, err := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(e.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+		})
+		if err != nil {
+			t.Fatalf("liveKeyCount list: %v", err)
+		}
+		count += len(out.Contents)
+		if !aws.ToBool(out.IsTruncated) {
+			return count
+		}
+		token = out.NextContinuationToken
+	}
+}
+
+// TestS3_CompleteRetry_NoSuchUploadVerified pins the decision-8 retry
+// hardening against the real backend: a CompleteMultipartUpload retry whose
+// first response was lost surfaces NoSuchUpload — the engine verifies via
+// HEAD (key present, size matches) and treats it as success. A NoSuchUpload
+// with no matching object (aborted upload) or a size mismatch stays an
+// error: success is never assumed, always verified.
+func TestS3_CompleteRetry_NoSuchUploadVerified(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	key := string(scope) + "/cr.bin"
+	body := []byte("complete-retry-body")
+
+	create, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	part, err := e.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key), UploadId: create.UploadId,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	in := &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key), UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{ETag: part.ETag, PartNumber: aws.Int32(1)}},
+		},
+	}
+	if _, err := e.client.CompleteMultipartUpload(ctx, in); err != nil {
+		t.Fatalf("first CompleteMultipartUpload: %v", err)
+	}
+
+	// The retry: the upload id is gone, the key exists at the expected size
+	// — verified success, not failure.
+	if err := e.completeMultipart(ctx, in, int64(len(body))); err != nil {
+		t.Fatalf("completeMultipart retry after success = %v, want nil (NoSuchUpload verified via HEAD)", err)
+	}
+
+	// Size mismatch on the verification HEAD: NOT success.
+	if err := e.completeMultipart(ctx, in, int64(len(body))+1); err == nil {
+		t.Fatal("completeMultipart retry with mismatched size = nil, want error (verification must not pass)")
+	}
+
+	// An ABORTED upload's Complete-retry: NoSuchUpload with no object behind
+	// it must surface the error, never claim success.
+	key2 := string(scope) + "/cr-aborted.bin"
+	create2, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key2),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload(2): %v", err)
+	}
+	part2, err := e.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key2), UploadId: create2.UploadId,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart(2): %v", err)
+	}
+	if _, err := e.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key2), UploadId: create2.UploadId,
+	}); err != nil {
+		t.Fatalf("AbortMultipartUpload(2): %v", err)
+	}
+	in2 := &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key2), UploadId: create2.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{ETag: part2.ETag, PartNumber: aws.Int32(1)}},
+		},
+	}
+	if err := e.completeMultipart(ctx, in2, int64(len(body))); err == nil {
+		t.Fatal("completeMultipart after abort = nil, want error (no object exists to verify)")
+	}
+}
+
+// TestS3Live_SEC54_TeardownEmpties pins the observable erase contract: a
+// scope with files and directories is torn down, and every prior path then
+// refuses fs.ErrNotExist through the engine while the raw backend shows
+// zero keys under the prefix.
+func TestS3Live_SEC54_TeardownEmpties(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("alpha")), false); err != nil {
+		t.Fatalf("WriteStream(a.txt): %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "d"); err != nil {
+		t.Fatalf("MakeDir(d): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "d/b.txt", bytes.NewReader([]byte("beta")), false); err != nil {
+		t.Fatalf("WriteStream(d/b.txt): %v", err)
+	}
+
+	if err := e.TeardownScope(ctx, scope); err != nil {
+		t.Fatalf("TeardownScope: %v", err)
+	}
+
+	for _, p := range []string{"a.txt", "d", "d/b.txt"} {
+		if _, err := e.Stat(ctx, scope, p); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Stat(%q after teardown) = %v, want fs.ErrNotExist", p, err)
+		}
+	}
+	if _, err := e.List(ctx, scope, "d"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("List(d after teardown) = %v, want fs.ErrNotExist", err)
+	}
+	// The scope root is virtual: it lists empty, never errors.
+	entries, err := e.List(ctx, scope, ".")
+	if err != nil {
+		t.Fatalf("List(. after teardown): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("List(. after teardown) = %d entries, want 0", len(entries))
+	}
+	if n := liveKeyCount(t, e, scope); n != 0 {
+		t.Fatalf("raw key count after teardown = %d, want 0 (bytes remain)", n)
+	}
+}
+
+// TestS3Live_Teardown_VersionSweep pins the #1 "deleted but storage didn't
+// shrink" bug: on a versioned bucket a plain delete writes only a
+// delete-marker and every prior version's bytes remain readable. Teardown
+// must delete every VersionId INCLUDING delete-markers — afterwards
+// ListObjectVersions under the prefix returns ZERO entries.
+func TestS3Live_Teardown_VersionSweep(t *testing.T) {
+	e, scope := liveVersionedS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+
+	// Build version history: two object versions, then a delete-marker.
+	if err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("one")), false); err != nil {
+		t.Fatalf("WriteStream(v1): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("two")), true); err != nil {
+		t.Fatalf("WriteStream(v2 overwrite): %v", err)
+	}
+	if err := e.RemoveFile(ctx, scope, "v.txt"); err != nil {
+		t.Fatalf("RemoveFile(v.txt): %v", err)
+	}
+
+	// Non-vacuity: the history actually exists before the sweep.
+	before, err := e.client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions(before): %v", err)
+	}
+	if len(before.Versions) < 2 || len(before.DeleteMarkers) < 1 {
+		t.Fatalf("pre-sweep history = %d versions, %d delete-markers; want >=2 and >=1 (test arrangement broken)",
+			len(before.Versions), len(before.DeleteMarkers))
+	}
+
+	if err := e.TeardownScope(ctx, scope); err != nil {
+		t.Fatalf("TeardownScope(versioned): %v", err)
+	}
+
+	after, err := e.client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions(after): %v", err)
+	}
+	if len(after.Versions) != 0 || len(after.DeleteMarkers) != 0 {
+		t.Fatalf("post-sweep history = %d versions, %d delete-markers; want 0 and 0 (bytes remain and bill)",
+			len(after.Versions), len(after.DeleteMarkers))
+	}
+}
+
+// TestS3Live_Teardown_AbortsOrphanMPU pins the orphan backstop: an
+// in-progress multipart upload never shows in listings and would survive a
+// key-only sweep — teardown aborts it.
+func TestS3Live_Teardown_AbortsOrphanMPU(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	key := string(scope) + "/orphan.bin"
+
+	create, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if _, err := e.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key), UploadId: create.UploadId,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader([]byte("orphaned part bytes")),
+	}); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	if got := liveMPUCount(t, e, scope); got != 1 {
+		t.Fatalf("pre-teardown MPU count = %d, want 1 (test arrangement broken)", got)
+	}
+
+	if err := e.TeardownScope(ctx, scope); err != nil {
+		t.Fatalf("TeardownScope: %v", err)
+	}
+
+	if got := liveMPUCount(t, e, scope); got != 0 {
+		t.Fatalf("post-teardown MPU count = %d, want 0 (orphaned upload survived the sweep)", got)
+	}
+	if _, err := e.Stat(ctx, scope, "orphan.bin"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(orphan.bin) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_Teardown_BatchOver1000 exercises the <=1000-key DeleteObjects
+// batch cap inside the teardown sweep: a scope holding more keys than one
+// batch allows is erased completely (a page-1-only or single-batch sweep
+// under-reports).
+func TestS3Live_Teardown_BatchOver1000(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping the >1000-key teardown seed")
+	}
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+	const n = 1100
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			key := fmt.Sprintf("%sbulk/k-%04d", prefix, i)
+			if _, err := e.client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(e.bucket), Key: aws.String(key), Body: bytes.NewReader([]byte{1}),
+			}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("teardown seed: %v", err)
+	}
+
+	if err := e.TeardownScope(ctx, scope); err != nil {
+		t.Fatalf("TeardownScope(1100 keys): %v", err)
+	}
+	if got := liveKeyCount(t, e, scope); got != 0 {
+		t.Fatalf("raw key count after teardown = %d, want 0 (batch cap under-swept)", got)
+	}
+}
+
+// TestS3Live_ProvisionErasesDirty pins erase-at-provision: a dirty prefix
+// left by a crashed prior session is erased before serving, and the freshly
+// provisioned scope then serves normally.
+func TestS3Live_ProvisionErasesDirty(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+
+	// A crashed prior session's leavings: stray keys AND an orphaned MPU.
+	liveSeed(t, e, prefix+"stale.bin", []byte("stale bytes"))
+	liveSeed(t, e, prefix+"stale-dir/", nil)
+	liveSeed(t, e, prefix+"stale-dir/child.txt", []byte("child"))
+	if _, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(prefix + "stale-mpu.bin"),
+	}); err != nil {
+		t.Fatalf("CreateMultipartUpload(stale): %v", err)
+	}
+
+	if err := e.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope: %v", err)
+	}
+
+	if got := liveKeyCount(t, e, scope); got != 0 {
+		t.Fatalf("raw key count after provision = %d, want 0 (dirty prefix served)", got)
+	}
+	if got := liveMPUCount(t, e, scope); got != 0 {
+		t.Fatalf("MPU count after provision = %d, want 0", got)
+	}
+
+	// The provisioned scope serves: write -> read round-trip.
+	if err := e.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("fresh")), false); err != nil {
+		t.Fatalf("WriteStream(fresh after provision): %v", err)
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "fresh.txt", 0, 16, &buf); err != nil || buf.String() != "fresh" {
+		t.Fatalf("ReadRange(fresh) = %q, %v; want \"fresh\", nil", buf.String(), err)
+	}
+}
+
+// TestS3Live_ScopeIsolation pins the blast radius of a teardown: erasing
+// one scope leaves a sibling scope byte-identical.
+func TestS3Live_ScopeIsolation(t *testing.T) {
+	e, scopeA := liveS3Engine(t)
+	ctx := context.Background()
+
+	scopeB := ScopeID(fmt.Sprintf("%s-sibling-%d",
+		strings.ToLower(strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())),
+		time.Now().UnixNano()))
+	t.Cleanup(func() { liveSweepScope(t, e, scopeB) })
+
+	for _, sc := range []ScopeID{scopeA, scopeB} {
+		if err := e.WriteStream(ctx, sc, "keep.txt", bytes.NewReader([]byte("survivor bytes")), false); err != nil {
+			t.Fatalf("WriteStream(%s/keep.txt): %v", sc, err)
+		}
+		if err := e.MakeDir(ctx, sc, "nest"); err != nil {
+			t.Fatalf("MakeDir(%s/nest): %v", sc, err)
+		}
+		if err := e.WriteStream(ctx, sc, "nest/deep.txt", bytes.NewReader([]byte("deep")), false); err != nil {
+			t.Fatalf("WriteStream(%s/nest/deep.txt): %v", sc, err)
+		}
+	}
+	wantKeys := liveKeyCount(t, e, scopeB)
+	wantDigest := liveDigestTag(t, e, string(scopeB)+"/keep.txt")
+
+	if err := e.TeardownScope(ctx, scopeA); err != nil {
+		t.Fatalf("TeardownScope(A): %v", err)
+	}
+
+	if got := liveKeyCount(t, e, scopeA); got != 0 {
+		t.Fatalf("scope A key count after its teardown = %d, want 0", got)
+	}
+	if got := liveKeyCount(t, e, scopeB); got != wantKeys {
+		t.Fatalf("scope B key count after A's teardown = %d, want %d (teardown bled across scopes)", got, wantKeys)
+	}
+	if got := liveDigestTag(t, e, string(scopeB)+"/keep.txt"); got != wantDigest {
+		t.Fatalf("scope B digest tag changed across A's teardown: %q -> %q", wantDigest, got)
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scopeB, "keep.txt", 0, 64, &buf); err != nil || buf.String() != "survivor bytes" {
+		t.Fatalf("scope B keep.txt = %q, %v; want \"survivor bytes\", nil", buf.String(), err)
+	}
+	buf.Reset()
+	if err := e.ReadRange(ctx, scopeB, "nest/deep.txt", 0, 64, &buf); err != nil || buf.String() != "deep" {
+		t.Fatalf("scope B nest/deep.txt = %q, %v; want \"deep\", nil", buf.String(), err)
 	}
 }
