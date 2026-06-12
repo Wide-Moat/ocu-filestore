@@ -59,7 +59,11 @@ jobs:
           name: ocu-filestored
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
-      - name: smoke — the real binary refuses with the scaffold sentinel
+      - name: smoke — the real daemon refuses a missing required flag
+        # The daemon now composes a real stack; invoked with only -engine and
+        # no required flags it refuses BEFORE binding any socket with the typed
+        # required-flag error. Asserts exit 1 plus a stable substring of the
+        # committed error text main.go emits for the first missing flag.
         # The runner's default shell is bash -e; capture the expected non-zero
         # exit with || so the assertion below judges it, not -e.
         run: |
@@ -68,11 +72,15 @@ jobs:
           out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
           echo "$out"
           if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 from the scaffold build, got $code"
+            echo "::error::expected exit 1 on a missing required flag, got $code"
             exit 1
           fi
-          echo "$out" | grep -q "not implemented in this build" || {
-            echo "::error::scaffold refusal sentinel missing from output"
+          echo "$out" | grep -q "required flag missing or invalid" || {
+            echo "::error::missing-required-flag error text missing from output"
+            exit 1
+          }
+          echo "$out" | grep -q "engine-root" || {
+            echo "::error::expected the first missing required flag (-engine-root) to be named"
             exit 1
           }
       - name: smoke — unknown engine is refused, never silently defaulted

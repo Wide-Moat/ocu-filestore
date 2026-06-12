@@ -93,6 +93,11 @@ jobs:
       - name: collect the release coverage profile (internal packages)
         run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
       - name: build and smoke the real binary
+        # The daemon composes a real stack now: invoked with only -engine and
+        # no required flags it refuses BEFORE binding any socket and exits 1
+        # (the typed missing-required-flag error). This tag-gate asserts only
+        # the exit code, which still holds; the e2e job owns the message-level
+        # assertions.
         run: |
           set -uo pipefail
           CGO_ENABLED=0 go build -trimpath -o ocu-filestored ./cmd/ocu-filestored
