@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,21 +137,77 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 }
 
 // TestRunS3EngineRefusesWithFullFlagSet pins the e2e-observable shape: a full,
-// otherwise-valid required-flag set with -engine s3 passes flag validation and
-// then refuses with errS3EngineUnavailable — proving the refusal comes from
-// the engine gate, not from a missing flag.
+// otherwise-valid required-flag set with -engine s3 and NO lane posture
+// refuses with the typed ADR-0011 lane requirement — every other flag defect
+// reports first, so this refusal provably means "flags valid, lane missing"
+// (13-15). With the loud dev-direct override the refusal moves to the engine
+// gate (errS3EngineUnavailable until the real composition lands).
 func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 	root := shortDir(t)
-	err := run([]string{
+	full := []string{
 		"--engine", "s3",
 		"--engine-root", filepath.Join(root, "engine"),
 		"--audit-sink", filepath.Join(root, "audit.jsonl"),
 		"--south-socket-dir", filepath.Join(root, "sock"),
 		"--filesystem-id", "fs1",
 		"--broker-max-file-size", "1",
-	})
-	if !errors.Is(err, errS3EngineUnavailable) {
-		t.Fatalf("run(-engine s3, full flags): got %v, want errS3EngineUnavailable", err)
+	}
+	if err := run(full); !errors.Is(err, errStorageLaneRequired) {
+		t.Fatalf("run(-engine s3, full flags, no lane): got %v, want errStorageLaneRequired (ADR-0011)", err)
+	}
+	if err := run(append(full, "--storage-lane-dev-direct")); !errors.Is(err, errS3EngineUnavailable) {
+		t.Fatalf("run(-engine s3, dev-direct): got %v, want errS3EngineUnavailable", err)
+	}
+}
+
+// TestValidateStorageLaneMatrix pins the 13-15 refusal matrix (ADR-0011,
+// NFR-SEC-16/85): s3 without a lane posture refuses naming the ADR; lane +
+// dev-direct together refuse as ambiguous; any lane flag on local-volume
+// refuses (a silent no-op would lie); -ca-bundle requires -storage-lane.
+func TestValidateStorageLaneMatrix(t *testing.T) {
+	call := func(engine, lane, bundle string, devDirect bool) error {
+		_, err := validate(engine, "/x", "/y", "/s", "fs1",
+			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
+			lane, bundle, devDirect)
+		return err
+	}
+
+	if err := call("s3", "", "", false); !errors.Is(err, errStorageLaneRequired) {
+		t.Fatalf("s3 + no lane posture = %v, want errStorageLaneRequired", err)
+	}
+	if err := call("s3", "http://lane:3128", "", true); !errors.Is(err, errStorageLaneAmbiguous) {
+		t.Fatalf("s3 + lane + dev-direct = %v, want errStorageLaneAmbiguous", err)
+	}
+	if err := call("s3", "http://lane:3128", "", false); err != nil {
+		t.Fatalf("s3 + lane = %v, want nil", err)
+	}
+	if err := call("s3", "", "", true); err != nil {
+		t.Fatalf("s3 + dev-direct = %v, want nil (loud dev override)", err)
+	}
+	if err := call("s3", "http://lane:3128", "/etc/ocu/lane-ca.pem", false); err != nil {
+		t.Fatalf("s3 + lane + ca-bundle = %v, want nil", err)
+	}
+	if err := call("s3", "", "/etc/ocu/lane-ca.pem", true); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("ca-bundle without lane = %v, want refusal", err)
+	}
+	if err := call("local-volume", "http://lane:3128", "", false); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("local-volume + lane = %v, want refusal", err)
+	}
+	if err := call("local-volume", "", "", true); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("local-volume + dev-direct = %v, want refusal", err)
+	}
+	if err := call("local-volume", "", "/etc/ocu/lane-ca.pem", false); !errors.Is(err, errMissingRequiredFlag) {
+		t.Fatalf("local-volume + ca-bundle = %v, want refusal", err)
+	}
+
+	// The lane refusal text names the ADR and the SEC row — the operator
+	// (and the e2e smoke) must see WHY a direct dial is refused.
+	msg := errStorageLaneRequired.Error()
+	for _, want := range []string{"ADR-0011", "SEC-16", "-storage-lane-dev-direct"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("lane refusal text %q does not name %q", msg, want)
+		}
 	}
 }
 
@@ -160,7 +217,7 @@ func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "")
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true)
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -169,7 +226,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	}
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "")
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false)
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -185,7 +242,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "")
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true)
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -195,7 +252,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 
 	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "")
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false)
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
@@ -209,7 +266,7 @@ func TestValidateSTSFlagGate(t *testing.T) {
 
 	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000")
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true)
 	if err != nil {
 		t.Fatalf("validate(s3 + sts pair): %v", err)
 	}
@@ -219,17 +276,17 @@ func TestValidateSTSFlagGate(t *testing.T) {
 
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, ""); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
 	}
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000"); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
 	}
 	if _, err := validate("s3", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000"); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
 	}
 }
@@ -357,7 +414,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				tc.rate, tc.brst, "", "", "")
+				tc.rate, tc.brst, "", "", "", "", "", false)
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}

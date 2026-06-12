@@ -62,6 +62,18 @@ var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 // local-volume under the s3 name. Match it with errors.Is.
 var errS3EngineUnavailable = errors.New("ocu-filestored: s3 engine not available in this build")
 
+// errStorageLaneRequired refuses `-engine s3` without a storage lane: the
+// s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
+// a direct backend dial is refused (NFR-SEC-16, NFR-SEC-85). Dev rigs must
+// say -storage-lane-dev-direct EXPLICITLY to dial direct. Match it with
+// errors.Is.
+var errStorageLaneRequired = errors.New("ocu-filestored: -engine s3 requires -storage-lane (ADR-0011: the s3 backend leg transits the storage egress lane; a direct backend dial is refused, NFR-SEC-16) — dev rigs may set -storage-lane-dev-direct explicitly")
+
+// errStorageLaneAmbiguous refuses -storage-lane together with
+// -storage-lane-dev-direct: the operator must pick exactly one dial
+// posture. Match it with errors.Is.
+var errStorageLaneAmbiguous = errors.New("ocu-filestored: -storage-lane and -storage-lane-dev-direct are mutually exclusive")
+
 // tenancyAdmission maps the Phase-8-frozen hyphenated -tenancy flag values to
 // the admission package's underscored constants. The flag value set is frozen
 // (single-tenant | multi-tenant) and is NOT byte-identical to admission's
@@ -125,6 +137,9 @@ type brokerConfig struct {
 	s3CredentialFile string
 	s3STSRoleARN     string
 	s3STSEndpoint    string
+	storageLane      string
+	caBundle         string
+	laneDevDirect    bool
 	auditSink        string
 	socketDir        string
 	filesystemID     string
@@ -167,6 +182,12 @@ func run(args []string) error {
 		"s3 engine only: assume this role per session via STS with a scope-prefix inline policy (sts_per_session credential kind); an ARN is not a secret. Empty = the static host-local credential")
 	s3STSEndpoint := fs.String("s3-sts-endpoint", "",
 		"s3 engine only: STS endpoint override for S3-compatible rigs; requires -s3-sts-role-arn")
+	storageLane := fs.String("storage-lane", "",
+		"s3 engine only: storage egress lane proxy URL — the FIXED proxy every backend request transits (ADR-0011); proxy env vars are never consulted")
+	laneDevDirect := fs.Bool("storage-lane-dev-direct", false,
+		"DEV RIGS ONLY: dial the s3 backend directly without the storage lane. This violates the ADR-0011 deployment posture; never set it in production")
+	caBundle := fs.String("ca-bundle", "",
+		"optional PEM bundle APPENDED to a cloned system cert pool for an inspecting storage-lane proxy's CA; requires -storage-lane; a missing or garbled bundle refuses startup")
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
@@ -189,7 +210,8 @@ func run(args []string) error {
 
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
-		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint)
+		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
+		*storageLane, *caBundle, *laneDevDirect)
 	if err != nil {
 		return err
 	}
@@ -212,7 +234,8 @@ func run(args []string) error {
 func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
 	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
-	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string) (brokerConfig, error) {
+	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string,
+	storageLane, caBundle string, laneDevDirect bool) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	kind, err := objectstore.ParseEngine(engine)
@@ -233,6 +256,27 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	}
 	if s3STSEndpoint != "" && s3STSRoleARN == "" {
 		return cfg, fmt.Errorf("%w: -s3-sts-endpoint requires -s3-sts-role-arn", errMissingRequiredFlag)
+	}
+
+	// Storage-lane refusal matrix (ADR-0011, NFR-SEC-16/85). The lane is a
+	// network-engine concept: on local-volume a lane flag would be a silent
+	// no-op, and a silent no-op lies.
+	if kind != objectstore.S3 {
+		if storageLane != "" {
+			return cfg, fmt.Errorf("%w: -storage-lane is only valid with -engine s3", errMissingRequiredFlag)
+		}
+		if laneDevDirect {
+			return cfg, fmt.Errorf("%w: -storage-lane-dev-direct is only valid with -engine s3", errMissingRequiredFlag)
+		}
+		if caBundle != "" {
+			return cfg, fmt.Errorf("%w: -ca-bundle is only valid with -engine s3", errMissingRequiredFlag)
+		}
+	}
+	if storageLane != "" && laneDevDirect {
+		return cfg, errStorageLaneAmbiguous
+	}
+	if caBundle != "" && storageLane == "" {
+		return cfg, fmt.Errorf("%w: -ca-bundle requires -storage-lane", errMissingRequiredFlag)
 	}
 
 	prof, ok := profileAdmission[profile]
@@ -268,12 +312,22 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		return cfg, err
 	}
 
+	// The lane requirement is the LAST gate: every other flag defect
+	// reports first, so this refusal provably means "flags valid, lane
+	// posture missing" (the e2e smoke pins exactly that shape).
+	if kind == objectstore.S3 && storageLane == "" && !laneDevDirect {
+		return cfg, errStorageLaneRequired
+	}
+
 	cfg = brokerConfig{
 		engineKind:       kind,
 		engineRoot:       engineRoot,
 		s3CredentialFile: s3CredentialFile,
 		s3STSRoleARN:     s3STSRoleARN,
 		s3STSEndpoint:    s3STSEndpoint,
+		storageLane:      storageLane,
+		caBundle:         caBundle,
+		laneDevDirect:    laneDevDirect,
 		auditSink:        auditSink,
 		socketDir:        socketDir,
 		filesystemID:     filesystemID,
