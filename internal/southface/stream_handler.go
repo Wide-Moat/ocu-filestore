@@ -257,7 +257,13 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	pr, pw := io.Pipe()
 	writeErrCh := make(chan error, 1)
 	go func() {
-		writeErrCh <- d.engine.WriteStream(sc.ctx, sc.ps.FilesystemID, enginePath(params.Path), pr, false)
+		err := d.engine.WriteStream(sc.ctx, sc.ps.FilesystemID, enginePath(params.Path), pr, false)
+		// Close the read end with the engine's error so a producer pw.Write
+		// blocked on a reader that returned early (e.g. WriteStream refused
+		// already_exists WITHOUT consuming r — A1) unblocks immediately with
+		// that error instead of deadlocking on the unread pipe.
+		pr.CloseWithError(err)
+		writeErrCh <- err
 	}()
 
 	var acc int64

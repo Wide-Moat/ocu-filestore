@@ -4,6 +4,8 @@
 package southface
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -170,4 +172,140 @@ func TestPropCursor(t *testing.T) {
 			t.Fatal("walk never spanned >=2 pages: cursor not exercised (vacuous)")
 		}
 	})
+}
+
+// TestPropReadRange is P-ReadRange (non-vacuous): for an arbitrary object of
+// size S and an arbitrary half-open window [offset, offset+length), the bytes
+// the engine's ReadRange yields equal EXACTLY the half-open window
+// data[clamp(offset):clamp(offset+length)] (short-read past EOF, no error) —
+// the contract readFile's window validation relies on. Counters assert both
+// the past-EOF branch and a fully-in-bounds case were generated (non-vacuity).
+func TestPropReadRange(t *testing.T) {
+	var pastEOF, inBounds int
+
+	rapid.Check(t, func(rt *rapid.T) {
+		size := rapid.IntRange(0, 64).Draw(rt, "size")
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte('A' + (i % 26))
+		}
+		eng := newFakeEngine()
+		eng.putBytes("fs", "obj", data)
+
+		offset := int64(rapid.IntRange(0, 80).Draw(rt, "offset"))
+		length := int64(rapid.IntRange(0, 80).Draw(rt, "length"))
+
+		// Expected half-open window with the engine's clamp + length<=0=full
+		// convention.
+		s := int64(size)
+		off := offset
+		if off > s {
+			off = s
+		}
+		var end int64
+		if length <= 0 {
+			end = s
+		} else {
+			end = off + length
+			if end > s {
+				end = s
+			}
+		}
+		want := data[off:end]
+
+		// Non-vacuity counters: did this draw exercise past-EOF / in-bounds?
+		if length > 0 && offset+length > s {
+			pastEOF++
+		}
+		if length > 0 && offset+length <= s {
+			inBounds++
+		}
+
+		var buf bytes.Buffer
+		if err := eng.ReadRange(context.Background(), "fs", "obj", offset, length, &buf); err != nil {
+			rt.Fatalf("ReadRange err = %v, want nil (past-EOF short-reads)", err)
+		}
+		if !bytes.Equal(buf.Bytes(), want) {
+			rt.Fatalf("window [%d,%d) over size %d = %q, want %q", offset, length, size, buf.Bytes(), want)
+		}
+	})
+
+	if pastEOF == 0 {
+		t.Fatal("P-ReadRange vacuous: no past-EOF window generated")
+	}
+	if inBounds == 0 {
+		t.Fatal("P-ReadRange vacuous: no fully-in-bounds window generated")
+	}
+}
+
+// TestPropSizeMismatch is P-SizeMismatch (non-vacuous): for an arbitrary
+// declared size D and an arbitrary actual byte total A, a mismatch in EITHER
+// direction always rejects invalid_argument/size_exceeded with NO staged node;
+// a matching A==D commits (positive control). Counters assert both A>D and A<D
+// were generated.
+func TestPropSizeMismatch(t *testing.T) {
+	var over, under, match int
+
+	rapid.Check(t, func(rt *rapid.T) {
+		declared := int64(rapid.IntRange(1, 32).Draw(rt, "declared"))
+		actual := rapid.IntRange(0, 40).Draw(rt, "actual")
+
+		eng := newFakeEngine()
+		sess := &recordingCeilingsSession{}
+		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
+
+		raw := make([]byte, actual)
+		for i := range raw {
+			raw[i] = byte('A' + (i % 26))
+		}
+		var frames [][]byte
+		frames = append(frames, paramsFrame(rt, streamScope, "/p.bin", declared))
+		if actual > 0 {
+			frames = append(frames, chunkFrame(rt, raw))
+		}
+		frames = append(frames, endFrame(rt))
+
+		w := serveStream(d, OpFileUpload, bytes.NewReader(concat(frames...)), streamScope, okIntents())
+
+		var staged bytes.Buffer
+		readErr := eng.ReadRange(context.Background(), streamScope, "p.bin", 0, 1, &staged)
+
+		switch {
+		case int64(actual) == declared:
+			match++
+			_, resp := streamTrailer(rt, w)
+			if resp.Error != nil {
+				rt.Fatalf("matching A==D=%d rejected: %+v", declared, resp.Error)
+			}
+			if readErr != nil {
+				rt.Fatalf("matching upload did not stage the object: %v", readErr)
+			}
+		default:
+			if int64(actual) > declared {
+				over++
+			} else {
+				under++
+			}
+			_, resp := streamTrailer(rt, w)
+			if resp.Error == nil || resp.Error.Code != wireCodeInvalidArgument {
+				rt.Fatalf("mismatch D=%d A=%d did not reject invalid_argument: %+v", declared, actual, resp.Error)
+			}
+			if readErr == nil {
+				rt.Fatalf("mismatch D=%d A=%d staged an object (must stage nothing)", declared, actual)
+			}
+		}
+		if !sess.balanced() {
+			rt.Fatalf("gauge unbalanced for D=%d A=%d", declared, actual)
+		}
+	})
+
+	if over == 0 {
+		t.Fatal("P-SizeMismatch vacuous: no over-declaration (A>D) generated")
+	}
+	if under == 0 {
+		t.Fatal("P-SizeMismatch vacuous: no under-declaration (A<D) generated")
+	}
+	if match == 0 {
+		t.Fatal("P-SizeMismatch vacuous: no matching (A==D) positive control generated")
+	}
 }
