@@ -168,10 +168,10 @@ func (d *dispatcher) streamAuditEvent(ps PeerScope, req ResolveRequest, grant Gr
 //     audit-down error denies before any chunk.
 //   - fd ceiling around the open handle; bytes ceiling around reassembly
 //     (released on EVERY exit — Pitfall 6).
-//   - Reassemble via a single io.Pipe -> engine.WriteStream(overwrite=false).
-//     Over-declaration (acc > declared) aborts at the ceiling; under-
-//     declaration (acc != declared at half-close) also aborts — both n2
-//     invalid_argument/size_exceeded, staging nothing.
+//   - Reassemble via a single io.Pipe -> engine.WriteStream(overwrite=
+//     params.OverwriteExisting). Over-declaration (acc > declared) aborts at
+//     the ceiling; under-declaration (acc != declared at half-close) also
+//     aborts — both n2 invalid_argument/size_exceeded, staging nothing.
 //   - EVERY reject writes the 0x02 trailer BEFORE pw.CloseWithError/return
 //     (WIRE-LESSONS #2). The stream is always HTTP 200.
 func (d *dispatcher) handleFileUpload(sc streamCtx) {
@@ -275,11 +275,13 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	}
 	defer sc.sess.ReleaseFD()
 
-	// --- reassembly: single io.Pipe -> WriteStream(overwrite=false) ---
+	// --- reassembly: single io.Pipe -> WriteStream(overwrite=params.OverwriteExisting) ---
+	// overwrite_existing defaults to false when the field is absent (JSON zero
+	// value), which preserves today's behaviour for any sender that omits it.
 	pr, pw := io.Pipe()
 	writeErrCh := make(chan error, 1)
 	go func() {
-		err := d.engine.WriteStream(sc.ctx, sc.ps.FilesystemID, enginePath(params.Path), pr, false)
+		err := d.engine.WriteStream(sc.ctx, sc.ps.FilesystemID, enginePath(params.Path), pr, params.OverwriteExisting)
 		// Close the read end with the engine's error so a producer pw.Write
 		// blocked on a reader that returned early (e.g. WriteStream refused
 		// already_exists WITHOUT consuming r — A1) unblocks immediately with

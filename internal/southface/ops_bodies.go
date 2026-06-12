@@ -156,17 +156,20 @@ type readFileResponse struct {
 // uploadParamsFrame is the FIRST (and exactly one) frame of a fileUpload
 // stream (OPS-05, D5). It is strict-decoded (DisallowUnknownFields): every
 // field the guest may legitimately send is declared so a guest that carries
-// metadata/media_type/tags/ttl_seconds is not rejected, while an unknown field
-// (e.g. the rejected metadata_retention_days, or the absent overwrite knob —
-// A1) is refused. filesystem_id/path are top-level (D3); filesystem_id is an
+// metadata/media_type/tags/ttl_seconds/overwrite_existing is not rejected,
+// while an unknown field (e.g. the rejected metadata_retention_days) is
+// refused. filesystem_id/path are top-level (D3); filesystem_id is an
 // untrusted hint cross-checked against the channel scope. declared_size_bytes
 // is REQUIRED — absent/<=0 denies invalid_argument with no escape hatch (D5
 // footnote). ttl_seconds clamps to session teardown and is never a retention
 // guarantee; metadata_retention_days does not exist (rejected).
+// overwrite_existing defaults to false when absent (JSON zero value), which
+// preserves today's overwrite=false behaviour for any sender that omits it.
 type uploadParamsFrame struct {
 	FilesystemID          string                `json:"filesystem_id"`
 	Path                  string                `json:"path"`
 	DeclaredSizeBytes     int64                 `json:"declared_size_bytes"`
+	OverwriteExisting     bool                  `json:"overwrite_existing"`
 	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
 	Metadata              map[string]string     `json:"metadata"`
 	MediaType             string                `json:"media_type"`
