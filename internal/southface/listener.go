@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // errBadScopeName — a session's filesystem_id is unfit for a socket filename
@@ -197,8 +198,18 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 	// channel-bound scope AND the gate-attested peer (uid, pid) so every
 	// handler — and every audit record's actor — reads identity from the
 	// context, never from a request field (NFR-SEC-43/76).
+	//
+	// Timeouts (NFR-SEC-46): ReadHeaderTimeout bounds a peer that connects
+	// and never finishes its headers; IdleTimeout reaps idle keep-alive
+	// connections. ReadTimeout stays UNSET on purpose — it would cap a whole
+	// legitimate chunked upload; the per-frame read deadline inside the
+	// streaming handler covers a stalled body instead. ReadHeaderTimeout
+	// also re-arms the connection deadline per request, so a handler-set
+	// body deadline never poisons the next request on the connection.
 	s.srv = &http.Server{
-		Handler: handler,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			cc, ok := c.(*credConn)
 			if !ok {

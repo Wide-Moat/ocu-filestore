@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // errSizeExceeded is the consumer-side mirror of ceilings.ErrSizeExceeded for
@@ -204,7 +205,20 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	// path.
 	defer func() { sc.sess.ReleaseBytes(acquired) }()
 
+	// Per-frame read deadline (NFR-SEC-46): extended before EVERY frame read
+	// so a stalled peer's next readFrame errors and aborts through the
+	// existing hard-abort path instead of pinning the goroutine, an fd slot,
+	// and acquired bytes forever. Best-effort: a transport without deadline
+	// support (the in-memory test recorder) is tolerated — the live
+	// unix-socket server supports it, and its ReadHeaderTimeout re-arms the
+	// connection deadline for any subsequent request.
+	rc := http.NewResponseController(sc.w)
+	extendReadDeadline := func() {
+		_ = rc.SetReadDeadline(time.Now().Add(d.frameReadTimeout))
+	}
+
 	// --- params frame ---
+	extendReadDeadline()
 	params, err := readParamsFrame(sc.body)
 	if err != nil {
 		if errors.Is(err, errFrameTooLarge) {
@@ -276,6 +290,7 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 
 	var acc int64
 	for {
+		extendReadDeadline()
 		flag, payload, ferr := readFrame(sc.body)
 		if ferr != nil {
 			// Truncated / oversize frame: HARD ABORT (WIRE-LESSONS #1). The

@@ -8,7 +8,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 )
+
+// defaultFrameReadTimeout is the conservative per-frame inbound read budget
+// for streaming ops: generous for any live peer writing a sub-4-MiB frame,
+// fatal only to a stalled one.
+const defaultFrameReadTimeout = 30 * time.Second
 
 // OCSF File System Activity ids (class 1001). There is no rename/move id, so a
 // move/copy is recorded as a Create on the produced (destination) handle
@@ -77,6 +83,15 @@ type dispatcher struct {
 	// fail-closed, but not the real whole-object limit. Tests set a small
 	// value directly (the package is in-package).
 	maxFileSize int64
+	// frameReadTimeout bounds the wait for EACH inbound stream frame
+	// (NFR-SEC-46): a peer that opens an upload and stalls would otherwise
+	// pin the goroutine, an fd-ceiling slot, and any acquired in-flight
+	// bytes for the session's lifetime. The streaming handler extends a
+	// per-connection read deadline by this much before every frame read; an
+	// expired deadline surfaces as a readFrame error and aborts through the
+	// existing hard-abort path. Defaulted in newDispatcherWithEngine; tests
+	// shrink it.
+	frameReadTimeout time.Duration
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -120,7 +135,8 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// PHASE-11 PLACEHOLDER (W1): default the whole-object upload ceiling
 		// to the per-message ceiling until the real BrokerMaxFileSizeBytes is
 		// wired. See the maxFileSize field doc.
-		maxFileSize: sizeCeiling,
+		maxFileSize:      sizeCeiling,
+		frameReadTimeout: defaultFrameReadTimeout,
 	}
 }
 
