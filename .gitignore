@@ -8,6 +8,9 @@
 .vscode/
 
 # ─── language build/runtime ───
+# The compiled daemon binary (the CI e2e/release jobs build it as
+# ./ocu-filestored; a local build must never enter the tree).
+/ocu-filestored
 *.bin
 __pycache__/
 *.pyc
