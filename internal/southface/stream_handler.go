@@ -293,6 +293,17 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		if flag == endStreamFlag {
 			break // client half-close = authoritative end (no numChunks)
 		}
+		if flag != dataFlag {
+			// Unknown frame flag (e.g. a compression flag this build does not
+			// negotiate, or any reserved value): HARD ABORT, mirroring
+			// readParamsFrame's flag check. Silently treating an unknown-flag
+			// frame as a data frame would feed bytes framed under different
+			// semantics into the reassembly (WIRE-LESSONS #1).
+			denyTrailer(denyMalformed, wireCodeInvalidArgument, "unsupported frame flag")
+			pw.CloseWithError(errMalformedFrame)
+			<-writeErrCh
+			return
+		}
 
 		var cf uploadChunkFrame
 		if json.Unmarshal(payload, &cf) != nil {
