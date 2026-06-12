@@ -173,3 +173,75 @@ func TestStreamDenyMandateFailureDegradesToUnavailable(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamAuthzDenyMandateSymmetry pins WR-P4 (SEC-79): the streaming
+// params-stage authz-deny path is symmetric with the unary path — it ALWAYS
+// emits a deny Mandate BEFORE the trailer, and a Mandate failure degrades the
+// trailer to unavailable rather than leaking the original deny code.
+//
+// The scope-mismatch deny (the other params-stage deny site) is already pinned
+// by TestStreamDenyMandateFailureDegradesToUnavailable/pre_allow_scope_mismatch.
+// This test covers the authz Resolve error path (resolver returns ErrIntentDenied
+// after the scope check passes), which differs from scope_mismatch in that
+// req/grant are populated before the Mandate is built.
+func TestStreamAuthzDenyMandateSymmetry(t *testing.T) {
+	// validParams sends a scope-matching params frame so the scope check passes
+	// and the authz Resolve is the first deny site reached.
+	validParams := func(t *testing.T) []byte {
+		t.Helper()
+		return paramsFrame(t, streamScope, "/auth.bin", 8)
+	}
+
+	t.Run("authz_deny_emits_mandate_healthy_sink", func(t *testing.T) {
+		// Healthy sink: the deny Mandate lands, the correct deny code is framed,
+		// and no unavailable degrade occurs.
+		eng := newFakeEngine()
+		g := &fakeGuard{}
+		sess := &recordingCeilingsSession{}
+		resolver := &fakeResolver{err: ErrIntentDenied}
+		d := newDispatcherWithEngine(resolver, g, &recordingRegistry{sess: sess}, 1<<20, eng)
+		d.maxFileSize = 1 << 20
+
+		w := serveStream(d, OpFileUpload, bytes.NewReader(validParams(t)), streamScope, okIntents())
+		assertErrorTrailer(t, w, wireCodePermissionDenied)
+
+		// The deny Mandate must have been emitted (guard captured at least one event).
+		g.mu.Lock()
+		n := len(g.events)
+		g.mu.Unlock()
+		if n == 0 {
+			t.Fatalf("no Mandate events recorded for authz deny; want at least one deny event")
+		}
+		if !sess.balanced() {
+			t.Fatalf("ceilings gauge unbalanced after authz deny")
+		}
+	})
+
+	t.Run("authz_deny_mandate_failure_degrades_to_unavailable", func(t *testing.T) {
+		// Faulted sink: the deny Mandate call fails (failFrom=0 — it is the
+		// FIRST and only Mandate; there is no prior allow Mandate on the
+		// authz-deny path). The trailer must degrade to unavailable, not the
+		// original permission_denied, so an unrecorded truth never surfaces.
+		eng := newFakeEngine()
+		g := &failAfterGuard{failFrom: 0}
+		sess := &recordingCeilingsSession{}
+		resolver := &fakeResolver{err: ErrIntentDenied}
+		d := newDispatcherWithEngine(resolver, g, &recordingRegistry{sess: sess}, 1<<20, eng)
+		d.maxFileSize = 1 << 20
+
+		w := serveStream(d, OpFileUpload, bytes.NewReader(validParams(t)), streamScope, okIntents())
+		// Verdict must be unavailable, NOT permission_denied.
+		assertErrorTrailer(t, w, wireCodeUnavailable)
+
+		// The Mandate was attempted (the guard saw the call that faulted).
+		g.mu.Lock()
+		calls := g.calls
+		g.mu.Unlock()
+		if calls == 0 {
+			t.Fatalf("guard saw 0 Mandate calls; the deny Mandate must be attempted even when it fails")
+		}
+		if !sess.balanced() {
+			t.Fatalf("ceilings gauge unbalanced after authz-deny Mandate failure")
+		}
+	})
+}

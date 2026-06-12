@@ -289,12 +289,18 @@ func TestFileUploadRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("fileDownload_streams_unimplemented", func(t *testing.T) {
+	t.Run("fileDownload_routes_to_streaming_handler", func(t *testing.T) {
+		// fileDownload is now a real server-stream; confirm it routes to the
+		// streaming branch (HTTP 200 + framed trailer) rather than a unary reject.
+		// A nil body with no params frame is malformed, but the trailer must be
+		// a framed error (not a unary 400/500), proving the streaming branch ran.
 		eng := newFakeEngine()
 		sess := &recordingCeilingsSession{}
 		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
 		w := serveStream(d, OpFileDownload, bytes.NewReader(nil), streamScope, okIntents())
-		assertErrorTrailer(t, w, wireCodeUnimplemented)
+		// A nil body means no params frame: the streaming handler returns a
+		// framed error trailer (invalid_argument — malformed params frame).
+		assertErrorTrailer(t, w, wireCodeInvalidArgument)
 	})
 }
 
@@ -618,6 +624,109 @@ func TestFileUploadAlreadyExists(t *testing.T) {
 	if !sess.balanced() {
 		t.Fatalf("gauge unbalanced after already_exists")
 	}
+}
+
+// paramsFrameOverwrite encodes an upload params frame with the given
+// overwrite_existing value.
+func paramsFrameOverwrite(t fataler, scope, path string, declared int64, overwrite bool) []byte {
+	t.Helper()
+	body := fmt.Sprintf(
+		`{"filesystem_id":%q,"path":%q,"declared_size_bytes":%d,"overwrite_existing":%t,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+		scope, path, declared, overwrite)
+	return frameBytes(t, []byte(body))
+}
+
+// TestFileUploadOverwriteExisting pins BL-P2: the overwrite_existing param
+// controls whether an upload onto an existing path succeeds or refuses.
+//
+//   - overwrite_existing=true onto an existing path REPLACES the content (no
+//     already_exists error, new bytes are readable).
+//   - overwrite_existing=false (or absent — the zero value) refuses
+//     already_exists, leaving the original bytes intact.
+//   - The strict-decode discipline is preserved: overwrite_existing is
+//     accepted as a known field (no rejection), while unknown fields still
+//     cause invalid_argument.
+func TestFileUploadOverwriteExisting(t *testing.T) {
+	const (
+		path    = "/ow.bin"
+		engPath = "ow.bin"
+	)
+	newContent := []byte("NEWBYTES")
+
+	t.Run("overwrite_true_replaces_existing", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(streamScope, engPath, []byte("OLDBYTES"))
+		sess := &recordingCeilingsSession{}
+		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
+
+		body := concat(
+			paramsFrameOverwrite(t, streamScope, path, int64(len(newContent)), true),
+			chunkFrame(t, newContent),
+			endFrame(t),
+		)
+		w := serveStream(d, OpFileUpload, bytes.NewReader(body), streamScope, okIntents())
+		assertSuccessTrailer(t, w)
+
+		// The new bytes are readable; old bytes are gone.
+		var buf bytes.Buffer
+		if err := eng.ReadRange(t.Context(), streamScope, engPath, 0, int64(len(newContent)), &buf); err != nil {
+			t.Fatalf("overwrite=true: ReadRange failed: %v", err)
+		}
+		if got := buf.String(); got != string(newContent) {
+			t.Fatalf("overwrite=true: stored bytes = %q, want %q", got, newContent)
+		}
+		if !sess.balanced() {
+			t.Fatalf("overwrite=true: ceilings gauge unbalanced")
+		}
+	})
+
+	t.Run("overwrite_false_refuses_already_exists", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(streamScope, engPath, []byte("OLDBYTES"))
+		sess := &recordingCeilingsSession{}
+		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
+
+		body := concat(
+			paramsFrameOverwrite(t, streamScope, path, int64(len(newContent)), false),
+			chunkFrame(t, newContent),
+			endFrame(t),
+		)
+		w := serveStream(d, OpFileUpload, bytes.NewReader(body), streamScope, okIntents())
+		assertErrorTrailer(t, w, wireCodeAlreadyExists)
+
+		// Original bytes are intact.
+		var buf bytes.Buffer
+		if err := eng.ReadRange(t.Context(), streamScope, engPath, 0, 8, &buf); err != nil || buf.String() != "OLDBYTES" {
+			t.Fatalf("overwrite=false: existing bytes changed: %q, %v", buf.String(), err)
+		}
+		if !sess.balanced() {
+			t.Fatalf("overwrite=false: ceilings gauge unbalanced")
+		}
+	})
+
+	t.Run("overwrite_absent_defaults_false", func(t *testing.T) {
+		// A params frame that omits overwrite_existing entirely must behave
+		// as overwrite=false (JSON zero value — today's behaviour preserved).
+		eng := newFakeEngine()
+		eng.putBytes(streamScope, engPath, []byte("OLDBYTES"))
+		sess := &recordingCeilingsSession{}
+		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
+
+		// Use paramsFrame (no overwrite field) onto an existing path.
+		body := concat(
+			paramsFrame(t, streamScope, path, int64(len(newContent))),
+			chunkFrame(t, newContent),
+			endFrame(t),
+		)
+		w := serveStream(d, OpFileUpload, bytes.NewReader(body), streamScope, okIntents())
+		assertErrorTrailer(t, w, wireCodeAlreadyExists)
+
+		// Original bytes still intact.
+		var buf bytes.Buffer
+		if err := eng.ReadRange(t.Context(), streamScope, engPath, 0, 8, &buf); err != nil || buf.String() != "OLDBYTES" {
+			t.Fatalf("overwrite_absent: existing bytes changed: %q, %v", buf.String(), err)
+		}
+	})
 }
 
 // TestFileUploadKeysChannelScope pins that ceilings key on the CHANNEL scope
