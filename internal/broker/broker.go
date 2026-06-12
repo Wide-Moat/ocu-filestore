@@ -100,7 +100,11 @@ func mapResolverErr(err error) error {
 // southface.Guard. The spine already maps its event to the concrete
 // auditgate.FileActivityEvent before calling Mandate (W1.2), so the adapter
 // forwards the event unchanged; the real sink type-asserts it and fails
-// closed on any durable-write failure (NFR-SEC-79).
+// closed on any durable-write failure (NFR-SEC-79). The real audit-down
+// sentinel is remapped onto the southface mirror so the spine's
+// denyClassForErr classifies an audit-down as unavailable/503 — without the
+// remap the deny held but the wire fell to internal/500 (Option A, the same
+// discipline as mapResolverErr/mapEngineErr).
 type guardAdapter struct{ g auditgate.Guard }
 
 var _ southface.Guard = (*guardAdapter)(nil)
@@ -109,14 +113,22 @@ var _ southface.Guard = (*guardAdapter)(nil)
 func NewGuard(g auditgate.Guard) southface.Guard { return guardAdapter{g: g} }
 
 func (a guardAdapter) Mandate(ctx context.Context, event any) error {
-	return a.g.Mandate(ctx, event)
+	err := a.g.Mandate(ctx, event)
+	if errors.Is(err, auditgate.ErrAuditUnavailable) {
+		return southface.ErrAuditUnavailable
+	}
+	return err
 }
 
 // --- Ceilings adapter (southface.CeilingsRegistry <- ceilings) ------------
 
 // ceilingsAdapter narrows the string session key to the named
-// ceilings.SessionKey and returns *ceilings.Session as a
-// southface.CeilingsSession (which it already satisfies structurally).
+// ceilings.SessionKey and wraps the returned *ceilings.Session in a
+// per-call sentinel remap: the real ceilings sentinels are translated onto
+// the southface mirrors the spine's denyClassForErr matches with errors.Is
+// (Option A) — without the remap every ceiling deny held but the wire fell
+// to internal/500 instead of resource_exhausted/429, breaking client
+// backoff and disagreeing with the streaming path.
 type ceilingsAdapter struct{ r *ceilings.Registry }
 
 var _ southface.CeilingsRegistry = (*ceilingsAdapter)(nil)
@@ -125,10 +137,45 @@ var _ southface.CeilingsRegistry = (*ceilingsAdapter)(nil)
 func NewCeilings(r *ceilings.Registry) southface.CeilingsRegistry { return ceilingsAdapter{r: r} }
 
 func (a ceilingsAdapter) Session(key string) southface.CeilingsSession {
-	return a.r.Session(ceilings.SessionKey(key))
+	return ceilingsSessionAdapter{s: a.r.Session(ceilings.SessionKey(key))}
 }
 
 func (a ceilingsAdapter) Release(key string) { a.r.Release(ceilings.SessionKey(key)) }
+
+// ceilingsSessionAdapter remaps the real per-session limiter sentinels onto
+// the southface mirrors on every fallible call. Release verbs pass through
+// (they return nothing; broken-pairing panics propagate unchanged).
+type ceilingsSessionAdapter struct{ s *ceilings.Session }
+
+var _ southface.CeilingsSession = ceilingsSessionAdapter{}
+
+func (a ceilingsSessionAdapter) TryConsumeOp() error { return mapCeilingsErr(a.s.TryConsumeOp()) }
+func (a ceilingsSessionAdapter) AcquireBytes(n int64) error {
+	return mapCeilingsErr(a.s.AcquireBytes(n))
+}
+func (a ceilingsSessionAdapter) ReleaseBytes(n int64) { a.s.ReleaseBytes(n) }
+func (a ceilingsSessionAdapter) TryAcquireFD() error  { return mapCeilingsErr(a.s.TryAcquireFD()) }
+func (a ceilingsSessionAdapter) ReleaseFD()           { a.s.ReleaseFD() }
+
+// mapCeilingsErr remaps the real ceilings sentinels onto the southface
+// mirrors (mirroring mapResolverErr/mapEngineErr). A non-sentinel error
+// passes through unchanged and falls to denyInternal in the spine.
+func mapCeilingsErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ceilings.ErrThrottleExceeded):
+		return southface.ErrThrottleExceeded
+	case errors.Is(err, ceilings.ErrBytesExceeded):
+		return southface.ErrBytesExceeded
+	case errors.Is(err, ceilings.ErrFDExceeded):
+		return southface.ErrFDExceeded
+	case errors.Is(err, ceilings.ErrSizeExceeded):
+		return southface.ErrSizeExceeded
+	default:
+		return err
+	}
+}
 
 // --- Engine adapter (southface.Engine <- objectstore) ---------------------
 

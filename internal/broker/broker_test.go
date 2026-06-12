@@ -119,14 +119,16 @@ type stubGuard struct{ err error }
 func (s stubGuard) Mandate(context.Context, any) error { return s.err }
 
 // TestGuardAdapterForwardsMandate pins that the guard adapter forwards the
-// event unchanged and propagates the fail-closed error (NFR-SEC-79).
+// event unchanged and propagates the fail-closed error (NFR-SEC-79). The
+// real audit-down sentinel crosses as the SOUTHFACE mirror (FC-01) so the
+// spine's deny mapper classifies it to unavailable/503.
 func TestGuardAdapterForwardsMandate(t *testing.T) {
 	if err := NewGuard(stubGuard{}).Mandate(context.Background(), struct{}{}); err != nil {
 		t.Fatalf("Mandate(ok): got %v, want nil", err)
 	}
-	want := auditgate.ErrAuditUnavailable
-	if err := NewGuard(stubGuard{err: want}).Mandate(context.Background(), struct{}{}); !errors.Is(err, want) {
-		t.Fatalf("Mandate(down): got %v, want ErrAuditUnavailable", err)
+	err := NewGuard(stubGuard{err: auditgate.ErrAuditUnavailable}).Mandate(context.Background(), struct{}{})
+	if !errors.Is(err, southface.ErrAuditUnavailable) {
+		t.Fatalf("Mandate(down): got %v, want the southface.ErrAuditUnavailable mirror (FC-01 remap)", err)
 	}
 }
 
