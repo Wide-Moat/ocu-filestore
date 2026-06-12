@@ -369,9 +369,8 @@ func mapS3Err(verb string, err error) error {
 
 // --- Engine verbs ----------------------------------------------------------
 //
-// The data and lifecycle verbs land wave by wave; until each lands it
-// refuses with ErrNotImplemented. Nothing constructs s3Engine in production
-// until the daemon composes it (the -engine s3 refusal stands meanwhile).
+// All 13 Engine verbs are implemented; the daemon composes this engine for
+// `-engine s3` (lane transport + CredentialSource per ADR-0011/T1-7).
 
 func (e *s3Engine) Kind() EngineKind { return S3 }
 

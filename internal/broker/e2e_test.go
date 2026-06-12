@@ -67,6 +67,13 @@ func brokerBin(t *testing.T) string {
 	return abs
 }
 
+// e2eEngineS3 reports whether the live slice drives the s3 engine: the CI
+// s3 leg sets OCU_E2E_ENGINE=s3 with the MinIO rig env; default is the
+// local-volume leg (unchanged).
+func e2eEngineS3() bool {
+	return os.Getenv("OCU_E2E_ENGINE") == "s3"
+}
+
 // daemon is a launched broker process bound to one session socket.
 type daemon struct {
 	cmd        *exec.Cmd
@@ -137,9 +144,7 @@ func startDaemon(t *testing.T, opt daemonOptions) *daemon {
 		auditSink = filepath.Join(blocker, "audit.jsonl")
 	}
 
-	args := []string{
-		"-engine", "local-volume",
-		"-engine-root", engineRoot,
+	common := []string{
 		"-audit-sink", auditSink,
 		"-south-socket-dir", socketDir,
 		"-profile", "trusted_operator",
@@ -148,11 +153,42 @@ func startDaemon(t *testing.T, opt daemonOptions) *daemon {
 		"-filesystem-id", scope,
 		"-granted-intents", intents,
 	}
+	var args []string
+	var env []string
+	if e2eEngineS3() {
+		// The s3 leg: the SAME live-binary slice re-pointed at the real s3
+		// engine against the MinIO rig (dev-direct dial — the rig has no
+		// lane proxy; production posture is pinned by the lane refusal
+		// smoke). Credentials travel via the daemon's env intake — never a
+		// flag value.
+		endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+		bucket := os.Getenv("OCU_S3_TEST_BUCKET")
+		if endpoint == "" || bucket == "" {
+			t.Skip("OCU_E2E_ENGINE=s3 but OCU_S3_TEST_ENDPOINT/OCU_S3_TEST_BUCKET unset - boot deploy/docker-compose.test.yml and export the rig env")
+		}
+		args = append([]string{
+			"-engine", "s3",
+			"-s3-endpoint", endpoint,
+			"-s3-bucket", bucket,
+			"-s3-path-style",
+			"-storage-lane-dev-direct",
+		}, common...)
+		env = append(os.Environ(),
+			"OCU_S3_ACCESS_KEY_ID="+os.Getenv("OCU_S3_TEST_ACCESS_KEY"),
+			"OCU_S3_SECRET_ACCESS_KEY="+os.Getenv("OCU_S3_TEST_SECRET_KEY"),
+		)
+	} else {
+		args = append([]string{
+			"-engine", "local-volume",
+			"-engine-root", engineRoot,
+		}, common...)
+	}
 	if opt.downloadablePrefix != "" {
 		args = append(args, "-downloadable-prefixes", opt.downloadablePrefix)
 	}
 
 	cmd := exec.Command(bin, args...)
+	cmd.Env = env // nil = inherit
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
@@ -516,4 +552,59 @@ func assertNothingStaged(t *testing.T, root string) {
 		}
 		return nil
 	})
+}
+
+// TestE2ES3CredentialRedaction closes the composed redaction check on the s3
+// leg: after a full daemon run that provisions against the real backend and
+// serves both an allowed and a denied operation, neither the daemon's stderr
+// nor the audit sink carries a single byte of the backend secret (the
+// credential-intake redaction discipline, proven end-to-end).
+func TestE2ES3CredentialRedaction(t *testing.T) {
+	if !e2eEngineS3() {
+		t.Skip("composed redaction check runs on the s3 leg (OCU_E2E_ENGINE=s3)")
+	}
+	skipUnlessPeerCredSupported(t)
+	secret := os.Getenv("OCU_S3_TEST_SECRET_KEY")
+	accessKey := os.Getenv("OCU_S3_TEST_ACCESS_KEY")
+	if secret == "" || accessKey == "" {
+		t.Fatal("the s3 leg requires OCU_S3_TEST_ACCESS_KEY/OCU_S3_TEST_SECRET_KEY")
+	}
+
+	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub"})
+
+	// One allow (upload writes through to the backend, audited) and one
+	// deny (missing object, audited) so both verdict paths emit events.
+	trailer := d.uploadStream(t, map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/redact.bin",
+		"declared_size_bytes":    11,
+		"authorization_metadata": authMeta("write"),
+	}, [][]byte{[]byte("REDACTCHECK")})
+	if got := strings.TrimSpace(string(trailer)); got != "{}" {
+		t.Fatalf("upload trailer = %q, want success {}", got)
+	}
+	resp := d.postUnary(t, "readFile", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/never-written.bin",
+		"authorization_metadata": authMeta("read"),
+	})
+	resp.Body.Close()
+
+	d.stop()
+
+	audit, err := os.ReadFile(d.auditSink)
+	if err != nil {
+		t.Fatalf("read audit sink: %v", err)
+	}
+	for name, blob := range map[string][]byte{
+		"audit sink":    audit,
+		"daemon stderr": d.stderr.Bytes(),
+	} {
+		if bytes.Contains(blob, []byte(secret)) {
+			t.Fatalf("%s contains the backend secret (redaction breach)", name)
+		}
+		if bytes.Contains(blob, []byte(accessKey)) {
+			t.Fatalf("%s contains the backend access key id (redaction breach)", name)
+		}
+	}
 }

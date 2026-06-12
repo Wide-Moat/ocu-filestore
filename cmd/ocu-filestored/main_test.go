@@ -116,16 +116,24 @@ func TestComposeRefusedTripleBindsNoSocket(t *testing.T) {
 	}
 }
 
-// TestComposeS3EngineRefusesPreBind pins T1-2: `-engine s3` returns the typed
-// errS3EngineUnavailable sentinel from compose BEFORE admission and before any
-// socket exists — never a silent local-volume fallback under the s3 name.
+// TestComposeS3EngineRefusesPreBind pins the s3 composition's fail-closed
+// intake: with no credential source available the composition refuses with
+// the typed credential error BEFORE any socket exists — the daemon never
+// serves an s3 engine it cannot sign for.
 func TestComposeS3EngineRefusesPreBind(t *testing.T) {
+	t.Setenv(objectstore.EnvS3AccessKeyID, "")
+	t.Setenv(objectstore.EnvS3SecretAccessKey, "")
 	cfg := validBrokerConfig(t)
 	cfg.engineKind = objectstore.S3
+	cfg.engineRoot = ""
+	cfg.s3Bucket = "ocu-bucket"
+	cfg.s3Endpoint = "http://127.0.0.1:9000"
+	cfg.s3Region = "us-east-1"
+	cfg.laneDevDirect = true
 
 	_, err := compose(cfg)
-	if !errors.Is(err, errS3EngineUnavailable) {
-		t.Fatalf("compose(engine=s3): got %v, want errS3EngineUnavailable", err)
+	if !errors.Is(err, objectstore.ErrCredentialMissing) {
+		t.Fatalf("compose(engine=s3, no credential): got %v, want ErrCredentialMissing", err)
 	}
 	// The refusal happened pre-bind: no socket file under the socket dir.
 	entries, _ := os.ReadDir(cfg.socketDir)
@@ -136,17 +144,59 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 	}
 }
 
+// TestComposeS3RealEngineServes pins the 13-16 composition end-to-end against
+// the live rig (gated): dev-direct transport + static env credentials compose
+// the REAL s3 engine, ProvisionScope runs against MinIO for real, the daemon
+// serves on a real socket, and Close tears the scope down.
+func TestComposeS3RealEngineServes(t *testing.T) {
+	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("OCU_S3_TEST_ENDPOINT not set - composed s3 engine live leg SKIPPED (boot deploy/docker-compose.test.yml)")
+	}
+	t.Setenv(objectstore.EnvS3AccessKeyID, os.Getenv("OCU_S3_TEST_ACCESS_KEY"))
+	t.Setenv(objectstore.EnvS3SecretAccessKey, os.Getenv("OCU_S3_TEST_SECRET_KEY"))
+	bucket := os.Getenv("OCU_S3_TEST_BUCKET")
+	if bucket == "" {
+		bucket = "ocu-conformance"
+	}
+
+	cfg := validBrokerConfig(t)
+	cfg.engineKind = objectstore.S3
+	cfg.engineRoot = ""
+	cfg.s3Bucket = bucket
+	cfg.s3Endpoint = endpoint
+	cfg.s3Region = "us-east-1"
+	cfg.s3PathStyle = true
+	cfg.laneDevDirect = true
+
+	srv, err := compose(cfg)
+	if err != nil {
+		t.Fatalf("compose(real s3): %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-serveErr; err != nil {
+		t.Fatalf("Serve returned %v on clean shutdown, want nil", err)
+	}
+}
+
 // TestRunS3EngineRefusesWithFullFlagSet pins the e2e-observable shape: a full,
 // otherwise-valid required-flag set with -engine s3 and NO lane posture
 // refuses with the typed ADR-0011 lane requirement — every other flag defect
 // reports first, so this refusal provably means "flags valid, lane missing"
-// (13-15). With the loud dev-direct override the refusal moves to the engine
-// gate (errS3EngineUnavailable until the real composition lands).
+// (13-15). With the loud dev-direct override and no credential, the refusal
+// moves to the credential intake (the composition gate).
 func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
+	t.Setenv(objectstore.EnvS3AccessKeyID, "")
+	t.Setenv(objectstore.EnvS3SecretAccessKey, "")
 	root := shortDir(t)
 	full := []string{
 		"--engine", "s3",
-		"--engine-root", filepath.Join(root, "engine"),
+		"--s3-bucket", "ocu-bucket",
+		"--s3-endpoint", "http://127.0.0.1:9000",
 		"--audit-sink", filepath.Join(root, "audit.jsonl"),
 		"--south-socket-dir", filepath.Join(root, "sock"),
 		"--filesystem-id", "fs1",
@@ -155,8 +205,46 @@ func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 	if err := run(full); !errors.Is(err, errStorageLaneRequired) {
 		t.Fatalf("run(-engine s3, full flags, no lane): got %v, want errStorageLaneRequired (ADR-0011)", err)
 	}
-	if err := run(append(full, "--storage-lane-dev-direct")); !errors.Is(err, errS3EngineUnavailable) {
-		t.Fatalf("run(-engine s3, dev-direct): got %v, want errS3EngineUnavailable", err)
+	if err := run(append(full, "--storage-lane-dev-direct")); !errors.Is(err, objectstore.ErrCredentialMissing) {
+		t.Fatalf("run(-engine s3, dev-direct, no creds): got %v, want ErrCredentialMissing", err)
+	}
+}
+
+// TestValidateEngineConditionalRequiredFlags pins the 13-16 matrix: each
+// engine kind requires its own backing-store flags and refuses the other
+// kind's.
+func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		engine, engineRoot             string
+		s3Bucket, s3Endpoint, s3Region string
+		s3PathStyle                    bool
+		wantErr                        bool
+	}{
+		{"local with engine-root ok", "local-volume", "/x", "", "", "us-east-1", false, false},
+		{"local without engine-root refused", "local-volume", "", "", "", "us-east-1", false, true},
+		{"local with s3-bucket refused", "local-volume", "/x", "b", "", "us-east-1", false, true},
+		{"local with s3-endpoint refused", "local-volume", "/x", "", "http://e", "us-east-1", false, true},
+		{"local with s3-path-style refused", "local-volume", "/x", "", "", "us-east-1", true, true},
+		{"s3 full ok", "s3", "", "b", "http://e", "us-east-1", true, false},
+		{"s3 with engine-root refused", "s3", "/x", "b", "http://e", "us-east-1", false, true},
+		{"s3 without bucket refused", "s3", "", "", "http://e", "us-east-1", false, true},
+		{"s3 without endpoint refused", "s3", "", "b", "", "us-east-1", false, true},
+		{"s3 without region refused", "s3", "", "b", "http://e", "", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validate(tc.engine, tc.engineRoot, "/y", "/s", "fs1",
+				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+				defaultOpsPerSecond, defaultOpsBurst, "", "", "",
+				"", "", tc.engine == "s3", // dev-direct posture for the s3 rows
+				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle)
+			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
+				t.Fatalf("validate(%s) = %v, want errMissingRequiredFlag", tc.name, err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validate(%s) = %v, want nil", tc.name, err)
+			}
+		})
 	}
 }
 
@@ -166,10 +254,15 @@ func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
 // refuses (a silent no-op would lie); -ca-bundle requires -storage-lane.
 func TestValidateStorageLaneMatrix(t *testing.T) {
 	call := func(engine, lane, bundle string, devDirect bool) error {
-		_, err := validate(engine, "/x", "/y", "/s", "fs1",
+		engineRoot, bucket, endpoint := "/x", "", ""
+		if engine == "s3" {
+			engineRoot, bucket, endpoint = "", "ocu-bucket", "http://127.0.0.1:9000"
+		}
+		_, err := validate(engine, engineRoot, "/y", "/s", "fs1",
 			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
-			lane, bundle, devDirect)
+			lane, bundle, devDirect,
+			bucket, endpoint, "us-east-1", false)
 		return err
 	}
 
@@ -215,9 +308,10 @@ func TestValidateStorageLaneMatrix(t *testing.T) {
 // parsed engine kind into brokerConfig (it was previously discarded) and that
 // local-volume remains the composed default.
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
-	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true)
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true,
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -226,7 +320,8 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	}
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false)
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false,
+		"", "", "us-east-1", false)
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -240,9 +335,10 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 // into brokerConfig for the s3 engine, and REFUSES on a non-s3 engine — a
 // silently inert credential flag would lie about the deployment posture.
 func TestValidateS3CredentialFileFlagGate(t *testing.T) {
-	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true)
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true,
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -252,7 +348,8 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 
 	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false)
+		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false,
+		"", "", "us-east-1", false)
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
@@ -264,9 +361,10 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 func TestValidateSTSFlagGate(t *testing.T) {
 	const arn = "arn:aws:iam::000000000000:role/ocu-session"
 
-	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true)
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true,
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
 	if err != nil {
 		t.Fatalf("validate(s3 + sts pair): %v", err)
 	}
@@ -276,17 +374,20 @@ func TestValidateSTSFlagGate(t *testing.T) {
 
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false,
+		"", "", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
 	}
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
+		"", "", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
 	}
-	if _, err := validate("s3", "/x", "/y", "/s", "fs1",
+	if _, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false); !errors.Is(err, errMissingRequiredFlag) {
+		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
 	}
 }
@@ -414,7 +515,8 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				tc.rate, tc.brst, "", "", "", "", "", false)
+				tc.rate, tc.brst, "", "", "", "", "", false,
+				"", "", "us-east-1", false)
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}

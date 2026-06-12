@@ -25,9 +25,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/admission"
 	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
@@ -55,12 +58,6 @@ var errMissingRequiredFlag = errors.New("ocu-filestored: required flag missing o
 // errBadIntent rejects a -granted-intents value outside the wire intent
 // vocabulary. Match it with errors.Is.
 var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
-
-// errS3EngineUnavailable refuses `-engine s3` loudly, BEFORE admission and
-// before any socket is bound: ADR-0010 names the s3 kind from day one, but
-// until the real engine is composed the daemon must never silently serve
-// local-volume under the s3 name. Match it with errors.Is.
-var errS3EngineUnavailable = errors.New("ocu-filestored: s3 engine not available in this build")
 
 // errStorageLaneRequired refuses `-engine s3` without a storage lane: the
 // s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
@@ -140,6 +137,10 @@ type brokerConfig struct {
 	storageLane      string
 	caBundle         string
 	laneDevDirect    bool
+	s3Bucket         string
+	s3Endpoint       string
+	s3Region         string
+	s3PathStyle      bool
 	auditSink        string
 	socketDir        string
 	filesystemID     string
@@ -188,6 +189,14 @@ func run(args []string) error {
 		"DEV RIGS ONLY: dial the s3 backend directly without the storage lane. This violates the ADR-0011 deployment posture; never set it in production")
 	caBundle := fs.String("ca-bundle", "",
 		"optional PEM bundle APPENDED to a cloned system cert pool for an inspecting storage-lane proxy's CA; requires -storage-lane; a missing or garbled bundle refuses startup")
+	s3Bucket := fs.String("s3-bucket", "",
+		"REQUIRED for -engine s3: the single backend bucket all scopes live under")
+	s3Endpoint := fs.String("s3-endpoint", "",
+		"REQUIRED for -engine s3: the backend endpoint URL (custom endpoints switch checksums to WhenRequired)")
+	s3Region := fs.String("s3-region", "us-east-1",
+		"s3 engine signing region")
+	s3PathStyle := fs.Bool("s3-path-style", false,
+		"s3 engine only: path-style addressing (required by most single-host S3-compatible backends)")
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
@@ -211,7 +220,8 @@ func run(args []string) error {
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
 		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
-		*storageLane, *caBundle, *laneDevDirect)
+		*storageLane, *caBundle, *laneDevDirect,
+		*s3Bucket, *s3Endpoint, *s3Region, *s3PathStyle)
 	if err != nil {
 		return err
 	}
@@ -235,7 +245,8 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
 	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
 	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string,
-	storageLane, caBundle string, laneDevDirect bool) (brokerConfig, error) {
+	storageLane, caBundle string, laneDevDirect bool,
+	s3Bucket, s3Endpoint, s3Region string, s3PathStyle bool) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	kind, err := objectstore.ParseEngine(engine)
@@ -288,8 +299,36 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		return cfg, fmt.Errorf("%w: %q", errBadTenancy, tenancy)
 	}
 
-	if engineRoot == "" {
-		return cfg, fmt.Errorf("%w: -engine-root is required", errMissingRequiredFlag)
+	// Engine-conditional required-flag matrix: each engine kind REQUIRES its
+	// own backing-store flags and REFUSES the other kind's — a silently
+	// inert backing-store flag would lie about what the daemon serves.
+	switch kind {
+	case objectstore.LocalVolume:
+		if engineRoot == "" {
+			return cfg, fmt.Errorf("%w: -engine-root is required", errMissingRequiredFlag)
+		}
+		if s3Bucket != "" {
+			return cfg, fmt.Errorf("%w: -s3-bucket is only valid with -engine s3", errMissingRequiredFlag)
+		}
+		if s3Endpoint != "" {
+			return cfg, fmt.Errorf("%w: -s3-endpoint is only valid with -engine s3", errMissingRequiredFlag)
+		}
+		if s3PathStyle {
+			return cfg, fmt.Errorf("%w: -s3-path-style is only valid with -engine s3", errMissingRequiredFlag)
+		}
+	case objectstore.S3:
+		if engineRoot != "" {
+			return cfg, fmt.Errorf("%w: -engine-root is not valid for the s3 engine (the backing store is the bucket)", errMissingRequiredFlag)
+		}
+		if s3Bucket == "" {
+			return cfg, fmt.Errorf("%w: -s3-bucket is required for the s3 engine", errMissingRequiredFlag)
+		}
+		if s3Endpoint == "" {
+			return cfg, fmt.Errorf("%w: -s3-endpoint is required for the s3 engine", errMissingRequiredFlag)
+		}
+		if s3Region == "" {
+			return cfg, fmt.Errorf("%w: -s3-region is required for the s3 engine", errMissingRequiredFlag)
+		}
 	}
 	if auditSink == "" {
 		return cfg, fmt.Errorf("%w: -audit-sink is required", errMissingRequiredFlag)
@@ -328,6 +367,10 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		storageLane:      storageLane,
 		caBundle:         caBundle,
 		laneDevDirect:    laneDevDirect,
+		s3Bucket:         s3Bucket,
+		s3Endpoint:       s3Endpoint,
+		s3Region:         s3Region,
+		s3PathStyle:      s3PathStyle,
 		auditSink:        auditSink,
 		socketDir:        socketDir,
 		filesystemID:     filesystemID,
@@ -405,21 +448,43 @@ func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstor
 // the returned Server and Closes it for teardown (engine TeardownScope +
 // registry/ceilings Release).
 func compose(cfg brokerConfig) (southface.Server, error) {
-	// Engine-kind gate FIRST — before admission and before any socket bind:
-	// `-engine s3` must refuse loudly until the real s3 engine is composed
-	// (ADR-0010 names both kinds; a silent local-volume fallback would lie).
+	// Engine-kind construction inputs FIRST — both ADR-0010 kinds are real.
+	// For s3: the dial path is the storage-lane transport (or the loud
+	// dev-direct rig client), the credential arrives through the
+	// CredentialSource seam, and the admitted credential KIND flows from
+	// that source. For local-volume the credential kind stays hard-wired:
+	// it exercises a filesystem permission, not a backend credential.
+	var (
+		eng        objectstore.Engine
+		s3Provider aws.CredentialsProvider
+		s3Client   *http.Client
+	)
+	credKind := admission.CredHostLocalLongLived
 	switch cfg.engineKind {
 	case objectstore.LocalVolume:
-		// The composed path below.
+		// Constructed after admission below.
 	case objectstore.S3:
-		return nil, errS3EngineUnavailable
+		var err error
+		if cfg.laneDevDirect {
+			s3Client, err = objectstore.NewDevDirectTransport(cfg.caBundle)
+		} else {
+			s3Client, err = objectstore.NewLaneTransport(cfg.storageLane, cfg.caBundle)
+		}
+		if err != nil {
+			return nil, err
+		}
+		source, err := selectCredentialSource(cfg, cfg.s3Bucket, cfg.s3Region)
+		if err != nil {
+			return nil, err
+		}
+		s3Provider, err = source.Provider(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		credKind = source.Kind()
 	default:
 		return nil, fmt.Errorf("%w %q", objectstore.ErrUnknownEngine, cfg.engineKind)
 	}
-
-	// The credential kind is not a free flag: the minimal shelf admits exactly
-	// one long-lived cell, host-local long-lived (A2). Hard-wire it.
-	const credKind = admission.CredHostLocalLongLived
 
 	// Admission FIRST — refuse before binding any socket (NFR-SEC-60).
 	if err := admission.Admit(cfg.profile, cfg.tenancy, credKind); err != nil {
@@ -430,7 +495,23 @@ func compose(cfg brokerConfig) (southface.Server, error) {
 	}
 
 	// Construct the seams.
-	eng := objectstore.NewLocalVolumeEngine(cfg.engineRoot)
+	switch cfg.engineKind {
+	case objectstore.LocalVolume:
+		eng = objectstore.NewLocalVolumeEngine(cfg.engineRoot)
+	case objectstore.S3:
+		var err error
+		eng, err = objectstore.NewS3Engine(objectstore.S3Config{
+			Endpoint:     cfg.s3Endpoint,
+			Region:       cfg.s3Region,
+			Bucket:       cfg.s3Bucket,
+			UsePathStyle: cfg.s3PathStyle,
+			Credentials:  s3Provider,
+			HTTPClient:   s3Client,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	resolver := authz.New(broker.NewPrefixDownloadablePolicy(cfg.dlPrefixes))
 	sink, err := auditgate.NewFileSink(cfg.auditSink)
 	if err != nil {

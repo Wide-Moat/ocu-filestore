@@ -4,11 +4,8 @@
 package objectstore
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -82,44 +79,6 @@ func TestParseEngineUnknownIsRefused(t *testing.T) {
 	}
 }
 
-// TestS3StubEngine pins the ENG-03 seam proof: a second engine kind satisfies
-// the full Engine interface, every verb refuses with ErrNotImplemented, and
-// Kind() names S3. The stub is never registered as a usable engine — it
-// exists to keep the two-kind seam honest at compile time (ADR-0010).
-func TestS3StubEngine(t *testing.T) {
-	ctx := context.Background()
-	var eng Engine = &s3StubEngine{}
-
-	if eng.Kind() != S3 {
-		t.Fatalf("Kind: got %q, want %q", eng.Kind(), S3)
-	}
-
-	scope := ScopeID("fs1")
-	for _, tc := range []struct {
-		name string
-		call func() error
-	}{
-		{"ProvisionScope", func() error { return eng.ProvisionScope(ctx, scope) }},
-		{"TeardownScope", func() error { return eng.TeardownScope(ctx, scope) }},
-		{"List", func() error { _, err := eng.List(ctx, scope, "d"); return err }},
-		{"Stat", func() error { _, err := eng.Stat(ctx, scope, "f"); return err }},
-		{"MakeDir", func() error { return eng.MakeDir(ctx, scope, "d") }},
-		{"MoveDir", func() error { return eng.MoveDir(ctx, scope, "a", "b", false) }},
-		{"RemoveDir", func() error { return eng.RemoveDir(ctx, scope, "d") }},
-		{"CopyFile", func() error { return eng.CopyFile(ctx, scope, "a", "b", false) }},
-		{"MoveFile", func() error { return eng.MoveFile(ctx, scope, "a", "b", false) }},
-		{"RemoveFile", func() error { return eng.RemoveFile(ctx, scope, "f") }},
-		{"ReadRange", func() error { return eng.ReadRange(ctx, scope, "f", 0, 1, io.Discard) }},
-		{"WriteStream", func() error { return eng.WriteStream(ctx, scope, "f", bytes.NewReader(nil), false) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.call(); !errors.Is(err, ErrNotImplemented) {
-				t.Fatalf("%s: got %v, want ErrNotImplemented", tc.name, err)
-			}
-		})
-	}
-}
-
 // TestIsPathEscape pins the normalize helper that collapses the two os.Root
 // escape wrappers into ONE caller-visible class: a rename escape arrives as
 // *os.LinkError (renameat path family), every other escape as *fs.PathError
@@ -169,7 +128,7 @@ func TestTransientThrottledSentinels(t *testing.T) {
 	}
 	distinct := []error{
 		ErrTransient, ErrThrottled, ErrAlreadyExists, ErrNotADirectory,
-		ErrNotImplemented, ErrUnknownEngine, ErrInvalidPath, ErrInvalidScopeID,
+		ErrUnknownEngine, ErrInvalidPath, ErrInvalidScopeID,
 	}
 	for i, a := range distinct {
 		for j, b := range distinct {

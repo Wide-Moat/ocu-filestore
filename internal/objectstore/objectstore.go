@@ -43,10 +43,6 @@ const (
 // errors.Is.
 var ErrUnknownEngine = errors.New("objectstore: unknown backend engine")
 
-// ErrNotImplemented is the scaffold sentinel: no engine has an
-// implementation in this build. Match it with errors.Is.
-var ErrNotImplemented = errors.New("objectstore: not implemented in this build")
-
 // ParseEngine maps a deployment-config string to an EngineKind, wrapping
 // ErrUnknownEngine and listing the valid kinds on an unknown value.
 func ParseEngine(s string) (EngineKind, error) {

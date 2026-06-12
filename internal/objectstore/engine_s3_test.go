@@ -315,10 +315,10 @@ func TestS3_MapS3Err_TerminalNeverRetryable(t *testing.T) {
 	}
 }
 
-// TestS3_EngineKindAndScaffold pins that the engine names the S3 kind. The
-// wave-by-wave ErrNotImplemented scaffold has fully shrunk: all 13 Engine
-// verbs are implemented, and a hostile scope id still refuses lexically
-// before any backend dial (the lifecycle verbs validate first).
+// TestS3_EngineKindAndScaffold pins that the engine names the S3 kind, that
+// all 13 Engine verbs are implemented (the wave-by-wave scaffold has fully
+// shrunk), and that a hostile scope id still refuses lexically before any
+// backend dial (the lifecycle verbs validate first).
 func TestS3_EngineKindAndScaffold(t *testing.T) {
 	eng, err := NewS3Engine(testS3Config())
 	if err != nil {
