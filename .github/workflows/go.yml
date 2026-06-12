@@ -52,7 +52,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+        # Pinned, not @latest: a moving version can introduce new checks that
+        # break unrelated PRs. Bump deliberately.
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
       - name: staticcheck
         run: staticcheck ./...
 

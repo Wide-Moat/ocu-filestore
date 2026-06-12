@@ -130,7 +130,8 @@ jobs:
               go build -trimpath -ldflags "-s -w -X main.version=${tag}" \
               -o "dist/ocu-filestored_linux_${arch}" ./cmd/ocu-filestored
           done
-          (cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt)
+          # `-- *` so a filename beginning with a dash is never read as an option.
+          (cd dist && sha256sum -- * > sha256sums.txt && cat sha256sums.txt)
 
       - name: generate the changelog since the previous tag
         id: changelog
@@ -139,7 +140,7 @@ jobs:
           if [ -z "$PREV_TAG" ]; then
             CHANGES=$(git log --oneline --no-merges)
           else
-            CHANGES=$(git log --oneline --no-merges ${PREV_TAG}..HEAD)
+            CHANGES=$(git log --oneline --no-merges "${PREV_TAG}..HEAD")
           fi
           echo "changes<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGES" >> $GITHUB_OUTPUT
