@@ -66,6 +66,35 @@ jobs:
       - name: go test
         run: go test ./...
 
+  # s3-conformance proves the S3 engine against a REAL MinIO backend on
+  # every PR: the engine-neutral conformance suite's S3 leg plus the full
+  # S3Live slice. No mocks — the rig is the committed compose file. The
+  # `-engine s3` live-BINARY e2e leg is NOT here: it needs the composed
+  # daemon (credentials + storage lane), so it lands with the composition
+  # task in e2e.yml.
+  s3-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: boot the MinIO rig
+        run: |
+          docker compose -f deploy/docker-compose.test.yml up -d --wait minio
+          docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
+      - name: conformance + live S3 slice against real MinIO
+        env:
+          OCU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          OCU_S3_TEST_BUCKET: ocu-conformance
+          OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
+          OCU_S3_TEST_ACCESS_KEY: ocu-test-root
+          OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
+        run: go test ./internal/objectstore/ -run 'Conformance|S3' -v -timeout 600s -count=1
+      - name: tear the rig down
+        if: always()
+        run: docker compose -f deploy/docker-compose.test.yml down -v
+
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -76,8 +105,25 @@ jobs:
       # Gate the internal/ packages — the broker's real logic. The cmd/
       # wrapper is thin and deliberately excluded. The floor guards against
       # regression and ratchets up as the implementation PRs land.
-      - name: collect coverage (internal packages)
+      #
+      # The MinIO rig runs INSIDE this job so the gated S3 tests execute
+      # during coverage collection and engine_s3.go counts toward the floor
+      # — the floor is never lowered to absorb the S3 engine (13-12).
+      - name: boot the MinIO rig (S3 leg counts toward the floor)
+        run: |
+          docker compose -f deploy/docker-compose.test.yml up -d --wait minio
+          docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
+      - name: collect coverage (internal packages, S3 leg included)
+        env:
+          OCU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          OCU_S3_TEST_BUCKET: ocu-conformance
+          OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
+          OCU_S3_TEST_ACCESS_KEY: ocu-test-root
+          OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
         run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
+      - name: tear the rig down
+        if: always()
+        run: docker compose -f deploy/docker-compose.test.yml down -v
       - name: enforce the line-coverage floor
         run: |
           set -euo pipefail
