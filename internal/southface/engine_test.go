@@ -201,3 +201,60 @@ func TestFakeEngineSemantics(t *testing.T) {
 		}
 	})
 }
+
+// TestDenyClassForEngineErr_BackendRows pins the W1 backend resilience rows
+// in the engine-error classifier: throttle -> throttle (resource_exhausted
+// downstream), transient -> backend_unavailable (unavailable downstream) —
+// including fmt-wrapped forms, the shape the broker adapter hands the spine.
+// The order non-regression and non-vacuity rows re-assert that inserting the
+// two branches did not disturb the load-bearing fs-sentinels-before-escape
+// ordering or widen the default.
+func TestDenyClassForEngineErr_BackendRows(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "errBackendThrottled -> throttle",
+			err:  errBackendThrottled,
+			want: denyThrottle,
+		},
+		{
+			name: "fmt-wrapped errBackendThrottled -> throttle (errors.Is chains)",
+			err:  fmt.Errorf("write failed: %w", errBackendThrottled),
+			want: denyThrottle,
+		},
+		{
+			name: "errBackendTransient -> backend_unavailable",
+			err:  errBackendTransient,
+			want: denyBackendUnavailable,
+		},
+		{
+			name: "fmt-wrapped errBackendTransient -> backend_unavailable (errors.Is chains)",
+			err:  fmt.Errorf("read failed: %w", errBackendTransient),
+			want: denyBackendUnavailable,
+		},
+		{
+			// ORDER NON-REGRESSION: EEXIST as a *fs.PathError still classifies
+			// already_exists after the branch insertion — never escape, never
+			// a backend row.
+			name: "PathError wrapping fs.ErrExist still -> already_exists",
+			err:  &fs.PathError{Op: "mkdir", Path: "d", Err: fs.ErrExist},
+			want: denyAlreadyExists,
+		},
+		{
+			// NON-VACUITY: a plain unrelated error still falls to internal —
+			// the new branches widened nothing.
+			name: "plain error still -> internal",
+			err:  errors.New("boom"),
+			want: denyInternal,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := denyClassForEngineErr(tc.err); got != tc.want {
+				t.Fatalf("denyClassForEngineErr(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}

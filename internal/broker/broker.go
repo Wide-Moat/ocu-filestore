@@ -275,6 +275,10 @@ func mapEngineErr(err error) error {
 		return southface.ErrAlreadyExists
 	case errors.Is(err, objectstore.ErrInvalidPath):
 		return southface.ErrInvalidPath
+	case errors.Is(err, objectstore.ErrThrottled):
+		return southface.ErrBackendThrottled
+	case errors.Is(err, objectstore.ErrTransient):
+		return southface.ErrBackendTransient
 	default:
 		return err
 	}

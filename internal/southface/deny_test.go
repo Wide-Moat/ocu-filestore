@@ -30,6 +30,7 @@ func TestDenyMapperTable(t *testing.T) {
 		{denyNotFound, wireCodeNotFound, 404, false},
 		{denyThrottle, wireCodeResourceExhausted, 429, false},
 		{denyAuditDown, wireCodeUnavailable, 503, false},
+		{denyBackendUnavailable, wireCodeUnavailable, 503, false},
 		{denyAlreadyExists, wireCodeAlreadyExists, 409, false},
 		{denyAborted, wireCodeAborted, 409, false},
 		{denyUnimplemented, wireCodeUnimplemented, 501, false},

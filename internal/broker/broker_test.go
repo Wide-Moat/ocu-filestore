@@ -227,6 +227,8 @@ func TestEngineAdapterRemapsTypedSentinels(t *testing.T) {
 	}{
 		{"already_exists_to_mirror", objectstore.ErrAlreadyExists, southface.ErrAlreadyExists, nil},
 		{"invalid_path_to_mirror", objectstore.ErrInvalidPath, southface.ErrInvalidPath, nil},
+		{"throttled_to_mirror", objectstore.ErrThrottled, southface.ErrBackendThrottled, nil},
+		{"transient_to_mirror", objectstore.ErrTransient, southface.ErrBackendTransient, nil},
 		{"fs_ErrExist_verbatim", fs.ErrExist, nil, fs.ErrExist},
 		{"fs_ErrNotExist_verbatim", fs.ErrNotExist, nil, fs.ErrNotExist},
 		{"path_escape_verbatim", escapePathErr, nil, escapePathErr},
@@ -284,4 +286,43 @@ func shortDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
+}
+
+// TestMapEngineErr_TransientThrottled pins the W1 resilience remap
+// round-trip: the objectstore throttle/transient sentinels — including
+// fmt-wrapped forms, the shape a real engine verb returns — land on the
+// southface mirrors, and the mirrors are distinct from each other and from
+// the earlier mirrors (a throttle is a pacing verdict, a transient is an
+// availability verdict; they map to different wire codes downstream).
+func TestMapEngineErr_TransientThrottled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   error
+		want error
+	}{
+		{"throttled", objectstore.ErrThrottled, southface.ErrBackendThrottled},
+		{"throttled_wrapped", fmt.Errorf("write verb: %w", objectstore.ErrThrottled), southface.ErrBackendThrottled},
+		{"transient", objectstore.ErrTransient, southface.ErrBackendTransient},
+		{"transient_wrapped", fmt.Errorf("read verb: %w", objectstore.ErrTransient), southface.ErrBackendTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapEngineErr(tc.in)
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("mapEngineErr(%v) = %v, want errors.Is(%v)", tc.in, got, tc.want)
+			}
+		})
+	}
+	// Mirror distinctness: the two new mirrors never cross-match each other
+	// or the earlier engine mirrors.
+	mirrors := []error{
+		southface.ErrBackendThrottled, southface.ErrBackendTransient,
+		southface.ErrAlreadyExists, southface.ErrInvalidPath,
+	}
+	for i, a := range mirrors {
+		for j, b := range mirrors {
+			if i != j && errors.Is(a, b) {
+				t.Fatalf("mirror %v unexpectedly matches %v", a, b)
+			}
+		}
+	}
 }

@@ -37,6 +37,13 @@ const (
 	// invalid_argument/400 with no x-deny-reason header (a request fault, not
 	// an authorization verdict).
 	denyDirNotEmpty = "directory_not_empty"
+
+	// denyBackendUnavailable is the audited TRUTH for a transient backend
+	// failure surviving the engine's bounded retries (a network engine's
+	// backend leg failed; the caller may retry). It is a DISTINCT audited
+	// truth from denyAuditDown — the audit gate is healthy; the storage
+	// backend is not — though both map to the unavailable wire code.
+	denyBackendUnavailable = "backend_unavailable"
 )
 
 // Connect wire codes (closed set).
@@ -87,20 +94,21 @@ type denyRow struct {
 // gating. The header is true only for rows whose wire code is
 // permission_denied or unauthenticated.
 var denyTable = map[string]denyRow{
-	denyScopeMismatch:   {wireCodePermissionDenied, true},
-	denyIntentDenied:    {wireCodePermissionDenied, true},
-	denyNotDownloadable: {wireCodePermissionDenied, true},
-	denyLeaseExpired:    {wireCodeUnauthenticated, true},
-	denySizeExceeded:    {wireCodeInvalidArgument, false},
-	denyMalformed:       {wireCodeInvalidArgument, false},
-	denyDirNotEmpty:     {wireCodeInvalidArgument, false},
-	denyNotFound:        {wireCodeNotFound, false},
-	denyThrottle:        {wireCodeResourceExhausted, false},
-	denyAuditDown:       {wireCodeUnavailable, false},
-	denyAlreadyExists:   {wireCodeAlreadyExists, false},
-	denyAborted:         {wireCodeAborted, false},
-	denyUnimplemented:   {wireCodeUnimplemented, false},
-	denyInternal:        {wireCodeInternal, false},
+	denyScopeMismatch:      {wireCodePermissionDenied, true},
+	denyIntentDenied:       {wireCodePermissionDenied, true},
+	denyNotDownloadable:    {wireCodePermissionDenied, true},
+	denyLeaseExpired:       {wireCodeUnauthenticated, true},
+	denySizeExceeded:       {wireCodeInvalidArgument, false},
+	denyMalformed:          {wireCodeInvalidArgument, false},
+	denyDirNotEmpty:        {wireCodeInvalidArgument, false},
+	denyNotFound:           {wireCodeNotFound, false},
+	denyThrottle:           {wireCodeResourceExhausted, false},
+	denyAuditDown:          {wireCodeUnavailable, false},
+	denyBackendUnavailable: {wireCodeUnavailable, false},
+	denyAlreadyExists:      {wireCodeAlreadyExists, false},
+	denyAborted:            {wireCodeAborted, false},
+	denyUnimplemented:      {wireCodeUnimplemented, false},
+	denyInternal:           {wireCodeInternal, false},
 }
 
 // statusForWireCode derives the HTTP status from a Connect wire code

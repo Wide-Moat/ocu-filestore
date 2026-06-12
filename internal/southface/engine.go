@@ -96,6 +96,18 @@ var (
 	// sentinel raised pre-syscall for a NUL/URL/absolute/dot-dot/empty path.
 	// Match it with errors.Is.
 	errInvalidPath = errors.New("southface: invalid path")
+
+	// errBackendThrottled mirrors objectstore.ErrThrottled: the backend
+	// refused the request under load shedding and the engine's paced retries
+	// were exhausted — the caller may retry with backoff. Match it with
+	// errors.Is.
+	errBackendThrottled = errors.New("southface: backend throttled")
+
+	// errBackendTransient mirrors objectstore.ErrTransient: a retryable
+	// backend failure (backend 5xx, request timeout, transport-level
+	// connection failure) survived the engine's bounded retries — the caller
+	// may retry. Match it with errors.Is.
+	errBackendTransient = errors.New("southface: transient backend failure")
 )
 
 // ErrAlreadyExists and ErrInvalidPath are the EXPORTED aliases of the two
@@ -110,6 +122,10 @@ var (
 	ErrAlreadyExists = errAlreadyExists
 	// ErrInvalidPath is the exported alias of errInvalidPath.
 	ErrInvalidPath = errInvalidPath
+	// ErrBackendThrottled is the exported alias of errBackendThrottled.
+	ErrBackendThrottled = errBackendThrottled
+	// ErrBackendTransient is the exported alias of errBackendTransient.
+	ErrBackendTransient = errBackendTransient
 )
 
 // isPathEscape mirrors the engine's containment-escape collapse helper: an
@@ -156,22 +172,31 @@ func guestPath(rel string) string {
 //
 //  1. errAlreadyExists OR fs.ErrExist -> denyAlreadyExists
 //  2. fs.ErrNotExist                  -> denyNotFound
-//  3. errInvalidPath OR isPathEscape  -> denyNotFound (wire degrade, D8)
-//  4. anything else                   -> denyInternal
+//  3. errBackendThrottled             -> denyThrottle
+//  4. errBackendTransient             -> denyBackendUnavailable
+//  5. errInvalidPath OR isPathEscape  -> denyNotFound (wire degrade, D8)
+//  6. anything else                   -> denyInternal
 //
 // MakeDir surfaces EEXIST, missing-parent ENOENT, AND a containment escape ALL
 // as *fs.PathError, and isPathEscape matches any *fs.PathError; testing the
 // fs.ErrExist / fs.ErrNotExist sentinels first guarantees a benign
 // already-exists or not-found is never recorded as a security escape. The
-// invalid-path / escape branch degrades the WIRE reason to not_found
-// (anti-enumeration, D8); the audited TRUTH for that case is recorded
-// separately by the handler's deny-audit event.
+// backend throttle/transient rows sit AFTER the fs sentinels (they are plain
+// sentinels, never *fs.PathError, so the order there is free) and BEFORE the
+// escape collapse, preserving the load-bearing tail. The invalid-path /
+// escape branch degrades the WIRE reason to not_found (anti-enumeration,
+// D8); the audited TRUTH for that case is recorded separately by the
+// handler's deny-audit event.
 func denyClassForEngineErr(err error) string {
 	switch {
 	case errors.Is(err, errAlreadyExists), errors.Is(err, fs.ErrExist):
 		return denyAlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyNotFound
+	case errors.Is(err, errBackendThrottled):
+		return denyThrottle
+	case errors.Is(err, errBackendTransient):
+		return denyBackendUnavailable
 	case errors.Is(err, errInvalidPath), isPathEscape(err):
 		return denyNotFound
 	default:
