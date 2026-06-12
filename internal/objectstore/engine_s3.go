@@ -4,7 +4,10 @@
 package objectstore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +16,8 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"syscall"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -20,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"golang.org/x/text/unicode/norm"
 )
@@ -63,7 +69,20 @@ var (
 	// disagrees with the backend beyond tolerance; retrying cannot fix a
 	// clock — never blind-retried.
 	errS3ClockSkew = errors.New("objectstore: backend refused request time (host clock skew; fix the clock, not retried)")
+	// errS3TooManyParts is the typed stream-size refusal: the stream would
+	// exceed the backend's part ceiling for the configured part size; the
+	// multipart upload is aborted before refusing.
+	errS3TooManyParts = errors.New("objectstore: stream exceeds the multipart part ceiling")
 )
+
+// digestTagKey is the object tag carrying the streamed SHA-256 (hex) of the
+// object's content bytes. A TAG, not create-time metadata: the digest of a
+// multipart stream is only known after the last part, while object metadata
+// is immutable from CreateMultipartUpload on — and buffering the stream to
+// learn the digest first would break the bounded-memory rule (SEC-46). The
+// multipart ETag is an MD5-of-MD5s composite and is NEVER used as a content
+// hash; this tag is the content digest for copy/move verification.
+const digestTagKey = "ocu-sha256"
 
 // S3Config configures NewS3Engine. None of these fields carries a secret
 // value directly: Credentials is an opaque provider whose secret material
@@ -146,6 +165,11 @@ func NewS3Engine(cfg S3Config) (Engine, error) {
 	cutoff := cfg.SinglePutCutoff
 	if cutoff == 0 {
 		cutoff = s3DefaultSinglePutCutoff
+	}
+	if cutoff > partSize {
+		// The single-PUT decision is made on the first part buffer; a cutoff
+		// above the buffer size could never bind. Clamp, never grow memory.
+		cutoff = partSize
 	}
 
 	opts := s3.Options{
@@ -460,7 +484,95 @@ func (e *s3Engine) Stat(ctx context.Context, scope ScopeID, p string) (FileInfo,
 	return FileInfo{}, fmt.Errorf("objectstore: s3 stat %q: %w", p, fs.ErrNotExist)
 }
 
-func (e *s3Engine) MakeDir(_ context.Context, _ ScopeID, _ string) error { return ErrNotImplemented }
+// dirExists reports whether the directory named by dirKey exists: marker
+// present, or any key under its prefix (a directory with children but a
+// lost marker is still a directory).
+func (e *s3Engine) dirExists(ctx context.Context, dirKey string) (bool, error) {
+	marker := dirMarkerKey(dirKey)
+	_, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(marker),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if mapped := mapS3Err("stat", err); !errors.Is(mapped, fs.ErrNotExist) {
+		return false, mapped
+	}
+	probe, perr := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(marker), MaxKeys: aws.Int32(1),
+	})
+	if perr != nil {
+		return false, mapS3Err("stat", perr)
+	}
+	return len(probe.Contents) > 0, nil
+}
+
+// parentExists reports whether key's parent directory exists; the scope
+// root always exists (prefixes are virtual).
+func (e *s3Engine) parentExists(ctx context.Context, key string) (bool, error) {
+	parent := parentKey(key)
+	if parent == "" {
+		return true, nil
+	}
+	return e.dirExists(ctx, parent)
+}
+
+// keyExists reports whether an object exists at exactly key.
+func (e *s3Engine) keyExists(ctx context.Context, key string) (bool, error) {
+	_, err := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if mapped := mapS3Err("stat", err); !errors.Is(mapped, fs.ErrNotExist) {
+		return false, mapped
+	}
+	return false, nil
+}
+
+// MakeDir creates a single directory level: parent must exist; an existing
+// directory (or a file at the same name) surfaces as a *fs.PathError
+// wrapping fs.ErrExist — the same EEXIST shape the local engine produces,
+// which the deny spine's classification ordering depends on. The marker PUT
+// is conditional (If-None-Match), so two concurrent MakeDirs race to
+// exactly one winner.
+func (e *s3Engine) MakeDir(ctx context.Context, scope ScopeID, p string) error {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return err
+	}
+	ok, err := e.parentExists(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &fs.PathError{Op: "mkdir", Path: p, Err: fs.ErrNotExist}
+	}
+	// A file at the same name refuses EEXIST (parity with mkdir(2)).
+	if exists, err := e.keyExists(ctx, key); err != nil {
+		return err
+	} else if exists {
+		return &fs.PathError{Op: "mkdir", Path: p, Err: fs.ErrExist}
+	}
+
+	marker := dirMarkerKey(key)
+	_, perr := e.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(e.bucket),
+		Key:           aws.String(marker),
+		Body:          bytes.NewReader(nil),
+		ContentLength: aws.Int64(0),
+		IfNoneMatch:   aws.String("*"),
+	})
+	if perr != nil {
+		if mapped := mapS3Err("mkdir", perr); errors.Is(mapped, ErrAlreadyExists) {
+			return &fs.PathError{Op: "mkdir", Path: p, Err: fs.ErrExist}
+		} else {
+			return mapped
+		}
+	}
+	return nil
+}
 
 func (e *s3Engine) MoveDir(_ context.Context, _ ScopeID, _, _ string, _ bool) error {
 	return ErrNotImplemented
@@ -478,8 +590,61 @@ func (e *s3Engine) MoveFile(_ context.Context, _ ScopeID, _, _ string, _ bool) e
 	return ErrNotImplemented
 }
 
-func (e *s3Engine) RemoveFile(_ context.Context, _ ScopeID, _ string) error {
-	return ErrNotImplemented
+// RemoveFile removes a single object. A directory target mirrors the local
+// engine's remove(2) semantics exactly: an EMPTY directory's marker is
+// removed successfully; a directory WITH children refuses with a
+// *fs.PathError wrapping ENOTEMPTY (the local engine's non-empty refusal
+// shape). A missing path refuses fs.ErrNotExist.
+func (e *s3Engine) RemoveFile(ctx context.Context, scope ScopeID, p string) error {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return err
+	}
+
+	if exists, err := e.keyExists(ctx, key); err != nil {
+		return err
+	} else if exists {
+		if _, derr := e.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key),
+		}); derr != nil {
+			return mapS3Err("removefile", derr)
+		}
+		return nil
+	}
+
+	// Directory probe: marker and/or children under the prefix.
+	marker := dirMarkerKey(key)
+	probe, perr := e.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(marker), MaxKeys: aws.Int32(2),
+	})
+	if perr != nil {
+		return mapS3Err("removefile", perr)
+	}
+	hasMarker := false
+	hasChildren := false
+	for _, obj := range probe.Contents {
+		if aws.ToString(obj.Key) == marker {
+			hasMarker = true
+		} else {
+			hasChildren = true
+		}
+	}
+	switch {
+	case hasChildren:
+		return &fs.PathError{Op: "remove", Path: p, Err: syscall.ENOTEMPTY}
+	case hasMarker:
+		// Empty directory: the marker delete IS the empty-dir remove —
+		// parity with the local engine's remove(2) succeeding on an empty
+		// directory.
+		if _, derr := e.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(marker),
+		}); derr != nil {
+			return mapS3Err("removefile", derr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("objectstore: s3 removefile %q: %w", p, fs.ErrNotExist)
+	}
 }
 
 // s3ReadReopenAttempts bounds the mid-stream reopen retries in ReadRange: a
@@ -580,6 +745,196 @@ func (e *s3Engine) ReadRange(ctx context.Context, scope ScopeID, p string, offse
 	}
 }
 
-func (e *s3Engine) WriteStream(_ context.Context, _ ScopeID, _ string, _ io.Reader, _ bool) error {
-	return ErrNotImplemented
+// fillBuffer reads from r until buf is full or the stream ends, returning
+// the byte count and whether the stream ended. A non-nil error is a real
+// source failure — never io.EOF (stream end is the bool).
+func fillBuffer(r io.Reader, buf []byte) (int, bool, error) {
+	n, err := io.ReadFull(r, buf)
+	switch {
+	case err == nil:
+		return n, false, nil
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return n, true, nil
+	default:
+		return n, false, err
+	}
+}
+
+// noCancelCtx returns a context detached from ctx's cancellation but
+// bounded by its own timeout — the cleanup contexts (multipart abort,
+// delete-on-mismatch) must run even when the operation's own ctx is the
+// thing that was cancelled.
+func noCancelCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
+// WriteStream consumes r into the named object with ONE reused part buffer
+// (SEC-46: bounded memory, never a whole-object read). A stream that ends
+// inside the first buffer at or under the cutoff goes up as a single
+// PutObject with a known Content-Length; anything larger streams as a
+// multipart upload whose every part except the last is the full part size
+// by construction. SHA-256 is computed in the same single pass and stored
+// as the ocu-sha256 object tag. overwrite=false is atomic: If-None-Match on
+// PutObject AND on CompleteMultipartUpload — never a read-then-write check.
+// Every error and cancellation path aborts the multipart upload; a partial
+// write is never visible (a multipart object only exists after Complete).
+// After upload, a HEAD verifies the size; a mismatch deletes the object and
+// errors.
+func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r io.Reader, overwrite bool) error {
+	key, err := e.objectKey(scope, p)
+	if err != nil {
+		return err
+	}
+	ok, err := e.parentExists(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &fs.PathError{Op: "write", Path: p, Err: fs.ErrNotExist}
+	}
+
+	hasher := sha256.New()
+	src := io.TeeReader(ctxReader{ctx: ctx, r: r}, hasher)
+	buf := make([]byte, e.partSize) // the ONE buffer this stream ever holds
+
+	n, ended, rerr := fillBuffer(src, buf)
+	if rerr != nil {
+		return fmt.Errorf("objectstore: s3 writestream: read source: %w", rerr)
+	}
+
+	var total int64
+	if ended && int64(n) <= e.singlePutCutoff {
+		total = int64(n)
+		digest := hex.EncodeToString(hasher.Sum(nil))
+		in := &s3.PutObjectInput{
+			Bucket:        aws.String(e.bucket),
+			Key:           aws.String(key),
+			Body:          bytes.NewReader(buf[:n]),
+			ContentLength: aws.Int64(total),
+			Tagging:       aws.String(digestTagKey + "=" + digest),
+		}
+		if !overwrite {
+			in.IfNoneMatch = aws.String("*")
+		}
+		if _, perr := e.client.PutObject(ctx, in); perr != nil {
+			return mapS3Err("writestream", perr)
+		}
+	} else {
+		var werr error
+		total, werr = e.writeMultipart(ctx, key, src, buf, n, ended, overwrite)
+		if werr != nil {
+			return werr
+		}
+		// The digest tag lands after Complete (multipart metadata is fixed
+		// at Create, before a single-pass digest can exist).
+		digest := hex.EncodeToString(hasher.Sum(nil))
+		if _, terr := e.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+			Bucket: aws.String(e.bucket),
+			Key:    aws.String(key),
+			Tagging: &types.Tagging{TagSet: []types.Tag{
+				{Key: aws.String(digestTagKey), Value: aws.String(digest)},
+			}},
+		}); terr != nil {
+			return mapS3Err("writestream tag", terr)
+		}
+	}
+
+	// Post-upload verification (section-9 discipline): the backend's view
+	// of the size must equal what was streamed; a mismatch deletes the
+	// object — a torn write is never left visible.
+	head, herr := e.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if herr != nil {
+		return mapS3Err("writestream verify", herr)
+	}
+	if got := aws.ToInt64(head.ContentLength); got != total {
+		cctx, cancel := noCancelCtx(ctx)
+		defer cancel()
+		_, _ = e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key),
+		})
+		return fmt.Errorf("objectstore: s3 writestream: size verification failed (streamed %d, backend reports %d); object deleted", total, got)
+	}
+	return nil
+}
+
+// writeMultipart streams the remainder of src as a multipart upload whose
+// first part is already in buf[:n]. Every part except the final one is the
+// full buffer by construction (>= the backend's 5 MiB minimum, enforced at
+// the constructor); crossing the part ceiling aborts and refuses typed. The
+// deferred abort fires on EVERY error and cancellation path — an
+// un-completed multipart upload never outlives the call.
+func (e *s3Engine) writeMultipart(ctx context.Context, key string, src io.Reader, buf []byte, n int, ended bool, overwrite bool) (int64, error) {
+	create, cerr := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if cerr != nil {
+		return 0, mapS3Err("writestream", cerr)
+	}
+	uploadID := create.UploadId
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		actx, cancel := noCancelCtx(ctx)
+		defer cancel()
+		_, _ = e.client.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key), UploadId: uploadID,
+		})
+	}()
+
+	var (
+		parts   []types.CompletedPart
+		partNum int32
+		total   int64
+	)
+	for {
+		if n > 0 || partNum == 0 {
+			partNum++
+			if partNum > s3MaxParts {
+				return 0, fmt.Errorf("objectstore: s3 writestream: %w (%d parts of %d bytes)", errS3TooManyParts, partNum, len(buf))
+			}
+			up, uerr := e.client.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket:        aws.String(e.bucket),
+				Key:           aws.String(key),
+				UploadId:      uploadID,
+				PartNumber:    aws.Int32(partNum),
+				Body:          bytes.NewReader(buf[:n]),
+				ContentLength: aws.Int64(int64(n)),
+			})
+			if uerr != nil {
+				return 0, mapS3Err("writestream", uerr)
+			}
+			// Strict part-number-ordered aggregation: parts are appended in
+			// upload order and numbered monotonically — the Complete body
+			// is ordered by construction.
+			parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(partNum)})
+			total += int64(n)
+		}
+		if ended {
+			break
+		}
+		var rerr error
+		n, ended, rerr = fillBuffer(src, buf)
+		if rerr != nil {
+			return 0, fmt.Errorf("objectstore: s3 writestream: read source: %w", rerr)
+		}
+	}
+
+	in := &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(e.bucket),
+		Key:             aws.String(key),
+		UploadId:        uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}
+	if !overwrite {
+		in.IfNoneMatch = aws.String("*")
+	}
+	if _, cerr := e.client.CompleteMultipartUpload(ctx, in); cerr != nil {
+		return 0, mapS3Err("writestream", cerr)
+	}
+	completed = true
+	return total, nil
 }

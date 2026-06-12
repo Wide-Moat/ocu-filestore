@@ -4,6 +4,7 @@
 package objectstore
 
 import (
+	"io"
 	"strings"
 	"testing"
 	"unicode"
@@ -87,6 +88,74 @@ func TestS3_KeyValidator_PrefixBoundary_Prop(t *testing.T) {
 		}
 		if strings.HasPrefix(key, "fs10/") {
 			rt.Fatalf("key %q crossed into sibling scope fs10/ (path=%q)", key, p)
+		}
+	})
+}
+
+// repeatReader yields 'a' bytes forever; LimitReader carves test streams
+// from it without allocating the stream.
+type repeatReader struct{}
+
+func (repeatReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
+// TestS3_PartMath_Prop pins the multipart sizing invariants over the SAME
+// fill-loop structure writeMultipart runs, for arbitrary stream and buffer
+// sizes: every non-final part is exactly the part size (in production the
+// constructor pins partSize >= the backend's 5 MiB non-final minimum, so
+// the >=5 MiB rule holds by construction), the final part is never larger,
+// part sizes sum to the stream total, and the part count is exactly
+// ceil(total/partSize) (one empty part for an empty stream, which in
+// production routes to single-PUT before this loop).
+func TestS3_PartMath_Prop(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		partSize := rapid.Int64Range(1, 64).Draw(rt, "partSize")
+		total := rapid.Int64Range(0, 64*70).Draw(rt, "total")
+
+		buf := make([]byte, partSize)
+		src := io.LimitReader(repeatReader{}, total)
+
+		var sizes []int64
+		n, ended, err := fillBuffer(src, buf)
+		if err != nil {
+			rt.Fatalf("fillBuffer: %v", err)
+		}
+		for {
+			if n > 0 || len(sizes) == 0 {
+				sizes = append(sizes, int64(n))
+			}
+			if ended {
+				break
+			}
+			n, ended, err = fillBuffer(src, buf)
+			if err != nil {
+				rt.Fatalf("fillBuffer: %v", err)
+			}
+		}
+
+		var sum int64
+		for i, s := range sizes {
+			sum += s
+			if i < len(sizes)-1 && s != partSize {
+				rt.Fatalf("non-final part %d is %d bytes, want exactly partSize %d (total=%d)", i+1, s, partSize, total)
+			}
+			if s > partSize {
+				rt.Fatalf("part %d is %d bytes, over partSize %d", i+1, s, partSize)
+			}
+		}
+		if sum != total {
+			rt.Fatalf("part sizes sum to %d, want %d", sum, total)
+		}
+		wantCount := (total + partSize - 1) / partSize
+		if wantCount == 0 {
+			wantCount = 1
+		}
+		if int64(len(sizes)) != wantCount {
+			rt.Fatalf("part count %d, want %d (total=%d partSize=%d)", len(sizes), wantCount, total, partSize)
 		}
 	})
 }

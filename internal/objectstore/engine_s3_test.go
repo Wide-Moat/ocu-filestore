@@ -6,6 +6,8 @@ package objectstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -323,8 +326,8 @@ func TestS3_EngineKindAndScaffold(t *testing.T) {
 	if eng.Kind() != S3 {
 		t.Fatalf("Kind() = %q, want %q", eng.Kind(), S3)
 	}
-	if err := eng.MakeDir(context.Background(), "fs1", "d"); !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("MakeDir scaffold error = %v, want ErrNotImplemented until 13-07", err)
+	if err := eng.CopyFile(context.Background(), "fs1", "a", "b", false); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("CopyFile scaffold error = %v, want ErrNotImplemented until 13-08", err)
 	}
 }
 
@@ -669,5 +672,374 @@ func TestS3Live_ReadRange_TailClamp(t *testing.T) {
 				t.Fatalf("ReadRange(%d, %d) = %q, want %q", tc.offset, tc.length, buf.String(), tc.want)
 			}
 		})
+	}
+}
+
+// --- 13-07: write verbs ----------------------------------------------------
+
+// liveDigestTag fetches the ocu-sha256 tag of a key ("" when absent).
+func liveDigestTag(t *testing.T, e *s3Engine, key string) string {
+	t.Helper()
+	out, err := e.client.GetObjectTagging(context.Background(), &s3.GetObjectTaggingInput{
+		Bucket: aws.String(e.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObjectTagging(%q): %v", key, err)
+	}
+	for _, tag := range out.TagSet {
+		if aws.ToString(tag.Key) == digestTagKey {
+			return aws.ToString(tag.Value)
+		}
+	}
+	return ""
+}
+
+// liveMPUCount returns the number of in-progress multipart uploads under the
+// scope prefix — the orphan detector.
+func liveMPUCount(t *testing.T, e *s3Engine, scope ScopeID) int {
+	t.Helper()
+	out, err := e.client.ListMultipartUploads(context.Background(), &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(e.bucket), Prefix: aws.String(string(scope) + "/"),
+	})
+	if err != nil {
+		t.Fatalf("ListMultipartUploads: %v", err)
+	}
+	return len(out.Uploads)
+}
+
+// failAfterReader serves `serve` pattern bytes then fails with err.
+type failAfterReader struct {
+	serve int
+	err   error
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if r.serve <= 0 {
+		return 0, r.err
+	}
+	if len(p) > r.serve {
+		p = p[:r.serve]
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.serve -= len(p)
+	return len(p), nil
+}
+
+// TestS3Live_WriteStream_SmallSinglePut pins the single-PUT path: byte-exact
+// round trip, size HEAD-verified, and the streamed SHA-256 stored as the
+// ocu-sha256 tag (never the ETag).
+func TestS3Live_WriteStream_SmallSinglePut(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	body := []byte("small single put body")
+
+	if err := e.WriteStream(ctx, scope, "small.txt", bytes.NewReader(body), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+
+	fi, err := e.Stat(ctx, scope, "small.txt")
+	if err != nil {
+		t.Fatalf("Stat after write: %v", err)
+	}
+	if fi.Size != int64(len(body)) {
+		t.Fatalf("Stat.Size = %d, want %d", fi.Size, len(body))
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "small.txt", 0, int64(len(body))+8, &buf); err != nil {
+		t.Fatalf("ReadRange after write: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), body) {
+		t.Fatalf("readback = %q, want %q", buf.Bytes(), body)
+	}
+
+	want := sha256.Sum256(body)
+	if got := liveDigestTag(t, e, string(scope)+"/small.txt"); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("ocu-sha256 tag = %q, want %q", got, hex.EncodeToString(want[:]))
+	}
+
+	// Empty stream: a zero-byte object is a valid single PUT.
+	if err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
+		t.Fatalf("WriteStream(empty): %v", err)
+	}
+	if fi, err := e.Stat(ctx, scope, "empty.bin"); err != nil || fi.Size != 0 {
+		t.Fatalf("Stat(empty) = %+v, %v; want size 0", fi, err)
+	}
+}
+
+// TestS3Live_WriteStream_LargeMPU pins the multipart path with a stream
+// crossing several part boundaries: byte-exact spot windows, HEAD-verified
+// size, and the single-pass digest tag matching the local SHA-256 — the
+// multipart ETag (an MD5-of-MD5s "-N" composite) is never the content hash.
+func TestS3Live_WriteStream_LargeMPU(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: skipping the 48 MiB multipart upload")
+	}
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	// 48 MiB + 100 bytes -> parts of 16 MiB: 3 full + 1 short final part.
+	const size = 48<<20 + 100
+	body := make([]byte, size)
+	for i := range body {
+		body[i] = byte(i * 31 / 7)
+	}
+
+	if err := e.WriteStream(ctx, scope, "large.bin", bytes.NewReader(body), false); err != nil {
+		t.Fatalf("WriteStream(48 MiB): %v", err)
+	}
+
+	fi, err := e.Stat(ctx, scope, "large.bin")
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Size != size {
+		t.Fatalf("Stat.Size = %d, want %d", fi.Size, int64(size))
+	}
+
+	want := sha256.Sum256(body)
+	if got := liveDigestTag(t, e, string(scope)+"/large.bin"); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("ocu-sha256 tag = %q, want %q (digest round-trip)", got, hex.EncodeToString(want[:]))
+	}
+
+	// Spot windows across part boundaries.
+	for _, win := range []struct{ off, ln int64 }{
+		{0, 64}, {16<<20 - 32, 64}, {32<<20 - 32, 64}, {size - 50, 100},
+	} {
+		var buf bytes.Buffer
+		if err := e.ReadRange(ctx, scope, "large.bin", win.off, win.ln, &buf); err != nil {
+			t.Fatalf("ReadRange(%d,%d): %v", win.off, win.ln, err)
+		}
+		end := win.off + int64(buf.Len())
+		if !bytes.Equal(buf.Bytes(), body[win.off:end]) {
+			t.Fatalf("window [%d,%d) differs from source", win.off, end)
+		}
+	}
+
+	if n := liveMPUCount(t, e, scope); n != 0 {
+		t.Fatalf("%d multipart uploads left in progress after success, want 0", n)
+	}
+}
+
+// TestS3Live_WriteStream_NoReplace412 pins atomic no-replace on BOTH upload
+// paths: overwrite=false against an existing key surfaces ErrAlreadyExists
+// via the conditional write's 412 (single PUT) and via conditional Complete
+// (multipart) — never a read-then-write check — and the loser never
+// corrupts the existing content.
+func TestS3Live_WriteStream_NoReplace412(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	first := []byte("the first writer wins")
+
+	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(first), false); err != nil {
+		t.Fatalf("WriteStream(first): %v", err)
+	}
+	err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("loser")), false)
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("WriteStream(second, overwrite=false) = %v, want ErrAlreadyExists", err)
+	}
+
+	// The multipart no-replace: a >cutoff stream onto the same key. WARNING-5:
+	// if the rig's backend rejects conditional Complete, this fails loudly
+	// here — surface it, never silently degrade.
+	big := make([]byte, 17<<20)
+	err = e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(big), false)
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("WriteStream(multipart, overwrite=false onto existing) = %v, want ErrAlreadyExists (conditional Complete)", err)
+	}
+	if n := liveMPUCount(t, e, scope); n != 0 {
+		t.Fatalf("%d multipart uploads left after refused conditional Complete, want 0 (aborted)", n)
+	}
+
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "f.txt", 0, int64(len(first))+8, &buf); err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), first) {
+		t.Fatalf("content after refused overwrites = %q, want the first writer's %q", buf.Bytes(), first)
+	}
+
+	// overwrite=true replaces cleanly.
+	second := []byte("replaced")
+	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(second), true); err != nil {
+		t.Fatalf("WriteStream(overwrite=true): %v", err)
+	}
+	buf.Reset()
+	if err := e.ReadRange(ctx, scope, "f.txt", 0, 64, &buf); err != nil || !bytes.Equal(buf.Bytes(), second) {
+		t.Fatalf("readback after overwrite=true = %q, %v; want %q", buf.Bytes(), err, second)
+	}
+}
+
+// TestS3Live_MPU_AbortOnError pins the abort discipline: a source failing
+// mid-multipart aborts the upload — ListMultipartUploads shows ZERO
+// in-progress uploads and the key never exists.
+func TestS3Live_MPU_AbortOnError(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	src := &failAfterReader{serve: 20 << 20, err: errors.New("simulated source failure")}
+	err := e.WriteStream(ctx, scope, "broken.bin", src, false)
+	if err == nil {
+		t.Fatal("WriteStream with failing source: got nil error")
+	}
+	if n := liveMPUCount(t, e, scope); n != 0 {
+		t.Fatalf("%d multipart uploads left after failed stream, want 0 (abort-on-error)", n)
+	}
+	if _, serr := e.Stat(ctx, scope, "broken.bin"); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Stat after aborted MPU = %v, want fs.ErrNotExist", serr)
+	}
+}
+
+// TestS3Live_WriteStream_PartialNeverVisible pins section-9 invisibility:
+// at no point does a failed stream leave readable bytes at the destination
+// — a multipart object exists only after Complete.
+func TestS3Live_WriteStream_PartialNeverVisible(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	src := &failAfterReader{serve: 33 << 20, err: errors.New("died mid-third-part")}
+	if err := e.WriteStream(ctx, scope, "partial.bin", src, false); err == nil {
+		t.Fatal("WriteStream with failing source: got nil error")
+	}
+	var buf bytes.Buffer
+	if err := e.ReadRange(ctx, scope, "partial.bin", 0, 16, &buf); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ReadRange after failed stream = %v (read %d bytes), want fs.ErrNotExist", err, buf.Len())
+	}
+	entries, err := e.List(ctx, scope, ".")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, fi := range entries {
+		if fi.Name == "partial.bin" {
+			t.Fatal("partial.bin visible in listing after failed stream")
+		}
+	}
+}
+
+// TestS3Live_WriteStream_CancelCtx pins the context contract on the
+// multipart path: cancellation mid-stream surfaces ctx.Err(), aborts the
+// upload, and leaves no key.
+func TestS3Live_WriteStream_CancelCtx(t *testing.T) {
+	e, scope := liveS3Engine(t)
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := &cancelAtReader{cancel: cancel, at: 20 << 20}
+	err := e.WriteStream(cctx, scope, "cancelled.bin", src, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteStream under cancel = %v, want errors.Is(context.Canceled)", err)
+	}
+	if n := liveMPUCount(t, e, scope); n != 0 {
+		t.Fatalf("%d multipart uploads left after cancel, want 0 (aborted)", n)
+	}
+	if _, serr := e.Stat(context.Background(), scope, "cancelled.bin"); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("Stat after cancelled stream = %v, want fs.ErrNotExist", serr)
+	}
+}
+
+// cancelAtReader serves pattern bytes and fires its cancel func once `at`
+// bytes have been served; subsequent reads block on the (now cancelled)
+// ctxReader wrapper upstream.
+type cancelAtReader struct {
+	cancel context.CancelFunc
+	at     int
+	served int
+}
+
+func (r *cancelAtReader) Read(p []byte) (int, error) {
+	if r.served >= r.at {
+		r.cancel()
+	}
+	for i := range p {
+		p[i] = 'c'
+	}
+	r.served += len(p)
+	return len(p), nil
+}
+
+// TestS3Live_MakeDir_MissingParent pins MakeDir's sentinel shapes: missing
+// parent -> *fs.PathError wrapping fs.ErrNotExist; existing directory ->
+// fs.ErrExist; a file at the same name -> fs.ErrExist; nested creation
+// under an existing parent succeeds.
+func TestS3Live_MakeDir_MissingParent(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.MakeDir(ctx, scope, "no-parent/child"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("MakeDir(missing parent) = %v, want fs.ErrNotExist", err)
+	}
+	var pe *fs.PathError
+	if err := e.MakeDir(ctx, scope, "no-parent/child"); !errors.As(err, &pe) {
+		t.Fatalf("MakeDir(missing parent) = %T, want *fs.PathError (the local engine's shape)", err)
+	}
+
+	if err := e.MakeDir(ctx, scope, "d"); err != nil {
+		t.Fatalf("MakeDir(d): %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "d"); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("MakeDir(existing dir) = %v, want fs.ErrExist", err)
+	}
+	if err := e.MakeDir(ctx, scope, "d/sub"); err != nil {
+		t.Fatalf("MakeDir(d/sub) under existing parent: %v", err)
+	}
+
+	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "f.txt"); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("MakeDir(over file) = %v, want fs.ErrExist", err)
+	}
+
+	// WriteStream into a missing parent refuses too (decision 2 parity).
+	if err := e.WriteStream(ctx, scope, "ghost/f.txt", bytes.NewReader([]byte("x")), false); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("WriteStream(missing parent) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestS3Live_RemoveFile_Parity pins the WARNING-4 remove(2) parity matrix:
+// file removed; missing -> fs.ErrNotExist; EMPTY directory marker removed
+// successfully; directory WITH children refuses ENOTEMPTY as *fs.PathError.
+func TestS3Live_RemoveFile_Parity(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	if err := e.RemoveFile(ctx, scope, "f.txt"); err != nil {
+		t.Fatalf("RemoveFile(file): %v", err)
+	}
+	if _, err := e.Stat(ctx, scope, "f.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat after remove = %v, want fs.ErrNotExist", err)
+	}
+
+	if err := e.RemoveFile(ctx, scope, "missing.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("RemoveFile(missing) = %v, want fs.ErrNotExist", err)
+	}
+
+	if err := e.MakeDir(ctx, scope, "empty-d"); err != nil {
+		t.Fatalf("MakeDir: %v", err)
+	}
+	if err := e.RemoveFile(ctx, scope, "empty-d"); err != nil {
+		t.Fatalf("RemoveFile(empty dir) = %v, want success (local remove(2) parity)", err)
+	}
+	if _, err := e.Stat(ctx, scope, "empty-d"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat(empty-d after remove) = %v, want fs.ErrNotExist", err)
+	}
+
+	if err := e.MakeDir(ctx, scope, "full-d"); err != nil {
+		t.Fatalf("MakeDir: %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "full-d/child.txt", bytes.NewReader([]byte("y")), false); err != nil {
+		t.Fatalf("WriteStream(child): %v", err)
+	}
+	err := e.RemoveFile(ctx, scope, "full-d")
+	var pe *fs.PathError
+	if !errors.As(err, &pe) || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("RemoveFile(non-empty dir) = %v, want *fs.PathError wrapping ENOTEMPTY", err)
+	}
+	if _, serr := e.Stat(ctx, scope, "full-d/child.txt"); serr != nil {
+		t.Fatalf("child vanished after refused dir remove: %v", serr)
 	}
 }
