@@ -41,3 +41,45 @@ func TestRunHelpIsNotAnError(t *testing.T) {
 		t.Fatalf("run(-h): got %v, want nil", err)
 	}
 }
+
+// TestRunSouthFaceFlagsParse pins that a valid full south-face flag set still
+// refuses the serve path with errNotBuilt: the flags parse and validate, but
+// the listener/admission/audit seams are not wired in this build.
+func TestRunSouthFaceFlagsParse(t *testing.T) {
+	err := run([]string{
+		"--south-socket-dir", "/tmp/ocu-sessions",
+		"--audit-sink", "/tmp/ocu-audit.log",
+		"--profile", "internal_workforce",
+		"--tenancy", "multi-tenant",
+	})
+	if !errors.Is(err, errNotBuilt) {
+		t.Fatalf("run(full south-face flags): got %v, want errNotBuilt", err)
+	}
+}
+
+// TestRunValidatesProfile pins that an unknown -profile value refuses with the
+// typed sentinel before the serve-path refusal — never a silent default.
+func TestRunValidatesProfile(t *testing.T) {
+	err := run([]string{"--profile", "root"})
+	if !errors.Is(err, errBadProfile) {
+		t.Fatalf("run(--profile root): got %v, want errBadProfile", err)
+	}
+}
+
+// TestRunValidatesTenancy pins that an unknown -tenancy value refuses with the
+// typed sentinel before the serve-path refusal — never a silent default.
+func TestRunValidatesTenancy(t *testing.T) {
+	err := run([]string{"--tenancy", "omni-tenant"})
+	if !errors.Is(err, errBadTenancy) {
+		t.Fatalf("run(--tenancy omni-tenant): got %v, want errBadTenancy", err)
+	}
+}
+
+// TestRunDefaultProfileTenancyValid pins that the default profile and tenancy
+// values are themselves in the legal set (a default must not be a value the
+// validator would reject).
+func TestRunDefaultProfileTenancyValid(t *testing.T) {
+	if err := run(nil); !errors.Is(err, errNotBuilt) {
+		t.Fatalf("run(defaults): got %v, want errNotBuilt (defaults must validate)", err)
+	}
+}
