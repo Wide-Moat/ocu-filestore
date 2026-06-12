@@ -254,7 +254,7 @@ func Verify(path string) error {
 // partial line with no newline (0 when the stream ends cleanly). Each
 // complete line is hashed as the exact written bytes including the
 // trailing newline — ReadBytes preserves the delimiter, so the hash input
-// needs no reconstruction. Any prev_hash mismatch or unparseable complete
+// needs no reassembly. Any prev_hash mismatch or unparseable complete
 // line is an error naming the line.
 func chainScan(r io.Reader) (last [sha256.Size]byte, lines int, torn int, err error) {
 	br := bufio.NewReader(r)
