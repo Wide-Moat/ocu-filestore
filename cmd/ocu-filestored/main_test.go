@@ -32,6 +32,7 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 	t.Helper()
 	root := shortDir(t)
 	return brokerConfig{
+		engineKind:     objectstore.LocalVolume,
 		engineRoot:     filepath.Join(root, "engine"),
 		auditSink:      filepath.Join(root, "audit.jsonl"),
 		socketDir:      filepath.Join(root, "sock"),
@@ -108,6 +109,69 @@ func TestComposeRefusedTripleBindsNoSocket(t *testing.T) {
 		if filepath.Ext(e.Name()) == ".sock" {
 			t.Fatalf("a socket %q was bound on a refused triple; want none", e.Name())
 		}
+	}
+}
+
+// TestComposeS3EngineRefusesPreBind pins T1-2: `-engine s3` returns the typed
+// errS3EngineUnavailable sentinel from compose BEFORE admission and before any
+// socket exists — never a silent local-volume fallback under the s3 name.
+func TestComposeS3EngineRefusesPreBind(t *testing.T) {
+	cfg := validBrokerConfig(t)
+	cfg.engineKind = objectstore.S3
+
+	_, err := compose(cfg)
+	if !errors.Is(err, errS3EngineUnavailable) {
+		t.Fatalf("compose(engine=s3): got %v, want errS3EngineUnavailable", err)
+	}
+	// The refusal happened pre-bind: no socket file under the socket dir.
+	entries, _ := os.ReadDir(cfg.socketDir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".sock" {
+			t.Fatalf("a socket %q was bound for the refused s3 engine; want none", e.Name())
+		}
+	}
+}
+
+// TestRunS3EngineRefusesWithFullFlagSet pins the e2e-observable shape: a full,
+// otherwise-valid required-flag set with -engine s3 passes flag validation and
+// then refuses with errS3EngineUnavailable — proving the refusal comes from
+// the engine gate, not from a missing flag.
+func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
+	root := shortDir(t)
+	err := run([]string{
+		"--engine", "s3",
+		"--engine-root", filepath.Join(root, "engine"),
+		"--audit-sink", filepath.Join(root, "audit.jsonl"),
+		"--south-socket-dir", filepath.Join(root, "sock"),
+		"--filesystem-id", "fs1",
+		"--broker-max-file-size", "1",
+	})
+	if !errors.Is(err, errS3EngineUnavailable) {
+		t.Fatalf("run(-engine s3, full flags): got %v, want errS3EngineUnavailable", err)
+	}
+}
+
+// TestValidateStoresEngineKindS3LocalUnaffected pins that validate carries the
+// parsed engine kind into brokerConfig (it was previously discarded) and that
+// local-volume remains the composed default.
+func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
+	cfg, err := validate("s3", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst)
+	if err != nil {
+		t.Fatalf("validate(engine=s3): %v", err)
+	}
+	if cfg.engineKind != objectstore.S3 {
+		t.Fatalf("validate(engine=s3) stored kind %q, want %q", cfg.engineKind, objectstore.S3)
+	}
+	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
+		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+		defaultOpsPerSecond, defaultOpsBurst)
+	if err != nil {
+		t.Fatalf("validate(engine=local-volume): %v", err)
+	}
+	if cfg.engineKind != objectstore.LocalVolume {
+		t.Fatalf("validate(engine=local-volume) stored kind %q, want %q", cfg.engineKind, objectstore.LocalVolume)
 	}
 }
 

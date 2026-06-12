@@ -56,6 +56,12 @@ var errMissingRequiredFlag = errors.New("ocu-filestored: required flag missing o
 // vocabulary. Match it with errors.Is.
 var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 
+// errS3EngineUnavailable refuses `-engine s3` loudly, BEFORE admission and
+// before any socket is bound: ADR-0010 names the s3 kind from day one, but
+// until the real engine is composed the daemon must never silently serve
+// local-volume under the s3 name. Match it with errors.Is.
+var errS3EngineUnavailable = errors.New("ocu-filestored: s3 engine not available in this build")
+
 // tenancyAdmission maps the Phase-8-frozen hyphenated -tenancy flag values to
 // the admission package's underscored constants. The flag value set is frozen
 // (single-tenant | multi-tenant) and is NOT byte-identical to admission's
@@ -104,6 +110,7 @@ func main() {
 
 // brokerConfig holds the validated, flag-derived inputs the composition needs.
 type brokerConfig struct {
+	engineKind     objectstore.EngineKind
 	engineRoot     string
 	auditSink      string
 	socketDir      string
@@ -188,7 +195,8 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64) (brokerConfig, error) {
 	var cfg brokerConfig
 
-	if _, err := objectstore.ParseEngine(engine); err != nil {
+	kind, err := objectstore.ParseEngine(engine)
+	if err != nil {
 		return cfg, err
 	}
 
@@ -226,6 +234,7 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	}
 
 	cfg = brokerConfig{
+		engineKind:     kind,
 		engineRoot:     engineRoot,
 		auditSink:      auditSink,
 		socketDir:      socketDir,
@@ -277,6 +286,18 @@ func splitNonEmpty(s string) []string {
 // the returned Server and Closes it for teardown (engine TeardownScope +
 // registry/ceilings Release).
 func compose(cfg brokerConfig) (southface.Server, error) {
+	// Engine-kind gate FIRST — before admission and before any socket bind:
+	// `-engine s3` must refuse loudly until the real s3 engine is composed
+	// (ADR-0010 names both kinds; a silent local-volume fallback would lie).
+	switch cfg.engineKind {
+	case objectstore.LocalVolume:
+		// The composed path below.
+	case objectstore.S3:
+		return nil, errS3EngineUnavailable
+	default:
+		return nil, fmt.Errorf("%w %q", objectstore.ErrUnknownEngine, cfg.engineKind)
+	}
+
 	// The credential kind is not a free flag: the minimal shelf admits exactly
 	// one long-lived cell, host-local long-lived (A2). Hard-wire it.
 	const credKind = admission.CredHostLocalLongLived

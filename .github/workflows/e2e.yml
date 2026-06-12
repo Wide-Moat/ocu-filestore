@@ -97,5 +97,33 @@ jobs:
             echo "::error::unknown-engine sentinel missing from output"
             exit 1
           }
+      - name: smoke — -engine s3 refuses loudly until the real engine lands
+        # T1-2: with the FULL required-flag set the daemon passes flag
+        # validation and then refuses the s3 kind pre-bind with the typed
+        # not-available error — proving the refusal is the engine gate, not a
+        # missing flag, and that no silent local-volume fallback exists.
+        run: |
+          set -uo pipefail
+          tmp=$(mktemp -d)
+          code=0
+          out=$(./ocu-filestored -engine s3 \
+            -engine-root "$tmp/engine" \
+            -audit-sink "$tmp/audit.jsonl" \
+            -south-socket-dir "$tmp/sock" \
+            -filesystem-id fs-smoke \
+            -broker-max-file-size 1 2>&1) || code=$?
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 on -engine s3, got $code"
+            exit 1
+          fi
+          echo "$out" | grep -q "s3 engine not available in this build" || {
+            echo "::error::s3-unavailable refusal text missing from output"
+            exit 1
+          }
+          if ls "$tmp/sock"/*.sock >/dev/null 2>&1; then
+            echo "::error::a socket was bound despite the s3 refusal"
+            exit 1
+          fi
       - name: run the Integration + E2E slice
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
