@@ -724,6 +724,72 @@ func TestReadFileNotDownloadable(t *testing.T) {
 	}
 }
 
+// TestReadFileNoContentRead pins CONC-01 (NFR-SEC-46/78): readFile validates
+// through engine.Stat ONLY — the engine's ReadRange is NEVER called, so no
+// content byte is read or buffered regardless of object size or the guest
+// range. The object here nominally spans 1 TiB (a size-only fake node with no
+// backing bytes): a content-buffering implementation could not answer it.
+// With zero content bytes in flight, the in-flight byte ceiling is satisfied
+// structurally for ANY number of concurrent readFile calls.
+func TestReadFileNoContentRead(t *testing.T) {
+	eng := newFakeEngine()
+	eng.putFile(opScope, "huge.bin", 1<<40) // 1 TiB nominal, no backing bytes
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+
+	for _, body := range []string{
+		readBody(opScope, "/huge.bin", 0, 1<<40, false), // full-window range
+		readBodyNoRange(opScope, "/huge.bin", false),    // absent range
+	} {
+		w := serveOp(d, OpReadFile, body, opScope, okIntents())
+		resp := decodeReadFile(t, w)
+		if resp.File.Size != 1<<40 {
+			t.Fatalf("size = %d, want the full 1 TiB nominal size", resp.File.Size)
+		}
+	}
+	if calls := eng.readRangeCalls(); len(calls) != 0 {
+		t.Fatalf("readFile called engine.ReadRange %v — content must never be read (Stat-only validation)", calls)
+	}
+}
+
+// TestReadFileBoundedAllocation is the O(size) heap pin for CONC-01: a
+// readFile of a 32 MiB object allocates far less than the object size (the
+// pre-fix implementation buffered the full window into a bytes.Buffer).
+func TestReadFileBoundedAllocation(t *testing.T) {
+	const objSize = 32 << 20
+	eng := newFakeEngine()
+	eng.putBytes(opScope, "big.bin", make([]byte, objSize))
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+
+	body := readBodyNoRange(opScope, "/big.bin", false)
+	allocs := testing.AllocsPerRun(3, func() {
+		w := serveOp(d, OpReadFile, body, opScope, okIntents())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+		}
+	})
+	// The request path allocates request/response plumbing (well under a
+	// hundred small allocations); a full-window buffer of a 32 MiB object
+	// would show up as orders of magnitude more allocated bytes. Pin the
+	// allocation COUNT — buffering 32 MiB through bytes.Buffer growth adds
+	// many large grow allocations per run.
+	if allocs > 500 {
+		t.Fatalf("readFile of a 32 MiB object made %v allocations per run — content is being buffered", allocs)
+	}
+}
+
+// TestReadFileDirectoryTarget pins that readFile of a directory refuses
+// not_found (readFile names a file; the directory listing surface is
+// listDirectory).
+func TestReadFileDirectoryTarget(t *testing.T) {
+	eng := newFakeEngine()
+	eng.mkdirSeed(opScope, "adir")
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+	w := serveOp(d, OpReadFile, readBodyNoRange(opScope, "/adir", false), opScope, okIntents())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("readFile(directory) status = %d, want 404; body %s", w.Code, w.Body.String())
+	}
+}
+
 // TestReadFileEngineErrors pins the engine-error deny paths: a missing object
 // maps not_found/404, and an escape-shaped path degrades to not_found (the
 // audited truth differs — D8 — but the wire is not_found).

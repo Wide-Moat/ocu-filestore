@@ -4,7 +4,6 @@
 package southface
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -420,9 +419,18 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 // handleReadFile implements OPS-04 readFile: a UNARY op on the existing
 // dispatch pipeline. It strict-decodes {filesystem_id, path, range}, enforces
 // downloadable AT READ from the broker-resolved grant FIRST (A2/SEC-73),
-// validates the half-open window through engine.ReadRange (the bytes are
-// discarded — readFile emits NO content; D6 TBD content body stays TBD), and
-// emits the metadata-only {file: File} body.
+// validates the target through engine.Stat WITHOUT reading any content
+// (readFile emits NO content; D6 TBD content body stays TBD), and emits the
+// metadata-only {file: File} body.
+//
+// NO CONTENT IS READ (NFR-SEC-46/78): an earlier build validated the window
+// by copying it into an in-memory buffer with the guest-supplied length —
+// K concurrent reads of a multi-GiB object could heap K x size. Stat answers
+// everything this op emits (existence, size, mtime), and the engine's
+// half-open window contract makes a range read past EOF a no-error
+// short-read anyway, so a range can never fail validation that Stat passes.
+// The guest range is accepted and intentionally unused here; bulk bytes are
+// the deferred fileDownload server-stream's job.
 func handleReadFile(d *handlerDeps, hc handlerCtx) {
 	var req readFileRequest
 	if !decodeOp(hc, &req) {
@@ -446,25 +454,17 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) {
 	scope := hc.ps.FilesystemID
 	rel := enginePath(req.Path)
 
-	// Validate the half-open window. An absent range is a full read
-	// (offset 0, length 0 -> engine reads to EOF). The bytes are written into
-	// a buffer that is DISCARDED — the call confirms the object exists and the
-	// window is readable; readFile emits metadata only.
-	var offset, length int64
-	if req.Range != nil {
-		offset, length = req.Range.Offset, req.Range.Length
-	}
-	var discard bytes.Buffer
-	if err := d.engine.ReadRange(ctx, scope, rel, offset, length, &discard); err != nil {
-		denyEngine(hc, err)
-		return
-	}
-
-	// Stat for the metadata-only response. The object existed (ReadRange
-	// succeeded); a Stat error here is an internal fault.
+	// Stat-only validation: existence and metadata, zero content bytes read,
+	// O(1) memory regardless of object size or the guest-declared range.
 	info, err := d.engine.Stat(ctx, scope, rel)
 	if err != nil {
 		denyEngine(hc, err)
+		return
+	}
+	if info.IsDir {
+		// readFile names a file; a directory target is not_found (the same
+		// class the read path surfaced for a directory before).
+		hc.mandateDeny(denyNotFound, denyNotFound, "object is not a file")
 		return
 	}
 	gp := guestPath(rel)
