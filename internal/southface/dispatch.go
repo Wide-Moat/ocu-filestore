@@ -242,6 +242,25 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// carries no op field in this build; the route op is authoritative and
 	// the body scope/intent are the only cross-checked fields.
 
+	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
+	// The route op is AUTHORITATIVE for what the request does; the wire
+	// authorization_metadata.intent is an untrusted hint. The authz intent
+	// passed to Resolve is DERIVED FROM THE ROUTE OP — never the wire — and a
+	// wire intent that disagrees with the op's required intent is refused
+	// (errRouteOpMismatch) before the resolver is consulted, so a read-only
+	// grant can never reach a mutation handler by declaring intent=read on a
+	// mutation route. An op absent from the closed map is a wiring fault and
+	// fails closed.
+	requiredIntent, ok := requiredIntentForOp(op)
+	if !ok {
+		writeConnectError(w, mapDeny(denyInternal), "no required intent bound to operation")
+		return
+	}
+	if env.AuthorizationMetadata.Intent != requiredIntent {
+		writeConnectError(w, mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
+		return
+	}
+
 	// STAGE 2: authz. Caller evidence is built from the channel scope, never
 	// from a request field. Deny sentinels map through the D4 table with the
 	// header gated to authorization verdicts.
@@ -249,7 +268,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := ResolveRequest{
 		Filesystem: env.FilesystemID,
 		Path:       env.Path,
-		Intent:     env.AuthorizationMetadata.Intent,
+		Intent:     requiredIntent,
 	}
 	grant, err := d.resolver.Resolve(r.Context(), evidence, req)
 	if err != nil {

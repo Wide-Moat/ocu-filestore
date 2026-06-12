@@ -83,6 +83,48 @@ var knownOps = map[Op]struct{}{
 	OpRemoveFilesystem:  {},
 }
 
+// opRequiredIntent is the CLOSED route-op -> required-intent map (NFR-SEC-49,
+// invariant 4). The op the route names is the AUTHORITATIVE statement of what
+// the request does; the wire authorization_metadata.intent is an untrusted
+// hint. The dispatch spine derives the authz intent from this map and refuses
+// any wire intent that disagrees (errRouteOpMismatch), so a session granted
+// only read can never reach a mutating handler by declaring intent=read on a
+// mutation route. Every op in knownOps MUST have a row here — the spine fails
+// closed on an absent row. The read/write split mirrors the guest mount's own
+// per-op intent stamping (read-class lookups vs write-class mutations).
+var opRequiredIntent = map[Op]Intent{
+	// Read-class: lookups and content reads.
+	OpListDirectory:   IntentRead,
+	OpReadFile:        IntentRead,
+	OpReadMetadata:    IntentRead,
+	OpGetFileMetadata: IntentRead,
+	OpListFiles:       IntentRead,
+	OpFileDownload:    IntentRead,
+
+	// Write-class: every namespace or content mutation.
+	OpMakeDirectory:     IntentWrite,
+	OpMoveDirectory:     IntentWrite,
+	OpRemoveDirectory:   IntentWrite,
+	OpCreateFile:        IntentWrite,
+	OpCopyFile:          IntentWrite,
+	OpMoveFile:          IntentWrite,
+	OpRemoveFile:        IntentWrite,
+	OpFileUpload:        IntentWrite,
+	OpImportFiles:       IntentWrite,
+	OpImportZip:         IntentWrite,
+	OpMigrateFilesystem: IntentWrite,
+	OpRemoveFilesystem:  IntentWrite,
+}
+
+// requiredIntentForOp returns the authoritative intent for a routed op.
+// ok=false names a wiring fault (an op outside the closed map) and the caller
+// MUST fail closed. No op maps to IntentPreview on this face: preview is the
+// north-face render axis and is never a legal south-face wire intent.
+func requiredIntentForOp(op Op) (Intent, bool) {
+	intent, ok := opRequiredIntent[op]
+	return intent, ok
+}
+
 // parseRoute matches a request's method and path against the south-face
 // service, returning the routed Op. A non-POST method to any path is
 // errBadMethod; a path outside the service prefix or naming an unknown op is

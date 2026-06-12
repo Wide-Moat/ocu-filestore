@@ -276,7 +276,14 @@ func TestRegistryUnimplemented(t *testing.T) {
 		t.Run(string(op), func(t *testing.T) {
 			d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
 			w := httptest.NewRecorder()
-			d.ServeHTTP(w, scopedRequest(op, bodyFor(boundScope, IntentRead), boundScope, []Intent{IntentRead}))
+			// Send each op's required intent (route-op binding, AUTHZ-01): a
+			// mismatching wire intent now refuses BEFORE the registry, which is
+			// not what this test pins.
+			intent, ok := requiredIntentForOp(op)
+			if !ok {
+				t.Fatalf("op %q has no required intent in the closed map", op)
+			}
+			d.ServeHTTP(w, scopedRequest(op, bodyFor(boundScope, intent), boundScope, []Intent{IntentRead, IntentWrite}))
 			if w.Code != http.StatusNotImplemented {
 				t.Fatalf("op %q: status %d, want 501", op, w.Code)
 			}

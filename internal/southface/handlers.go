@@ -67,6 +67,24 @@ func decodeOp(hc handlerCtx, out any) bool {
 	return true
 }
 
+// assertWriteGrant is the defense-in-depth write-class gate every mutation
+// handler runs BEFORE any engine touch (NFR-SEC-49, invariant 4): even if the
+// spine's route-op->required-intent binding were ever regressed, a session
+// whose channel-bound grant set lacks IntentWrite can never reach a mutating
+// engine verb. It mirrors handleReadFile's hc.grant downloadable check —
+// deny-by-default, asserted at the handler in addition to the spine. On a
+// missing write grant it emits the intent_denied deny audit event and writes
+// the wire deny, returning false; the handler returns immediately.
+func assertWriteGrant(hc handlerCtx) bool {
+	for _, g := range hc.ps.GrantedIntents {
+		if g == IntentWrite {
+			return true
+		}
+	}
+	hc.mandateDeny(denyIntentDenied, denyIntentDenied, "intent denied for operation")
+	return false
+}
+
 // denyEngine maps an engine error to its deny class, emits the handler-stage
 // deny audit event with the broker-resolved truth, and writes the wire deny
 // (which MAY degrade away from the truth, D8). The audited truth for an
@@ -276,6 +294,9 @@ func handleMakeDirectory(d *handlerDeps, hc handlerCtx) {
 	if !decodeOp(hc, &req) {
 		return
 	}
+	if !assertWriteGrant(hc) {
+		return
+	}
 	rel := enginePath(req.Path)
 	if err := d.makeDirs(context.Background(), hc.ps.FilesystemID, rel, req.MakeParents); err != nil {
 		denyEngine(hc, err)
@@ -289,6 +310,9 @@ func handleMakeDirectory(d *handlerDeps, hc handlerCtx) {
 func handleMoveDirectory(d *handlerDeps, hc handlerCtx) {
 	var req moveDirectoryRequest
 	if !decodeOp(hc, &req) {
+		return
+	}
+	if !assertWriteGrant(hc) {
 		return
 	}
 	src := enginePath(req.Source)
@@ -307,6 +331,9 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) {
 func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) {
 	var req removeDirectoryRequest
 	if !decodeOp(hc, &req) {
+		return
+	}
+	if !assertWriteGrant(hc) {
 		return
 	}
 	ctx := context.Background()
@@ -341,6 +368,9 @@ func handleCopyFile(d *handlerDeps, hc handlerCtx) {
 	if !decodeOp(hc, &req) {
 		return
 	}
+	if !assertWriteGrant(hc) {
+		return
+	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
 	if err := d.engine.CopyFile(context.Background(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
@@ -357,6 +387,9 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) {
 	if !decodeOp(hc, &req) {
 		return
 	}
+	if !assertWriteGrant(hc) {
+		return
+	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
 	if err := d.engine.MoveFile(context.Background(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
@@ -371,6 +404,9 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) {
 func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 	var req removeFileRequest
 	if !decodeOp(hc, &req) {
+		return
+	}
+	if !assertWriteGrant(hc) {
 		return
 	}
 	rel := enginePath(req.Path)
