@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 
-// Package broker is the composition layer: it binds the six internal seam
+// Package broker is the composition layer: it binds the four internal seam
 // packages (authz, auditgate, ceilings, objectstore) to the southface
 // CONSUMER interfaces, which import none of them. Each adapter is a thin
 // per-call type narrowing — the real seams are structurally compatible but

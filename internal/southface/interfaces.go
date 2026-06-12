@@ -12,8 +12,12 @@ import (
 // needs. The seam packages live on their own unmerged branches, so this
 // package mirrors only the method signatures it calls — byte-for-byte at
 // the method level — and the daemon wiring binds the real implementations
-// in the composition phase. Nothing here imports internal/authz,
-// internal/auditgate, internal/ceilings, or internal/admission.
+// in the composition phase. These consumer interfaces import none of the
+// seam packages; the one exception elsewhere in the package is audit_event.go,
+// which imports internal/auditgate solely to map the spine's auditEvent into
+// the concrete auditgate.FileActivityEvent the real sink type-asserts (so the
+// fail-closed Mandate gate works). Nothing imports internal/authz,
+// internal/ceilings, or internal/admission.
 
 // Intent mirrors the authorization intent axis from
 // feat/authz-resolver:internal/authz/authz.go (Intent string with
