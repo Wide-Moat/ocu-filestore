@@ -265,7 +265,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
 	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
-	if err := d.guard.Mandate(r.Context(), allowEvent); err != nil {
+	if err := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent)); err != nil {
 		writeConnectError(w, mapDeny(denyClassForErr(err)), "audit gate unavailable")
 		return
 	}
@@ -286,7 +286,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// only supplies the per-op deny event content.
 	mandateDeny := func(auditReason, wireClass, message string) {
 		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
-		_ = d.guard.Mandate(r.Context(), denyEvent)
+		_ = d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent))
 		writeConnectError(w, mapDenyDegraded(auditReason, wireClass), message)
 	}
 

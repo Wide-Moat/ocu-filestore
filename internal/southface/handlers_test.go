@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 )
 
 // newEngineDispatcher builds a dispatcher with the seven phase-9 handlers
@@ -470,14 +472,16 @@ func TestHandlerSecondDenyEvent(t *testing.T) {
 		if got := len(g.events); got != 2 {
 			t.Fatalf("emitted %d audit events, want 2 (allow + handler deny)", got)
 		}
-		// The allow event came first (DenyReason empty), then the deny event.
-		first, ok := g.events[0].(auditEvent)
-		if !ok || first.DenyReason != "" {
-			t.Fatalf("first event = %+v, want the allow event (empty DenyReason)", g.events[0])
+		// The allow event came first (allow disposition, no x_deny_reason),
+		// then the deny event. The spine adopts auditgate.FileActivityEvent
+		// (W1.2), so the captured event is the mapped OCSF record.
+		first, ok := g.events[0].(auditgate.FileActivityEvent)
+		if !ok || first.Outcome.DispositionID != auditgate.DispositionAllow || first.Outcome.XDenyReason != "" {
+			t.Fatalf("first event = %+v, want the allow event (allow disposition, empty x_deny_reason)", g.events[0])
 		}
-		second, ok := g.events[1].(auditEvent)
-		if !ok || second.DenyReason != denyAlreadyExists {
-			t.Fatalf("second event = %+v, want a deny event with DenyReason already_exists", g.events[1])
+		second, ok := g.events[1].(auditgate.FileActivityEvent)
+		if !ok || second.Outcome.DispositionID != auditgate.DispositionDeny || second.Outcome.XDenyReason != denyAlreadyExists {
+			t.Fatalf("second event = %+v, want a deny event with x_deny_reason already_exists", g.events[1])
 		}
 	})
 
@@ -492,9 +496,9 @@ func TestHandlerSecondDenyEvent(t *testing.T) {
 		if len(g.events) != 2 {
 			t.Fatalf("emitted %d events, want 2", len(g.events))
 		}
-		second := g.events[1].(auditEvent)
-		if second.DenyReason != denyDirNotEmpty {
-			t.Fatalf("deny reason = %q, want directory_not_empty (not malformed_envelope)", second.DenyReason)
+		second := g.events[1].(auditgate.FileActivityEvent)
+		if second.Outcome.XDenyReason != denyDirNotEmpty {
+			t.Fatalf("deny reason = %q, want directory_not_empty (not malformed_envelope)", second.Outcome.XDenyReason)
 		}
 	})
 
@@ -526,9 +530,9 @@ func TestEngineDenyMap(t *testing.T) {
 		if w.Header().Get("x-deny-reason") != "" {
 			t.Fatalf("x-deny-reason set on not_found, want none")
 		}
-		second := g.events[1].(auditEvent)
-		if second.DenyReason != denyNotFound {
-			t.Fatalf("audit reason = %q, want not_found", second.DenyReason)
+		second := g.events[1].(auditgate.FileActivityEvent)
+		if second.Outcome.XDenyReason != denyNotFound {
+			t.Fatalf("audit reason = %q, want not_found", second.Outcome.XDenyReason)
 		}
 	})
 
@@ -544,9 +548,9 @@ func TestEngineDenyMap(t *testing.T) {
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404 (degraded)", w.Code)
 		}
-		second := g.events[1].(auditEvent)
-		if second.DenyReason != denyScopeMismatch {
-			t.Fatalf("audit reason = %q, want the escape truth (scope_mismatch)", second.DenyReason)
+		second := g.events[1].(auditgate.FileActivityEvent)
+		if second.Outcome.XDenyReason != denyScopeMismatch {
+			t.Fatalf("audit reason = %q, want the escape truth (scope_mismatch)", second.Outcome.XDenyReason)
 		}
 	})
 }

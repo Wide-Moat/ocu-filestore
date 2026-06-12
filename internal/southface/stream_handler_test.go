@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 )
 
 const streamScope = "fs-stream"
@@ -586,12 +588,12 @@ func TestFileUploadMandateBeforeTrailer(t *testing.T) {
 		if len(g.events) == 0 {
 			t.Fatalf("no deny audit event on the size reject")
 		}
-		ev, ok := g.events[len(g.events)-1].(auditEvent)
+		ev, ok := g.events[len(g.events)-1].(auditgate.FileActivityEvent)
 		if !ok {
-			t.Fatalf("audit event is not auditEvent: %T", g.events[len(g.events)-1])
+			t.Fatalf("audit event is not auditgate.FileActivityEvent: %T", g.events[len(g.events)-1])
 		}
-		if ev.DenyReason != denySizeExceeded {
-			t.Fatalf("deny audit reason = %q, want %q", ev.DenyReason, denySizeExceeded)
+		if ev.Outcome.XDenyReason != denySizeExceeded {
+			t.Fatalf("deny audit reason = %q, want %q", ev.Outcome.XDenyReason, denySizeExceeded)
 		}
 	})
 }
