@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gofmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt -l (fail on any unformatted file)
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+
+  staticcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - name: staticcheck
+        run: staticcheck ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go test
+        run: go test ./...
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Gate the internal/ packages — the broker's real logic. The cmd/
+      # wrapper is thin and deliberately excluded. The floor guards against
+      # regression and ratchets up as the implementation PRs land.
+      - name: collect coverage (internal packages)
+        run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
+      - name: enforce the line-coverage floor
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          floor=60.0
+          awk -v t="$total" -v f="$floor" 'BEGIN {
+            if (t+0 < f+0) { printf "::error::go internal coverage %.1f%% below floor %.1f%%\n", t, f; exit 1 }
+            printf "go internal coverage %.1f%% >= floor %.1f%%\n", t, f
+          }'
+      - name: upload the coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-profile
+          path: cover.out
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Check out the canonical architecture repo so the byte-identity gate
+      # actually enforces in CI; without this the script's skip branch would
+      # make the gate dead on every runner.
+      - uses: actions/checkout@v4
+        with:
+          repository: Wide-Moat/open-computer-use
+          path: canon
+      - name: SPDX header presence
+        run: bash scripts/check-spdx.sh
+      - name: vendored contract identity
+        env:
+          OCU_CANON_DIR: canon
+        run: bash scripts/check-contract-identity.sh
