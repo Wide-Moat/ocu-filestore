@@ -82,7 +82,12 @@ jobs:
         run: |
           set -euo pipefail
           total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
-          floor=60.0
+          # Ratcheted in PR-11 (daemon wiring + e2e): the integrated suite
+          # measures 87.7% over ./internal/... on a host where the live-socket
+          # e2e cases run (Linux CI) or loud-skip (darwin, peer-cred gate). The
+          # floor is floor(measured)-1 = 86.0 — one point of headroom, never
+          # above measured — clearing the >=80% release-readiness target.
+          floor=86.0
           awk -v t="$total" -v f="$floor" 'BEGIN {
             if (t+0 < f+0) { printf "::error::go internal coverage %.1f%% below floor %.1f%%\n", t, f; exit 1 }
             printf "go internal coverage %.1f%% >= floor %.1f%%\n", t, f
