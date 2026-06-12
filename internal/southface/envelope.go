@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -169,6 +170,50 @@ func decodeUnaryEnvelope(w http.ResponseWriter, r *http.Request, ceiling int64, 
 	}
 	// Single-value enforcement: a second decode must hit EOF. Any further
 	// token (a second JSON value) is a malformed envelope.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == nil {
+		return errMalformedEnvelope
+	}
+	return nil
+}
+
+// decodeStrictBytes strict-decodes a single JSON object from an in-memory body
+// buffer into out: unknown fields are rejected (DisallowUnknownFields) and a
+// trailing second value is rejected (single-value enforcement). It is the
+// no-network decode path the spine and the per-op handlers share over the
+// buffered body — the size ceiling / MaxBytesReader backstop is applied once
+// when the body is read, so no reader is needed here. Any decode fault returns
+// errMalformedEnvelope.
+func decodeStrictBytes(body []byte, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return errMalformedEnvelope
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == nil {
+		return errMalformedEnvelope
+	}
+	return nil
+}
+
+// decodeUnaryEnvelopeBytes decodes the spine's routing/cross-check view
+// (filesystem_id, path, authorization_metadata) from the buffered body. It is
+// deliberately LENIENT on unknown fields: the op-specific fields (source,
+// destination, limit, cursor, recursive, overwrite_existing, make_parents) are
+// part of the real body and are STRICT-decoded by the per-op handler, which
+// owns the authoritative schema. The spine still rejects a body that is not a
+// single well-formed JSON object (a decode error or a trailing second value);
+// the unknown-field guard moves to the handler where the full schema is known.
+//
+// The phase-8 strict envelope decode (decodeUnaryEnvelope, the reader path)
+// stays unchanged for the reader API and its tests; the buffered path used by
+// the dispatcher is the one that must admit op-specific fields.
+func decodeUnaryEnvelopeBytes(body []byte, out *unaryEnvelope) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(out); err != nil {
+		return errMalformedEnvelope
+	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err == nil {
 		return errMalformedEnvelope

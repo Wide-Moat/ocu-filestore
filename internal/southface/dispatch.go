@@ -5,7 +5,19 @@ package southface
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+)
+
+// OCSF File System Activity ids (class 1001). There is no rename/move id, so a
+// move/copy is recorded as a Create on the produced (destination) handle
+// (Q7). The set is the slice the namespace ops need; the auditgate branch owns
+// the full enum, the wiring phase maps these onto it.
+const (
+	activityCreate = 1 // create / make / move-destination / copy-destination
+	activityRead   = 2 // read / list
+	activityDelete = 4 // delete / remove
 )
 
 // connectError is the Connect unary error body: a Connect code and a human
@@ -40,20 +52,50 @@ type dispatcher struct {
 	guard    Guard
 	ceilings CeilingsRegistry
 	registry map[Op]opHandler
+	// engine is the consumer-side storage seam the seven phase-9 handlers
+	// call; the wiring phase binds the real local-volume engine.
+	engine Engine
+	// ids is the session-scoped uuid record store the listing emitter mints
+	// through and phase 10 resolves through.
+	ids *objectIDStore
 	// sizeCeiling is the per-request declared/streamed body ceiling
 	// (NFR-SEC-78), applied pre-buffer on the Content-Length and as the
 	// MaxBytesReader backstop.
 	sizeCeiling int64
 }
 
-// newDispatcher builds a dispatcher with the default-unimplemented registry
-// and the injected seams.
+// newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
+// the injected engine seam (the other eleven ops stay unimplemented) and the
+// injected authz/audit/ceilings seams. A nil engine leaves the registry
+// fully unimplemented (the phase-8 spine tests construct the dispatcher
+// without an engine).
 func newDispatcher(resolver Resolver, guard Guard, ceilings CeilingsRegistry, sizeCeiling int64) *dispatcher {
+	return newDispatcherWithEngine(resolver, guard, ceilings, sizeCeiling, nil)
+}
+
+// newDispatcherWithEngine builds a dispatcher binding the storage engine seam
+// and a fresh session-scoped uuid store. When engine is non-nil it registers
+// the seven phase-9 handlers, replacing their unimplemented entries; the other
+// eleven ops stay unimplemented. The phase-8 spine ordering/registry tests use
+// newDispatcher (engine nil) and continue to see every op unimplemented.
+func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRegistry, sizeCeiling int64, engine Engine) *dispatcher {
+	reg := newHandlerRegistry()
+	if engine != nil {
+		reg[OpListDirectory] = handleListDirectory
+		reg[OpMakeDirectory] = handleMakeDirectory
+		reg[OpMoveDirectory] = handleMoveDirectory
+		reg[OpRemoveDirectory] = handleRemoveDirectory
+		reg[OpCopyFile] = handleCopyFile
+		reg[OpMoveFile] = handleMoveFile
+		reg[OpRemoveFile] = handleRemoveFile
+	}
 	return &dispatcher{
 		resolver:    resolver,
 		guard:       guard,
 		ceilings:    ceilings,
-		registry:    newHandlerRegistry(),
+		registry:    reg,
+		engine:      engine,
+		ids:         newObjectIDStore(),
 		sizeCeiling: sizeCeiling,
 	}
 }
@@ -129,9 +171,24 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// STAGE 1: strict envelope decode through the MaxBytesReader backstop.
+	// STAGE 1: buffer the body once through the MaxBytesReader backstop, then
+	// strict-decode the envelope from the buffer. The same bytes are handed to
+	// the per-op handler so it re-decodes the op-specific fields without a
+	// second network read; the size ceiling / MaxBytesReader backstop stays
+	// intact on the single read.
+	r.Body = http.MaxBytesReader(w, r.Body, d.sizeCeiling)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeConnectError(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+			return
+		}
+		writeConnectError(w, mapDeny(denyMalformed), "malformed request envelope")
+		return
+	}
 	var env unaryEnvelope
-	if err := decodeUnaryEnvelope(w, r, d.sizeCeiling, &env); err != nil {
+	if err := decodeUnaryEnvelopeBytes(bodyBytes, &env); err != nil {
 		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "malformed request envelope")
 		return
 	}
@@ -158,50 +215,144 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Path:       env.Path,
 		Intent:     env.AuthorizationMetadata.Intent,
 	}
-	if _, err := d.resolver.Resolve(r.Context(), evidence, req); err != nil {
+	grant, err := d.resolver.Resolve(r.Context(), evidence, req)
+	if err != nil {
 		writeConnectError(w, mapDeny(denyClassForErr(err)), "authorization denied")
 		return
 	}
 
-	// STAGE 3: audit Mandate BEFORE any 2xx (NFR-SEC-79). The event carries
-	// the broker-resolved truth; an unavailable audit gate denies the
+	// STAGE 3: audit Mandate BEFORE any 2xx (NFR-SEC-79). The event is the
+	// per-op, broker-resolved-truth allow record (ActivityID / ObjectHandle /
+	// Intent / Downloadable per op); an unavailable audit gate denies the
 	// operation and the handler is never invoked. No x-deny-reason on an
-	// audit-down verdict (n3).
-	if err := d.guard.Mandate(r.Context(), d.auditEvent(op, ps, req)); err != nil {
+	// audit-down verdict (n3). This pre-handler allow-Mandate stays HERE,
+	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
+	// refusal emits a SECOND deny event through the mandateDeny hook below.
+	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
+	if err := d.guard.Mandate(r.Context(), allowEvent); err != nil {
 		writeConnectError(w, mapDeny(denyClassForErr(err)), "audit gate unavailable")
 		return
 	}
 
-	// STAGE 4: the per-op handler. Every op is registered; all return Connect
-	// unimplemented in this build. A route op absent from the registry is a
-	// wiring fault and fails closed.
+	// STAGE 4: the per-op handler. The seven phase-9 ops have real handlers;
+	// the other eleven stay unimplemented. A route op absent from the registry
+	// is a wiring fault and fails closed.
 	h, ok := d.registry[op]
 	if !ok {
 		writeConnectError(w, mapDeny(denyUnimplemented), "operation not registered")
 		return
 	}
-	h(w, r)
+
+	// mandateDeny lets the handler emit a SECOND deny audit event (the
+	// operational refusal, carrying the broker-resolved truth as the audit
+	// reason) BEFORE the wire deny. The wire reason MAY degrade away from the
+	// truth (D8). The Mandate ordering stays owned by the spine — the handler
+	// only supplies the per-op deny event content.
+	mandateDeny := func(auditReason, wireClass, message string) {
+		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
+		_ = d.guard.Mandate(r.Context(), denyEvent)
+		writeConnectError(w, mapDenyDegraded(auditReason, wireClass), message)
+	}
+
+	h(d.handlerDeps(), handlerCtx{
+		w:           w,
+		op:          op,
+		body:        bodyBytes,
+		ps:          ps,
+		grant:       grant,
+		mandateDeny: mandateDeny,
+	})
 }
 
-// auditEvent builds the broker-resolved-truth audit event for an operation.
-// The concrete event encoding is the audit gate's (frozen on its branch); the
-// spine passes an opaque value through the Guard.Mandate seam exactly as the
-// real gate consumes it.
-func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest) auditEvent {
-	return auditEvent{
-		Op:         op,
-		Scope:      ps.FilesystemID,
-		Path:       req.Path,
-		Intent:     req.Intent,
-		PeerUID:    ps.UID,
-		PeerPID:    ps.PID,
-		AccessTime: nil,
+// activityForOp returns the OCSF ActivityID for an op (Q7): a listing is a
+// Read, make/move/copy is a Create (no rename id), remove is a Delete. A
+// non-namespace op defaults to Read — those ops stay unimplemented and never
+// reach the audit builder in this build.
+func activityForOp(op Op) int {
+	switch op {
+	case OpMakeDirectory, OpMoveDirectory, OpCopyFile, OpMoveFile:
+		return activityCreate
+	case OpRemoveDirectory, OpRemoveFile:
+		return activityDelete
+	default: // OpListDirectory and the rest
+		return activityRead
 	}
+}
+
+// objectHandleForOp derives the audited object handle for an op. For
+// move/copy the handle is the DESTINATION (the produced object); for the
+// others it is the envelope path. The destination is read from the buffered
+// body so the audit record names the produced handle even though the spine
+// envelope carries no destination field.
+func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) string {
+	path := req.Path
+	switch op {
+	case OpMoveDirectory:
+		var b moveDirectoryRequest
+		if json.Unmarshal(body, &b) == nil {
+			path = b.Destination
+		}
+	case OpCopyFile:
+		var b copyFileRequest
+		if json.Unmarshal(body, &b) == nil {
+			path = b.Destination
+		}
+	case OpMoveFile:
+		var b moveFileRequest
+		if json.Unmarshal(body, &b) == nil {
+			path = b.Destination
+		}
+	}
+	return scope + ":" + path
+}
+
+// auditEvent builds the per-op broker-resolved-truth ALLOW event. The concrete
+// durable encoding is the audit gate's (frozen on its branch); the spine
+// passes an opaque value through Guard.Mandate exactly as the real gate
+// consumes it. The op-aware fields (ActivityID, ObjectHandle, Intent,
+// Downloadable) are populated per Q7; the committed envelope fields keep their
+// meaning.
+func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte) auditEvent {
+	return auditEvent{
+		Op:           op,
+		Scope:        ps.FilesystemID,
+		Path:         req.Path,
+		Intent:       req.Intent,
+		PeerUID:      ps.UID,
+		PeerPID:      ps.PID,
+		AccessTime:   nil,
+		ActivityID:   activityForOp(op),
+		ObjectHandle: objectHandleForOp(op, ps.FilesystemID, req, body),
+		ByteCount:    0,
+		Downloadable: grant.Downloadable,
+	}
+}
+
+// denyAuditEvent builds the per-op DENY event for a handler-stage operational
+// refusal: the same op-aware shape as the allow event, carrying the
+// broker-resolved truth as the DenyReason. It is emitted through the spine's
+// guard (via the mandateDeny hook) BEFORE the wire deny so the durable record
+// captures that the op did not take effect (T-09-04 / NFR-SEC-79).
+func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte, auditReason string) auditEvent {
+	e := d.auditEvent(op, ps, req, grant, body)
+	e.DenyReason = auditReason
+	return e
+}
+
+// handlerDeps returns the per-op handler dependencies (engine seam + uuid
+// store). The dispatcher carries them so the wiring phase binds the real
+// engine and a session-scoped store.
+func (d *dispatcher) handlerDeps() *handlerDeps {
+	return &handlerDeps{engine: d.engine, ids: d.ids}
 }
 
 // auditEvent is the spine's broker-resolved-truth record passed to the audit
 // gate. It is intentionally opaque to the gate (Mandate takes any); the gate's
-// own encoding shapes the durable record in the composition phase.
+// own encoding shapes the durable record in the composition phase. The
+// op-aware fields (ActivityID/ObjectHandle/ByteCount/Downloadable) and the
+// handler-stage DenyReason extend the committed envelope shape in place so the
+// package keeps ONE audit struct (the wiring phase maps it onto the real
+// auditgate.FileActivityEvent).
 type auditEvent struct {
 	Op         Op
 	Scope      string
@@ -210,6 +361,14 @@ type auditEvent struct {
 	PeerUID    uint32
 	PeerPID    int32
 	AccessTime *int64
+
+	ActivityID   int
+	ObjectHandle string
+	ByteCount    int64
+	Downloadable bool
+	// DenyReason is set only on a handler-stage deny event; empty on an
+	// allow event.
+	DenyReason string
 }
 
 // withStatus returns a copy of the verdict with an overridden HTTP status,

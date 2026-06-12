@@ -29,6 +29,14 @@ const (
 	denyAborted       = "aborted"
 	denyUnimplemented = "unimplemented"
 	denyInternal      = "internal"
+
+	// denyDirNotEmpty is the audited TRUTH for a non-recursive removeDirectory
+	// on a non-empty directory (phase 9, W1). It is a distinct audit-reason
+	// token — NOT denyMalformed/"malformed_envelope" — so the durable record
+	// names the real operational refusal; its WIRE class is
+	// invalid_argument/400 with no x-deny-reason header (a request fault, not
+	// an authorization verdict).
+	denyDirNotEmpty = "directory_not_empty"
 )
 
 // Connect wire codes (closed set).
@@ -85,6 +93,7 @@ var denyTable = map[string]denyRow{
 	denyLeaseExpired:    {wireCodeUnauthenticated, true},
 	denySizeExceeded:    {wireCodeInvalidArgument, false},
 	denyMalformed:       {wireCodeInvalidArgument, false},
+	denyDirNotEmpty:     {wireCodeInvalidArgument, false},
 	denyNotFound:        {wireCodeNotFound, false},
 	denyThrottle:        {wireCodeResourceExhausted, false},
 	denyAuditDown:       {wireCodeUnavailable, false},
