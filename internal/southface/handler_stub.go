@@ -42,9 +42,14 @@ func unimplemented(_ *handlerDeps, hc handlerCtx) {
 // newHandlerRegistry returns a registry mapping every frozen southface.Op —
 // all 16 unary ops and the two streaming ops (fileUpload, fileDownload) — to
 // the unimplemented handler. Building from the closed op set guarantees full
-// coverage; newDispatcher then replaces exactly the seven phase-9 ops with
-// their real handlers. A registry that omitted an op would route it to a nil
-// handler.
+// coverage; newDispatcherWithEngine then replaces the phase-9 ops and readFile
+// (OPS-04, a unary op) with their real handlers. A registry that omitted an op
+// would route it to a nil handler.
+//
+// fileUpload (OPS-05) is dispatched OUT-OF-BAND: the ServeHTTP streaming
+// branch routes it to serveStreaming before the registry is consulted, so its
+// registry entry stays unimplemented and is never reached on the streaming
+// path. fileDownload/getFileMetadata/listFiles stay unimplemented (deferred).
 func newHandlerRegistry() map[Op]opHandler {
 	reg := make(map[Op]opHandler, len(knownOps))
 	for op := range knownOps {

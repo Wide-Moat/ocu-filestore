@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -378,4 +379,64 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 		return
 	}
 	writeAck(hc.w)
+}
+
+// handleReadFile implements OPS-04 readFile: a UNARY op on the existing
+// dispatch pipeline. It strict-decodes {filesystem_id, path, range}, enforces
+// downloadable AT READ from the broker-resolved grant FIRST (A2/SEC-73),
+// validates the half-open window through engine.ReadRange (the bytes are
+// discarded — readFile emits NO content; D6 TBD content body stays TBD), and
+// emits the metadata-only {file: File} body.
+func handleReadFile(d *handlerDeps, hc handlerCtx) {
+	var req readFileRequest
+	if !decodeOp(hc, &req) {
+		return
+	}
+
+	// DOWNLOADABLE@READ, FIRST (SEC-73 wire half, A2). The spine's STAGE-2
+	// Resolve(intent=read) already produced the authoritative grant; a
+	// non-downloadable read denies BEFORE any engine touch, regardless of the
+	// wire authorization_metadata.downloadable flag or any write-time stored
+	// tag. The handler reads ONLY hc.grant.Downloadable — never the wire flag.
+	if !hc.grant.Downloadable {
+		hc.mandateDeny(denyNotDownloadable, denyNotDownloadable, "object not downloadable")
+		return
+	}
+
+	// The committed handlerCtx carries no ctx field; the namespace handlers
+	// use context.Background() (handlers.go convention) for engine calls. The
+	// wiring phase threads the request context here.
+	ctx := context.Background()
+	scope := hc.ps.FilesystemID
+	rel := enginePath(req.Path)
+
+	// Validate the half-open window. An absent range is a full read
+	// (offset 0, length 0 -> engine reads to EOF). The bytes are written into
+	// a buffer that is DISCARDED — the call confirms the object exists and the
+	// window is readable; readFile emits metadata only.
+	var offset, length int64
+	if req.Range != nil {
+		offset, length = req.Range.Offset, req.Range.Length
+	}
+	var discard bytes.Buffer
+	if err := d.engine.ReadRange(ctx, scope, rel, offset, length, &discard); err != nil {
+		denyEngine(hc, err)
+		return
+	}
+
+	// Stat for the metadata-only response. The object existed (ReadRange
+	// succeeded); a Stat error here is an internal fault.
+	info, err := d.engine.Stat(ctx, scope, rel)
+	if err != nil {
+		denyEngine(hc, err)
+		return
+	}
+	gp := guestPath(rel)
+	writeJSON(hc.w, readFileResponse{File: file{
+		Path:  gp,
+		Size:  info.Size,
+		MTime: mtimeString(info.ModTime),
+		MIME:  mimeForPath(rel),
+		UUID:  d.ids.idFor(scope, gp),
+	}})
 }

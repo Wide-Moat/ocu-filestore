@@ -113,6 +113,46 @@ type directory struct {
 	MTime string `json:"mtime"`
 }
 
+// fileRange is the half-open [offset, offset+length) read window on a readFile
+// request. An absent range (a nil *fileRange on the request) is a full read;
+// a range past EOF short-reads to EOF without error (engine ReadRange
+// contract).
+type fileRange struct {
+	Offset int64 `json:"offset"`
+	Length int64 `json:"length"`
+}
+
+// readFileRequest is the pinned readFile (OPS-04) body: {filesystem_id, path,
+// range{offset,length}} plus the D3 authorization_metadata. Range is a pointer
+// so an absent range decodes as nil (full read). The authorization_metadata
+// downloadable flag is NEVER trusted at read — the broker re-derives
+// downloadable from its own resolved grant (A2/SEC-73).
+type readFileRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	Path                  string                `json:"path"`
+	Range                 *fileRange            `json:"range"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+}
+
+// file is the readFile metadata-only response shape: the guest-read field
+// names (path/size/mtime/mime/uuid). It carries NO content/data/bytes field —
+// readFile emits metadata only; bulk bytes are the deferred fileDownload
+// server-stream's job (D6 TBD content body stays TBD). Its shape matches
+// filesystemFile so both faces read the same field names.
+type file struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"size"`
+	MTime string `json:"mtime"`
+	MIME  string `json:"mime"`
+	UUID  string `json:"uuid"`
+}
+
+// readFileResponse wraps the metadata-only file body: {file: File}. No content
+// field exists on this op (D6).
+type readFileResponse struct {
+	File file `json:"file"`
+}
+
 // uploadParamsFrame is the FIRST (and exactly one) frame of a fileUpload
 // stream (OPS-05, D5). It is strict-decoded (DisallowUnknownFields): every
 // field the guest may legitimately send is declared so a guest that carries

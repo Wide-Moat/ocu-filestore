@@ -140,3 +140,52 @@ func TestGoldenListDirectory(t *testing.T) {
 		t.Fatalf("golden file missing guest-read mtime/mime: %+v", gotFile)
 	}
 }
+
+// TestGoldenReadFileMetadata pins the readFile (OPS-04) metadata-only response
+// against the GOLDEN-FIXTURES triplet (fs-golden-01 / golden.bin, 42 bytes):
+// the body is parsed-equal to {"file":{...}} carrying the guest-read field
+// names with NO content body (D6). The grant is downloadable.
+func TestGoldenReadFileMetadata(t *testing.T) {
+	eng := newFakeEngine()
+	eng.putBytes(goldenScope, "golden.bin", make([]byte, 42))
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+
+	body := `{"filesystem_id":"fs-golden-01","path":"/golden.bin","range":{"offset":0,"length":42},"authorization_metadata":{"intent":"read","downloadable":false}}`
+	w := serveOp(d, OpReadFile, body, goldenScope, okIntents())
+	resp := decodeReadFile(t, w)
+
+	// The metadata-only contract: full object size, guest-convention path, a
+	// minted 32-char uuid handle, and the guest-read mtime/mime present.
+	if resp.File.Path != "/golden.bin" {
+		t.Fatalf("golden readFile path = %q, want /golden.bin", resp.File.Path)
+	}
+	if resp.File.Size != 42 {
+		t.Fatalf("golden readFile size = %d, want 42", resp.File.Size)
+	}
+	if len(resp.File.UUID) != 32 {
+		t.Fatalf("golden readFile uuid = %q, want a 32-char minted handle", resp.File.UUID)
+	}
+	if resp.File.MTime == "" || resp.File.MIME == "" {
+		t.Fatalf("golden readFile missing guest-read mtime/mime: %+v", resp.File)
+	}
+
+	// Parsed-equal structure: the top object has exactly the "file" key, and
+	// the file object has exactly the five metadata keys (no content body).
+	top := parseJSON(t, w.Body.Bytes()).(map[string]any)
+	if len(top) != 1 {
+		t.Fatalf("readFile body has %d top-level keys, want 1 (file): %s", len(top), w.Body.String())
+	}
+	fileObj, ok := top["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("readFile body file is not an object: %s", w.Body.String())
+	}
+	wantKeys := map[string]bool{"path": true, "size": true, "mtime": true, "mime": true, "uuid": true}
+	if len(fileObj) != len(wantKeys) {
+		t.Fatalf("file object has %d keys, want %d (metadata-only): %s", len(fileObj), len(wantKeys), w.Body.String())
+	}
+	for k := range fileObj {
+		if !wantKeys[k] {
+			t.Fatalf("file object carries unexpected key %q (D6 metadata-only): %s", k, w.Body.String())
+		}
+	}
+}

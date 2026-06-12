@@ -62,6 +62,21 @@ type dispatcher struct {
 	// (NFR-SEC-78), applied pre-buffer on the Content-Length and as the
 	// MaxBytesReader backstop.
 	sizeCeiling int64
+	// maxFileSize is the WHOLE-OBJECT upload ceiling (NFR-SEC-46): the
+	// fileUpload pre-buffer reject compares declared_size_bytes against it
+	// BEFORE reading any chunk. It is DISTINCT from sizeCeiling, which is the
+	// per-RPC-message body ceiling (~4 MiB — the size of a single envelope or
+	// frame). A whole object legitimately exceeds the per-message ceiling
+	// while being streamed in many sub-ceiling frames, so the two ceilings
+	// cannot be the same value.
+	//
+	// PHASE-11 PLACEHOLDER (W1): the real ceiling is the control-plane's
+	// BrokerMaxFileSizeBytes, bound in the wiring phase. Until then this is
+	// defaulted to sizeCeiling in newDispatcherWithEngine, so an unwired
+	// deployment caps uploads at the per-message ceiling — conservative and
+	// fail-closed, but not the real whole-object limit. Tests set a small
+	// value directly (the package is in-package).
+	maxFileSize int64
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -88,6 +103,11 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		reg[OpCopyFile] = handleCopyFile
 		reg[OpMoveFile] = handleMoveFile
 		reg[OpRemoveFile] = handleRemoveFile
+		// readFile (OPS-04) rides the unary dispatch unchanged. fileUpload
+		// (OPS-05) is dispatched OUT-OF-BAND via serveStreaming and never read
+		// from this registry, so its entry stays unimplemented (see
+		// handler_stub.go).
+		reg[OpReadFile] = handleReadFile
 	}
 	return &dispatcher{
 		resolver:    resolver,
@@ -97,6 +117,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		engine:      engine,
 		ids:         newObjectIDStore(),
 		sizeCeiling: sizeCeiling,
+		// PHASE-11 PLACEHOLDER (W1): default the whole-object upload ceiling
+		// to the per-message ceiling until the real BrokerMaxFileSizeBytes is
+		// wired. See the maxFileSize field doc.
+		maxFileSize: sizeCeiling,
 	}
 }
 
@@ -125,6 +149,18 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "unknown route")
+		return
+	}
+
+	// STREAMING BRANCH (per-op flag, NOT content-type sniffing): a streaming
+	// op (fileUpload, fileDownload) has its own STAGE-0 gate
+	// (application/connect+json, no Content-Length pre-buffer reject) and
+	// emits a framed HTTP-200 trailer for every verdict. It MUST branch HERE,
+	// before the unary checkContentType (hard-equals application/json) and the
+	// unary Content-Length pre-buffer reject would kill a chunked connect+json
+	// upload (Pitfalls 1, 2). The unary path below is unchanged.
+	if isStreamingOp(op) {
+		d.serveStreaming(w, r, op)
 		return
 	}
 

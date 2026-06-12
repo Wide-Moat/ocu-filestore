@@ -592,3 +592,158 @@ func TestHandlerUnimplementedStillRejects(t *testing.T) {
 		t.Fatalf("createFile status = %d, want 501 (still unimplemented)", w.Code)
 	}
 }
+
+// readBody builds a readFile request body with an explicit range.
+func readBody(scope, path string, offset, length int64, wireDownloadable bool) string {
+	return fmt.Sprintf(
+		`{"filesystem_id":%q,"path":%q,"range":{"offset":%d,"length":%d},"authorization_metadata":{"intent":"read","downloadable":%t}}`,
+		scope, path, offset, length, wireDownloadable)
+}
+
+// readBodyNoRange builds a readFile request body omitting the range (full read).
+func readBodyNoRange(scope, path string, wireDownloadable bool) string {
+	return fmt.Sprintf(
+		`{"filesystem_id":%q,"path":%q,"authorization_metadata":{"intent":"read","downloadable":%t}}`,
+		scope, path, wireDownloadable)
+}
+
+// decodeReadFile parses a 200 readFile response into its metadata body.
+func decodeReadFile(t *testing.T, w *httptest.ResponseRecorder) readFileResponse {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("readFile status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	var resp readFileResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("readFile body not JSON: %v (%s)", err, w.Body.String())
+	}
+	return resp
+}
+
+// TestReadFileRangedRead pins OPS-04: a ranged readFile validates the window
+// through engine.ReadRange and emits the metadata-only {file} body with the
+// FULL object size and NO content bytes. The grant is downloadable.
+func TestReadFileRangedRead(t *testing.T) {
+	eng := newFakeEngine()
+	eng.putBytes(opScope, "golden.bin", make([]byte, 42))
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"in_bounds", readBody(opScope, "/golden.bin", 2, 3, false)},
+		{"past_eof_short_read", readBody(opScope, "/golden.bin", 40, 100, false)},
+		{"absent_range_full", readBodyNoRange(opScope, "/golden.bin", false)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := serveOp(d, OpReadFile, c.body, opScope, okIntents())
+			resp := decodeReadFile(t, w)
+			if resp.File.Path != "/golden.bin" {
+				t.Fatalf("file path = %q, want /golden.bin", resp.File.Path)
+			}
+			if resp.File.Size != 42 {
+				t.Fatalf("file size = %d, want full object size 42", resp.File.Size)
+			}
+			if resp.File.MTime == "" || resp.File.MIME == "" || resp.File.UUID == "" {
+				t.Fatalf("metadata missing a guest-read field: %+v", resp.File)
+			}
+		})
+	}
+}
+
+// TestReadFileMetadataOnly pins that the readFile response carries NO
+// content/data/bytes key (D6 TBD content body stays TBD).
+func TestReadFileMetadataOnly(t *testing.T) {
+	eng := newFakeEngine()
+	eng.putBytes(opScope, "golden.bin", []byte("ABCDEFGH"))
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+	w := serveOp(d, OpReadFile, readBody(opScope, "/golden.bin", 0, 4, false), opScope, okIntents())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	// The body is {"file":{...}} with the file object carrying only metadata
+	// keys. Assert no content/data/bytes anywhere.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &top); err != nil {
+		t.Fatalf("body not JSON object: %v", err)
+	}
+	fileRaw, ok := top["file"]
+	if !ok {
+		t.Fatalf("response missing the file body: %s", w.Body.String())
+	}
+	var fileObj map[string]json.RawMessage
+	if err := json.Unmarshal(fileRaw, &fileObj); err != nil {
+		t.Fatalf("file not JSON object: %v", err)
+	}
+	for _, forbidden := range []string{"content", "data", "bytes"} {
+		if _, present := fileObj[forbidden]; present {
+			t.Fatalf("readFile body carries a forbidden %q key (D6): %s", forbidden, w.Body.String())
+		}
+	}
+}
+
+// TestReadFileNotDownloadable pins SEC-73/A2: a non-downloadable read denies
+// permission_denied/403 with x-deny-reason: not_downloadable from the
+// broker-resolved GRANT — regardless of the wire downloadable flag value or
+// any would-be stored tag — and engine.ReadRange is NOT called (the deny
+// precedes the read).
+func TestReadFileNotDownloadable(t *testing.T) {
+	for _, wireFlag := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wire_downloadable_%t", wireFlag), func(t *testing.T) {
+			eng := newFakeEngine()
+			eng.putBytes(opScope, "golden.bin", []byte("ABCDEFGH"))
+			g := &fakeGuard{}
+			// The resolved grant denies downloadable; the wire flag is flipped
+			// to prove the verdict follows the grant, not the flag.
+			d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: false}}, g, okCeilings(), eng)
+			w := serveOp(d, OpReadFile, readBody(opScope, "/golden.bin", 0, 4, wireFlag), opScope, okIntents())
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (not_downloadable); body %s", w.Code, w.Body.String())
+			}
+			if h := w.Header().Get("x-deny-reason"); h != denyNotDownloadable {
+				t.Fatalf("x-deny-reason = %q, want %q", h, denyNotDownloadable)
+			}
+			if ce := decodeErrBody(t, w); ce.Code != wireCodePermissionDenied {
+				t.Fatalf("code = %q, want permission_denied", ce.Code)
+			}
+			if calls := eng.readRangeCalls(); len(calls) != 0 {
+				t.Fatalf("ReadRange was called on a denied read: %v (deny must precede the read)", calls)
+			}
+			// A deny audit event was emitted (the handler-stage deny Mandate).
+			if len(g.events) == 0 {
+				t.Fatalf("no deny audit event emitted on not_downloadable")
+			}
+		})
+	}
+}
+
+// TestReadFileEngineErrors pins the engine-error deny paths: a missing object
+// maps not_found/404, and an escape-shaped path degrades to not_found (the
+// audited truth differs — D8 — but the wire is not_found).
+func TestReadFileEngineErrors(t *testing.T) {
+	t.Run("missing_object", func(t *testing.T) {
+		eng := newFakeEngine()
+		d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+		w := serveOp(d, OpReadFile, readBody(opScope, "/missing.bin", 0, 1, false), opScope, okIntents())
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (not found); body %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestReadFileDeferredOpsUnimplemented pins that the deferred uuid-axis read
+// ops stay unimplemented even with an engine wired.
+func TestReadFileDeferredOpsUnimplemented(t *testing.T) {
+	eng := newFakeEngine()
+	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+	for _, op := range []Op{OpGetFileMetadata, OpListFiles} {
+		body := fmt.Sprintf(`{"filesystem_id":%q,"path":"/x","authorization_metadata":{"intent":"read","downloadable":false}}`, opScope)
+		w := serveOp(d, op, body, opScope, okIntents())
+		if w.Code != http.StatusNotImplemented {
+			t.Fatalf("%s status = %d, want 501 (deferred)", op, w.Code)
+		}
+	}
+}

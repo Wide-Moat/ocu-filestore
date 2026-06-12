@@ -42,12 +42,13 @@ func newDirNode(name string) *node {
 }
 
 type fakeEngine struct {
-	mu     sync.Mutex
-	roots  map[string]*node // scope -> root dir node
-	clock  int64            // monotone mtime source
-	muts   []string         // recorded mutation target paths (P1 non-vacuity)
-	listed []string         // recorded List target paths (rmdir-guard witness)
-	rmDirs []string         // recorded RemoveDir target paths (no-delete witness)
+	mu      sync.Mutex
+	roots   map[string]*node // scope -> root dir node
+	clock   int64            // monotone mtime source
+	muts    []string         // recorded mutation target paths (P1 non-vacuity)
+	listed  []string         // recorded List target paths (rmdir-guard witness)
+	rmDirs  []string         // recorded RemoveDir target paths (no-delete witness)
+	rdrange []string         // recorded ReadRange target paths (SEC-73 deny-precedes-read witness)
 }
 
 func newFakeEngine() *fakeEngine {
@@ -333,6 +334,7 @@ func (e *fakeEngine) putBytes(scope, rel string, b []byte) {
 func (e *fakeEngine) ReadRange(_ context.Context, scope, path string, offset, length int64, w io.Writer) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.rdrange = append(e.rdrange, path)
 	n, _, _, _, err := e.walk(scope, path)
 	if err != nil {
 		return err
@@ -443,6 +445,17 @@ func (e *fakeEngine) removeDirCalls() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.rmDirs))
 	copy(out, e.rmDirs)
+	return out
+}
+
+// readRangeCalls returns the ReadRange target paths recorded — the witness
+// that a not_downloadable readFile deny precedes (and never reaches) the
+// engine read (SEC-73/A2).
+func (e *fakeEngine) readRangeCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.rdrange))
+	copy(out, e.rdrange)
 	return out
 }
 

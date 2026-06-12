@@ -251,21 +251,28 @@ func TestPropChannelScope(t *testing.T) {
 	}
 }
 
-// TestRegistryUnimplemented pins that every one of the 18 frozen ops — the 16
-// unary ops and the two streaming ops — is registered and returns Connect
-// unimplemented/501 with no x-deny-reason in this build.
+// TestRegistryUnimplemented pins that every UNARY op that is not implemented
+// in this build is registered and returns Connect unimplemented/501 with no
+// x-deny-reason. readFile (OPS-04) is implemented over an engine, so against
+// this nil-engine test dispatcher its registry entry stays unimplemented and
+// it is included here (the engine-backed readFile success/deny paths are
+// pinned in handlers_test.go). The two STREAMING ops (fileUpload, fileDownload)
+// no longer ride the unary registry — ServeHTTP routes them to serveStreaming
+// before the unary content-type/registry gate (phase 10), so they are
+// validated on the streaming path (fileDownload's unimplemented trailer and
+// the fileUpload routing are pinned in stream_handler_test.go), not here.
 func TestRegistryUnimplemented(t *testing.T) {
-	allOps := []Op{
+	unaryUnimplemented := []Op{
 		OpListDirectory, OpMakeDirectory, OpMoveDirectory, OpRemoveDirectory,
 		OpCreateFile, OpReadFile, OpReadMetadata, OpGetFileMetadata,
 		OpListFiles, OpCopyFile, OpMoveFile, OpRemoveFile,
-		OpFileUpload, OpFileDownload, OpImportFiles, OpImportZip,
+		OpImportFiles, OpImportZip,
 		OpMigrateFilesystem, OpRemoveFilesystem,
 	}
-	if len(allOps) != 18 {
-		t.Fatalf("op list has %d entries, want 18", len(allOps))
+	if len(unaryUnimplemented) != 16 {
+		t.Fatalf("unary op list has %d entries, want 16", len(unaryUnimplemented))
 	}
-	for _, op := range allOps {
+	for _, op := range unaryUnimplemented {
 		t.Run(string(op), func(t *testing.T) {
 			d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
 			w := httptest.NewRecorder()
