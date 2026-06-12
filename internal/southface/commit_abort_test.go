@@ -12,8 +12,8 @@ import (
 // It sends params + all declared bytes in chunk frames + a MALFORMED/unknown-
 // flag frame instead of the 0x02 end-stream, then asserts two invariants:
 //
-//  (a) the trailer carries the abort verdict (not success),
-//  (b) the object is NOT visible afterward (engine.ReadRange/Stat → not_found).
+//	(a) the trailer carries the abort verdict (not success),
+//	(b) the object is NOT visible afterward (engine.ReadRange/Stat → not_found).
 //
 // This covers the case the guest reported: a stream that delivers all declared
 // bytes and then a malformed terminal frame must be treated as aborted — no

@@ -197,3 +197,27 @@ type uploadChunkFrame struct {
 	// marshal byte-identical to the golden {"chunk":"..."} frame.
 	NumChunks int64 `json:"numChunks,omitempty"`
 }
+
+// fileDownloadRequest is the FIRST (and exactly one) frame of a fileDownload
+// stream (OPS-06). It is strict-decoded (DisallowUnknownFields). The uuid
+// is the broker-held object handle minted by the listing/readFile emitter
+// (objectIDStore); the broker resolves uuid→(scope,path) internally — a
+// cross-scope uuid presentation degrades to not_found on the wire (D8,
+// anti-enumeration). filesystem_id is an untrusted hint cross-checked
+// against the channel scope. The authorization_metadata.downloadable flag
+// is NEVER trusted at read — the broker re-derives downloadable from its
+// own resolved grant at read time (NFR-SEC-73). Range is a pointer so an
+// absent range decodes as nil (full read from offset 0 to EOF).
+type fileDownloadRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	UUID                  string                `json:"uuid"`
+	Range                 *fileRange            `json:"range"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+}
+
+// downloadDataFrame is a fileDownload outbound data frame carrying one
+// content chunk. Go marshals []byte as standard base64, matching the
+// guest framer's expected {"data":"<base64>"} encoding byte-for-byte.
+type downloadDataFrame struct {
+	Data []byte `json:"data"`
+}

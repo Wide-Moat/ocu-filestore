@@ -14,6 +14,13 @@ import (
 	"time"
 )
 
+// downloadChunkSize is the maximum number of raw bytes written into a single
+// outbound data frame during a fileDownload stream. Large enough for
+// throughput (256 KiB avoids frame-count overhead for multi-MiB objects),
+// small enough to stay well under the per-frame transport ceiling and to
+// keep outbound memory bounded regardless of object size.
+const downloadChunkSize = 256 * 1024
+
 // errSizeExceeded is the consumer-side mirror of ceilings.ErrSizeExceeded for
 // the local whole-object pre-buffer check. checkDeclaredSize returns it; the
 // handler maps it to the policy size deny (invalid_argument/size_exceeded),
@@ -40,9 +47,8 @@ func checkDeclaredSize(declared, ceiling int64) error {
 
 // isStreamingOp reports whether an op is dispatched on the client/server
 // streaming path rather than the unary pipeline. The flag is per-op (NOT a
-// content-type sniff): fileUpload is the client-stream this phase implements;
-// fileDownload is listed so the routing is correct, though it stays
-// unimplemented (deferred).
+// content-type sniff): fileUpload is the client-stream inbound; fileDownload
+// is the server-stream outbound.
 func isStreamingOp(op Op) bool {
 	return op == OpFileUpload || op == OpFileDownload
 }
@@ -113,7 +119,15 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 			ps:   ps,
 			sess: sess,
 		})
-	default: // OpFileDownload — deferred
+	case OpFileDownload:
+		d.handleFileDownload(streamCtx{
+			w:    w,
+			body: r.Body,
+			ctx:  r.Context(),
+			ps:   ps,
+			sess: sess,
+		})
+	default:
 		_ = writeEndStream(w, &connectError{Code: wireCodeUnimplemented, Message: "operation not implemented in this build"})
 	}
 }
@@ -376,6 +390,219 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		v := mapDeny(denyClassForEngineErr(werr))
 		denyTrailer(auditTruthForEngineErr(werr), v.WireCode, "upload refused")
 		return
+	}
+
+	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.
+	_ = writeEndStream(sc.w, nil)
+}
+
+// streamDownloadAuditEvent builds a fileDownload audit event from the resolved
+// params + grant. ActivityID is a Read; Downloadable carries the resolved
+// grant; ByteCount is zero (byte count is unknown ahead of the range read;
+// the audit records the intent, not the transferred size). ObjectHandle is
+// the scope:path derived from the objectIDStore resolution.
+func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, grant Grant) auditEvent {
+	return auditEvent{
+		Op:           OpFileDownload,
+		Scope:        ps.FilesystemID,
+		Path:         req.Path,
+		Intent:       req.Intent,
+		PeerUID:      ps.UID,
+		PeerPID:      ps.PID,
+		ActivityID:   activityRead,
+		ObjectHandle: ps.FilesystemID + ":" + req.Path,
+		ByteCount:    0,
+		Downloadable: grant.Downloadable,
+	}
+}
+
+// handleFileDownload streams the object bytes as a server-stream (OPS-06).
+// The contract (every clause is load-bearing):
+//
+//   - Read exactly one params frame (ONE 0x00 data frame); strict-decode it.
+//     A read error or a leading end-stream frame is a HARD ABORT (WIRE-LESSONS #1).
+//   - Cross-check decoded filesystem_id against the CHANNEL scope; everything
+//     keys on the channel scope (Anti-pattern).
+//   - Resolve uuid→(scope,path) from the session-scoped objectIDStore; a uuid
+//     unknown to this session is not_found. A cross-scope uuid (stored scope ≠
+//     channel scope) audits as scope_mismatch but degrades to not_found on the
+//     wire (anti-enumeration, D8).
+//   - Resolve(intent=read) from the channel scope; map resolver errors.
+//   - DOWNLOADABLE@READ from the broker-resolved grant (NFR-SEC-73): the wire
+//     flag is NEVER trusted; a non-downloadable grant denies.
+//   - Mandate the ALLOW event BEFORE the first data frame (audit-before-ack,
+//     SEC-79); an audit-write failure denies before any byte is sent.
+//   - Stream bytes via engine.ReadRange(offset, length) in downloadChunkSize
+//     chunks, each framed as a 0x00 data frame {"data":"<base64>"}. A nil Range
+//     is a full read (offset 0, length 0 → ReadRange reads to EOF).
+//   - Finish with a 0x02 end-stream success trailer. A mid-stream engine error
+//     terminates with a 0x02 error trailer; the stream is ALWAYS HTTP 200.
+func (d *dispatcher) handleFileDownload(sc streamCtx) {
+	var (
+		req   ResolveRequest
+		grant Grant
+	)
+
+	// denyDownloadTrailer emits the deny audit Mandate (broker-resolved truth)
+	// then writes the deny trailer. If the Mandate itself fails, the verdict
+	// degrades to unavailable — an unrecorded truth never surfaces on the wire
+	// (NFR-SEC-79, invariant 8, mirrors denyTrailer in handleFileUpload).
+	denyDownloadTrailer := func(auditReason, wireCode, message string) {
+		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, auditReason)
+		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
+			return
+		}
+		_ = writeEndStream(sc.w, &connectError{Code: wireCode, Message: message})
+	}
+
+	// Per-frame read deadline on the single inbound frame (the params frame).
+	rc := http.NewResponseController(sc.w)
+	_ = rc.SetReadDeadline(time.Now().Add(d.frameReadTimeout))
+
+	// --- params frame (exactly one) ---
+	flag, payload, err := readFrame(sc.body)
+	if err != nil {
+		if errors.Is(err, errFrameTooLarge) {
+			denyDownloadTrailer(denyThrottle, wireCodeResourceExhausted, "params frame exceeds transport ceiling")
+			return
+		}
+		denyDownloadTrailer(denyMalformed, wireCodeInvalidArgument, "malformed params frame")
+		return
+	}
+	if flag != dataFlag {
+		denyDownloadTrailer(denyMalformed, wireCodeInvalidArgument, "malformed params frame")
+		return
+	}
+
+	var params fileDownloadRequest
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&params); err != nil {
+		denyDownloadTrailer(denyMalformed, wireCodeInvalidArgument, "malformed params frame")
+		return
+	}
+	var extra json.RawMessage
+	if dec.Decode(&extra) == nil {
+		denyDownloadTrailer(denyMalformed, wireCodeInvalidArgument, "malformed params frame")
+		return
+	}
+
+	// --- channel-scope cross-check (key on the channel, never the body) ---
+	if params.FilesystemID != sc.ps.FilesystemID {
+		denyDownloadTrailer(denyScopeMismatch, wireCodePermissionDenied, "request scope does not match the session channel")
+		return
+	}
+
+	// --- uuid → (scope, path) resolution via the session-scoped objectIDStore ---
+	// The uuid was minted by this broker session's listing or readFile emitter.
+	// An unknown uuid is not_found. A cross-scope uuid (the stored scope differs
+	// from the channel scope) audits as scope_mismatch but degrades to not_found
+	// on the wire so a valid uuid from another session cannot be used to enumerate
+	// scope membership (D8, anti-enumeration).
+	rec, ok := d.ids.lookup(params.UUID)
+	if !ok {
+		denyDownloadTrailer(denyNotFound, wireCodeNotFound, "object not found")
+		return
+	}
+	if rec.scope != sc.ps.FilesystemID {
+		// Cross-scope: audit scope_mismatch truth, wire not_found (D8).
+		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, denyScopeMismatch)
+		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
+			return
+		}
+		_ = writeEndStream(sc.w, &connectError{Code: wireCodeNotFound, Message: "object not found"})
+		return
+	}
+	// Populate req from the resolved (scope, path) for the remainder of the
+	// audit and resolver calls.
+	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: rec.path, Intent: IntentRead}
+
+	// --- authz Resolve(intent=read) from the channel scope ---
+	evidence := CallerEvidence{Scope: sc.ps.FilesystemID, GrantedIntents: sc.ps.GrantedIntents}
+	grant, err = d.resolver.Resolve(sc.ctx, evidence, req)
+	if err != nil {
+		wireClass := denyClassForErr(err)
+		v := mapDeny(wireClass)
+		denyDownloadTrailer(wireClass, v.WireCode, "authorization denied")
+		return
+	}
+
+	// --- DOWNLOADABLE@READ, broker-side (NFR-SEC-73, A2) ---
+	// The grant is the broker-resolved truth; the wire flag is never consulted.
+	if !grant.Downloadable {
+		denyDownloadTrailer(denyNotDownloadable, wireCodePermissionDenied, "object not downloadable")
+		return
+	}
+
+	// --- audit ALLOW before any data frame (audit-before-ack, SEC-79) ---
+	allow := d.streamDownloadAuditEvent(sc.ps, req, grant)
+	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
+		// The allow Mandate failed (audit down). Deny before any byte is sent;
+		// do NOT re-Mandate a deny (the gate is unavailable).
+		_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
+		return
+	}
+
+	// --- stream bytes: ReadRange → framed data frames ---
+	// Derive the read window from the request's optional Range field.
+	// A nil Range is a full read (offset 0, length 0 → ReadRange reads to EOF).
+	var offset, length int64
+	if params.Range != nil {
+		offset = params.Range.Offset
+		length = params.Range.Length
+	}
+
+	rel := enginePath(req.Path)
+	pr, pw := io.Pipe()
+	readErrCh := make(chan error, 1)
+	go func() {
+		err := d.engine.ReadRange(sc.ctx, sc.ps.FilesystemID, rel, offset, length, pw)
+		pw.CloseWithError(err)
+		readErrCh <- err
+	}()
+
+	buf := make([]byte, downloadChunkSize)
+	for {
+		n, rerr := io.ReadFull(pr, buf)
+		if n > 0 {
+			frame, merr := json.Marshal(downloadDataFrame{Data: buf[:n]})
+			if merr != nil {
+				// JSON marshal of a []byte is infallible in practice (base64).
+				// Treat as internal; drain the reader and terminate with error.
+				pr.CloseWithError(merr)
+				<-readErrCh
+				_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "frame encode failed"})
+				return
+			}
+			if werr := writeFrame(sc.w, dataFlag, frame); werr != nil {
+				// Client disconnected; drain and return without a trailer
+				// (connection is gone; writing a trailer would also fail).
+				pr.CloseWithError(werr)
+				<-readErrCh
+				return
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+				// EOF after a partial read (ReadFull returns ErrUnexpectedEOF
+				// at the natural end of a non-multiple-of-chunk-size object).
+				// Drain the engine goroutine, then write the success trailer.
+				if engErr := <-readErrCh; engErr != nil {
+					_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "read error"})
+					return
+				}
+				break
+			}
+			// A read error from the pipe means the engine goroutine faulted.
+			engErr := <-readErrCh
+			if engErr == nil {
+				engErr = rerr
+			}
+			_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "read error"})
+			return
+		}
 	}
 
 	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.

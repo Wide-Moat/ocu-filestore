@@ -289,12 +289,18 @@ func TestFileUploadRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("fileDownload_streams_unimplemented", func(t *testing.T) {
+	t.Run("fileDownload_routes_to_streaming_handler", func(t *testing.T) {
+		// fileDownload is now a real server-stream; confirm it routes to the
+		// streaming branch (HTTP 200 + framed trailer) rather than a unary reject.
+		// A nil body with no params frame is malformed, but the trailer must be
+		// a framed error (not a unary 400/500), proving the streaming branch ran.
 		eng := newFakeEngine()
 		sess := &recordingCeilingsSession{}
 		d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
 		w := serveStream(d, OpFileDownload, bytes.NewReader(nil), streamScope, okIntents())
-		assertErrorTrailer(t, w, wireCodeUnimplemented)
+		// A nil body means no params frame: the streaming handler returns a
+		// framed error trailer (invalid_argument — malformed params frame).
+		assertErrorTrailer(t, w, wireCodeInvalidArgument)
 	})
 }
 
