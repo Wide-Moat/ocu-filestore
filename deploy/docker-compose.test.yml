@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# TEST RIG ONLY — a real MinIO backend for the S3 engine's conformance and
+# live test legs (no mocks: every S3 assertion in this repo runs against
+# this rig or real AWS). This file is distinct from the future one-click
+# solo deployment compose; nothing here is a production posture. The
+# credentials below are throwaway test-rig values, never secrets.
+#
+# Local invocation (two steps: bucket-init is a one-shot that exits 0, which
+# `up -d --wait` would misread as a failed service):
+#
+#   docker compose -f deploy/docker-compose.test.yml up -d --wait minio
+#   docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
+#   OCU_S3_TEST_ENDPOINT=http://127.0.0.1:9000 \
+#   OCU_S3_TEST_BUCKET=ocu-conformance \
+#   OCU_S3_TEST_VERSIONED_BUCKET=ocu-conformance-versioned \
+#   OCU_S3_TEST_ACCESS_KEY=ocu-test-root \
+#   OCU_S3_TEST_SECRET_KEY=ocu-test-secret-key \
+#     go test ./internal/objectstore/ -run 'Conformance|S3Live' -count=1
+#   docker compose -f deploy/docker-compose.test.yml down -v
+#
+# Buckets created by the one-shot init service:
+#   ocu-conformance            — unversioned; the main conformance/live leg
+#   ocu-conformance-versioned  — versioning enabled; the SEC-54 version-sweep leg
+
+services:
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    environment:
+      # Test-rig root credentials (throwaway values, not secrets).
+      MINIO_ROOT_USER: ocu-test-root
+      MINIO_ROOT_PASSWORD: ocu-test-secret-key
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  bucket-init:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set rig http://minio:9000 ocu-test-root ocu-test-secret-key
+        mc mb --ignore-existing rig/ocu-conformance
+        mc mb --ignore-existing rig/ocu-conformance-versioned
+        mc version enable rig/ocu-conformance-versioned
+        mc ls rig
