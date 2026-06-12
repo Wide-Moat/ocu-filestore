@@ -53,6 +53,23 @@ func (e *localVolumeEngine) scopePath(id ScopeID) string {
 	return filepath.Join(e.baseDir, string(id))
 }
 
+// ctxReader makes a byte stream cancellation-aware: every Read consults
+// ctx.Err() first, so a long copy loop aborts within one chunk of a
+// cancellation instead of running to stream EOF. The surfaced error IS
+// ctx.Err() (errors.Is-matchable through the verb's wrap), per the Engine
+// context contract.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 // toFileInfo maps an os.FileInfo to the engine's minimal internal struct.
 func toFileInfo(fi os.FileInfo) FileInfo {
 	return FileInfo{
@@ -336,7 +353,7 @@ func (e *localVolumeEngine) RemoveFile(_ context.Context, scope ScopeID, path st
 // destination refuses with ErrAlreadyExists — enforced ATOMICALLY at the
 // link commit (no stat-then-rename TOCTOU); the early Stat is a fast-path
 // reject only, sparing the byte copy.
-func (e *localVolumeEngine) CopyFile(_ context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+func (e *localVolumeEngine) CopyFile(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -361,14 +378,14 @@ func (e *localVolumeEngine) CopyFile(_ context.Context, scope ScopeID, src, dst 
 	}
 	defer srcF.Close()
 
-	return writeTempAndCommit(sr, cleanDst, srcF, overwrite)
+	return writeTempAndCommit(sr, cleanDst, ctxReader{ctx: ctx, r: srcF}, overwrite)
 }
 
 // ReadRange streams the half-open byte range [offset, offset+length) of the
 // named file into w. A range extending past EOF short-reads to EOF without
 // error (io.LimitReader absorbs the EOF); an offset at or past EOF yields
 // zero bytes without error. No whole-object buffering.
-func (e *localVolumeEngine) ReadRange(_ context.Context, scope ScopeID, path string, offset, length int64, w io.Writer) error {
+func (e *localVolumeEngine) ReadRange(ctx context.Context, scope ScopeID, path string, offset, length int64, w io.Writer) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -386,7 +403,7 @@ func (e *localVolumeEngine) ReadRange(_ context.Context, scope ScopeID, path str
 			return fmt.Errorf("objectstore: seek: %w", err)
 		}
 	}
-	if _, err := io.Copy(w, io.LimitReader(f, length)); err != nil {
+	if _, err := io.Copy(w, ctxReader{ctx: ctx, r: io.LimitReader(f, length)}); err != nil {
 		return fmt.Errorf("objectstore: read range: %w", err)
 	}
 	return nil
@@ -401,7 +418,7 @@ func (e *localVolumeEngine) ReadRange(_ context.Context, scope ScopeID, path str
 // stat-then-rename TOCTOU: of two concurrent overwrite=false writers
 // exactly one wins); the early Stat is a fast-path reject only, sparing the
 // stream consumption.
-func (e *localVolumeEngine) WriteStream(_ context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
+func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -421,7 +438,7 @@ func (e *localVolumeEngine) WriteStream(_ context.Context, scope ScopeID, path s
 		}
 	}
 
-	return writeTempAndCommit(sr, cleanPath, r, overwrite)
+	return writeTempAndCommit(sr, cleanPath, ctxReader{ctx: ctx, r: r}, overwrite)
 }
 
 // writeTempAndCommit is the shared atomic-write tail for WriteStream and

@@ -4,12 +4,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/admission"
+	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
@@ -308,5 +311,78 @@ func TestTenancyHyphenToUnderscoreMap(t *testing.T) {
 	// The hyphenated flag value is NOT byte-identical to admission's constant.
 	if string(admission.TenancySingleTenant) == "single-tenant" {
 		t.Fatal("admission constant is hyphenated; the map would be a no-op (it must not be)")
+	}
+}
+
+// nopServer is a no-op southface.Server for exercising teardownServer.Close
+// in isolation.
+type nopServer struct{}
+
+func (nopServer) Serve() error { return nil }
+func (nopServer) Close() error { return nil }
+
+// deadlineRecordingEngine records whether the lifecycle context handed to
+// TeardownScope carried a deadline. Only TeardownScope is implemented; the
+// embedded nil Engine panics on any other verb — Close must touch exactly
+// the one lifecycle verb.
+type deadlineRecordingEngine struct {
+	objectstore.Engine
+	hadDeadline bool
+	deadline    time.Time
+}
+
+func (e *deadlineRecordingEngine) TeardownScope(ctx context.Context, _ objectstore.ScopeID) error {
+	e.deadline, e.hadDeadline = ctx.Deadline()
+	return nil
+}
+
+// TestTeardownLifecycleCtxCarriesDeadline pins the W1 bounded-lifecycle
+// contract: teardownServer.Close hands TeardownScope a context with a real
+// deadline (bounded by teardownTimeout) — never a bare context.Background().
+// A hung backend sweep can therefore never wedge shutdown indefinitely.
+func TestTeardownLifecycleCtxCarriesDeadline(t *testing.T) {
+	eng := &deadlineRecordingEngine{}
+	reg := ceilings.NewRegistry(ceilings.Config{
+		OpsPerSecond:         defaultOpsPerSecond,
+		OpsBurst:             defaultOpsBurst,
+		InFlightBytesCeiling: defaultInFlightBytes,
+		FDCeiling:            defaultFDCeiling,
+		Clock:                time.Now,
+	})
+	srv := &teardownServer{
+		Server:  nopServer{},
+		engine:  eng,
+		ceiling: reg,
+		scope:   objectstore.ScopeID("fs1"),
+		fsid:    "fs1",
+	}
+
+	before := time.Now()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !eng.hadDeadline {
+		t.Fatal("TeardownScope context carried no deadline; want a bounded lifecycle context")
+	}
+	if max := before.Add(teardownTimeout + time.Minute); eng.deadline.After(max) {
+		t.Fatalf("teardown deadline %v exceeds the teardownTimeout bound (max %v)", eng.deadline, max)
+	}
+	if eng.deadline.Before(before) {
+		t.Fatalf("teardown deadline %v is in the past", eng.deadline)
+	}
+}
+
+// TestLifecycleTimeoutsBounded pins that both lifecycle bounds are finite,
+// positive, and ordered (teardown sweeps a whole scope on a network engine,
+// so its bound is the generous one).
+func TestLifecycleTimeoutsBounded(t *testing.T) {
+	if provisionTimeout <= 0 {
+		t.Fatalf("provisionTimeout = %v; want > 0", provisionTimeout)
+	}
+	if teardownTimeout <= 0 {
+		t.Fatalf("teardownTimeout = %v; want > 0", teardownTimeout)
+	}
+	if teardownTimeout < provisionTimeout {
+		t.Fatalf("teardownTimeout %v < provisionTimeout %v; the scope sweep bound must be the generous one", teardownTimeout, provisionTimeout)
 	}
 }

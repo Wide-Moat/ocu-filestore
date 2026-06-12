@@ -68,6 +68,17 @@ var ErrAlreadyExists = errors.New("objectstore: object already exists")
 // errors.Is.
 var ErrNotADirectory = errors.New("objectstore: path is not a directory")
 
+// ErrTransient is the retryable backend-failure sentinel: the backend leg
+// failed in a way that may succeed on a later attempt (backend 5xx, request
+// timeout, transport-level connection failure) after the engine's own
+// bounded retries were exhausted. Match it with errors.Is.
+var ErrTransient = errors.New("objectstore: transient backend failure")
+
+// ErrThrottled is the backend-pacing sentinel: the backend refused the
+// request under load shedding and the engine's paced retries were exhausted;
+// the caller may retry later with backoff. Match it with errors.Is.
+var ErrThrottled = errors.New("objectstore: backend throttled")
+
 // FileInfo carries the minimal metadata the broker's handlers need from
 // stat/list verbs. It is an INTERNAL struct — the wire File shape and its
 // field mapping are the wire layer's job, never modelled here.
@@ -112,6 +123,28 @@ func isPathEscape(err error) bool {
 // not. Cross-scope copy/move never reaches the engine: a request naming a
 // scope the caller does not hold is scope_mismatch territory upstream
 // (NFR-SEC-43), so every verb here takes exactly one scope.
+//
+// Context contract: EVERY verb honors ctx — cancellation or deadline expiry
+// aborts the operation promptly (including mid-stream in WriteStream,
+// CopyFile, and ReadRange) and the verb surfaces ctx.Err() through its
+// returned error (errors.Is-matchable). An aborted write never leaves a
+// partial object visible at the destination path.
+//
+// Idempotency contract (per verb, for retry after an AMBIGUOUS failure —
+// the caller saw an error but cannot know whether the backend applied the
+// operation):
+//
+//   - ProvisionScope, TeardownScope, Stat, List, ReadRange, MakeDir,
+//     RemoveFile, RemoveDir, CopyFile: idempotent — safe to re-invoke; the
+//     re-invocation converges on the same end state (MakeDir on an existing
+//     directory and RemoveFile on a removed file surface their usual
+//     exists/not-exist errors, which the caller treats as convergence).
+//   - WriteStream: NOT re-invokable with the same reader — the stream is
+//     consumed; a retry needs a fresh reader from the source of truth.
+//   - MoveFile, MoveDir: re-invokable only until the source delete commits;
+//     the engine orders copy -> verify -> delete so a retry after any
+//     failure never loses bytes (a surviving duplicate is the acceptable
+//     failure mode, never a lost object).
 type Engine interface {
 	// Kind names the engine.
 	Kind() EngineKind

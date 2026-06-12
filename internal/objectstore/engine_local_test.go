@@ -125,6 +125,53 @@ func TestLocalEngine_WriteStreamCleanup(t *testing.T) {
 	}
 }
 
+// cancellingReader serves one chunk, then cancels the context it carries —
+// simulating a caller cancellation landing mid-stream. The bytes it would
+// serve afterwards must never reach the destination.
+type cancellingReader struct {
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (r *cancellingReader) Read(p []byte) (int, error) {
+	r.reads++
+	if r.reads == 1 {
+		return copy(p, []byte("first chunk before cancel")), nil
+	}
+	r.cancel()
+	return copy(p, []byte("bytes after cancel must not commit")), nil
+}
+
+// TestLocalEngine_WriteStreamCancelCtx pins the Engine context contract on
+// the local engine: a cancellation mid-WriteStream aborts promptly, surfaces
+// ctx.Err() (errors.Is-matchable), and leaves NOTHING visible — no
+// destination object, no temp file (invisibility holds under cancellation).
+func TestLocalEngine_WriteStreamCancelCtx(t *testing.T) {
+	eng, base, scope := newLocalEngine(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := eng.WriteStream(ctx, scope, "cancelled.txt", &cancellingReader{cancel: cancel}, false)
+	if err == nil {
+		t.Fatal("WriteStream under mid-stream cancel: got nil error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteStream under mid-stream cancel: got %v, want errors.Is(context.Canceled)", err)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(base, string(scope)))
+	if err != nil {
+		t.Fatalf("read scope dir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("scope dir not empty after cancelled write: %v", names)
+	}
+}
+
 // TestLocalEngine_ReadRange pins the half-open [offset, offset+length)
 // contract: exact bytes, short-read at EOF without error, offset 0 from
 // start, and an offset past EOF yielding zero bytes without error.

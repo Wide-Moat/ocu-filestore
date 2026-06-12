@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -143,5 +144,38 @@ func TestIsPathEscape(t *testing.T) {
 				t.Fatalf("isPathEscape(%v): got %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTransientThrottledSentinels pins the W1 resilience sentinels: each is
+// errors.Is-matchable through a wrap, and the two are distinct identities
+// from each other and from every earlier sentinel (a throttle is a pacing
+// verdict, a transient is a retryable failure — they map to different deny
+// classes downstream).
+func TestTransientThrottledSentinels(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sentinel error
+	}{
+		{"transient", ErrTransient},
+		{"throttled", ErrThrottled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapped := fmt.Errorf("verb context: %w", tc.sentinel)
+			if !errors.Is(wrapped, tc.sentinel) {
+				t.Fatalf("wrapped %v does not errors.Is-match its sentinel", tc.sentinel)
+			}
+		})
+	}
+	distinct := []error{
+		ErrTransient, ErrThrottled, ErrAlreadyExists, ErrNotADirectory,
+		ErrNotImplemented, ErrUnknownEngine, ErrInvalidPath, ErrInvalidScopeID,
+	}
+	for i, a := range distinct {
+		for j, b := range distinct {
+			if i != j && errors.Is(a, b) {
+				t.Fatalf("sentinel %v unexpectedly matches %v", a, b)
+			}
+		}
 	}
 }

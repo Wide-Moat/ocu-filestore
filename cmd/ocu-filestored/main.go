@@ -101,6 +101,16 @@ const (
 	defaultFDCeiling     = int32(256)
 )
 
+// Lifecycle deadlines: the two engine lifecycle calls run under bounded
+// contexts — never context.Background() bare — so a hung backend can never
+// wedge startup or teardown indefinitely. Teardown sweeps a whole scope on a
+// network engine (paginated listings, batched deletes), so its bound is
+// generous but finite.
+const (
+	provisionTimeout = 1 * time.Minute
+	teardownTimeout  = 10 * time.Minute
+)
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ocu-filestored:", err)
@@ -330,7 +340,9 @@ func compose(cfg brokerConfig) (southface.Server, error) {
 	// engine directly (lifecycle is not a consumer-seam verb). TeardownScope
 	// runs on Close (NFR-SEC-54).
 	scope := objectstore.ScopeID(cfg.filesystemID)
-	if err := eng.ProvisionScope(context.Background(), scope); err != nil {
+	provisionCtx, cancelProvision := context.WithTimeout(context.Background(), provisionTimeout)
+	defer cancelProvision()
+	if err := eng.ProvisionScope(provisionCtx, scope); err != nil {
 		return nil, err
 	}
 
@@ -378,7 +390,9 @@ type teardownServer struct {
 // the teardown error is reported only if the session closed cleanly.
 func (t *teardownServer) Close() error {
 	closeErr := t.Server.Close()
-	teardownErr := t.engine.TeardownScope(context.Background(), t.scope)
+	teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
+	defer cancelTeardown()
+	teardownErr := t.engine.TeardownScope(teardownCtx, t.scope)
 	t.ceiling.Release(ceilings.SessionKey(t.fsid))
 	if closeErr != nil {
 		return closeErr
