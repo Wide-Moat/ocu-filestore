@@ -98,6 +98,20 @@ var (
 	errInvalidPath = errors.New("southface: invalid path")
 )
 
+// ErrAlreadyExists and ErrInvalidPath are the EXPORTED aliases of the two
+// engine mirror sentinels above. They are the SAME error values (errors.Is
+// matches identically), exported so the composition layer's engine adapter
+// can remap the real objectstore typed sentinels onto these mirrors (Option
+// A) without southface importing internal/objectstore — the consumer-seam
+// isolation is preserved. The unexported names remain the in-package
+// classification targets; the deny mapper is unchanged.
+var (
+	// ErrAlreadyExists is the exported alias of errAlreadyExists.
+	ErrAlreadyExists = errAlreadyExists
+	// ErrInvalidPath is the exported alias of errInvalidPath.
+	ErrInvalidPath = errInvalidPath
+)
+
 // isPathEscape mirrors the engine's containment-escape collapse helper: an
 // escape surfaces from the syscall layer as a *fs.PathError or *os.LinkError.
 // It is the LAST branch denyClassForEngineErr consults — the typed and
