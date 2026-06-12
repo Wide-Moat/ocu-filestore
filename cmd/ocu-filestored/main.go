@@ -14,9 +14,10 @@
 // host-owned 0700 directory per-session sockets are minted into),
 // -tenancy/-profile (the admission axes), -audit-sink, -engine/-engine-root,
 // -broker-max-file-size (>0, the whole-object ceiling), -filesystem-id,
-// -granted-intents, -downloadable-prefixes, and -max-request-bytes (the
-// per-RPC-message ceiling). -north-listen parses but binds nothing this phase
-// (the north face is deferred).
+// -granted-intents, -downloadable-prefixes, -max-request-bytes (the
+// per-RPC-message ceiling), and the optional per-session ops token-bucket
+// tuning pair -ops-per-second (>0) / -ops-burst (>=1). -north-listen parses
+// but binds nothing this phase (the north face is deferred).
 package main
 
 import (
@@ -84,8 +85,9 @@ var intentVocabulary = map[string]southface.Intent{
 }
 
 // Per-session ceiling defaults for the minimal trusted_operator shelf. They
-// are conservative non-zero values; a full-shelf deployment makes them
-// operator-tunable.
+// are conservative non-zero values. The ops token-bucket pair is
+// operator-tunable via -ops-per-second / -ops-burst (these consts are the
+// flag defaults); the byte and fd ceilings stay fixed this phase.
 const (
 	defaultOpsPerSecond  = 100.0
 	defaultOpsBurst      = 200.0
@@ -108,6 +110,8 @@ type brokerConfig struct {
 	filesystemID   string
 	maxFileSize    int64
 	maxRequestByte int64
+	opsPerSecond   float64
+	opsBurst       float64
 	grantedIntents []southface.Intent
 	dlPrefixes     []string
 	profile        admission.WorkloadTrustProfile
@@ -145,6 +149,10 @@ func run(args []string) error {
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
 		"comma-separated broker-side downloadable prefixes (NFR-SEC-73); empty = nothing downloadable")
+	opsPerSecond := fs.Float64("ops-per-second", defaultOpsPerSecond,
+		"per-session file-ops token-bucket refill rate in ops/s (>0); the throttle ceiling (NFR-SEC-46)")
+	opsBurst := fs.Float64("ops-burst", defaultOpsBurst,
+		"per-session file-ops token-bucket capacity in tokens (>=1); a session starts with a full bucket")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -154,7 +162,8 @@ func run(args []string) error {
 	}
 
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
-		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes)
+		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
+		*opsPerSecond, *opsBurst)
 	if err != nil {
 		return err
 	}
@@ -170,9 +179,13 @@ func run(args []string) error {
 // validate parses and checks the flag surface, returning a brokerConfig or a
 // typed error. Required flags (-engine-root, -audit-sink, -filesystem-id, a
 // positive -broker-max-file-size) are checked after parse and never panic.
+// The optional ops token-bucket pair defaults to 100/200; an explicit
+// non-positive -ops-per-second or an -ops-burst below one whole token (which
+// would wedge the bucket) is a wiring fault and refuses with the same typed
+// error.
 func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
-	maxFileSize, maxRequestBytes int64) (brokerConfig, error) {
+	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	if _, err := objectstore.ParseEngine(engine); err != nil {
@@ -200,6 +213,12 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	if maxFileSize <= 0 {
 		return cfg, fmt.Errorf("%w: -broker-max-file-size must be > 0", errMissingRequiredFlag)
 	}
+	if opsPerSecond <= 0 {
+		return cfg, fmt.Errorf("%w: -ops-per-second must be > 0", errMissingRequiredFlag)
+	}
+	if opsBurst < 1 {
+		return cfg, fmt.Errorf("%w: -ops-burst must be >= 1", errMissingRequiredFlag)
+	}
 
 	intents, err := parseIntents(grantedIntents)
 	if err != nil {
@@ -213,6 +232,8 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		filesystemID:   filesystemID,
 		maxFileSize:    maxFileSize,
 		maxRequestByte: maxRequestBytes,
+		opsPerSecond:   opsPerSecond,
+		opsBurst:       opsBurst,
 		grantedIntents: intents,
 		dlPrefixes:     splitNonEmpty(downloadablePrefixes),
 		profile:        prof,
@@ -277,8 +298,8 @@ func compose(cfg brokerConfig) (southface.Server, error) {
 		return nil, err
 	}
 	reg := ceilings.NewRegistry(ceilings.Config{
-		OpsPerSecond:         defaultOpsPerSecond,
-		OpsBurst:             defaultOpsBurst,
+		OpsPerSecond:         cfg.opsPerSecond,
+		OpsBurst:             cfg.opsBurst,
 		InFlightBytesCeiling: defaultInFlightBytes,
 		FDCeiling:            defaultFDCeiling,
 		Clock:                time.Now,

@@ -38,6 +38,8 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 		filesystemID:   "fs-main-01",
 		maxFileSize:    1 << 30,
 		maxRequestByte: 4 << 20,
+		opsPerSecond:   defaultOpsPerSecond,
+		opsBurst:       defaultOpsBurst,
 		grantedIntents: []southface.Intent{southface.IntentRead, southface.IntentWrite},
 		dlPrefixes:     []string{"/pub"},
 		profile:        admission.ProfileTrustedOperator,
@@ -55,6 +57,28 @@ func TestComposeAdmittedServesAndCloses(t *testing.T) {
 		t.Fatalf("compose(admitted): %v", err)
 	}
 	// Serve in the background; a clean Close returns nil from Serve.
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := <-serveErr; err != nil {
+		t.Fatalf("Serve returned %v on clean shutdown, want nil", err)
+	}
+}
+
+// TestComposeTinyOpsBucketServes pins the operator-tunable throttle floor:
+// the smallest legal ops bucket (-ops-per-second 1 -ops-burst 1) is accepted
+// and the daemon serves and closes cleanly — a tiny bucket throttles, it
+// never refuses to start.
+func TestComposeTinyOpsBucketServes(t *testing.T) {
+	cfg := validBrokerConfig(t)
+	cfg.opsPerSecond = 1
+	cfg.opsBurst = 1
+	srv, err := compose(cfg)
+	if err != nil {
+		t.Fatalf("compose(ops 1/1): %v", err)
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 	if err := srv.Close(); err != nil {
@@ -111,10 +135,15 @@ func TestRunValidatesEngine(t *testing.T) {
 }
 
 // TestRunMissingRequiredFlags pins WIRE-MAIN: each missing/invalid required
-// flag returns a typed error (never a panic), and never reaches the serve
-// path. The defaults leave -engine-root / -audit-sink / -filesystem-id empty
-// and -broker-max-file-size 0, so the first missing required flag is named.
+// flag — and each explicitly-bad optional ops ceiling — returns a typed error
+// (never a panic), and never reaches the serve path: no socket is bound. The
+// defaults leave -engine-root / -audit-sink / -filesystem-id empty and
+// -broker-max-file-size 0, so the first missing required flag is named. The
+// ops rows carry all required flags so only the bad ceiling can refuse:
+// -ops-per-second must be > 0 and -ops-burst >= 1 (a sub-one burst would
+// wedge the bucket).
 func TestRunMissingRequiredFlags(t *testing.T) {
+	required := []string{"--engine-root", "/x", "--audit-sink", "/y", "--filesystem-id", "fs1", "--broker-max-file-size", "1024"}
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -125,13 +154,56 @@ func TestRunMissingRequiredFlags(t *testing.T) {
 		{"zero_broker_max_file_size", []string{"--engine-root", "/x", "--audit-sink", "/y", "--filesystem-id", "fs1", "--broker-max-file-size", "0"}},
 		{"negative_broker_max_file_size", []string{"--engine-root", "/x", "--audit-sink", "/y", "--filesystem-id", "fs1", "--broker-max-file-size", "-1"}},
 		{"all_defaults_missing_required", nil},
+		{"zero_ops_per_second", append(append([]string{}, required...), "--ops-per-second", "0")},
+		{"negative_ops_per_second", append(append([]string{}, required...), "--ops-per-second", "-5")},
+		{"zero_ops_burst", append(append([]string{}, required...), "--ops-burst", "0")},
+		{"fractional_ops_burst", append(append([]string{}, required...), "--ops-burst", "0.5")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := run(tc.args)
+			sockDir := shortDir(t)
+			err := run(append(append([]string{}, tc.args...), "--south-socket-dir", sockDir))
 			if !errors.Is(err, errMissingRequiredFlag) {
 				t.Fatalf("run(%s): got %v, want errMissingRequiredFlag", tc.name, err)
 			}
+			// The refusal happens before composition — no socket was bound.
+			entries, _ := os.ReadDir(sockDir)
+			for _, e := range entries {
+				if filepath.Ext(e.Name()) == ".sock" {
+					t.Fatalf("run(%s) bound socket %q despite the typed refusal; want none", tc.name, e.Name())
+				}
+			}
 		})
+	}
+}
+
+// TestValidateOpsCeilingPlumbing pins the operator-tunable throttle plumbing:
+// the ops token-bucket values land in brokerConfig unchanged, and omitting
+// the flags yields the shelf defaults (100 ops/s, 200-token burst) with no
+// error from the rate path.
+func TestValidateOpsCeilingPlumbing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rate, brst float64
+	}{
+		{"defaults_flags_omitted", defaultOpsPerSecond, defaultOpsBurst},
+		{"tiny_bucket_one_one", 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
+				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+				tc.rate, tc.brst)
+			if err != nil {
+				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
+			}
+			if cfg.opsPerSecond != tc.rate || cfg.opsBurst != tc.brst {
+				t.Fatalf("config carries ops %g/%g, want %g/%g",
+					cfg.opsPerSecond, cfg.opsBurst, tc.rate, tc.brst)
+			}
+		})
+	}
+	// The defaults are the documented 100/200 shelf values.
+	if defaultOpsPerSecond != 100.0 || defaultOpsBurst != 200.0 {
+		t.Fatalf("flag defaults are %g/%g, want 100/200", defaultOpsPerSecond, defaultOpsBurst)
 	}
 }
 

@@ -126,6 +126,39 @@ func TestGaugeRoundTrip(t *testing.T) {
 	mustPanic(t, "ReleaseBytes beyond current", func() { sess.ReleaseBytes(1) })
 }
 
+// TestTinyBucketThrottlesAndRefills pins the smallest operator-tunable
+// bucket (1 ops/s, 1-token burst) deterministically: the first immediate op
+// is admitted, the second is refused with ErrThrottleExceeded, and a
+// one-second clock advance re-admits exactly one op — then refuses again
+// (LIM-01, NFR-SEC-46). No sleeps: the clock is an injected closure.
+func TestTinyBucketThrottlesAndRefills(t *testing.T) {
+	now := time.Unix(0, 0)
+	reg := NewRegistry(Config{
+		OpsPerSecond:         1,
+		OpsBurst:             1,
+		InFlightBytesCeiling: 1,
+		FDCeiling:            1,
+		Clock:                func() time.Time { return now },
+	})
+	sess := reg.Session("tiny-bucket")
+
+	if err := sess.TryConsumeOp(); err != nil {
+		t.Fatalf("first TryConsumeOp on full 1/1 bucket: got %v, want nil", err)
+	}
+	if err := sess.TryConsumeOp(); !errors.Is(err, ErrThrottleExceeded) {
+		t.Fatalf("second immediate TryConsumeOp: got %v, want ErrThrottleExceeded", err)
+	}
+
+	// One second at 1 ops/s refills exactly one token.
+	now = now.Add(time.Second)
+	if err := sess.TryConsumeOp(); err != nil {
+		t.Fatalf("TryConsumeOp after 1s refill: got %v, want nil", err)
+	}
+	if err := sess.TryConsumeOp(); !errors.Is(err, ErrThrottleExceeded) {
+		t.Fatalf("TryConsumeOp after refill token spent: got %v, want ErrThrottleExceeded", err)
+	}
+}
+
 // TestNilClockPanics pins the clock-seam purity contract: this package
 // never reads the wall clock itself, so a Registry constructed without an
 // injected clock is a wiring error and fails loud, never a silent fallback.
