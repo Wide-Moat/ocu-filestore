@@ -670,10 +670,13 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 				break
 			}
 			// A read error from the pipe means the engine goroutine faulted.
+			// Drain the engine goroutine; prefer its error over the pipe's
+			// consumer error (the engine error is the root cause).
 			engErr := <-readErrCh
 			if engErr == nil {
 				engErr = rerr
 			}
+			sc.reqLog.Error("download engine fault", slog.String("err", engErr.Error()))
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "read error"})
 			return
 		}

@@ -31,12 +31,6 @@ func (c *callRecorder) snapshot() []string {
 	return out
 }
 
-func (c *callRecorder) reset() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.calls = nil
-}
-
 // fakeGuard is a recording Guard: it appends "mandate" to the shared
 // recorder, captures the event, and returns the configured error.
 type fakeGuard struct {

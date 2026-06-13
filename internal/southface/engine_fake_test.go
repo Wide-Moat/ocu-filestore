@@ -370,7 +370,7 @@ func (e *fakeEngine) ReadRange(_ context.Context, scope, path string, offset, le
 // file node with the read bytes.
 func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Reader, overwrite bool) error {
 	e.mu.Lock()
-	n, parent, leaf, _, err := e.walk(scope, path)
+	n, parent, _, _, err := e.walk(scope, path)
 	if err != nil {
 		e.mu.Unlock()
 		return err
@@ -397,7 +397,7 @@ func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Rea
 	defer e.mu.Unlock()
 	// Re-resolve the parent under the lock before linking (the tree may have
 	// changed while reading).
-	_, parent, leaf, _, err = e.walk(scope, path)
+	_, parent, leaf, _, err := e.walk(scope, path)
 	if err != nil {
 		return err
 	}

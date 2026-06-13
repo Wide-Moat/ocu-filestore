@@ -10,6 +10,8 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -60,33 +62,50 @@ func TestPathAttr(t *testing.T) {
 // expose.
 func TestRedactNoByteOrCredSink(t *testing.T) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", nil, 0)
+
+	// parser.ParseDir is deprecated since Go 1.25 (does not honour build
+	// tags). Iterate the directory manually and call parser.ParseFile on each
+	// .go source file instead; this preserves identical coverage of the
+	// package's exported declarations without adding any new dependency.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parser.ParseDir: %v", err)
+		t.Fatalf("os.ReadDir: %v", err)
 	}
-	for pkgName, pkg := range pkgs {
-		if strings.HasSuffix(pkgName, "_test") {
+	var astFiles []*ast.File
+	for _, de := range entries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".go") {
 			continue
 		}
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok {
-					continue
-				}
-				// Only inspect exported functions.
-				if !fn.Name.IsExported() {
-					continue
-				}
-				if fn.Type.Params == nil {
-					continue
-				}
-				for _, field := range fn.Type.Params.List {
-					typeName := typeString(fset, field.Type)
-					lower := strings.ToLower(typeName)
-					if lower == "[]byte" || strings.Contains(lower, "credential") {
-						t.Errorf("exported func %s has forbidden param type %q (redaction rule: no credential/payload helper)", fn.Name.Name, typeName)
-					}
+		af, ferr := parser.ParseFile(fset, filepath.Join(".", de.Name()), nil, 0)
+		if ferr != nil {
+			t.Fatalf("parser.ParseFile %s: %v", de.Name(), ferr)
+		}
+		// Skip test files — the same filter ParseDir callers applied via the
+		// pkgName suffix check.
+		if strings.HasSuffix(af.Name.Name, "_test") {
+			continue
+		}
+		astFiles = append(astFiles, af)
+	}
+
+	for _, file := range astFiles {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			// Only inspect exported functions.
+			if !fn.Name.IsExported() {
+				continue
+			}
+			if fn.Type.Params == nil {
+				continue
+			}
+			for _, field := range fn.Type.Params.List {
+				typeName := typeString(fset, field.Type)
+				lower := strings.ToLower(typeName)
+				if lower == "[]byte" || strings.Contains(lower, "credential") {
+					t.Errorf("exported func %s has forbidden param type %q (redaction rule: no credential/payload helper)", fn.Name.Name, typeName)
 				}
 			}
 		}

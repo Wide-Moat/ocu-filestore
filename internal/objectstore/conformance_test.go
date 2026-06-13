@@ -618,7 +618,7 @@ func runConformance(t *testing.T, f confFactory) {
 				rapid.SampledFrom([]string{
 					"..", "../escape.txt", "a/../../escape.txt", "/abs.txt",
 					"//", "a//b", ".", "", "./x", "a/./b", "..\\win",
-					"x\x00nul", "file://host/x", "%2e%2e/enc", "‮evil",
+					"x\x00nul", "file://host/x", "%2e%2e/enc", "\u202eevil",
 					"é-nonnfc", " ", "a/", "/",
 					strings.Repeat("d/", 200) + "leaf",
 				}),
