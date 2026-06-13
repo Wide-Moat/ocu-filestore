@@ -278,6 +278,99 @@ func TestEngineAdapterNilPassesThrough(t *testing.T) {
 	}
 }
 
+// TestMapCeilingsErr pins the ceilings sentinel remap arms in isolation: each
+// real ceilings sentinel (including an fmt-wrapped form, the shape a real
+// limiter call returns through the spine) lands on the matching southface
+// mirror; a nil passes through nil and a non-sentinel passes through verbatim
+// (so the spine falls to denyInternal/500 rather than a spurious 429). The four
+// quota mirrors are also asserted distinct from each other so a throttle is
+// never confused with a bytes/fd/size verdict downstream.
+func TestMapCeilingsErr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   error
+		want error // nil -> expect verbatim/no-mirror
+	}{
+		{"nil_passes_through", nil, nil},
+		{"throttle", ceilings.ErrThrottleExceeded, southface.ErrThrottleExceeded},
+		{"throttle_wrapped", fmt.Errorf("op verb: %w", ceilings.ErrThrottleExceeded), southface.ErrThrottleExceeded},
+		{"bytes", ceilings.ErrBytesExceeded, southface.ErrBytesExceeded},
+		{"bytes_wrapped", fmt.Errorf("acquire: %w", ceilings.ErrBytesExceeded), southface.ErrBytesExceeded},
+		{"fd", ceilings.ErrFDExceeded, southface.ErrFDExceeded},
+		{"size", ceilings.ErrSizeExceeded, southface.ErrSizeExceeded},
+		{"non_sentinel_passthrough", errors.New("boom"), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapCeilingsErr(tc.in)
+			if tc.want == nil {
+				if tc.in == nil {
+					if got != nil {
+						t.Fatalf("mapCeilingsErr(nil) = %v, want nil", got)
+					}
+					return
+				}
+				// Non-vacuity: an unknown error is NOT remapped to any quota
+				// mirror; it passes through so the spine denies internal.
+				if errors.Is(got, southface.ErrThrottleExceeded) ||
+					errors.Is(got, southface.ErrBytesExceeded) ||
+					errors.Is(got, southface.ErrFDExceeded) ||
+					errors.Is(got, southface.ErrSizeExceeded) {
+					t.Fatalf("non-sentinel %v was remapped to a quota mirror (got %v)", tc.in, got)
+				}
+				if got == nil {
+					t.Fatalf("non-sentinel error dropped to nil")
+				}
+				return
+			}
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("mapCeilingsErr(%v) = %v, want errors.Is(%v)", tc.in, got, tc.want)
+			}
+		})
+	}
+	// Mirror distinctness across the four quota verdicts.
+	mirrors := []error{
+		southface.ErrThrottleExceeded, southface.ErrBytesExceeded,
+		southface.ErrFDExceeded, southface.ErrSizeExceeded,
+	}
+	for i, a := range mirrors {
+		for j, b := range mirrors {
+			if i != j && errors.Is(a, b) {
+				t.Fatalf("quota mirror %v unexpectedly matches %v", a, b)
+			}
+		}
+	}
+}
+
+// TestEngineAdapterListStatRemapErrors pins the error-mapping leg of the List
+// and Stat adapter verbs (the success legs are covered by the real-local-verbs
+// test): an engine that fails returns the remapped southface mirror, and on
+// error List returns a nil slice (never a half-built one). Driving the failure
+// through these two read verbs fires the error-return arm of each that the
+// happy path leaves uncovered.
+func TestEngineAdapterListStatRemapErrors(t *testing.T) {
+	a := NewEngine(stubEngine{err: objectstore.ErrInvalidPath})
+
+	infos, err := a.List(context.Background(), "fs1", "/x")
+	if !errors.Is(err, southface.ErrInvalidPath) {
+		t.Fatalf("List error remap: got %v, want ErrInvalidPath mirror", err)
+	}
+	if infos != nil {
+		t.Fatalf("List on error: got %v, want a nil slice", infos)
+	}
+
+	_, err = a.Stat(context.Background(), "fs1", "/x")
+	if !errors.Is(err, southface.ErrInvalidPath) {
+		t.Fatalf("Stat error remap: got %v, want ErrInvalidPath mirror", err)
+	}
+
+	// A transient backend fault on a read verb crosses as the transient mirror
+	// (distinct wire code from a path verdict).
+	at := NewEngine(stubEngine{err: objectstore.ErrTransient})
+	if _, err := at.Stat(context.Background(), "fs1", "/x"); !errors.Is(err, southface.ErrBackendTransient) {
+		t.Fatalf("Stat transient remap: got %v, want ErrBackendTransient mirror", err)
+	}
+}
+
 // shortDir returns a short-pathed temp directory cleaned up at test end.
 func shortDir(t *testing.T) string {
 	t.Helper()

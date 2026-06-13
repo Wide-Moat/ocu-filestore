@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -309,5 +310,130 @@ func TestSnapshot(t *testing.T) {
 	snap4 := s.Snapshot()
 	if snap4.InFlightBytes != 0 || snap4.FDInUse != 0 {
 		t.Errorf("repeated snapshots mutated state: %+v", snap4)
+	}
+}
+
+// TestCheckDeclaredSize pins the pre-buffer size gate (NFR-SEC-78): a declared
+// size strictly above the ceiling is rejected with ErrSizeExceeded before any
+// body byte is read; a declared size AT the ceiling and one strictly UNDER pass
+// (nil); and a declared 0 (unknown length) is accepted on purpose — the
+// in-flight gauge bounds unknown-length bodies per chunk. The comparison is a
+// direct >, never a subtraction, so a near-MaxInt64 declared size against a
+// modest ceiling still rejects without wrapping.
+func TestCheckDeclaredSize(t *testing.T) {
+	const ceiling int64 = 1 << 20 // 1 MiB
+	for _, tc := range []struct {
+		name     string
+		declared int64
+		ceiling  int64
+		wantErr  bool
+	}{
+		{"over_ceiling_rejected", ceiling + 1, ceiling, true},
+		{"at_ceiling_accepted", ceiling, ceiling, false},
+		{"under_ceiling_accepted", ceiling - 1, ceiling, false},
+		{"zero_unknown_length_accepted", 0, ceiling, false},
+		{"max_int64_over_modest_ceiling_no_wrap", math.MaxInt64, ceiling, true},
+		{"max_int64_at_max_ceiling_accepted", math.MaxInt64, math.MaxInt64, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckDeclaredSize(tc.declared, tc.ceiling)
+			if tc.wantErr {
+				if !errors.Is(err, ErrSizeExceeded) {
+					t.Fatalf("CheckDeclaredSize(%d, %d) = %v, want ErrSizeExceeded", tc.declared, tc.ceiling, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CheckDeclaredSize(%d, %d) = %v, want nil", tc.declared, tc.ceiling, err)
+			}
+		})
+	}
+}
+
+// TestRegistrySessionReuseAndRelease pins the Registry session lifecycle: the
+// same key always yields the SAME *Session (so its accrued limiter state
+// persists across lookups), Release drops the entry so a later Session(key)
+// hands back a FRESH session with full capacity, and Release of an unknown key
+// is a harmless no-op. The re-acquire branch (a key looked up twice returns the
+// cached pointer) and Release are exercised end to end.
+func TestRegistrySessionReuseAndRelease(t *testing.T) {
+	reg := NewRegistry(Config{
+		OpsPerSecond:         1,
+		OpsBurst:             1, // burst of exactly 1 so the bucket is observably drained
+		InFlightBytesCeiling: 1 << 20,
+		FDCeiling:            8,
+		Clock:                frozenClock(), // frozen: a drained bucket never refills
+	})
+
+	// First lookup creates the session; second lookup returns the SAME pointer.
+	s1 := reg.Session("sess-a")
+	s2 := reg.Session("sess-a")
+	if s1 != s2 {
+		t.Fatalf("Session(\"sess-a\") returned different pointers on re-acquire")
+	}
+
+	// Drain the one ops token on the shared session.
+	if err := s1.TryConsumeOp(); err != nil {
+		t.Fatalf("first TryConsumeOp: %v", err)
+	}
+	// The cached session is drained (frozen clock -> no refill): the second
+	// pointer sees the same empty bucket.
+	if err := s2.TryConsumeOp(); !errors.Is(err, ErrThrottleExceeded) {
+		t.Fatalf("cached session bucket not shared: got %v, want ErrThrottleExceeded", err)
+	}
+
+	// Release drops the entry; a later lookup hands back a FRESH session with a
+	// full bucket.
+	reg.Release("sess-a")
+	s3 := reg.Session("sess-a")
+	if s3 == s1 {
+		t.Fatalf("Session after Release returned the stale pointer, want a fresh session")
+	}
+	if err := s3.TryConsumeOp(); err != nil {
+		t.Fatalf("fresh session after Release: TryConsumeOp = %v, want nil (full bucket)", err)
+	}
+
+	// Release of an unknown key is a harmless no-op (must not panic).
+	reg.Release("never-created")
+}
+
+// TestRegistryConcurrentFirstUse pins the double-checked creation under the
+// write lock: many goroutines racing on the SAME never-seen key must all get
+// the exact same *Session — exactly one create wins and the losers take the
+// inner re-check branch (the entry already exists when they grab the write
+// lock). Run under -race this also proves the map access is correctly guarded.
+func TestRegistryConcurrentFirstUse(t *testing.T) {
+	reg := NewRegistry(Config{
+		OpsPerSecond:         1,
+		OpsBurst:             1,
+		InFlightBytesCeiling: 1 << 20,
+		FDCeiling:            8,
+		Clock:                frozenClock(),
+	})
+
+	const goroutines = 64
+	got := make([]*Session, goroutines)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start // release all goroutines at once to maximize contention
+			got[idx] = reg.Session("hot-key")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Every goroutine must observe the identical pointer — only one create won.
+	first := got[0]
+	if first == nil {
+		t.Fatal("Session returned nil")
+	}
+	for i, s := range got {
+		if s != first {
+			t.Fatalf("goroutine %d got a different *Session; the double-checked create admitted more than one", i)
+		}
 	}
 }

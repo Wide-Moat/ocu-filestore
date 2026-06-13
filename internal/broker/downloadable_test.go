@@ -117,6 +117,52 @@ func TestPreviewStaysNonDownloadable(t *testing.T) {
 	}
 }
 
+// TestPrefixPolicyNormalizesConfiguredPrefixes pins the construction-time
+// normalization: a whitespace-only or empty configured prefix is dropped (it
+// never makes everything downloadable), a trailing slash is trimmed so "/pub/"
+// and "/pub" behave identically, and a bare root "/" is kept as a sentinel that
+// matches NOTHING on its own (a deployment that wants the whole scope egress-
+// able configures explicit prefixes, never the bare root). These rows exercise
+// the trailing-slash-trim and root-sentinel branches the earlier tests skip.
+func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
+	// Whitespace-only and empty entries are dropped; "/pub/" trims to "/pub".
+	tag := NewPrefixDownloadablePolicy([]string{"  ", "", "/pub/", "  /share/out/  "})
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"/pub/report.pdf", true}, // trailing slash on the prefix was trimmed
+		{"/pub", true},
+		{"/share/out/a.txt", true}, // surrounding whitespace was trimmed
+		{"/share/out", true},
+		{"/private/x", false}, // the dropped empty/whitespace entries grant nothing
+	} {
+		dl, err := tag(context.Background(), "fs1", tc.path)
+		if err != nil {
+			t.Fatalf("tag(%q): err %v", tc.path, err)
+		}
+		if dl != tc.want {
+			t.Fatalf("tag(%q): downloadable %v, want %v", tc.path, dl, tc.want)
+		}
+	}
+
+	// A bare root "/" is kept verbatim (the trailing-slash trim is skipped for
+	// it): it never expands to cover the whole tree on a path-boundary match —
+	// "/anything" is NOT beneath it ("//"-joined prefix never matches), so a
+	// deployment that wants the whole scope egress-able must configure explicit
+	// prefixes, not the bare root.
+	rootTag := NewPrefixDownloadablePolicy([]string{"/"})
+	for _, path := range []string{"/anything", "/deep/nested/file.bin", "/pub/x"} {
+		dl, err := rootTag(context.Background(), "fs1", path)
+		if err != nil {
+			t.Fatalf("rootTag(%q): err %v", path, err)
+		}
+		if dl {
+			t.Fatalf("rootTag(%q): downloadable true, want false (bare root does not cover the tree)", path)
+		}
+	}
+}
+
 // TestPrefixPolicyFailClosedOnError pins that the policy returns (false, err)
 // on an internal lookup failure so the resolver denies egress — fail-closed.
 func TestPrefixPolicyFailClosedOnError(t *testing.T) {

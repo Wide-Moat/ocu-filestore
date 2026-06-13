@@ -641,3 +641,116 @@ func TestArchiveError_Error(t *testing.T) {
 		})
 	}
 }
+
+// TestInvalidArchiveBytes pins the parse-failure leg of ValidateZip: bytes that
+// are not a zip archive (a too-short buffer, random noise) are rejected with
+// ErrInvalidArchive before any entry is read, and the sink is aborted — nothing
+// staged becomes visible (the defer safety net fires on the early return).
+func TestInvalidArchiveBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		bytes []byte
+	}{
+		{"empty", nil},
+		{"too short", []byte{0x50, 0x4b}},
+		{"random noise", []byte("this is plainly not a zip archive at all")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &recordingSink{}
+			err := ValidateZip(context.Background(), tc.bytes, testConfig(), sink)
+			if !errors.Is(err, ErrInvalidArchive) {
+				t.Fatalf("ValidateZip(%s): got %v, want ErrInvalidArchive", tc.name, err)
+			}
+			if len(sink.staged) != 0 || sink.committed {
+				t.Fatalf("sink leaked state on a parse failure: staged=%v committed=%v", sink.staged, sink.committed)
+			}
+			if !sink.aborted {
+				t.Fatalf("sink not aborted on a parse failure")
+			}
+		})
+	}
+}
+
+// failingSink wraps recordingSink and fails a chosen seam, so the sink-error
+// wrap legs of processEntry (StageEntry, MakeDir) and the commit-error leg of
+// ValidateZip are exercised. It is a fault-injection fake, not a mock of a real
+// service — the engine's real sink lands at wiring time.
+type failingSink struct {
+	recordingSink
+	stageErr  error
+	dirErr    error
+	commitErr error
+}
+
+func (s *failingSink) StageEntry(ctx context.Context, name string, r io.Reader, mode fs.FileMode) error {
+	if s.stageErr != nil {
+		// Drain the reader so the tee/counting path still runs before the fault.
+		_, _ = io.Copy(io.Discard, r)
+		return s.stageErr
+	}
+	return s.recordingSink.StageEntry(ctx, name, r, mode)
+}
+
+func (s *failingSink) MakeDir(ctx context.Context, name string) error {
+	if s.dirErr != nil {
+		return s.dirErr
+	}
+	return s.recordingSink.MakeDir(ctx, name)
+}
+
+func (s *failingSink) Commit(ctx context.Context) error {
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	return s.recordingSink.Commit(ctx)
+}
+
+// TestSinkFailuresAbort pins the sink-error legs: a StageEntry, MakeDir, or
+// Commit failure propagates a wrapped error (errors.Is still finds the sink's
+// own sentinel through the wrap) and leaves the sink aborted, never committed.
+// A Commit failure is the boundary case — every entry passed every check, yet a
+// commit fault must still abort and surface, never silently half-commit.
+func TestSinkFailuresAbort(t *testing.T) {
+	boom := errors.New("sink seam failure")
+
+	t.Run("stage entry failure", func(t *testing.T) {
+		data := buildZip(t, zipEntry{name: "f.txt", body: []byte("content bytes")})
+		sink := &failingSink{stageErr: boom}
+		err := ValidateZip(context.Background(), data, testConfig(), sink)
+		if !errors.Is(err, boom) {
+			t.Fatalf("ValidateZip: got %v, want the StageEntry fault wrapped", err)
+		}
+		if sink.committed || !sink.aborted {
+			t.Fatalf("sink state: committed=%v aborted=%v, want aborted only", sink.committed, sink.aborted)
+		}
+	})
+
+	t.Run("make dir failure", func(t *testing.T) {
+		data := buildZip(t, zipEntry{name: "adir/", mode: fs.ModeDir | 0o755})
+		sink := &failingSink{dirErr: boom}
+		err := ValidateZip(context.Background(), data, testConfig(), sink)
+		if !errors.Is(err, boom) {
+			t.Fatalf("ValidateZip: got %v, want the MakeDir fault wrapped", err)
+		}
+		if sink.committed || !sink.aborted {
+			t.Fatalf("sink state: committed=%v aborted=%v, want aborted only", sink.committed, sink.aborted)
+		}
+	})
+
+	t.Run("commit failure", func(t *testing.T) {
+		// Every entry passes every check, so the success path reaches Commit;
+		// the commit fault must still abort and surface wrapped.
+		data := buildZip(t, zipEntry{name: "ok.txt", body: []byte("all entries pass")})
+		sink := &failingSink{commitErr: boom}
+		err := ValidateZip(context.Background(), data, testConfig(), sink)
+		if !errors.Is(err, boom) {
+			t.Fatalf("ValidateZip: got %v, want the Commit fault wrapped", err)
+		}
+		if sink.committed {
+			t.Fatalf("sink marked committed despite a commit fault")
+		}
+		if !sink.aborted {
+			t.Fatalf("sink not aborted on a commit fault")
+		}
+	})
+}
