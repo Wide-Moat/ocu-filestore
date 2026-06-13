@@ -20,6 +20,16 @@ metadata:
     app.kubernetes.io/component: storage-broker
     app.kubernetes.io/part-of: open-computer-use
 spec:
+  # Recreate, NOT the default RollingUpdate: the engine-root and audit PVCs are
+  # RWO and the audit-chain flock guard (T2-7) is per-pod (an emptyDir lock, no
+  # cross-pod protection). RollingUpdate would start the new pod before the old
+  # terminates — both would contend for the same RWO PVC (the rollout stalls on
+  # the volume attach) and could momentarily double-write the audit chain.
+  # Recreate fully terminates the old pod and detaches its PVCs before the new
+  # pod starts, so there is exactly one writer at every instant.
+  strategy:
+    type: Recreate
+
   # One replica per tenant — see README and NFR-SEC-76.
   # Do NOT increase replicas: the local-volume engine uses RWO PVCs that cannot
   # be safely shared, and the flock guard (T2-7) enforces single-writer at the
