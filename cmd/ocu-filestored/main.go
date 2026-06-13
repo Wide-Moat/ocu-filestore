@@ -346,12 +346,33 @@ func run(args []string) error {
 		return runHealthCheck(*opsListen)
 	}
 
-	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
-		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
-		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
-		*storageLane, *caBundle, *laneDevDirect,
-		*s3Bucket, *s3Endpoint, *s3Region, *s3PathStyle,
-		*logLevel, *opsListen)
+	cfg, err := validate(rawFlags{
+		engine:               *engine,
+		engineRoot:           *engineRoot,
+		auditSink:            *auditSink,
+		socketDir:            *socketDir,
+		filesystemID:         *filesystemID,
+		profile:              *profile,
+		tenancy:              *tenancy,
+		grantedIntents:       *grantedIntents,
+		downloadablePrefixes: *downloadablePrefixes,
+		maxFileSize:          *maxFileSize,
+		maxRequestBytes:      *maxRequestBytes,
+		opsPerSecond:         *opsPerSecond,
+		opsBurst:             *opsBurst,
+		s3CredentialFile:     *s3CredentialFile,
+		s3STSRoleARN:         *s3STSRoleARN,
+		s3STSEndpoint:        *s3STSEndpoint,
+		storageLane:          *storageLane,
+		caBundle:             *caBundle,
+		laneDevDirect:        *laneDevDirect,
+		s3Bucket:             *s3Bucket,
+		s3Endpoint:           *s3Endpoint,
+		s3Region:             *s3Region,
+		s3PathStyle:          *s3PathStyle,
+		logLevelStr:          *logLevel,
+		opsListenAddr:        *opsListen,
+	})
 	if err != nil {
 		return err
 	}
@@ -366,17 +387,21 @@ func run(args []string) error {
 	// latencies) and into the ops listener (so /metrics serves it).
 	m := telemetry.NewBrokerMetrics(version)
 
-	// Start the loopback-only ops listener BEFORE the south face, so /metrics
+	// Construct the loopback-only ops listener BEFORE the south face, so /metrics
 	// is available as soon as the daemon is "ready". An empty -ops-listen
 	// disables the listener; a non-loopback address was refused in validate.
+	// The Serve goroutine is NOT launched here: compose() registers /healthz and
+	// /readyz on this listener's mux, and the http.ServeMux Handle-before-Serve
+	// contract means those routes must be wired before accepting connections.
+	// Launching Serve up here would open a window where a probe hits an
+	// unregistered route and gets 404; the goroutine starts after compose below.
 	var opsListener *telemetry.OpsListener
 	if cfg.opsListen != "" {
 		opsListener, err = telemetry.NewOpsListener(cfg.opsListen, m, l)
 		if err != nil {
 			return err
 		}
-		go opsListener.Serve()
-		l.Info("ops listener started", slog.String("addr", opsListener.Addr()))
+		l.Info("ops listener constructed", slog.String("addr", opsListener.Addr()))
 	}
 
 	// Startup echo at INFO: operator configuration summary. NEVER includes
@@ -427,7 +452,21 @@ func run(args []string) error {
 		}
 		return absErr
 	}
-	if err := os.MkdirAll(filepath.Dir(auditSinkAbs), 0o700); err != nil {
+	auditSinkDir := filepath.Dir(auditSinkAbs)
+	if err := os.MkdirAll(auditSinkDir, 0o700); err != nil {
+		if opsListener != nil {
+			_ = opsListener.Close()
+		}
+		return err
+	}
+	// os.MkdirAll applies the requested mode through the process umask, so a
+	// freshly created directory under the default umask 022 lands at 0755 — not
+	// the 0700 we ask for. Chmod the leaf unconditionally to PIN 0700: the audit
+	// sink and its lock file hold the hash-chained activity log and must not sit
+	// in a world-traversable directory. Chmod ignores umask, so this is the
+	// load-bearing step. (A pre-existing directory keeps whatever mode the
+	// operator set on its ancestors; only the audit-sink leaf is pinned here.)
+	if err := os.Chmod(auditSinkDir, 0o700); err != nil {
 		if opsListener != nil {
 			_ = opsListener.Close()
 		}
@@ -461,6 +500,16 @@ func run(args []string) error {
 	l.Info("session provisioned",
 		slog.String(observ.KeyScope, cfg.filesystemID),
 	)
+
+	// Now that compose() has registered /healthz and /readyz on the ops
+	// listener's mux, start accepting connections. Launching Serve here (not at
+	// construction) closes the Handle-before-Serve gap: every probe route is
+	// wired before the first connection is accepted, so an orchestrator probe
+	// can never hit a 404 on /healthz or /readyz during startup.
+	if opsListener != nil {
+		go opsListener.Serve()
+		l.Info("ops listener started", slog.String("addr", opsListener.Addr()))
+	}
 	return serveUntilSignal(srv, l, opsListener)
 }
 
@@ -531,6 +580,41 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 	}
 }
 
+// rawFlags is the unvalidated flag surface handed to validate. It mirrors the
+// daemon's command-line flags one field per flag, BEFORE any parsing or
+// admission. Passing this struct (instead of a long positional argument list)
+// names every value at the call site, so a reorder of two same-typed fields
+// (e.g. the s3Bucket/s3Endpoint/s3Region strings, or the laneDevDirect/
+// s3PathStyle bools) can no longer compile silently into a swapped meaning.
+// validate consumes a rawFlags and returns the validated brokerConfig.
+type rawFlags struct {
+	engine               string
+	engineRoot           string
+	auditSink            string
+	socketDir            string
+	filesystemID         string
+	profile              string
+	tenancy              string
+	grantedIntents       string
+	downloadablePrefixes string
+	maxFileSize          int64
+	maxRequestBytes      int64
+	opsPerSecond         float64
+	opsBurst             float64
+	s3CredentialFile     string
+	s3STSRoleARN         string
+	s3STSEndpoint        string
+	storageLane          string
+	caBundle             string
+	laneDevDirect        bool
+	s3Bucket             string
+	s3Endpoint           string
+	s3Region             string
+	s3PathStyle          bool
+	logLevelStr          string
+	opsListenAddr        string
+}
+
 // validate parses and checks the flag surface, returning a brokerConfig or a
 // typed error. Required flags (-engine-root, -audit-sink, -filesystem-id, a
 // positive -broker-max-file-size) are checked after parse and never panic.
@@ -539,14 +623,36 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 // would wedge the bucket) is a wiring fault and refuses with the same typed
 // error. An unknown -log-level token refuses with errBadLogLevel (via
 // observ.ParseLevel) BEFORE any socket is bound.
-func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
-	profile, tenancy, grantedIntents, downloadablePrefixes string,
-	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
-	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string,
-	storageLane, caBundle string, laneDevDirect bool,
-	s3Bucket, s3Endpoint, s3Region string, s3PathStyle bool,
-	logLevelStr, opsListenAddr string) (brokerConfig, error) {
+func validate(r rawFlags) (brokerConfig, error) {
 	var cfg brokerConfig
+
+	// Destructure the named flag surface into the locals the checks below
+	// read. The names match the rawFlags fields one-for-one.
+	engine := r.engine
+	engineRoot := r.engineRoot
+	auditSink := r.auditSink
+	socketDir := r.socketDir
+	filesystemID := r.filesystemID
+	profile := r.profile
+	tenancy := r.tenancy
+	grantedIntents := r.grantedIntents
+	downloadablePrefixes := r.downloadablePrefixes
+	maxFileSize := r.maxFileSize
+	maxRequestBytes := r.maxRequestBytes
+	opsPerSecond := r.opsPerSecond
+	opsBurst := r.opsBurst
+	s3CredentialFile := r.s3CredentialFile
+	s3STSRoleARN := r.s3STSRoleARN
+	s3STSEndpoint := r.s3STSEndpoint
+	storageLane := r.storageLane
+	caBundle := r.caBundle
+	laneDevDirect := r.laneDevDirect
+	s3Bucket := r.s3Bucket
+	s3Endpoint := r.s3Endpoint
+	s3Region := r.s3Region
+	s3PathStyle := r.s3PathStyle
+	logLevelStr := r.logLevelStr
+	opsListenAddr := r.opsListenAddr
 
 	// -log-level is validated FIRST — before any engine or socket flag — so
 	// an unknown level token is refused pre-bind with a clear typed error.

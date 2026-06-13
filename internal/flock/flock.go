@@ -21,7 +21,7 @@
 //
 // flock(2) is available on both Linux and darwin (this project's dev+prod
 // platforms). LOCK_NB makes the attempt non-blocking: a locked file returns
-// errAlreadyRunning immediately instead of blocking until the holder exits.
+// ErrAlreadyRunning immediately instead of blocking until the holder exits.
 // The lock is held by the process for its entire lifetime; it is released
 // automatically by the kernel when the process exits, even on SIGKILL, so
 // there is no stale-lock problem.
@@ -33,14 +33,10 @@ import (
 	"syscall"
 )
 
-// errAlreadyRunning is returned by Acquire when another daemon holds the
-// lock. Match it with errors.Is.
-var errAlreadyRunning = errors.New("flock: another instance is already running (lock held)")
-
-// ErrAlreadyRunning is the exported alias for errAlreadyRunning, accessible
-// to callers outside the package (e.g. main.go) without importing an
-// otherwise-internal symbol. The values are identical; errors.Is matches.
-var ErrAlreadyRunning = errAlreadyRunning
+// ErrAlreadyRunning is returned by Acquire when another daemon holds the
+// lock. It is the single sentinel callers outside the package (e.g. main.go)
+// match against with errors.Is.
+var ErrAlreadyRunning = errors.New("flock: another instance is already running (lock held)")
 
 // Lock is an exclusive advisory lock on a lock file. The zero value is
 // invalid; use Acquire to obtain a Lock.
@@ -66,7 +62,7 @@ func Acquire(path string) (*Lock, error) {
 	if err != nil {
 		_ = f.Close()
 		if err == syscall.EWOULDBLOCK {
-			return nil, errAlreadyRunning
+			return nil, ErrAlreadyRunning
 		}
 		return nil, err
 	}
