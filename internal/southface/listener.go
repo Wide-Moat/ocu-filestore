@@ -117,18 +117,73 @@ type gatedListener struct {
 	onPeerAccept func()
 }
 
+// acceptBackoffInitial and acceptBackoffCap bound the capped-backoff
+// applied on EMFILE/ENFILE/ECONNABORTED accept errors (T2-6, RES-08).
+// The initial pause is short enough that a burst of fd-exhaustion errors
+// does not stall a burst of legitimate connections for long; the cap is
+// generous enough to avoid hot-spinning under sustained fd exhaustion.
+const (
+	acceptBackoffInitial = 5 * time.Millisecond
+	acceptBackoffCap     = 1 * time.Second
+)
+
+// isTemporaryAcceptErr reports whether err from inner.Accept is a
+// TEMPORARY condition that the accept loop should back off and retry on,
+// rather than treat as a fatal listener error.
+//
+// EMFILE (too many open file descriptors) and ENFILE (system file table
+// full) are triggered by a burst of concurrent connections when the process
+// hits its fd ceiling; the condition is transient and self-resolves when
+// connections close. ECONNABORTED means the peer reset before the kernel
+// finished the handshake — also transient.
+//
+// A closed-listener error (net.ErrClosed or its system-call wrapper) is
+// NOT temporary: it means the server was shut down and the loop must exit.
+func isTemporaryAcceptErr(err error) bool {
+	var se syscall.Errno
+	if errors.As(err, &se) {
+		return se == syscall.EMFILE || se == syscall.ENFILE || se == syscall.ECONNABORTED
+	}
+	return false
+}
+
 // Accept returns the next host-peer connection, closing and skipping any
 // connection whose peer-cred extraction fails or whose uid is not the host
 // uid. No byte is read from a rejected connection (NFR-SEC-76). An admitted
 // connection is wrapped in credConn so the attested (uid, pid) survive to
 // ConnContext and into the audit actor — the gate is the ONE extraction
 // point; nothing downstream re-derives identity.
+//
+// On a TEMPORARY accept error (EMFILE, ENFILE, ECONNABORTED) the loop backs
+// off with a capped exponential delay (acceptBackoffInitial..acceptBackoffCap)
+// and continues instead of returning the error to the http.Server, which
+// would shut the server down (T2-6, RES-08). The backoff is deliberate:
+// tight-spinning under fd exhaustion would waste CPU without giving the OS
+// time to reclaim descriptors. The peer-cred gate is not modified by the
+// backoff — it applies AFTER the accept, when the temporary error does not
+// produce a conn to gate.
 func (g *gatedListener) Accept() (net.Conn, error) {
+	backoff := acceptBackoffInitial
 	for {
 		conn, err := g.inner.Accept()
 		if err != nil {
+			if isTemporaryAcceptErr(err) {
+				// Transient resource exhaustion: back off and retry.
+				// The backoff doubles up to the cap on each consecutive
+				// error so a sustained EMFILE burst does not busy-loop.
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > acceptBackoffCap {
+					backoff = acceptBackoffCap
+				}
+				continue
+			}
 			return nil, err
 		}
+		// A conn arrived — reset the backoff so the next burst starts
+		// fresh from the short initial value.
+		backoff = acceptBackoffInitial
+
 		uid, pid, err := g.checkPeer(conn)
 		if err != nil {
 			if g.onPeerDrop != nil {
