@@ -126,11 +126,17 @@ spec:
         timeoutSeconds: 5
         failureThreshold: 3
 
+      # Readiness probe — exec the daemon's -health-check self-probe, NOT
+      # httpGet. The ops listener binds loopback only; a kubelet httpGet probe
+      # is issued from the node and host:127.0.0.1 would hit the node's own
+      # loopback, never the pod netns, so /readyz could never be reached. An
+      # exec probe runs inside the container where 127.0.0.1 is the pod's
+      # loopback. See broker-deployment.yaml and README for the full rationale.
       readinessProbe:
-        httpGet:
-          path: /readyz
-          port: 9464
-          host: 127.0.0.1
+        exec:
+          command:
+            - /usr/local/bin/ocu-filestored
+            - -health-check
         initialDelaySeconds: 5
         periodSeconds: 10
         timeoutSeconds: 5

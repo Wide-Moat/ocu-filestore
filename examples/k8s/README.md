@@ -185,18 +185,39 @@ livenessProbe:
       - -health-check
 ```
 
-### Readiness (`/readyz`)
+### Readiness
 
-The `readinessProbe` uses an `httpGet` probe against `127.0.0.1:9464/readyz`.
-The kubelet initiates this from the pod's own network namespace, so 127.0.0.1
-resolves correctly. `/readyz` returns 200 only when:
+The `readinessProbe` also uses the daemon's `-health-check` self-probe mode as
+an `exec` probe — **not** an `httpGet` probe.
 
-- The audit sink is not latched (a permanent write failure latches the sink and
-  causes 100% denies — see the audit-latch recovery runbook in docs/operations.md).
-- The local-volume engine root directory is listable.
+The reason is the ops listener's bind posture. The daemon binds its ops
+listener to loopback only (`127.0.0.1:9464`); this is a deliberate security
+choice and the daemon must not be changed to bind a non-loopback address. A
+kubelet `httpGet` probe, however, is **not** issued from inside the container:
+the kubelet dials the pod from the node and a `host: 127.0.0.1` field resolves
+to the **node's** own loopback, which never reaches the pod's network
+namespace. An `httpGet` probe against a loopback-bound listener therefore never
+succeeds, and the pod would never become Ready.
 
-A 503 on `/readyz` removes the pod from service endpoints until the underlying
-problem is fixed.
+An `exec` probe runs the command **inside the container**, where `127.0.0.1` is
+the pod's own loopback and the self-probe reaches the ops listener. The
+distroless image has no shell or `curl`, so the daemon binary serves as its own
+prober:
+
+```yaml
+readinessProbe:
+  exec:
+    command:
+      - /usr/local/bin/ocu-filestored
+      - -health-check
+```
+
+The `-health-check` self-probe dials the ops listener and confirms the daemon
+is serving on its loopback endpoint. The richer audit-latch readiness
+distinction (`/readyz` returning 503 when the audit sink is latched — see the
+audit-latch recovery runbook in docs/operations.md) is observable directly on
+the ops listener from inside the pod, but a kubelet probe of a loopback-bound
+listener must go through an `exec` probe rather than `httpGet`.
 
 ---
 
