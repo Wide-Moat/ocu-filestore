@@ -136,14 +136,6 @@ var errMissingRequiredFlag = errors.New("ocu-filestored: required flag missing o
 // vocabulary. Match it with errors.Is.
 var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 
-// lockFileName is the name of the exclusive flock file placed in the socket
-// directory. It guards the session socket directory from a second daemon
-// minting sockets into the same place (T2-7, LIFE-07). The audit hash chain
-// is guarded by a separate lock keyed on the audit-sink file (see
-// auditLockSuffix) so two daemons sharing one sink collide even when their
-// socket directories differ.
-const lockFileName = ".ocu-filestored.lock"
-
 // auditLockSuffix names the exclusive flock file that guards the audit hash
 // chain. It is the audit-sink path plus this suffix, so the lock is keyed on
 // the very resource it protects: two daemons pointed at the same -audit-sink
@@ -152,8 +144,8 @@ const lockFileName = ".ocu-filestored.lock"
 const auditLockSuffix = ".lock"
 
 // errAlreadyRunning wraps flock.ErrAlreadyRunning with a human message that
-// names the lock file so the operator knows which file to inspect.
-var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (flock held on socket directory)")
+// names the resource so the operator knows which lock to inspect.
+var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the audit-sink lock)")
 
 // errStorageLaneRequired refuses `-engine s3` without a storage lane: the
 // s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
@@ -408,23 +400,26 @@ func run(args []string) error {
 		slog.String("s3_credential_file", cfg.s3CredentialFile),
 	)
 
-	// Single-instance flock guards (T2-7, LIFE-07): acquire two exclusive
-	// non-blocking flocks BEFORE removing any stale socket and binding. Each
-	// lock names the specific shared resource it protects, so a collision on
-	// either is sufficient to refuse a second start and neither guarantee
-	// depends on the other flag matching. Both locks release on process exit
-	// even on SIGKILL (the kernel releases fds on process termination), so
-	// there is no stale-lock problem across crashes.
+	// Single-instance flock guard (T2-7, LIFE-07): acquire one exclusive
+	// non-blocking flock BEFORE removing any stale socket and binding. The lock
+	// is keyed on the -audit-sink resource (<audit-sink>.lock) and is sufficient
+	// to prevent two daemons on the SAME scope from interleaving appends and
+	// corrupting the hash chain: one daemon = one filesystem_id = one audit-sink,
+	// so two daemons on the same scope share the same sink and collide here.
 	//
-	// (1) Audit-chain lock, keyed on the -audit-sink resource itself
-	// (<audit-sink>.lock). Two daemons pointed at the same sink would
-	// interleave appends and corrupt the chain's hash linkage; they must
-	// collide here regardless of -south-socket-dir, so the lock is keyed on
-	// the sink path (canonicalized to an absolute, clean path so different
-	// spellings of the same file still collide). The sink's parent directory
-	// is the audit sink's own; NewFileSink creates the sink and fsyncs that
-	// directory, but the lock file is opened first, so ensure the directory
-	// exists.
+	// A per-socket-directory lock was intentionally removed: the legitimate
+	// deployment topology is N daemons (one per filesystem_id) sharing ONE
+	// socket directory, each binding its own <filesystem_id>.sock there. A
+	// per-directory lock over-restricts to one daemon per directory, refusing
+	// the second through Nth daemons in that topology. The per-scope
+	// audit-sink lock fully preserves the no-interleaved-chain guarantee
+	// without imposing that topology restriction.
+	//
+	// The lock releases on process exit even on SIGKILL (the kernel releases
+	// fds on process termination), so there is no stale-lock problem across
+	// crashes. The sink's parent directory is the audit sink's own;
+	// NewFileSink creates the sink and fsyncs that directory, but the lock
+	// file is opened first, so ensure the directory exists.
 	auditSinkAbs, absErr := filepath.Abs(cfg.auditSink)
 	if absErr != nil {
 		if opsListener != nil {
@@ -455,36 +450,6 @@ func run(args []string) error {
 	// Release the audit-sink lock when the daemon exits (after teardown).
 	defer afl.Release()
 	l.Info("single-instance audit-sink lock acquired", slog.String("lock_file", auditLockPath))
-
-	// (2) Socket-directory lock, keyed on <south-socket-dir>/.ocu-filestored.lock.
-	// Two daemons minting sockets into the same directory would clash on bind;
-	// the default double-start (same socket directory) collides here. The
-	// socket directory may not exist yet (provisionSession creates it); use
-	// os.MkdirAll so the lock file path is always valid, consistent with
-	// provisionSession's own MkdirAll.
-	if err := os.MkdirAll(cfg.socketDir, 0o700); err != nil {
-		if opsListener != nil {
-			_ = opsListener.Close()
-		}
-		return err
-	}
-	lockPath := filepath.Join(cfg.socketDir, lockFileName)
-	fl, lockErr := flock.Acquire(lockPath)
-	if lockErr != nil {
-		if opsListener != nil {
-			_ = opsListener.Close()
-		}
-		if errors.Is(lockErr, flock.ErrAlreadyRunning) {
-			l.Error("single-instance guard: another daemon holds the socket-directory lock; refusing to start",
-				slog.String("lock_file", lockPath),
-			)
-			return errAlreadyRunning
-		}
-		return lockErr
-	}
-	// Release the socket-directory lock when the daemon exits (after teardown).
-	defer fl.Release()
-	l.Info("single-instance socket-directory lock acquired", slog.String("lock_file", lockPath))
 
 	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {

@@ -138,6 +138,39 @@ func TestDistinctAuditSinksDoNotCollide(t *testing.T) {
 	defer l2.Release()
 }
 
+// TestDistinctSinksSharedSocketDirBothSucceed reproduces the multi-scope
+// topology fix: N daemons with DISTINCT audit-sinks (one per filesystem_id)
+// that all share the SAME socket directory must ALL acquire their per-scope
+// locks successfully. The per-directory lock is intentionally absent; the
+// per-scope audit-sink lock is the sole guard, so distinct scopes — which
+// yield distinct sink paths and therefore distinct lock files — must not block
+// one another regardless of the shared socket directory.
+func TestDistinctSinksSharedSocketDirBothSucceed(t *testing.T) {
+	sharedSocketDir := t.TempDir() // both daemons share this directory
+	sinkDir := t.TempDir()
+
+	sink1 := filepath.Join(sinkDir, "audit-scope-a.jsonl")
+	sink2 := filepath.Join(sinkDir, "audit-scope-b.jsonl")
+
+	// Daemon A: scope-a audit-sink, shared socket dir.
+	lockA := sink1 + auditLockSuffix
+	la, err := Acquire(lockA)
+	if err != nil {
+		t.Fatalf("daemon A (scope-a audit-sink, shared socket-dir) Acquire = %v, want nil — distinct scopes must coexist", err)
+	}
+	defer la.Release()
+
+	// Daemon B: DIFFERENT sink (distinct scope), SAME socket directory.
+	// This is the topology the per-directory lock broke: both daemons must
+	// acquire their respective per-scope locks without either blocking the other.
+	lockB := sink2 + auditLockSuffix
+	lb, err := Acquire(lockB)
+	if err != nil {
+		t.Fatalf("daemon B (scope-b audit-sink, shared socket-dir=%q) Acquire = %v, want nil — the shared socket-dir must not prevent the second scope from starting (topology fix)", sharedSocketDir, err)
+	}
+	defer lb.Release()
+}
+
 // TestSameSinkSameSocketDirStillCollides verifies the default double-start
 // (identical -audit-sink AND identical -south-socket-dir) is still refused:
 // the audit lock alone already collides on the shared sink path.

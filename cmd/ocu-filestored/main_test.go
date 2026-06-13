@@ -1418,6 +1418,54 @@ func TestEnvFallbackMapContainsAllNonCredentialFlags(t *testing.T) {
 	})
 }
 
+// TestMultiScopeSharedSocketDirBothCompose pins the multi-scope topology fix
+// (T2-7): two compose() calls with DISTINCT filesystem_id values (and therefore
+// distinct audit-sinks) sharing the SAME socket directory must both succeed.
+//
+// Before the fix, a per-directory flock prevented the second daemon from
+// starting. The per-scope audit-sink lock is now the sole guard; distinct
+// scopes have distinct sinks and therefore distinct lock files, so they coexist
+// even when their -south-socket-dir is the same directory.
+func TestMultiScopeSharedSocketDirBothCompose(t *testing.T) {
+	sharedSocketDir := shortDir(t)
+
+	// Scope A: first daemon, its own engine root and audit sink.
+	cfgA := validBrokerConfig(t)
+	cfgA.socketDir = sharedSocketDir
+	cfgA.filesystemID = "fs-scope-a"
+	cfgA.auditSink = filepath.Join(shortDir(t), "audit-a.jsonl")
+
+	srvA, err := compose(cfgA, testLogger(), telemetry.NewBrokerMetrics("test-a"))
+	if err != nil {
+		t.Fatalf("compose(scope-a, shared socket-dir): %v", err)
+	}
+	serveErrA := make(chan error, 1)
+	go func() { serveErrA <- srvA.Serve() }()
+	defer func() {
+		_ = srvA.Close()
+		<-serveErrA
+	}()
+
+	// Scope B: second daemon, DISTINCT filesystem_id (distinct audit-sink),
+	// but the SAME socket directory. This must succeed — the shared socket dir
+	// is not locked; only the per-scope audit-sink lock guards the chain.
+	cfgB := validBrokerConfig(t)
+	cfgB.socketDir = sharedSocketDir
+	cfgB.filesystemID = "fs-scope-b"
+	cfgB.auditSink = filepath.Join(shortDir(t), "audit-b.jsonl")
+
+	srvB, err := compose(cfgB, testLogger(), telemetry.NewBrokerMetrics("test-b"))
+	if err != nil {
+		t.Fatalf("compose(scope-b, shared socket-dir): %v — the per-directory lock regression is back; distinct scopes must coexist in one socket dir", err)
+	}
+	serveErrB := make(chan error, 1)
+	go func() { serveErrB <- srvB.Serve() }()
+	if err := srvB.Close(); err != nil {
+		t.Fatalf("close(scope-b): %v", err)
+	}
+	<-serveErrB
+}
+
 // TestSystemdUnitIsTypeNotify pins the systemd unit has Type=notify and the
 // required hardening directives.
 func TestSystemdUnitIsTypeNotify(t *testing.T) {
