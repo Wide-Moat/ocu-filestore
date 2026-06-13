@@ -126,10 +126,18 @@ spec:
             - 127.0.0.1:9464
 
           env:
+            # filesystem-id MUST be STABLE across pod recreations. In a
+            # Deployment, metadata.name is the GENERATED pod name (e.g.
+            # ocu-filestored-7d9f8c-abc12), which changes on every rollout and
+            # restart. Sourcing the id from it would give each new pod a fresh
+            # scope directory on the persistent RWO PVC while the previous
+            # pod's scope dir is never swept — a silent PVC fill. Use a literal
+            # instead, scoped one-per-tenant like the broker (NFR-SEC-76).
+            # (The bare Pod in sandbox-peer-pod.yaml may use metadata.name
+            # because a Pod's name is operator-set and stable across its
+            # lifetime — only a Deployment's pod name is generated/unstable.)
             - name: OCU_FILESYSTEM_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
+              value: "ocu-filestored-tenant"
 
           securityContext:
             runAsNonRoot: true
