@@ -158,8 +158,14 @@ func (a ceilingsSessionAdapter) TryAcquireFD() error  { return mapCeilingsErr(a.
 func (a ceilingsSessionAdapter) ReleaseFD()           { a.s.ReleaseFD() }
 
 // mapCeilingsErr remaps the real ceilings sentinels onto the southface
-// mirrors (mirroring mapResolverErr/mapEngineErr). A non-sentinel error
-// passes through unchanged and falls to denyInternal in the spine.
+// mirrors (mirroring mapResolverErr/mapEngineErr) for the three quota verbs
+// the CeilingsSession seam exposes: TryConsumeOp (ops/s throttle), AcquireBytes
+// (in-flight bytes), and TryAcquireFD (open descriptors). ErrSizeExceeded is
+// deliberately NOT mapped here: the declared-size ceiling is a free-function
+// check (ceilings.CheckDeclaredSize), not a session method, so that sentinel
+// never transits this seam — the streaming handler enforces the declared-size
+// deny locally. A non-sentinel error passes through unchanged and falls to
+// denyInternal in the spine.
 func mapCeilingsErr(err error) error {
 	switch {
 	case err == nil:
@@ -170,8 +176,6 @@ func mapCeilingsErr(err error) error {
 		return southface.ErrBytesExceeded
 	case errors.Is(err, ceilings.ErrFDExceeded):
 		return southface.ErrFDExceeded
-	case errors.Is(err, ceilings.ErrSizeExceeded):
-		return southface.ErrSizeExceeded
 	default:
 		return err
 	}
@@ -185,10 +189,12 @@ func mapCeilingsErr(err error) error {
 // called by main on the real engine directly (scope provision and
 // erase-before-reuse, NFR-SEC-54), not through the consumer seam.
 //
-// Engine errors pass through with a narrow remap: only the objectstore typed
-// sentinels (ErrAlreadyExists, ErrInvalidPath) are translated to the
-// southface mirrors; the stdlib fs.ErrExist/fs.ErrNotExist and the
-// *fs.PathError/*os.LinkError escapes pass through VERBATIM so the spine's
+// Engine errors pass through with a narrow remap: the four objectstore typed
+// sentinels are translated to the southface mirrors (ErrAlreadyExists,
+// ErrInvalidPath, ErrThrottled->ErrBackendThrottled,
+// ErrTransient->ErrBackendTransient — see mapEngineErr). The stdlib
+// fs.ErrExist/fs.ErrNotExist and the *fs.PathError/*os.LinkError escapes from
+// the stdlib fs/os layer pass through VERBATIM so the spine's
 // denyClassForEngineErr keeps matching them with its load-bearing ordering
 // (NFR-SEC-25, Pitfall 3).
 type engineAdapter struct{ e objectstore.Engine }
