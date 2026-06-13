@@ -97,7 +97,7 @@ func (d *dispatcher) recordAllow(op string) {
 	if d.brokerMetrics == nil {
 		return
 	}
-	d.brokerMetrics.RecordOp(op, "allow", "none")
+	d.brokerMetrics.RecordOp(op, "allow", denyclassNone)
 }
 
 // observeStage wraps a call to a stage function and records its latency in the
@@ -106,6 +106,21 @@ func (d *dispatcher) recordAllow(op string) {
 func (d *dispatcher) observeStage(stage string, elapsed float64) {
 	if d.brokerMetrics != nil {
 		d.brokerMetrics.ObserveStage(stage, elapsed)
+	}
+}
+
+// recordOp records one ops_total entry for the given op/outcome/deny_class
+// triple, nil-guarding brokerMetrics. It is the streaming-path counterpart to
+// the unary denyOp/recordAllow choke points: the two highest-volume data-plane
+// ops (fileUpload/fileDownload) book their verdict through here so every
+// upload/download deny-rate and throughput row is visible (southface-02). The
+// deny_class single-source is the shared denyclass vocabulary (every value a
+// streaming refusal carries as its audit reason is a valid RecordOp label), so
+// no recover() crutch guards the call — a panic would be genuine label drift
+// and MUST surface loudly in tests.
+func (d *dispatcher) recordOp(op string, outcome, denyClass string) {
+	if d.brokerMetrics != nil {
+		d.brokerMetrics.RecordOp(op, outcome, denyClass)
 	}
 }
 
@@ -466,7 +481,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// STAGE 4: time the engine handler call. The timer wraps h(...) as an
 	// additive observation; the handler's own logic is unchanged.
 	engineStart := time.Now()
-	h(d.handlerDeps(), handlerCtx{
+	outcome := h(d.handlerDeps(), handlerCtx{
 		ctx:         r.Context(),
 		w:           w,
 		op:          op,
@@ -476,7 +491,29 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		mandateDeny: mandateDeny,
 	})
 	d.observeStage("engine", time.Since(engineStart).Seconds())
-	d.recordAllow(opStr)
+
+	// Record ops_total EXACTLY once for the dispatched op, gated on the
+	// handler's reported outcome (southface-01). recordAllow used to fire
+	// UNCONDITIONALLY here, so a handler that refused INTERNALLY (intent_denied,
+	// malformed body/cursor, denyEngine, directory_not_empty, not_downloadable,
+	// unimplemented) still booked a spurious second ops_total{outcome=allow}
+	// for a refused request. The outcome now gates it: a success books the
+	// single allow; a refusal that recorded its own deny through mandateDeny
+	// books nothing further; a refusal that wrote the wire error directly books
+	// its single deny here.
+	switch {
+	case outcome.allowed:
+		d.recordAllow(opStr)
+	case outcome.denyClass != "" && d.brokerMetrics != nil:
+		// The handler already wrote the wire error directly (decodeOp,
+		// malformed cursor, unimplemented) and did NOT touch the counter, so
+		// the spine books the single deny entry here — metric ONLY, never a
+		// second wire write. No recover() crutch: outcome.denyClass is always a
+		// member of the shared denyclass vocabulary, the exact deny_class label
+		// enum RecordOp accepts; a panic here would be a genuine label-drift
+		// wiring bug and MUST surface loudly in tests.
+		d.brokerMetrics.RecordOp(opStr, "deny", outcome.denyClass)
+	}
 }
 
 // activityForOp returns the OCSF ActivityID for an op (Q7): a listing is a

@@ -48,15 +48,64 @@ func (hc handlerCtx) ctxOrBackground() context.Context {
 	return context.Background()
 }
 
+// opOutcome is what a STAGE-4 handler reports back to the spine so the spine
+// records ops_total EXACTLY once for the dispatched op (southface-01). The
+// zero value is an allow; a handler that refused internally returns a deny
+// outcome carrying the broker-resolved deny class.
+//
+// Two deny shapes exist because a handler-internal refusal reaches the metric
+// counter by one of two routes:
+//
+//   - Through the mandateDeny hook (intent_denied, directory_not_empty,
+//     not_downloadable, every denyEngine refusal): the hook already records the
+//     deny in ops_total, so the handler returns outcomeDenyRecorded and the
+//     spine records NOTHING further — neither the spurious allow nor a second
+//     deny.
+//   - Without the hook (a malformed op body, a malformed cursor, the
+//     unimplemented stub): these write the wire error directly and never touch
+//     the counter, so the handler returns outcomeDeny(class) and the SPINE
+//     records the single deny entry from the returned class.
+//
+// Either way the spine emits one ops_total row whose outcome is never "allow"
+// for a refused request, closing the spurious-second-allow accounting bug.
+type opOutcome struct {
+	// allowed is true only when the handler wrote a SUCCESS response. The spine
+	// records ops_total{outcome=allow,deny_class=none} ONLY in that case.
+	allowed bool
+	// denyClass is the broker-resolved deny class the spine must record when the
+	// refusal did NOT already record through the mandateDeny hook. Empty when
+	// allowed, or when the deny was already recorded (outcomeDenyRecorded).
+	denyClass string
+}
+
+// outcomeAllow reports a handler that wrote a success response; the spine
+// records the single allow entry.
+func outcomeAllow() opOutcome { return opOutcome{allowed: true} }
+
+// outcomeDenyRecorded reports a handler-internal refusal that ALREADY recorded
+// its deny in ops_total (it went through the mandateDeny hook). The spine
+// records nothing further.
+func outcomeDenyRecorded() opOutcome { return opOutcome{} }
+
+// outcomeDeny reports a handler-internal refusal that did NOT record its deny
+// (it wrote the wire error directly): the spine records the single deny entry
+// from class.
+func outcomeDeny(class string) opOutcome { return opOutcome{denyClass: class} }
+
 // opHandler is the per-operation handler signature. The seven phase-9 ops bind
-// real handlers; the other eleven stay unimplemented in this build.
-type opHandler func(d *handlerDeps, hc handlerCtx)
+// real handlers; the other eleven stay unimplemented in this build. The
+// returned opOutcome tells the spine whether — and how — to record ops_total
+// for the dispatched op (southface-01).
+type opHandler func(d *handlerDeps, hc handlerCtx) opOutcome
 
 // unimplemented writes the Connect unimplemented error (501) with no
 // x-deny-reason header. Every op the seven phase-9 handlers do not replace
-// resolves to this — the registry is complete, those bodies are not.
-func unimplemented(_ *handlerDeps, hc handlerCtx) {
+// resolves to this — the registry is complete, those bodies are not. It writes
+// the wire error directly (no mandateDeny hook), so it returns the deny class
+// for the spine to record the single ops_total entry.
+func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {
 	writeConnectError(hc.w, mapDeny(denyUnimplemented), "operation not implemented in this build")
+	return outcomeDeny(denyUnimplemented)
 }
 
 // newHandlerRegistry returns a registry mapping every frozen southface.Op —
