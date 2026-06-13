@@ -80,6 +80,88 @@ func TestReleaseIsIdempotent(t *testing.T) {
 	l.Release() // must not panic
 }
 
+// auditLockSuffix mirrors the daemon's suffix for the audit-chain lock file
+// (see cmd/ocu-filestored/main.go). The audit-chain lock is keyed on the
+// audit-sink path itself so the lock names the resource it protects.
+const auditLockSuffix = ".lock"
+
+// TestAuditSinkLockKeyedOnSinkNotSocketDir reproduces flock-01: the
+// audit-chain guard must be keyed on the -audit-sink resource, NOT on the
+// -south-socket-dir. Two daemons pointed at the SAME audit sink but DIFFERENT
+// socket directories must collide — otherwise both start and corrupt the one
+// audit hash chain. The lock file is the sink path plus auditLockSuffix, so a
+// shared sink yields a shared lock file regardless of socket directory.
+func TestAuditSinkLockKeyedOnSinkNotSocketDir(t *testing.T) {
+	sink := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	// Daemon A: shared sink, socket dir A (irrelevant to the audit lock).
+	lockA := sink + auditLockSuffix
+	la, err := Acquire(lockA)
+	if err != nil {
+		t.Fatalf("daemon A audit-lock Acquire = %v, want nil", err)
+	}
+	defer la.Release()
+
+	// Daemon B: SAME sink, DIFFERENT socket dir. Its audit lock file is
+	// derived from the same sink path, so it must collide with daemon A.
+	lockB := sink + auditLockSuffix
+	lb, err := Acquire(lockB)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		if lb != nil {
+			lb.Release()
+		}
+		t.Fatalf("daemon B (same audit-sink, different socket-dir) audit-lock Acquire = %v, want ErrAlreadyRunning", err)
+	}
+	if lb != nil {
+		t.Fatal("daemon B audit-lock returned a non-nil Lock alongside ErrAlreadyRunning")
+	}
+}
+
+// TestDistinctAuditSinksDoNotCollide verifies that two daemons pointed at
+// DIFFERENT audit sinks each take a DISTINCT audit-chain lock and both
+// succeed — independent chains must not block one another.
+func TestDistinctAuditSinksDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	sink1 := filepath.Join(dir, "audit-1.jsonl")
+	sink2 := filepath.Join(dir, "audit-2.jsonl")
+
+	l1, err := Acquire(sink1 + auditLockSuffix)
+	if err != nil {
+		t.Fatalf("sink1 audit-lock Acquire = %v, want nil", err)
+	}
+	defer l1.Release()
+
+	l2, err := Acquire(sink2 + auditLockSuffix)
+	if err != nil {
+		t.Fatalf("sink2 audit-lock Acquire (distinct sink) = %v, want nil — distinct chains must not block", err)
+	}
+	defer l2.Release()
+}
+
+// TestSameSinkSameSocketDirStillCollides verifies the default double-start
+// (identical -audit-sink AND identical -south-socket-dir) is still refused:
+// the audit lock alone already collides on the shared sink path.
+func TestSameSinkSameSocketDirStillCollides(t *testing.T) {
+	sink := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	la, err := Acquire(sink + auditLockSuffix)
+	if err != nil {
+		t.Fatalf("first audit-lock Acquire = %v, want nil", err)
+	}
+	defer la.Release()
+
+	lb, err := Acquire(sink + auditLockSuffix)
+	if !errors.Is(err, ErrAlreadyRunning) {
+		if lb != nil {
+			lb.Release()
+		}
+		t.Fatalf("second audit-lock Acquire (same sink, same socket-dir) = %v, want ErrAlreadyRunning", err)
+	}
+	if lb != nil {
+		t.Fatal("second audit-lock returned a non-nil Lock alongside ErrAlreadyRunning")
+	}
+}
+
 // TestLockFileIsCreated verifies that Acquire creates the lock file on disk
 // so operators can observe it (and so that stale-lock cleanup is predictable).
 func TestLockFileIsCreated(t *testing.T) {
