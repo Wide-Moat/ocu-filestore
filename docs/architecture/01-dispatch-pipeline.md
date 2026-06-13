@@ -151,7 +151,7 @@ it (NFR-SEC-76/78). The steps, in order:
 
 9. **Declared-size pre-buffer reject (NFR-SEC-78).** A unary request carries a
    known-size body, so an **absent Content-Length** (`r.ContentLength < 0`) is
-   refused (`malformed`) before any byte is read; a Content-Length **above the
+   refused (`malformed_envelope`) before any byte is read; a Content-Length **above the
    per-message ceiling** is a `size_exceeded` deny. This is the cheap reject
    that runs before the buffer is even allocated.
 
@@ -179,7 +179,7 @@ the size ceiling intact.
 - A `MaxBytesError` from the read (a body that exceeds the ceiling, including a
   lying or absent Content-Length that slipped the STAGE-0 cheap check) maps to
   `size_exceeded`.
-- Any other read error maps to `malformed`.
+- Any other read error maps to `malformed_envelope`.
 
 The spine then strict-decodes its **routing/cross-check view** of the body with
 `envelope.go:decodeUnaryEnvelopeBytes` into `unaryEnvelope`
@@ -189,7 +189,7 @@ decode is **deliberately lenient on unknown fields**: the op-specific fields
 `make_parents`, …) belong to the real per-op body and are strict-decoded later
 by the handler, which owns the authoritative schema. The spine decode still
 rejects a body that is not a single well-formed JSON object — a decode error or
-a trailing second JSON value is `malformed`.
+a trailing second JSON value is `malformed_envelope`.
 
 > The package also carries a fully strict reader-path decoder
 > (`decodeUnaryEnvelope`, with `DisallowUnknownFields`) and a strict in-memory
@@ -244,7 +244,7 @@ The fix has two halves:
 2. **A wire intent that disagrees with the route op's required intent is
    refused before the resolver is consulted.** If
    `env.AuthorizationMetadata.Intent != requiredIntent`, the request is
-   `errRouteOpMismatch` → `malformed`/`invalid_argument`, and `Resolve` is
+   `errRouteOpMismatch` → `malformed_envelope`/`invalid_argument`, and `Resolve` is
    never called. This closes the attack where a caller declares `intent=read`
    on a mutation route to slip a read-only grant past authorization.
 
@@ -585,7 +585,7 @@ wire-code mapping only:
 
 | Deny class | Wire code | HTTP | `x-deny-reason`? |
 |------------|-----------|------|------------------|
-| `malformed` | `invalid_argument` | 400 | no |
+| `malformed_envelope` | `invalid_argument` | 400 | no |
 | `directory_not_empty` | `invalid_argument` | 400 | no |
 | `throttle` | `resource_exhausted` | 429 | no |
 | `audit_down` | `unavailable` | 503 | no |
@@ -631,7 +631,7 @@ truth), never the degraded wire reason (`denyWith` / `denyWithLog`).
   three-axis authz sentinels, then size/throttle/audit. An error outside the
   known set fails closed to `internal`.
 - `envelope.go:denyClassForDecodeErr` maps envelope/route decode sentinels:
-  `size_exceeded` for the size sentinel; `malformed` for the
+  `size_exceeded` for the size sentinel; `malformed_envelope` for the
   malformed-envelope / unknown-route / bad-version / bad-content-type /
   route-op-mismatch sentinels; `internal` otherwise. (`errBadMethod` is handled
   out of band as the 405.)
