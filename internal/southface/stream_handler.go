@@ -664,6 +664,16 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	// engine-classified verdict (not_found) and no bytes are sent.
 	var offset, length int64
 	if params.Range != nil {
+		// Validate the client-supplied window BEFORE the ALLOW audit (SEC-79):
+		// a negative offset or length is a malformed window — a client request
+		// fault. Route it through the framed deny trailer as denyMalformed /
+		// wireCodeInvalidArgument, mirroring the upload handler's declared_size
+		// pre-buffer check. This guarantees the durable chain records a single
+		// deny with no prior ALLOW — never an allow-then-internal/500 pair.
+		if params.Range.Offset < 0 || params.Range.Length < 0 {
+			denyDownloadTrailer(denyMalformed, wireCodeInvalidArgument, "negative range offset or length")
+			return
+		}
 		offset = params.Range.Offset
 		length = params.Range.Length
 	} else {
