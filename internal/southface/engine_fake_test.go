@@ -139,8 +139,15 @@ func (e *fakeEngine) List(_ context.Context, scope, path string) ([]FileInfo, er
 	if err != nil {
 		return nil, err
 	}
-	if n == nil || !n.isDir {
+	if n == nil {
 		return nil, pathErr("open", path, fs.ErrNotExist)
+	}
+	if !n.isDir {
+		// A client listed a path that is a FILE. Mirror the real engines:
+		// both local (ENOTDIR) and S3 engines return ErrNotADirectory on
+		// this edge so both classify identically through
+		// denyClassForEngineErr as denyMalformed (invalid_argument/400).
+		return nil, errNotADirectory
 	}
 	out := make([]FileInfo, 0, len(n.children))
 	for _, c := range n.children {

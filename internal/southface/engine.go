@@ -109,6 +109,22 @@ var (
 	// connection failure) survived the engine's bounded retries — the caller
 	// may retry. Match it with errors.Is.
 	errBackendTransient = errors.New("southface: transient backend failure")
+
+	// errNotADirectory mirrors objectstore.ErrNotADirectory: the engine
+	// sentinel raised when a List (or scope-lifecycle call) targets a path
+	// that exists but is a file, not a directory. Both local and S3 engines
+	// return this sentinel on the same edge; it classifies as denyMalformed
+	// (invalid_argument/400) because the client named a wrong-kind path —
+	// a request fault, not a backend failure or a missing resource.
+	// Match it with errors.Is.
+	errNotADirectory = errors.New("southface: path is not a directory")
+
+	// errInvalidRange mirrors objectstore.ErrInvalidRange: the ReadRange
+	// pre-flight sentinel raised for a negative offset or negative length.
+	// It classifies as denyMalformed (invalid_argument/400): the client
+	// supplied a malformed window that is a request fault regardless of which
+	// engine is bound. Match it with errors.Is.
+	errInvalidRange = errors.New("southface: invalid read range")
 )
 
 // ErrAlreadyExists and ErrInvalidPath are the EXPORTED aliases of the two
@@ -127,6 +143,10 @@ var (
 	ErrBackendThrottled = errBackendThrottled
 	// ErrBackendTransient is the exported alias of errBackendTransient.
 	ErrBackendTransient = errBackendTransient
+	// ErrNotADirectory is the exported alias of errNotADirectory.
+	ErrNotADirectory = errNotADirectory
+	// ErrInvalidRange is the exported alias of errInvalidRange.
+	ErrInvalidRange = errInvalidRange
 )
 
 // isPathEscape mirrors the engine's containment-escape collapse helper: an
@@ -277,6 +297,15 @@ func denyClassForEngineErr(err error) string {
 		return denyAlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyNotFound
+	case errors.Is(err, errNotADirectory):
+		// A client listed a path that exists but is a file — a request fault,
+		// not a missing resource. Classify as malformed (invalid_argument/400)
+		// so the wire class signals the caller named a wrong-kind path.
+		return denyMalformed
+	case errors.Is(err, errInvalidRange):
+		// A client supplied a negative read range — a malformed window.
+		// Classify as denyMalformed (invalid_argument/400): a request fault.
+		return denyMalformed
 	case errors.Is(err, errBackendThrottled):
 		return denyThrottle
 	case errors.Is(err, errBackendTransient):

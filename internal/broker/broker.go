@@ -281,6 +281,17 @@ func mapEngineErr(err error) error {
 		return southface.ErrAlreadyExists
 	case errors.Is(err, objectstore.ErrInvalidPath):
 		return southface.ErrInvalidPath
+	case errors.Is(err, objectstore.ErrNotADirectory):
+		// Both local and S3 engines raise this when a List targets a file
+		// path. Remap to the southface mirror so denyClassForEngineErr and
+		// auditTruthForEngineErr classify it as denyMalformed
+		// (invalid_argument/400) — a client request fault, not internal/500.
+		return southface.ErrNotADirectory
+	case errors.Is(err, objectstore.ErrInvalidRange):
+		// Both engines raise this for a negative offset or length in ReadRange.
+		// Remap to the southface mirror so the spine classifies it as
+		// denyMalformed (invalid_argument/400) — a client request fault.
+		return southface.ErrInvalidRange
 	case errors.Is(err, objectstore.ErrThrottled):
 		return southface.ErrBackendThrottled
 	case errors.Is(err, objectstore.ErrTransient):

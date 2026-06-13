@@ -114,6 +114,14 @@ func auditTruthForEngineErr(err error) string {
 		return denyAlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyNotFound
+	case errors.Is(err, errNotADirectory):
+		// The client listed a path that is a file — request fault; audited
+		// as malformed (matches the wire class: no truth/wire split needed).
+		return denyMalformed
+	case errors.Is(err, errInvalidRange):
+		// The client supplied a negative read range — request fault; audited
+		// as malformed (matches the wire class: no truth/wire split needed).
+		return denyMalformed
 	case errors.Is(err, errInvalidPath), isPathEscape(err):
 		return denyScopeMismatch // escape truth: a path leaving the bound scope
 	default:
