@@ -76,14 +76,14 @@ func KnownOps() []string {
 // BrokerMetrics is the concrete metric set for the ocu-filestore broker daemon.
 // Obtain it via NewBrokerMetrics; do not construct directly.
 type BrokerMetrics struct {
-	reg            *Registry
-	opsTotal       *Counter
-	stageLatency   *Histogram
-	peerAccepted   *Counter
-	peerDropped    *Counter
-	inFlightBytes  *Gauge
-	fdInUse        *Gauge
-	opsTokens      *Gauge
+	reg           *Registry
+	opsTotal      *Counter
+	stageLatency  *Histogram
+	peerAccepted  *Counter
+	peerDropped   *Counter
+	inFlightBytes *Gauge
+	fdInUse       *Gauge
+	opsTokens     *Gauge
 }
 
 // NewBrokerMetrics creates and registers the full broker metric set.

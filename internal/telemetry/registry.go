@@ -214,9 +214,9 @@ func (h *Histogram) Snapshot(labels Labels) HistogramSnapshot {
 
 // metric is the union type for the registry's families.
 type metric struct {
-	kind    string // "counter", "gauge", "histogram"
-	name    string
-	help    string
+	kind      string // "counter", "gauge", "histogram"
+	name      string
+	help      string
 	counter   *Counter
 	gauge     *Gauge
 	histogram *Histogram
@@ -308,25 +308,40 @@ func (r *Registry) NewBuildInfo(version string) *Gauge {
 	return g
 }
 
+// countingWriter wraps an io.Writer and counts bytes written.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // WriteTo renders all registered metric families in Prometheus text format
-// 0.0.4 to w. It holds only the per-family read locks; callers must not
-// register new metrics concurrently (registration is startup-only).
-func (r *Registry) WriteTo(w io.Writer) {
+// 0.0.4 to w. It satisfies io.WriterTo. It holds only the per-family read
+// locks; callers must not register new metrics concurrently (registration
+// is startup-only).
+func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	r.mu.RLock()
 	metrics := make([]metric, len(r.metrics))
 	copy(metrics, r.metrics)
 	r.mu.RUnlock()
 
+	cw := &countingWriter{w: w}
 	for _, m := range metrics {
 		switch m.kind {
 		case "counter":
-			writeCounter(w, m.counter)
+			writeCounter(cw, m.counter)
 		case "gauge":
-			writeGauge(w, m.gauge)
+			writeGauge(cw, m.gauge)
 		case "histogram":
-			writeHistogram(w, m.histogram)
+			writeHistogram(cw, m.histogram)
 		case "build_info":
-			writeBuildInfo(w, m.gauge)
+			writeBuildInfo(cw, m.gauge)
 		}
 	}
+	return cw.n, nil
 }

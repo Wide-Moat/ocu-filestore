@@ -263,7 +263,7 @@ func TestProvisionLifecycle(t *testing.T) {
 		t.Fatalf("WriteFile stale: %v", err)
 	}
 
-	s, err := provisionSession(dir, entry, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger())
+	s, err := provisionSession(dir, entry, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestProvisionLifecycle(t *testing.T) {
 	}
 
 	// Second Provision after Close rebinds cleanly.
-	s2, err := provisionSession(dir, entry, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger())
+	s2, err := provisionSession(dir, entry, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("second provisionSession after Close: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestPeerCredsRetainedThroughConnContext(t *testing.T) {
 	entry := SessionEntry{FilesystemID: "fs-creds", GrantedIntents: []Intent{IntentRead}}
 	checker := func(net.Conn) (uint32, int32, error) { return 4242, 99, nil }
 
-	s, err := provisionSession(dir, entry, reg, credEchoHandler(), checker, 4242, discardLogger())
+	s, err := provisionSession(dir, entry, reg, credEchoHandler(), checker, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestPeerCredsLinuxReal(t *testing.T) {
 	reg := NewSessionRegistry()
 	entry := SessionEntry{FilesystemID: "fs-creds-real", GrantedIntents: []Intent{IntentRead}}
 
-	s, err := provisionSession(dir, entry, reg, credEchoHandler(), extractPeerCred, uint32(os.Getuid()), discardLogger())
+	s, err := provisionSession(dir, entry, reg, credEchoHandler(), extractPeerCred, uint32(os.Getuid()), discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestAuditActorCarriesGatePeerCreds(t *testing.T) {
 	d := newDispatcherWithEngine(&fakeResolver{}, g, okCeilings(), 1<<20, newFakeEngine())
 	checker := func(net.Conn) (uint32, int32, error) { return 1717, 4242, nil }
 
-	s, err := provisionSession(dir, entry, reg, d, checker, 1717, discardLogger())
+	s, err := provisionSession(dir, entry, reg, d, checker, 1717, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestAuditActorCarriesGatePeerCreds(t *testing.T) {
 func TestSocketDirMode(t *testing.T) {
 	dir := filepath.Join(shortSocketDir(t), "host-owned")
 	reg := NewSessionRegistry()
-	s, err := provisionSession(dir, SessionEntry{FilesystemID: "fs-mode"}, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger())
+	s, err := provisionSession(dir, SessionEntry{FilesystemID: "fs-mode"}, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestProvisionRejectsBadScopeName(t *testing.T) {
 	dir := filepath.Join(shortSocketDir(t), "d")
 	reg := NewSessionRegistry()
 	for _, fsid := range []string{"", "a/b", "../escape"} {
-		if _, err := provisionSession(dir, SessionEntry{FilesystemID: fsid}, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger()); err == nil {
+		if _, err := provisionSession(dir, SessionEntry{FilesystemID: fsid}, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger(), nil, nil); err == nil {
 			t.Fatalf("provisionSession(%q): got nil error, want refusal", fsid)
 		}
 	}
@@ -675,7 +675,7 @@ func TestPeerDropWarnLogsViaLogger(t *testing.T) {
 	// Checker always returns uid 12345, server hostUID is 999 -> uid_mismatch
 	checker := func(net.Conn) (uint32, int32, error) { return 12345, 55, nil }
 
-	s, err := provisionSession(dir, entry, reg, http.NotFoundHandler(), checker, 999, l)
+	s, err := provisionSession(dir, entry, reg, http.NotFoundHandler(), checker, 999, l, nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -700,5 +700,57 @@ func TestPeerDropWarnLogsViaLogger(t *testing.T) {
 	}
 	if !strings.Contains(logged, "WARN") {
 		t.Fatalf("peer-drop log level is not WARN:\n%s", logged)
+	}
+}
+
+// TestPeerCounterWiredToGate verifies that the onPeerAccepted and onPeerDropped
+// callbacks are invoked by the gatedListener accept gate. The counters are
+// incremented alongside (and independently of) the logger-based WARN hook.
+func TestPeerCounterWiredToGate(t *testing.T) {
+	dir := filepath.Join(shortSocketDir(t), "counters")
+	reg := NewSessionRegistry()
+	entry := SessionEntry{FilesystemID: "fs-counters", GrantedIntents: []Intent{IntentRead}}
+
+	// Use atomics to avoid a data race between the accept goroutine (writer)
+	// and the test goroutine (reader).
+	var accepted, dropped int64
+	onAccepted := func() { atomic.AddInt64(&accepted, 1) }
+	onDropped := func() { atomic.AddInt64(&dropped, 1) }
+
+	// Checker: uid 12345, hostUID 999 -> uid_mismatch -> dropped.
+	checker := func(net.Conn) (uint32, int32, error) { return 12345, 55, nil }
+
+	s, err := provisionSession(dir, entry, reg, http.NotFoundHandler(), checker, 999, discardLogger(), onAccepted, onDropped)
+	if err != nil {
+		t.Fatalf("provisionSession: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+
+	// Connect twice — both should be dropped (uid mismatch).
+	for i := 0; i < 2; i++ {
+		conn, err := net.Dial("unix", s.SocketPath())
+		if err != nil {
+			t.Fatalf("Dial[%d]: %v", i, err)
+		}
+		buf := make([]byte, 1)
+		conn.Read(buf)
+		conn.Close()
+	}
+
+	// Wait for the accept goroutine to process both drops.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&dropped) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if atomic.LoadInt64(&accepted) != 0 {
+		t.Errorf("accepted counter: want 0, got %d", atomic.LoadInt64(&accepted))
+	}
+	if atomic.LoadInt64(&dropped) < 2 {
+		t.Errorf("dropped counter: want >=2, got %d", atomic.LoadInt64(&dropped))
 	}
 }

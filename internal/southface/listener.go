@@ -111,6 +111,10 @@ type gatedListener struct {
 	// existing tests that construct gatedListener by literal need not supply
 	// one and continue to compile and pass unchanged.
 	onPeerDrop func(uid uint32, pid int32, reason string)
+	// onPeerAccept is an optional callback invoked when a connection is
+	// admitted through the gate (uid matches hostUID). A nil value is a no-op.
+	// The composition layer supplies a telemetry counter increment here.
+	onPeerAccept func()
 }
 
 // Accept returns the next host-peer connection, closing and skipping any
@@ -139,6 +143,9 @@ func (g *gatedListener) Accept() (net.Conn, error) {
 			}
 			_ = conn.Close()
 			continue
+		}
+		if g.onPeerAccept != nil {
+			g.onPeerAccept()
 		}
 		return &credConn{Conn: conn, uid: uid, pid: pid}, nil
 	}
@@ -179,7 +186,7 @@ func (s *session) SocketPath() string { return s.socketPath }
 // to route the http.Server's internal error log into the JSON stream. A nil
 // logger produces a discard-all logger (the caller must ensure non-nil; Serve
 // normalises the Logger field before calling here).
-func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, handler http.Handler, checkPeer peerChecker, hostUID uint32, logger *slog.Logger) (*session, error) {
+func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, handler http.Handler, checkPeer peerChecker, hostUID uint32, logger *slog.Logger, onPeerAccepted func(), onPeerDropped func()) (*session, error) {
 	socketPath, err := socketPathForScope(dir, entry.FilesystemID)
 	if err != nil {
 		return nil, err
@@ -220,7 +227,11 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 				slog.Uint64(observ.KeyPeerUID, uint64(uid)),
 				slog.Int64(observ.KeyPeerPID, int64(pid)),
 			)
+			if onPeerDropped != nil {
+				onPeerDropped()
+			}
 		},
+		onPeerAccept: onPeerAccepted,
 	}
 
 	s := &session{

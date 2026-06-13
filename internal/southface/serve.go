@@ -77,6 +77,16 @@ type Config struct {
 	// treated as a discard-all logger so existing callers and tests that
 	// construct Config by literal need not supply one.
 	Logger *slog.Logger
+	// OnPeerAccepted is an optional callback invoked when a connection is
+	// admitted through the SEC-76 accept gate (uid matches the host uid). A nil
+	// value is a no-op. The composition layer supplies a telemetry counter
+	// increment here so southface does not import telemetry directly.
+	OnPeerAccepted func()
+	// OnPeerDropped is an optional callback invoked when a connection is
+	// rejected at the SEC-76 accept gate (uid mismatch or peercred error). A nil
+	// value is a no-op. The composition layer supplies a telemetry counter
+	// increment here alongside the plan-01 logger-based onPeerDrop callback.
+	OnPeerDropped func()
 }
 
 // Serve is the sole exported south-face constructor. It validates the wiring
@@ -107,7 +117,7 @@ func Serve(cfg Config) (Server, error) {
 	d.maxFileSize = cfg.BrokerMaxFileSize
 	d.logger = logger
 
-	s, err := provisionSession(cfg.Dir, cfg.Entry, cfg.Registry, d, cfg.CheckPeer, cfg.HostUID, logger)
+	s, err := provisionSession(cfg.Dir, cfg.Entry, cfg.Registry, d, cfg.CheckPeer, cfg.HostUID, logger, cfg.OnPeerAccepted, cfg.OnPeerDropped)
 	if err != nil {
 		return nil, err
 	}

@@ -322,7 +322,7 @@ func TestFileDownloadRealSocket(t *testing.T) {
 	d := newDispatcherWithEngine(resolver, guard, &recordingRegistry{sess: sess}, 1<<20, eng)
 	d.maxFileSize = 1 << 20
 
-	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger())
+	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
