@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"strings"
 	"time"
 )
@@ -140,13 +141,84 @@ func isPathEscape(err error) bool {
 	return errors.As(err, &pathErr) || errors.As(err, &linkErr)
 }
 
-// enginePath converts the guest's POSIX leading-slash convention to the
-// engine's relative convention: "/" and "" become ".", a single leading "/"
-// is stripped ("/a/b" -> "a/b"), and an already-relative path passes through
-// ("a/b" -> "a/b"). It normalizes the slash only; the engine's own path
-// validation is the authority on rejection. This translation runs before
-// every engine call and is the single place the two conventions reconcile —
-// the highest-risk detail in the namespace surface (Pitfall 1).
+// canonicalizePath returns the single canonical in-scope form of a
+// guest-supplied wire path, or errInvalidPath. It is the wire-boundary
+// obligation the dispatch spine discharges ONCE after STAGE 1b and before
+// STAGE 2 authz (bypass-01/03): the cleaned form it returns is what authz, the
+// downloadable tag, the engine read/write, the uuid store, and the audit
+// record ALL see, so the layer that decides downloadable can never disagree
+// with the layer that reads the bytes.
+//
+// Its job is precisely to make authz-path == engine-path: it rejects the
+// unsafe lexical classes objectstore.ValidatePath rejects that can change which
+// object a path names — NUL byte, URL-shaped handle, and an absolute/".."
+// path that escapes the scope root — and applies path.Clean so redundant and
+// traversal segments are collapsed BEFORE any path-aware decision. It maps the
+// guest leading-slash convention to a single canonical guest form: the guest
+// "/a/b" canonicalizes to "/a/b" and trims through enginePath to the engine
+// "a/b" that objectstore.ValidatePath cleans to the identical "a/b".
+//
+// Unlike the engine-side ValidatePath it does NOT reject the scope root itself
+// (canonical "/") or enforce the per-path component cap: those are OP-specific
+// concerns the handlers and the engine already enforce with their own wire
+// classes (a listDirectory of the root is legitimate; a file open of the root
+// or an over-deep path is refused downstream — not_found / the walk-depth cap —
+// not a boundary invalid_argument). The boundary's only contract is the
+// authz==engine path identity. southface declares its own mirror so the
+// consumer-seam isolation (no objectstore import) is preserved, exactly as it
+// mirrors errInvalidPath and the other engine sentinels.
+func canonicalizePath(guest string) (string, error) {
+	if strings.ContainsRune(guest, '\x00') {
+		return "", errInvalidPath
+	}
+	if hasURLScheme(guest) {
+		return "", errInvalidPath
+	}
+	// path.Clean operates on the slash convention directly. Anchor at the scope
+	// root so a leading-slash path and a relative path clean identically:
+	// "/a/b" and "a/b" both clean to "/a/b". A ".." that climbs above the root
+	// surfaces as a residual leading "/.." (path.Clean keeps a leading ".."
+	// after the anchor), caught below.
+	rel := strings.TrimPrefix(guest, "/")
+	clean := path.Clean("/" + rel)
+	// A residual ".." component after Clean means the path tried to escape the
+	// scope root — the bypass-01 class. Refuse it (the engine would also reject
+	// it, but the egress axis must be decided on the CLEANED in-scope form, so
+	// the boundary refuses an escape outright rather than pass it downstream).
+	if clean == "/.." || strings.HasPrefix(clean, "/../") {
+		return "", errInvalidPath
+	}
+	return clean, nil
+}
+
+// hasURLScheme reports whether s begins with an RFC-3986 scheme followed by
+// "://". It mirrors the engine-side objectstore check and must run on the raw
+// input BEFORE path.Clean, which deduplicates "//" and would hide the scheme
+// shape — blocking a backend address (e.g. "s3://bucket/key") smuggled through
+// the path field.
+func hasURLScheme(s string) bool {
+	i := 0
+	isAlpha := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
+	if i >= len(s) || !isAlpha(s[i]) {
+		return false
+	}
+	i++
+	for i < len(s) && (isAlpha(s[i]) || isDigit(s[i]) || s[i] == '+' || s[i] == '-' || s[i] == '.') {
+		i++
+	}
+	return i+2 < len(s) && s[i] == ':' && s[i+1] == '/' && s[i+2] == '/'
+}
+
+// enginePath converts a CANONICAL guest leading-slash path to the engine's
+// relative convention: "/" and "" become ".", a single leading "/" is stripped
+// ("/a/b" -> "a/b"), and an already-relative path passes through. It normalizes
+// the slash only — the path it receives has already been through
+// canonicalizePath at the wire boundary, so it carries no traversal or
+// redundant segments; the engine's own ValidatePath re-validates as
+// defense-in-depth (Pitfall 1).
 func enginePath(guestPath string) string {
 	p := strings.TrimPrefix(guestPath, "/")
 	if p == "" {
@@ -155,12 +227,15 @@ func enginePath(guestPath string) string {
 	return p
 }
 
-// guestPath is the inverse of enginePath for emitting listing responses: it
-// stamps the guest's leading-slash convention back onto an engine-relative
-// path. The scope root "." becomes "/"; any other relative path gains a
-// single leading "/". Listing responses carry guest-convention paths so the
-// guest mount re-uses them directly.
-func guestPath(rel string) string {
+// guestPathFromRel is the inverse of enginePath for emitting listing responses
+// and for keying the uuid store off an engine-relative path: it stamps the
+// guest's leading-slash convention back onto an engine-relative path. The scope
+// root "." becomes "/"; any other relative path gains a single leading "/".
+// Renamed from the former "guestPath" so it can never be mistaken for the
+// canonicalizer — it normalizes the slash convention only and does NOT clean
+// traversal segments; every path reaching it has already been canonicalized at
+// the wire boundary (bypass-03).
+func guestPathFromRel(rel string) string {
 	if rel == "." || rel == "" {
 		return "/"
 	}

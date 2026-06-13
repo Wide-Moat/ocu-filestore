@@ -296,6 +296,19 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		return
 	}
 
+	// --- canonicalize the decoded path ONCE (bypass-01/03) ---
+	// Mirror the unary spine boundary: clean params.Path a single time after the
+	// scope cross-check and before authz/audit/engine so the resolver, the
+	// audit ObjectHandle, and the engine WriteStream target all name the SAME
+	// object. A path the canonicalizer rejects is a pre-allow invalid_argument
+	// deny — nothing is staged.
+	canonUpload, cerr := canonicalizePath(params.Path)
+	if cerr != nil {
+		denyTrailer(denyMalformed, wireCodeInvalidArgument, "invalid or unsafe path")
+		return
+	}
+	params.Path = canonUpload
+
 	// --- authz Resolve(intent=write) from the channel scope ---
 	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: params.Path, Intent: IntentWrite}
 	evidence := CallerEvidence{Scope: sc.ps.FilesystemID, GrantedIntents: sc.ps.GrantedIntents}
@@ -606,9 +619,22 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		_ = writeEndStream(sc.w, &connectError{Code: wireCodeNotFound, Message: "object not found"})
 		return
 	}
+	// Canonicalize the resolved path ONCE before authz/audit/engine
+	// (bypass-01/03). The uuid store is now keyed off canonical paths (the
+	// listing and readFile emitters mint against the spine-canonicalized
+	// req.Path), so this is normally a no-op identity; it is the belt-and-
+	// suspenders that guarantees the downloadable tag, the engine ReadRange
+	// target, and the audit ObjectHandle all name the SAME object even for any
+	// record minted before this boundary existed. A non-canonical record is a
+	// not_found-class refusal — never an egress grant on a dirty path.
+	canonDownload, cerr := canonicalizePath(rec.path)
+	if cerr != nil {
+		denyDownloadTrailer(denyNotFound, wireCodeNotFound, "object not found")
+		return
+	}
 	// Populate req from the resolved (scope, path) for the remainder of the
 	// audit and resolver calls.
-	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: rec.path, Intent: IntentRead}
+	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: canonDownload, Intent: IntentRead}
 
 	// --- authz Resolve(intent=read) from the channel scope ---
 	evidence := CallerEvidence{Scope: sc.ps.FilesystemID, GrantedIntents: sc.ps.GrantedIntents}

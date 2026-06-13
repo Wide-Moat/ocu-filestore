@@ -30,12 +30,26 @@ type handlerCtx struct {
 	// listing of a hostile tree must not outlive its caller). A zero
 	// handlerCtx (some unit tests construct one directly) falls back to
 	// context.Background() through the ctxOrBackground accessor.
-	ctx         context.Context
-	w           http.ResponseWriter
-	op          Op
-	body        []byte
-	ps          PeerScope
-	grant       Grant
+	ctx context.Context
+	w   http.ResponseWriter
+	op  Op
+	// body is the buffered op body. A handler re-decodes it for op-specific
+	// fields OTHER than the primary path (cursor, limit, source/destination,
+	// range, overwrite). It MUST NOT take the primary path from here: the spine
+	// canonicalized the path ONCE at the boundary (bypass-01/03) and the
+	// authoritative cleaned form is canonPath below; re-decoding the raw path
+	// from body would reintroduce the raw-vs-cleaned disagreement the boundary
+	// fix closes.
+	body []byte
+	// canonPath is the single canonical primary path the spine cleaned at the
+	// STAGE 1b->2 boundary. authz, the downloadable tag, the audit ObjectHandle,
+	// the engine call, and the uuid store all derive from it, so a path-aware
+	// decision can never disagree with the bytes touched. It is in the guest
+	// leading-slash convention; enginePath trims it for the engine call.
+	canonPath string
+	ps        PeerScope
+	grant     Grant
+
 	mandateDeny func(auditReason, wireClass, message string)
 }
 

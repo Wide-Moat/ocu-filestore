@@ -383,6 +383,24 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// carries no op field in this build; the route op is authoritative and
 	// the body scope/intent are the only cross-checked fields.
 
+	// STAGE 1b -> 2 BOUNDARY: canonicalize the decoded path ONCE (bypass-01/03).
+	// Nothing trusts the body before STAGE 1b; now that the channel-scope
+	// cross-check has cleared, clean the path a SINGLE time so authz, the
+	// downloadable tag, the engine, the uuid store, and the audit record all
+	// see the SAME object. This is an additive step WITHIN the boundary — the
+	// LOCKED STAGE 0->4 order is unchanged — and it runs BEFORE STAGE 2 so a
+	// `<downloadable-prefix>/../<private>` wire path can never have its egress
+	// axis decided on the raw bytes while a different object is read. A path
+	// the canonicalizer rejects is invalid_argument at the boundary; the
+	// handler is never reached. From here, env.Path is the canonical form and
+	// every downstream consumer derives from it.
+	canonPath, perr := canonicalizePath(env.Path)
+	if perr != nil {
+		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
+		return
+	}
+	env.Path = canonPath
+
 	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
 	// The route op is AUTHORITATIVE for what the request does; the wire
 	// authorization_metadata.intent is an untrusted hint. The authz intent
@@ -486,6 +504,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w:           w,
 		op:          op,
 		body:        bodyBytes,
+		canonPath:   env.Path, // the spine-canonicalized primary path (bypass-01/03)
 		ps:          ps,
 		grant:       grant,
 		mandateDeny: mandateDeny,

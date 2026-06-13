@@ -49,6 +49,7 @@ type fakeEngine struct {
 	listed  []string         // recorded List target paths (rmdir-guard witness)
 	rmDirs  []string         // recorded RemoveDir target paths (no-delete witness)
 	rdrange []string         // recorded ReadRange target paths (SEC-73 deny-precedes-read witness)
+	stated  []string         // recorded Stat target paths (canonical-path / deny-precedes-read witness)
 }
 
 func newFakeEngine() *fakeEngine {
@@ -152,6 +153,7 @@ func (e *fakeEngine) List(_ context.Context, scope, path string) ([]FileInfo, er
 func (e *fakeEngine) Stat(_ context.Context, scope, path string) (FileInfo, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.stated = append(e.stated, path)
 	n, _, _, _, err := e.walk(scope, path)
 	if err != nil {
 		return FileInfo{}, err
@@ -456,6 +458,18 @@ func (e *fakeEngine) readRangeCalls() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.rdrange))
 	copy(out, e.rdrange)
+	return out
+}
+
+// statCalls returns the Stat target paths recorded — the witness that a
+// traversal/non-downloadable readFile deny precedes (and never reaches) the
+// engine Stat, and that the path the engine sees is the canonical one
+// (bypass-01/03).
+func (e *fakeEngine) statCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.stated))
+	copy(out, e.stated)
 	return out
 }
 
