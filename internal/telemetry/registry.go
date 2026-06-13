@@ -296,7 +296,7 @@ func (r *Registry) NewBuildInfo(version string) *Gauge {
 		sortedK: []string{},
 		cells:   make(map[string]float64),
 	}
-	// Store the raw key so WriteTo can reconstruct the label string.
+	// Store the raw key so WriteTo can rebuild the label string.
 	// We encode the version in the cell key as "version=<raw>" and
 	// WriteTo handles the escaping.
 	cellKey := "version=" + version
