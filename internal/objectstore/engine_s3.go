@@ -1015,9 +1015,12 @@ func (e *s3Engine) MoveFile(ctx context.Context, scope ScopeID, src, dst string,
 	if verifyErr != nil {
 		cctx, cancel := noCancelCtx(ctx)
 		defer cancel()
-		_, _ = e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
+		_, delErr := e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(e.bucket), Key: aws.String(dstKey),
 		})
+		if delErr != nil {
+			return errors.Join(verifyErr, fmt.Errorf("objectstore: s3 movefile: cleanup delete of bad copy also failed: %w", mapS3Err("movefile cleanup", delErr)))
+		}
 		return verifyErr
 	}
 
@@ -1045,7 +1048,7 @@ func (e *s3Engine) verifyCopy(ctx context.Context, srcKey, dstKey string) error 
 		return mapS3Err("movefile verify", err)
 	}
 	if aws.ToInt64(srcHead.ContentLength) != aws.ToInt64(dstHead.ContentLength) {
-		return fmt.Errorf("objectstore: s3 movefile: size mismatch after copy (src %d, dst %d); bad copy deleted, source intact",
+		return fmt.Errorf("objectstore: s3 movefile: size mismatch after copy (src %d, dst %d); attempted to delete bad copy, source intact",
 			aws.ToInt64(srcHead.ContentLength), aws.ToInt64(dstHead.ContentLength))
 	}
 	srcDigest, serr := e.digestTagOf(ctx, srcKey)
@@ -1060,7 +1063,7 @@ func (e *s3Engine) verifyCopy(ctx context.Context, srcKey, dstKey string) error 
 		return derr
 	}
 	if dstDigest != srcDigest {
-		return fmt.Errorf("objectstore: s3 movefile: digest mismatch after copy; bad copy deleted, source intact")
+		return fmt.Errorf("objectstore: s3 movefile: digest mismatch after copy; attempted to delete bad copy, source intact")
 	}
 	return nil
 }
@@ -1506,10 +1509,14 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 	if got := aws.ToInt64(head.ContentLength); got != total {
 		cctx, cancel := noCancelCtx(ctx)
 		defer cancel()
-		_, _ = e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
+		sizeErr := fmt.Errorf("objectstore: s3 writestream: size verification failed (streamed %d, backend reports %d); attempted to delete torn object", total, got)
+		_, delErr := e.client.DeleteObject(cctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(e.bucket), Key: aws.String(key),
 		})
-		return fmt.Errorf("objectstore: s3 writestream: size verification failed (streamed %d, backend reports %d); object deleted", total, got)
+		if delErr != nil {
+			return errors.Join(sizeErr, fmt.Errorf("objectstore: s3 writestream: cleanup delete of torn object also failed: %w", mapS3Err("writestream cleanup", delErr)))
+		}
+		return sizeErr
 	}
 	return nil
 }

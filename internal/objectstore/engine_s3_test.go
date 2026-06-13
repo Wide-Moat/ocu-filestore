@@ -1901,3 +1901,32 @@ func TestS3Live_AbortScopeMPUs_MultiUploadSweep(t *testing.T) {
 		t.Fatalf("abortScopeMPUs(already empty): %v", err)
 	}
 }
+
+// --- leak-mpu-02: cleanup-delete error joined + softened messages -----------
+
+// TestS3Live_MoveFile_BadCopyMessage pins the softened error message from the
+// verifyCopy size-mismatch path (leak-mpu-02 fix): the error must say
+// "attempted to delete" rather than "deleted" so the wire/audit truth never
+// asserts a removal that may not have occurred. The digest-mismatch path
+// carries the same message shape; both are exercised via direct verifyCopy
+// calls against live-seeded object pairs.
+func TestS3Live_MoveFile_BadCopyMessage(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	pfx := string(scope) + "/"
+
+	// Size mismatch: src 5 bytes, dst 3 bytes — verifyCopy refuses.
+	liveSeed(t, e, pfx+"sz-src.bin", []byte("FIVE_")) // 5 bytes
+	liveSeed(t, e, pfx+"sz-dst.bin", []byte("THR"))   // 3 bytes
+
+	szErr := e.verifyCopy(ctx, pfx+"sz-src.bin", pfx+"sz-dst.bin")
+	if szErr == nil {
+		t.Fatal("verifyCopy(size mismatch) = nil, want error")
+	}
+	if !strings.Contains(szErr.Error(), "attempted to delete") {
+		t.Fatalf("size-mismatch message = %q; want \"attempted to delete\" (must not assert unconfirmed removal)", szErr.Error())
+	}
+	if strings.Contains(szErr.Error(), "; bad copy deleted") {
+		t.Fatalf("size-mismatch message = %q; must not contain \"; bad copy deleted\" (false-removal claim)", szErr.Error())
+	}
+}
