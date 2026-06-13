@@ -59,73 +59,12 @@ jobs:
           name: ocu-filestored
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
-      - name: smoke — the real daemon refuses a missing required flag
-        # The daemon now composes a real stack; invoked with only -engine and
-        # no required flags it refuses BEFORE binding any socket with the typed
-        # required-flag error. Asserts exit 1 plus a stable substring of the
-        # committed error text main.go emits for the first missing flag.
-        # The runner's default shell is bash -e; capture the expected non-zero
-        # exit with || so the assertion below judges it, not -e.
-        run: |
-          set -uo pipefail
-          code=0
-          out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
-          echo "$out"
-          if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 on a missing required flag, got $code"
-            exit 1
-          fi
-          echo "$out" | grep -q "required flag missing or invalid" || {
-            echo "::error::missing-required-flag error text missing from output"
-            exit 1
-          }
-          echo "$out" | grep -q "engine-root" || {
-            echo "::error::expected the first missing required flag (-engine-root) to be named"
-            exit 1
-          }
-      - name: smoke — unknown engine is refused, never silently defaulted
-        run: |
-          set -uo pipefail
-          code=0
-          out=$(./ocu-filestored -engine bogus 2>&1) || code=$?
-          echo "$out"
-          if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 on unknown engine, got $code"
-            exit 1
-          fi
-          echo "$out" | grep -q "unknown backend engine" || {
-            echo "::error::unknown-engine sentinel missing from output"
-            exit 1
-          }
-      - name: smoke — -engine s3 without a storage lane refuses naming ADR-0011
-        # T1-8: with the FULL s3 flag set and NO lane posture the daemon
-        # passes flag validation and then refuses pre-bind with the typed
-        # lane requirement naming ADR-0011 — the bypass dial does not exist
-        # (NFR-SEC-16/85), and no socket is ever bound.
-        run: |
-          set -uo pipefail
-          tmp=$(mktemp -d)
-          code=0
-          out=$(./ocu-filestored -engine s3 \
-            -s3-bucket ocu-smoke \
-            -s3-endpoint http://127.0.0.1:9 \
-            -audit-sink "$tmp/audit.jsonl" \
-            -south-socket-dir "$tmp/sock" \
-            -filesystem-id fs-smoke \
-            -broker-max-file-size 1 2>&1) || code=$?
-          echo "$out"
-          if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 on -engine s3 without a lane, got $code"
-            exit 1
-          fi
-          echo "$out" | grep -q "ADR-0011" || {
-            echo "::error::the lane refusal must name ADR-0011"
-            exit 1
-          }
-          if ls "$tmp/sock"/*.sock >/dev/null 2>&1; then
-            echo "::error::a socket was bound despite the lane refusal"
-            exit 1
-          fi
+      - name: smoke — the real daemon refuses bad invocations pre-bind
+        # All three pre-bind refusals (missing required flag, unknown engine,
+        # -engine s3 without a storage lane naming ADR-0011 — NFR-SEC-16/85)
+        # live in ONE committed script so e2e and release assert the SAME
+        # invariants against the SAME binary, never drifting YAML copies.
+        run: bash scripts/e2e-smoke.sh ./ocu-filestored
       - name: run the Integration + E2E slice (local-volume leg)
         env:
           OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
@@ -184,7 +123,26 @@ jobs:
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
-        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+        # Capture -json and positively assert the S3-engine leg actually ran.
+        # The s3 e2e cases t.Skip when OCU_E2E_ENGINE/rig env do not reach the
+        # suite (or OCU_BROKER_BIN is unset), and a skip counts as a pass — a
+        # var typo would otherwise report green while exercising no live S3.
+        # TestE2ES3CredentialRedaction runs ONLY on the s3 leg, so its real
+        # pass is the unique liveness signal for this job.
+        run: |
+          set -uo pipefail
+          code=0
+          go test -run 'Integration|E2E' ./... -json -timeout 600s \
+            | tee /tmp/e2e-s3.json >/dev/null || code=$?
+          grep -oE '"Output":"[^"]*"' /tmp/e2e-s3.json \
+            | sed -E 's/^"Output":"//; s/"$//; s/\\n$//; s/\\t/\t/g' || true
+          if ! grep -E '"Action":"pass"' /tmp/e2e-s3.json \
+            | grep -qE '"Test":"TestE2ES3CredentialRedaction"'; then
+            echo "::error::the s3-leg e2e case TestE2ES3CredentialRedaction did not pass — the rig/engine env never reached the live slice (every s3 case skipped)"
+            exit 1
+          fi
+          echo "s3 e2e leg ran: TestE2ES3CredentialRedaction passed against real MinIO"
+          exit "$code"
       - name: tear the rig down
         if: always()
         run: docker compose -f deploy/docker-compose.test.yml down -v

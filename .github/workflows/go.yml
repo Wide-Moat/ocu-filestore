@@ -111,7 +111,34 @@ jobs:
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
-        run: go test ./internal/objectstore/ -run 'Conformance|S3' -v -timeout 600s -count=1
+        # Capture -json so we can both surface a readable log AND positively
+        # assert the LIVE S3 leg actually ran. The live S3 cases t.Skip when
+        # the rig env is unset/mistyped, and a skip counts as a pass — an
+        # endpoint-var typo would otherwise report green while exercising
+        # nothing. Run once, tee the json to disk, render a readable log from
+        # its Output fields, then gate on the captured stream.
+        run: |
+          set -uo pipefail
+          code=0
+          go test ./internal/objectstore/ -run 'Conformance|S3' -json -timeout 600s -count=1 \
+            | tee /tmp/s3-conformance.json >/dev/null || code=$?
+          # Render a readable log from the captured stream for the job output.
+          grep -oE '"Output":"[^"]*"' /tmp/s3-conformance.json \
+            | sed -E 's/^"Output":"//; s/"$//' | sed -E 's/\\n$//; s/\\t/\t/g' || true
+          # Fail the job unless at least one LIVE S3 case reached a real pass
+          # (not a skip). The top-level TestConformance_S3 parent reports pass
+          # even when all its subtests skip, so it is NOT a liveness signal;
+          # the conformance SUBTESTS (TestConformance_S3/...) and the
+          # top-level TestS3Live_* cases pass only when the rig was reached.
+          passed=$(grep -E '"Action":"pass"' /tmp/s3-conformance.json \
+            | grep -cE '"Test":"(TestConformance_S3/[^"]+|TestS3Live_[A-Za-z0-9_]+)"' || true)
+          if [ "${passed:-0}" -eq 0 ]; then
+            echo "::error::no live S3 case passed — the MinIO rig env did not reach the suite (every live case skipped)"
+            exit 1
+          fi
+          echo "live S3 leg ran: $passed live S3 case(s) passed against real MinIO"
+          # Propagate any real test failure from the single run above.
+          exit "$code"
       - name: tear the rig down
         if: always()
         run: docker compose -f deploy/docker-compose.test.yml down -v

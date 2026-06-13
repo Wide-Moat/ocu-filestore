@@ -97,18 +97,14 @@ jobs:
       - name: collect the release coverage profile (internal packages)
         run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
       - name: build and smoke the real binary
-        # The daemon composes a real stack now: invoked with only -engine and
-        # no required flags it refuses BEFORE binding any socket and exits 1
-        # (the typed missing-required-flag error). This tag-gate asserts only
-        # the exit code, which still holds; the e2e job owns the message-level
-        # assertions.
+        # Build the binary the release-gating slice runs against, then run the
+        # SAME committed pre-bind smoke the e2e workflow uses (missing flag,
+        # unknown engine, s3-without-lane naming ADR-0011). Release no longer
+        # carries a weaker exit-code-only copy; one script, asserted once.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           CGO_ENABLED=0 go build -trimpath -o ocu-filestored ./cmd/ocu-filestored
-          code=0
-          out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
-          echo "$out"
-          [ "$code" -eq 1 ] || { echo "::error::expected exit 1, got $code"; exit 1; }
+          bash scripts/e2e-smoke.sh ./ocu-filestored
       - name: run the Integration + E2E slice
         # The e2e helper finds the real daemon via OCU_BROKER_BIN; without it
         # every live case t.Skip's (a skip counts as a pass) and this
