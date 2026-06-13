@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -41,6 +42,7 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/authz"
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
+	"github.com/Wide-Moat/ocu-filestore/internal/flock"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
@@ -133,6 +135,15 @@ var errMissingRequiredFlag = errors.New("ocu-filestored: required flag missing o
 // errBadIntent rejects a -granted-intents value outside the wire intent
 // vocabulary. Match it with errors.Is.
 var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
+
+// lockFileName is the name of the exclusive flock file placed in the socket
+// directory. It guards the audit hash chain from interleaved writes by a
+// second daemon instance (T2-7, LIFE-07).
+const lockFileName = ".ocu-filestored.lock"
+
+// errAlreadyRunning wraps flock.ErrAlreadyRunning with a human message that
+// names the lock file so the operator knows which file to inspect.
+var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (flock held on socket directory)")
 
 // errStorageLaneRequired refuses `-engine s3` without a storage lane: the
 // s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
@@ -386,6 +397,41 @@ func run(args []string) error {
 		// The file's credential bytes never enter a log line.
 		slog.String("s3_credential_file", cfg.s3CredentialFile),
 	)
+
+	// Single-instance flock guard (T2-7, LIFE-07): acquire an exclusive
+	// non-blocking flock on <south-socket-dir>/.ocu-filestored.lock BEFORE
+	// removing any stale socket and binding. Two concurrent daemon instances
+	// would interleave writes into the same audit hash chain and corrupt it;
+	// the flock prevents that. The lock is released on process exit even on
+	// SIGKILL (kernel releases fds on process termination), so there is no
+	// stale-lock problem across crashes.
+	//
+	// The socket directory may not exist yet (provisionSession creates it);
+	// use os.MkdirAll here so the lock file path is always valid, consistent
+	// with provisionSession's own MkdirAll.
+	if err := os.MkdirAll(cfg.socketDir, 0o700); err != nil {
+		if opsListener != nil {
+			_ = opsListener.Close()
+		}
+		return err
+	}
+	lockPath := filepath.Join(cfg.socketDir, lockFileName)
+	fl, lockErr := flock.Acquire(lockPath)
+	if lockErr != nil {
+		if opsListener != nil {
+			_ = opsListener.Close()
+		}
+		if errors.Is(lockErr, flock.ErrAlreadyRunning) {
+			l.Error("single-instance guard: another daemon holds the lock; refusing to start",
+				slog.String("lock_file", lockPath),
+			)
+			return errAlreadyRunning
+		}
+		return lockErr
+	}
+	// Release the lock when the daemon exits (after teardown).
+	defer fl.Release()
+	l.Info("single-instance lock acquired", slog.String("lock_file", lockPath))
 
 	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {
