@@ -174,6 +174,48 @@ func TestNilClockPanics(t *testing.T) {
 	})
 }
 
+// TestNewRegistryFailLoudOnBadCeilings pins the single-place "callers
+// validate" contract: a real (enforcing) Registry refuses a non-positive
+// rate, a sub-one burst, or a negative byte/fd ceiling with a panic, so a
+// misconfigured limiter is a loud wiring failure rather than a silent
+// permanent throttle (rate=0 would drain once then deny forever).
+func TestNewRegistryFailLoudOnBadCeilings(t *testing.T) {
+	base := func() Config {
+		return Config{
+			OpsPerSecond:         1,
+			OpsBurst:             1,
+			InFlightBytesCeiling: 1,
+			FDCeiling:            1,
+			Clock:                frozenClock(),
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"zero_rate", func(c *Config) { c.OpsPerSecond = 0 }},
+		{"negative_rate", func(c *Config) { c.OpsPerSecond = -1 }},
+		{"zero_burst", func(c *Config) { c.OpsBurst = 0 }},
+		{"fractional_burst", func(c *Config) { c.OpsBurst = 0.5 }},
+		{"negative_bytes_ceiling", func(c *Config) { c.InFlightBytesCeiling = -1 }},
+		{"negative_fd_ceiling", func(c *Config) { c.FDCeiling = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(&cfg)
+			mustPanic(t, "NewRegistry "+tc.name, func() {
+				NewRegistry(cfg)
+			})
+		})
+	}
+
+	// A fully valid enforcing config must NOT panic.
+	if reg := NewRegistry(base()); reg == nil {
+		t.Fatal("NewRegistry with a valid config returned nil")
+	}
+}
+
 // TestNopRegistryAdmitsEverything pins the non-enforcing constructor for
 // downstream wiring: ops, bytes, and fd admission all succeed repeatedly —
 // it must never throttle a phase 8-11 test harness.
