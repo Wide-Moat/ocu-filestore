@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -286,6 +287,121 @@ func shortDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
+}
+
+// TestEngineAdapterRealLocalVerbs exercises the uncovered engine adapter verbs
+// (Stat, MoveDir, RemoveDir, CopyFile, MoveFile, RemoveFile) and the ceilings
+// ReleaseFD method end-to-end against a real local-volume engine so that the
+// delegation path — adapter narrows string to ScopeID, delegates to engine,
+// remaps errors — is covered by live execution.
+func TestEngineAdapterRealLocalVerbs(t *testing.T) {
+	base := shortDir(t)
+	eng := objectstore.NewLocalVolumeEngine(base)
+	ctx := context.Background()
+
+	// Provision a scope so the local engine has a rooted directory to work in.
+	const scope = "brktest01"
+	if err := eng.ProvisionScope(ctx, objectstore.ScopeID(scope)); err != nil {
+		t.Fatalf("ProvisionScope: %v", err)
+	}
+	t.Cleanup(func() { eng.TeardownScope(ctx, objectstore.ScopeID(scope)) })
+
+	a := NewEngine(eng)
+
+	// The engineAdapter passes paths to the objectstore engine in the relative
+	// convention the engine expects (no leading slash; "." is the scope root).
+
+	// --- WriteStream + Stat --------------------------------------------------
+	content := []byte("hello delegation")
+	if err := a.WriteStream(ctx, scope, "greet.txt", strings.NewReader(string(content)), false); err != nil {
+		t.Fatalf("WriteStream: %v", err)
+	}
+	fi, err := a.Stat(ctx, scope, "greet.txt")
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Name != "greet.txt" {
+		t.Fatalf("Stat.Name = %q, want %q", fi.Name, "greet.txt")
+	}
+	if fi.Size != int64(len(content)) {
+		t.Fatalf("Stat.Size = %d, want %d", fi.Size, len(content))
+	}
+	if fi.IsDir {
+		t.Fatalf("Stat.IsDir = true, want false for a regular file")
+	}
+
+	// --- MakeDir (already covered) + MoveDir ---------------------------------
+	if err := a.MakeDir(ctx, scope, "src"); err != nil {
+		t.Fatalf("MakeDir(src): %v", err)
+	}
+	if err := a.MoveDir(ctx, scope, "src", "dst", false); err != nil {
+		t.Fatalf("MoveDir(src→dst): %v", err)
+	}
+	// dst must now exist; src must be gone.
+	if _, err := a.Stat(ctx, scope, "dst"); err != nil {
+		t.Fatalf("Stat(dst) after MoveDir: %v", err)
+	}
+
+	// --- RemoveDir -----------------------------------------------------------
+	if err := a.RemoveDir(ctx, scope, "dst"); err != nil {
+		t.Fatalf("RemoveDir(dst): %v", err)
+	}
+
+	// --- CopyFile ------------------------------------------------------------
+	if err := a.CopyFile(ctx, scope, "greet.txt", "greet-copy.txt", false); err != nil {
+		t.Fatalf("CopyFile: %v", err)
+	}
+	fi2, err := a.Stat(ctx, scope, "greet-copy.txt")
+	if err != nil {
+		t.Fatalf("Stat(copy): %v", err)
+	}
+	if fi2.Size != fi.Size {
+		t.Fatalf("CopyFile size mismatch: got %d, want %d", fi2.Size, fi.Size)
+	}
+
+	// --- MoveFile ------------------------------------------------------------
+	if err := a.MoveFile(ctx, scope, "greet-copy.txt", "greet-moved.txt", false); err != nil {
+		t.Fatalf("MoveFile: %v", err)
+	}
+	if _, err := a.Stat(ctx, scope, "greet-moved.txt"); err != nil {
+		t.Fatalf("Stat after MoveFile: %v", err)
+	}
+
+	// --- RemoveFile ----------------------------------------------------------
+	if err := a.RemoveFile(ctx, scope, "greet-moved.txt"); err != nil {
+		t.Fatalf("RemoveFile: %v", err)
+	}
+}
+
+// TestCeilingsAdapterReleaseFD pins the ceilings adapter ReleaseFD delegation:
+// TryAcquireFD followed by ReleaseFD must leave the session in a state where
+// another TryAcquireFD succeeds (the fd counter returned to zero). This covers
+// the ReleaseFD wrapper at line 158 of broker.go, which was 0% covered.
+func TestCeilingsAdapterReleaseFD(t *testing.T) {
+	reg := ceilings.NewRegistry(ceilings.Config{
+		OpsPerSecond:         1000,
+		OpsBurst:             1000,
+		InFlightBytesCeiling: 1 << 30,
+		FDCeiling:            1, // ceiling of exactly 1 so the acquire/release cycle is observable
+		Clock:                time.Now,
+	})
+	a := NewCeilings(reg)
+	sess := a.Session("fd-release-key")
+
+	// Acquire the one available fd slot.
+	if err := sess.TryAcquireFD(); err != nil {
+		t.Fatalf("TryAcquireFD (first): %v", err)
+	}
+	// With FDCeiling=1 a second acquire must fail.
+	if err := sess.TryAcquireFD(); !errors.Is(err, southface.ErrFDExceeded) {
+		t.Fatalf("TryAcquireFD (second, ceiling=1): got %v, want ErrFDExceeded", err)
+	}
+	// ReleaseFD returns the slot; the next acquire must succeed again.
+	sess.ReleaseFD()
+	if err := sess.TryAcquireFD(); err != nil {
+		t.Fatalf("TryAcquireFD after ReleaseFD: %v", err)
+	}
+	sess.ReleaseFD() // clean up
 }
 
 // TestMapEngineErr_TransientThrottled pins the W1 resilience remap

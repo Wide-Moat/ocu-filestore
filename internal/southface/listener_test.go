@@ -463,3 +463,78 @@ func TestProvisionRejectsBadScopeName(t *testing.T) {
 		}
 	}
 }
+
+// TestGatedListenerAddr pins that gatedListener.Addr delegates to the inner
+// listener's address (coverage for the zero-line Addr method at listener.go:132).
+// The assertion is that the returned address is non-nil and reports a unix network,
+// which is the real contract the http.Server caller relies on.
+func TestGatedListenerAddr(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "addr.sock")
+	inner, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer inner.Close()
+
+	gl := &gatedListener{
+		inner:     inner,
+		checkPeer: func(net.Conn) (uint32, int32, error) { return 0, 0, nil },
+		hostUID:   0,
+	}
+
+	addr := gl.Addr()
+	if addr == nil {
+		t.Fatal("gatedListener.Addr() = nil, want the inner listener address")
+	}
+	if addr.Network() != "unix" {
+		t.Fatalf("gatedListener.Addr().Network() = %q, want %q", addr.Network(), "unix")
+	}
+}
+
+// TestCredConnSyscallConn pins that credConn.SyscallConn delegates to the
+// wrapped connection when the inner conn satisfies syscallConner, and returns
+// an error when it does not. This covers the SyscallConn method at
+// listener.go:89, which was 0% covered.
+func TestCredConnSyscallConn(t *testing.T) {
+	socketPath := filepath.Join(shortSocketDir(t), "sc.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Dial a real unix connection so the inner conn is a *net.UnixConn
+	// (which satisfies syscallConner) and SyscallConn can succeed.
+	dialDone := make(chan net.Conn, 1)
+	go func() {
+		c, _ := net.Dial("unix", socketPath)
+		dialDone <- c
+	}()
+
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer server.Close()
+	client := <-dialDone
+	if client != nil {
+		defer client.Close()
+	}
+
+	cc := &credConn{Conn: server, uid: 42, pid: 7}
+	raw, err := cc.SyscallConn()
+	if err != nil {
+		t.Fatalf("credConn.SyscallConn() on a real *net.UnixConn: %v", err)
+	}
+	if raw == nil {
+		t.Fatal("credConn.SyscallConn() returned nil RawConn, want a valid descriptor")
+	}
+
+	// When the inner conn does NOT expose SyscallConn, the method returns an
+	// error (the "inner connection does not expose SyscallConn" branch).
+	type plainConn struct{ net.Conn }
+	ccPlain := &credConn{Conn: plainConn{server}, uid: 42, pid: 7}
+	if _, err := ccPlain.SyscallConn(); err == nil {
+		t.Fatal("credConn.SyscallConn() on a non-syscallConner inner conn: got nil error, want an error")
+	}
+}

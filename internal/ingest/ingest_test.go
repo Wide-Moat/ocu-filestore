@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"strings"
 	"testing"
 )
 
@@ -573,5 +574,70 @@ func TestAbsolutePathEntry(t *testing.T) {
 		if _, err := validateEntryName(raw); !errors.Is(err, ErrInvalidEntry) {
 			t.Fatalf("validateEntryName(%q): got %v, want ErrInvalidEntry", raw, err)
 		}
+	}
+}
+
+// TestArchiveError_Error pins the structured rendering of ArchiveError.Error:
+// each combination of filled fields appends its clause in the documented order
+// (entry → type → count/ceiling), and errors.Is still matches the sentinel
+// Code through the error chain. Every branch of Error() is exercised so the
+// method is no longer 0% covered.
+func TestArchiveError_Error(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  *ArchiveError
+		// substrings that MUST appear in the rendered message
+		wantContains []string
+		// sentinel the error must match via errors.Is
+		wantCode error
+	}{
+		{
+			name:         "code only",
+			err:          &ArchiveError{Code: ErrInvalidEntry},
+			wantContains: []string{ErrInvalidEntry.Error()},
+			wantCode:     ErrInvalidEntry,
+		},
+		{
+			name:         "code + entry name",
+			err:          &ArchiveError{Code: ErrInvalidEntry, EntryName: "../../evil.txt"},
+			wantContains: []string{ErrInvalidEntry.Error(), "../../evil.txt"},
+			wantCode:     ErrInvalidEntry,
+		},
+		{
+			name:         "code + type",
+			err:          &ArchiveError{Code: ErrTypeDenied, Type: "application/x-executable"},
+			wantContains: []string{ErrTypeDenied.Error(), "application/x-executable"},
+			wantCode:     ErrTypeDenied,
+		},
+		{
+			name:         "code + entry + type",
+			err:          &ArchiveError{Code: ErrTypeDenied, EntryName: "run.exe", Type: "application/x-elf"},
+			wantContains: []string{ErrTypeDenied.Error(), "run.exe", "application/x-elf"},
+			wantCode:     ErrTypeDenied,
+		},
+		{
+			name:         "code + count + ceiling",
+			err:          &ArchiveError{Code: ErrEntryCountExceeded, Count: 50001, Ceiling: 50000},
+			wantContains: []string{ErrEntryCountExceeded.Error(), "50001", "50000"},
+			wantCode:     ErrEntryCountExceeded,
+		},
+		{
+			name:         "code + entry + count + ceiling",
+			err:          &ArchiveError{Code: ErrTotalExceeded, EntryName: "big.bin", Count: 0, Ceiling: 1},
+			wantContains: []string{ErrTotalExceeded.Error(), "big.bin", "0", "1"},
+			wantCode:     ErrTotalExceeded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := tc.err.Error()
+			for _, want := range tc.wantContains {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("ArchiveError.Error() = %q, must contain %q", msg, want)
+				}
+			}
+			if !errors.Is(tc.err, tc.wantCode) {
+				t.Fatalf("errors.Is(%v, %v) = false, Unwrap must return the Code sentinel", tc.err, tc.wantCode)
+			}
+		})
 	}
 }

@@ -271,6 +271,75 @@ func TestCredentialRedaction(t *testing.T) {
 	}
 }
 
+// TestStaticCredential_StringGoString pins that the staticCredential and
+// StaticCredentialSource String/GoString methods — the %v and %#v paths —
+// return a redaction marker and NEVER expose the access key id or the secret
+// key bytes. These methods were 0% covered; they are security-load-bearing:
+// a bug here lets a credential leak through any log or error that formats the
+// type.
+func TestStaticCredential_StringGoString(t *testing.T) {
+	t.Setenv(EnvS3AccessKeyID, "AKIDTEST-SGS")
+	t.Setenv(EnvS3SecretAccessKey, testSecret)
+
+	src, err := NewStaticCredentialSource("")
+	if err != nil {
+		t.Fatalf("NewStaticCredentialSource: %v", err)
+	}
+
+	// staticCredential (inner type, accessed as src.cred).
+	cred := src.cred
+	strVal := cred.String()
+	goStrVal := cred.GoString()
+	for _, rendered := range []string{strVal, goStrVal} {
+		if strings.Contains(rendered, testSecret) {
+			t.Fatalf("staticCredential rendering leaked the secret: %q", rendered)
+		}
+		if strings.Contains(rendered, "AKIDTEST-SGS") {
+			t.Fatalf("staticCredential rendering leaked the access key id: %q", rendered)
+		}
+		if rendered == "" {
+			t.Fatalf("staticCredential rendering returned empty string — must return a non-empty redaction marker")
+		}
+	}
+
+	// StaticCredentialSource (outer type).
+	srcStr := src.String()
+	srcGoStr := src.GoString()
+	for _, rendered := range []string{srcStr, srcGoStr} {
+		if strings.Contains(rendered, testSecret) {
+			t.Fatalf("StaticCredentialSource rendering leaked the secret: %q", rendered)
+		}
+		if strings.Contains(rendered, "AKIDTEST-SGS") {
+			t.Fatalf("StaticCredentialSource rendering leaked the access key id: %q", rendered)
+		}
+		if rendered == "" {
+			t.Fatalf("StaticCredentialSource rendering returned empty string — must return a non-empty redaction marker")
+		}
+	}
+}
+
+// TestSTSCredentialSource_StringGoString pins that STSCredentialSource
+// String/GoString never expose the parent credential's secret (the redaction
+// property for the STS wrapper, mirroring TestStaticCredential_StringGoString
+// for the same coverage gap on the STS side).
+func TestSTSCredentialSource_StringGoString(t *testing.T) {
+	src, err := NewSTSCredentialSource(stsTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewSTSCredentialSource: %v", err)
+	}
+
+	strVal := src.String()
+	goStrVal := src.GoString()
+	for _, rendered := range []string{strVal, goStrVal} {
+		if strings.Contains(rendered, testSecret) {
+			t.Fatalf("STSCredentialSource rendering leaked the parent secret: %q", rendered)
+		}
+		if rendered == "" {
+			t.Fatalf("STSCredentialSource rendering returned empty string — must return a non-empty redaction marker")
+		}
+	}
+}
+
 // --- 13-14: STS-per-session source -----------------------------------------
 
 // stsTestConfig returns a valid STSConfig backed by an env static parent.
