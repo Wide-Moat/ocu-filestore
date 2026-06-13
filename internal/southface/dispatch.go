@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -377,6 +378,18 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			denyOp(mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+			return
+		}
+		// Classify a client disconnect or deadline BEFORE the generic malformed
+		// branch (mirrors denyClassForEngineErr step 0, T2-5/RES-03): a
+		// cancelled or deadline-exceeded read is an aborted verdict, not a
+		// durable record of the client sending malformed bytes. A genuinely
+		// truncated or undecodable body that is NOT a disconnect falls through
+		// to denyMalformed below.
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			r.Context().Err() != nil {
+			denyOp(mapDeny(denyAborted), "client disconnected during request body read")
 			return
 		}
 		denyOp(mapDeny(denyMalformed), "malformed request envelope")
