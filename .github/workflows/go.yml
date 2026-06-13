@@ -224,10 +224,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Check out the canonical architecture repo so the byte-identity gate
       # actually enforces in CI; without this the script's skip branch would
-      # make the gate dead on every runner.
+      # make the gate dead on every runner. PIN the canon to the exact commit
+      # the vendored contracts were re-vendored from (tag v0.9.6.0). An
+      # unpinned checkout floats on the canon default-branch HEAD, so a benign
+      # canon edit would redden unrelated PRs here and a canon revert could
+      # hide real drift. Bump this ref deliberately when re-vendoring.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: Wide-Moat/open-computer-use
+          ref: 0ebf93e9e12ba5e192c72c7a0e43335bcf73248c # v0.9.6.0
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
