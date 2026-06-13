@@ -154,6 +154,28 @@ func (g *ByteGauge) ReleaseBytes(n int64) {
 	g.current -= n
 }
 
+// Per-session ceiling defaults for the minimal trusted_operator shelf
+// (NFR-SEC-46). They are deliberately split by tunability:
+//
+//   - The ops/s token-bucket pair (rate and burst) is operator-tunable and
+//     therefore lives as flag defaults in the wiring layer, validated there
+//     and again fail-loud in NewRegistry.
+//   - The in-flight-bytes and open-fd ceilings are FIXED this phase: the
+//     single-tenant trusted_operator shelf has one session class, so a
+//     per-deployment knob would add a tuning surface with no operator to
+//     turn it. They are exported here so the wiring layer references one
+//     named, documented home instead of an inline magic literal, and so a
+//     later phase can promote them to validated flags (same >0 guard the
+//     ops knobs already get) without changing the values.
+const (
+	// DefaultInFlightBytesCeiling bounds one session's concurrently
+	// in-flight bytes. 2 GiB.
+	DefaultInFlightBytesCeiling int64 = 1 << 31
+	// DefaultFDCeiling bounds one session's concurrently open file
+	// descriptors.
+	DefaultFDCeiling int32 = 256
+)
+
 // Config holds the per-session ceiling values a Registry stamps onto each
 // new Session. Callers validate the values before constructing a Registry.
 type Config struct {

@@ -216,6 +216,29 @@ func TestNewRegistryFailLoudOnBadCeilings(t *testing.T) {
 	}
 }
 
+// TestFixedCeilingDefaults pins the fixed-this-phase byte and fd ceiling
+// defaults to their documented values and confirms a Registry built from
+// them passes the fail-loud validation (the defaults are servable, never a
+// silent permanent throttle).
+func TestFixedCeilingDefaults(t *testing.T) {
+	if DefaultInFlightBytesCeiling != 1<<31 {
+		t.Errorf("DefaultInFlightBytesCeiling: got %d, want %d (2 GiB)", DefaultInFlightBytesCeiling, int64(1)<<31)
+	}
+	if DefaultFDCeiling != 256 {
+		t.Errorf("DefaultFDCeiling: got %d, want 256", DefaultFDCeiling)
+	}
+	reg := NewRegistry(Config{
+		OpsPerSecond:         1,
+		OpsBurst:             1,
+		InFlightBytesCeiling: DefaultInFlightBytesCeiling,
+		FDCeiling:            DefaultFDCeiling,
+		Clock:                frozenClock(),
+	})
+	if reg == nil {
+		t.Fatal("NewRegistry with the fixed defaults returned nil")
+	}
+}
+
 // TestNopRegistryAdmitsEverything pins the non-enforcing constructor for
 // downstream wiring: ops, bytes, and fd admission all succeed repeatedly —
 // it must never throttle a phase 8-11 test harness.
