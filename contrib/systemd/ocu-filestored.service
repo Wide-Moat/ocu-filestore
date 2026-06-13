@@ -1,31 +1,46 @@
-# SPDX-License-Identifier: FSL-1.1-Apache-2.0
-# Copyright (c) 2025 Open Computer Use Contributors
+# ocu-filestored.service — systemd unit for the storage-broker daemon
 #
-# systemd service unit for the ocu-filestored storage-broker daemon
-# (component-04). Requires systemd >= 207 for Type=notify.
+# Requires systemd >= 207 (Type=notify). Tested on systemd >= 240.
 #
-# DEPLOYMENT NOTES:
-#   - Copy to /etc/systemd/system/ocu-filestored.service (or drop-in dir).
-#   - Adjust the ExecStart flags (filesystem-id, engine-root, audit-sink,
-#     granted-intents) to match the deployment's values.
-#   - The three WritablePaths directives cover the only mutable surfaces:
-#     engine root (customer workspace bytes), audit sink directory
-#     (fail-closed OCSF records), and the per-session socket directory.
-#   - After editing: systemctl daemon-reload && systemctl enable ocu-filestored
+# INSTALLATION:
+#   cp contrib/systemd/ocu-filestored.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now ocu-filestored
+#
+# SITE CUSTOMISATION — use a drop-in rather than editing this file:
+#   mkdir /etc/systemd/system/ocu-filestored.service.d/
+#   # create site.conf with [Service] Environment= overrides
+#   systemctl daemon-reload
+#
+# The three ReadWritePaths entries cover the only mutable surfaces:
+#   1. Engine root  — customer workspace bytes (local-volume engine).
+#   2. Audit sink   — fail-closed OCSF JSONL hash-chained records.
+#   3. Socket dir   — per-session Unix sockets for the sandbox peer.
+#
+# IMPORTANT — log rotation: NEVER use copytruncate on the audit sink.
+# The sink is hash-chained; copytruncate breaks the chain. The correct
+# procedure is stop → rotate (move/rename) → start. See docs/operations.md.
 
 [Unit]
 Description=Open Computer Use storage broker daemon (component-04)
 Documentation=https://github.com/Wide-Moat/ocu-filestore
-After=network.target
-Wants=network.target
+# The south face needs no network (Unix sockets only); the north face is
+# deferred. Add After=network.target if -engine s3 is used.
+After=local-fs.target
 
 [Service]
+# Type=notify: the daemon sends READY=1 via NOTIFY_SOCKET after the south
+# face begins accepting connections, and STOPPING=1 on SIGTERM/SIGINT.
+# systemd waits for READY=1 before declaring the unit active.
 Type=notify
 NotifyAccess=main
 
 User=ocufilestore
 Group=ocufilestore
 
+# ExecStart: the required serving flags. Adjust per deployment.
+# All flags can also be supplied via OCU_FILESTORE_* environment variables
+# in a drop-in [Service] Environment= block — see docs/configuration.md.
 ExecStart=/usr/local/bin/ocu-filestored \
     -engine local-volume \
     -engine-root /var/lib/ocu-filestore/engine-root \
@@ -38,10 +53,11 @@ ExecStart=/usr/local/bin/ocu-filestored \
     -tenancy single-tenant \
     -ops-listen 127.0.0.1:9464
 
-# Graceful stop: send SIGTERM, wait up to TimeoutStopSec for the bounded drain
-# (southface forces-closes in-flight operations at 25s), then SIGKILL. The
-# bound is 35s — 10s above the daemon's 25s drain — so a clean stop always
-# lets erase-before-reuse teardown finish before SIGKILL (NFR-SEC-54).
+# Graceful stop: SIGTERM → bounded 25s drain → erase-before-reuse (NFR-SEC-54).
+# TimeoutStopSec is 35s — 10s above the daemon's 25s drain bound — so a
+# clean stop always lets the graceful path finish before SIGKILL.
+# A second SIGTERM during the drain kills the process immediately (the
+# daemon releases the signal intercept after the first signal).
 TimeoutStopSec=35s
 KillMode=mixed
 KillSignal=SIGTERM
@@ -49,7 +65,12 @@ KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5s
 
-# --- Security hardening ---
+# ── Security hardening ────────────────────────────────────────────────────
+# The broker needs no elevated capabilities: it only reads/writes a
+# directory, appends to a log file, and accepts Unix-socket connections.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -62,20 +83,21 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+
+# Allow only the syscall groups a normal service daemon needs.
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# The three mutable surfaces the daemon writes (everything else is read-only
-# per ProtectSystem=strict):
-#   1. Engine root: customer workspace bytes.
-#   2. Audit sink directory: fail-closed OCSF audit records.
-#   3. Per-session socket directory: unix sockets for sandbox peers.
+# The three mutable write surfaces (everything else is read-only under
+# ProtectSystem=strict):
 ReadWritePaths=/var/lib/ocu-filestore/engine-root
 ReadWritePaths=/var/log/ocu-filestore
 ReadWritePaths=/run/ocu-filestore/sessions
 
+# Let systemd manage the runtime, log, and state directories (created with
+# correct ownership before ExecStart runs).
 RuntimeDirectory=ocu-filestore
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0700
 LogsDirectory=ocu-filestore
 StateDirectory=ocu-filestore
 
