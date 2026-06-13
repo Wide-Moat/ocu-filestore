@@ -66,6 +66,21 @@ jobs:
       - name: go test
         run: go test ./...
 
+  # race runs the whole suite under the race detector (T1-14): the daemon is
+  # concurrency-heavy (accept gate, per-session ceilings, streaming pipes,
+  # signal-driven shutdown), so a silent data race is a correctness hole the
+  # plain test job cannot see. Gated tests (live S3, real-binary e2e) skip
+  # here exactly as they do in the test job.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go test -race
+        run: go test -race ./... -timeout 600s
+
   # s3-conformance proves the S3 engine against a REAL MinIO backend on
   # every PR: the engine-neutral conformance suite's S3 leg plus the full
   # S3Live slice. No mocks — the rig is the committed compose file. The

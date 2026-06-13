@@ -90,6 +90,8 @@ jobs:
           go-version-file: go.mod
       - name: full test suite
         run: go test ./... -timeout 600s
+      - name: full test suite under the race detector (T1-14)
+        run: go test -race ./... -timeout 600s
       - name: collect the release coverage profile (internal packages)
         run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
       - name: build and smoke the real binary
