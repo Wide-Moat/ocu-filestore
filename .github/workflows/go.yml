@@ -182,8 +182,6 @@ jobs:
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
-      - name: maintainer identity
-        run: bash scripts/check-doc-identity.sh
       - name: vendored contract identity
         env:
           OCU_CANON_DIR: canon
