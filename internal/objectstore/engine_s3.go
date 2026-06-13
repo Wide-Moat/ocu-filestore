@@ -510,8 +510,17 @@ func (e *s3Engine) deleteAllVersions(ctx context.Context, prefix string) error {
 // client-side prefix filter: some S3-compatible backends return an upload
 // for a directory-style Prefix only when it equals the full object key, so
 // a prefix-scoped listing silently under-reports and the sweep would lie.
+//
+// Abort failures are aggregated (first-error kept, count tracked, loop
+// continues) so that a single failing abort never strands every remaining
+// in-progress upload as a silently-billing orphan — the same best-effort
+// sweep contract as deleteByPrefix / deleteAllVersions (SEC-54).
 func (e *s3Engine) abortScopeMPUs(ctx context.Context, prefix string) error {
-	var keyMarker, uploadMarker *string
+	var (
+		keyMarker, uploadMarker *string
+		aborted, failed         int
+		firstErr                error
+	)
 	for {
 		page, lerr := e.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
 			Bucket:         aws.String(e.bucket),
@@ -525,19 +534,31 @@ func (e *s3Engine) abortScopeMPUs(ctx context.Context, prefix string) error {
 			if !strings.HasPrefix(aws.ToString(up.Key), prefix) {
 				continue
 			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if _, aerr := e.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(e.bucket),
 				Key:      up.Key,
 				UploadId: up.UploadId,
 			}); aerr != nil {
-				return mapS3Err("mpu sweep", aerr)
+				failed++
+				if firstErr == nil {
+					firstErr = mapS3Err("mpu sweep", aerr)
+				}
+				continue
 			}
+			aborted++
 		}
 		if !aws.ToBool(page.IsTruncated) {
 			break
 		}
 		keyMarker = page.NextKeyMarker
 		uploadMarker = page.NextUploadIdMarker
+	}
+	if failed > 0 {
+		return fmt.Errorf("objectstore: s3 mpu sweep under %q: %d of %d aborts failed: %w",
+			prefix, failed, failed+aborted, firstErr)
 	}
 	return nil
 }

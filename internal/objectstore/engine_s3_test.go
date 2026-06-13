@@ -1848,3 +1848,56 @@ func TestS3Live_ScopeIsolation(t *testing.T) {
 		t.Fatalf("scope B nest/deep.txt = %q, %v; want \"deep\", nil", buf.String(), err)
 	}
 }
+
+// --- leak-mpu-01: abortScopeMPUs aggregate sweep ---------------------------
+
+// TestS3Live_AbortScopeMPUs_MultiUploadSweep pins the aggregate sweep
+// contract for abortScopeMPUs (leak-mpu-01 fix): multiple in-progress MPUs
+// under one scope prefix are ALL aborted in a single sweep — the loop never
+// stops at the first entry. The second call on an already-empty scope returns
+// nil without error (the idempotent empty case). This exercises the
+// full-sweep / aggregate path; an individual AbortMultipartUpload network
+// error cannot be manufactured against a real backend without intercepting
+// HTTP, so the aggregate-on-error branch is proven structurally by the code
+// change (aggregate vars + continue on aerr != nil, matching deleteByPrefix).
+func TestS3Live_AbortScopeMPUs_MultiUploadSweep(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+	prefix := string(scope) + "/"
+
+	const nUploads = 3
+	keys := [nUploads]string{
+		prefix + "mpu-a.bin",
+		prefix + "mpu-b.bin",
+		prefix + "mpu-c.bin",
+	}
+
+	// Create all three in-progress multipart uploads (no parts needed — the
+	// sweep operates on the upload record, not the parts).
+	for _, key := range keys {
+		if _, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(e.bucket), Key: aws.String(key),
+		}); err != nil {
+			t.Fatalf("CreateMultipartUpload(%q): %v", key, err)
+		}
+	}
+
+	if got := liveMPUCount(t, e, scope); got != nUploads {
+		t.Fatalf("pre-sweep MPU count = %d, want %d (test arrangement broken)", got, nUploads)
+	}
+
+	// Direct call: abortScopeMPUs must abort ALL uploads, not just the first.
+	scopePrefix := string(scope) + "/"
+	if err := e.abortScopeMPUs(ctx, scopePrefix); err != nil {
+		t.Fatalf("abortScopeMPUs(%q): %v", scopePrefix, err)
+	}
+
+	if got := liveMPUCount(t, e, scope); got != 0 {
+		t.Fatalf("post-sweep MPU count = %d, want 0 (%d uploads survived the sweep)", got, got)
+	}
+
+	// Idempotent empty case: a second sweep on the now-clean scope returns nil.
+	if err := e.abortScopeMPUs(ctx, scopePrefix); err != nil {
+		t.Fatalf("abortScopeMPUs(already empty): %v", err)
+	}
+}
