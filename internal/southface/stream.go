@@ -53,6 +53,17 @@ var (
 	// errMalformedFrame is the hard-abort sentinel for an undecodable inbound
 	// data frame payload (WIRE-LESSONS #1: never skip a malformed frame).
 	errMalformedFrame = errors.New("southface: malformed inbound frame")
+
+	// errStreamAborted is the hard-abort sentinel the upload reassembler closes
+	// the engine pipe with when the inbound frame read fails BEFORE the explicit
+	// end-stream half-close — a truncated frame or a mid-stream connection drop
+	// (readFrame returns io.EOF / io.ErrUnexpectedEOF). It MUST be distinct from
+	// io.EOF: io.Copy inside the engine's WriteStream treats a pipe read that
+	// returns io.EOF as a CLEAN end-of-stream and would commit the partial
+	// bytes (temp+rename), so passing the raw io.EOF to pw.CloseWithError would
+	// commit a torn object. Closing with this non-EOF sentinel makes WriteStream
+	// fail and discard the temp, preserving the abort-discards-nothing invariant.
+	errStreamAborted = errors.New("southface: inbound stream aborted before half-close")
 )
 
 // endStreamResponse is the JSON body of an end-stream error trailer:

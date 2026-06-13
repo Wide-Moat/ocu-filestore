@@ -773,6 +773,64 @@ func TestE2EDownloadRange(t *testing.T) {
 	})
 }
 
+// TestE2EDownloadWholeObjectMultiChunk drives a WHOLE-object (no Range)
+// fileDownload of an object LARGER than one outbound data frame
+// (downloadChunkSize = 256 KiB) over the real socket. It pins three things the
+// single-frame range test does not: (a) the no-Range branch resolves the read
+// length from the broker-side object size (a Stat), so the full object streams
+// rather than zero bytes; (b) the outbound chunk loop emits multiple data
+// frames and the guest reassembles them byte-exact; (c) a non-multiple-of-
+// chunk-size tail (the natural ReadFull ErrUnexpectedEOF at object end) closes
+// with the success trailer. The /pub prefix is downloadable so the resolved
+// grant permits the read (SEC-73).
+func TestE2EDownloadWholeObjectMultiChunk(t *testing.T) {
+	skipUnlessPeerCredSupported(t)
+	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub", maxFileSize: 1 << 20})
+
+	mkResp := d.postUnary(t, "makeDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub",
+		"authorization_metadata": authMeta("write"),
+	})
+	mkResp.Body.Close()
+	if mkResp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory /pub status = %d, want 200", mkResp.StatusCode)
+	}
+
+	// 600 KiB + a 1234-byte tail: spans three full 256 KiB frames plus a
+	// short final frame, so both the full-frame loop and the tail path run.
+	const size = 600*1024 + 1234
+	content := make([]byte, size)
+	for i := range content {
+		content[i] = byte((i*31 + 7) & 0xff)
+	}
+
+	// Upload in two chunks to prove reassembly is independent of the inbound
+	// chunk boundaries.
+	trailer := d.uploadStream(t, map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/big.bin",
+		"declared_size_bytes":    size,
+		"authorization_metadata": authMeta("write"),
+	}, [][]byte{content[:size/2], content[size/2:]})
+	if got := strings.TrimSpace(string(trailer)); got != "{}" {
+		t.Fatalf("upload trailer = %q, want success {}", got)
+	}
+
+	uuid := d.listUUID(t, "/pub", "/pub/big.bin")
+
+	out := d.downloadStream(t, uuid, nil)
+	if out.trailer.Error != nil {
+		t.Fatalf("whole-object download trailer = %+v, want success", out.trailer.Error)
+	}
+	if len(out.data) != size {
+		t.Fatalf("whole-object download length = %d, want %d", len(out.data), size)
+	}
+	if !bytes.Equal(out.data, content) {
+		t.Fatalf("whole-object multi-chunk download bytes differ from the uploaded content")
+	}
+}
+
 // TestE2EUploadMidStreamCancel pins the streaming-abort path over the real
 // socket: a fileUpload that declares a size, sends one chunk, then drops the
 // connection BEFORE the end-stream half-close (the request context cancels

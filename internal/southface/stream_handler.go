@@ -350,7 +350,14 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 			} else {
 				denyTrailer(denyAborted, wireCodeAborted, "malformed inbound frame")
 			}
-			pw.CloseWithError(ferr)
+			// Close the engine pipe with a NON-EOF abort sentinel, never the raw
+			// ferr: a truncated frame or a mid-stream connection drop surfaces as
+			// io.EOF / io.ErrUnexpectedEOF, and io.Copy inside WriteStream treats
+			// a pipe read returning io.EOF as a CLEAN end-of-stream — committing
+			// the partial bytes (temp+rename) instead of discarding them. The
+			// sentinel forces WriteStream to fail and reclaim the temp so an
+			// aborted upload stages nothing visible (atomicity on the abort path).
+			pw.CloseWithError(errStreamAborted)
 			<-writeErrCh
 			return
 		}
@@ -577,6 +584,35 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		return
 	}
 
+	// --- resolve the read window BEFORE the ALLOW audit ---
+	// The engine ReadRange contract is the half-open window
+	// [offset, offset+length): a length of 0 is an EMPTY window (zero bytes),
+	// NOT a read-to-EOF — both engines treat it that way. A nil Range is
+	// therefore a WHOLE-object read, for which the length is the object's
+	// current size resolved by a Stat. The Stat runs BEFORE the ALLOW Mandate
+	// so a vanished object (the listing that minted the uuid raced a delete)
+	// records a single deny, never an allow-then-deny pair; it degrades to the
+	// engine-classified verdict (not_found) and no bytes are sent.
+	var offset, length int64
+	if params.Range != nil {
+		offset = params.Range.Offset
+		length = params.Range.Length
+	} else {
+		// statSizeContained recovers a panicking engine.Stat into errInternalPanic
+		// so a whole-object size probe cannot escape the streaming contract: every
+		// download verdict is a framed HTTP-200 trailer, never a unary error from
+		// the outer recoverDispatch net (which has already committed the 200
+		// header here). A real Stat error or a recovered panic both classify
+		// through denyClassForEngineErr (a panic → denyInternal).
+		size, serr := statSizeContained(sc.ctx, d.engine, sc.ps.FilesystemID, enginePath(req.Path))
+		if serr != nil {
+			wireClass := denyClassForEngineErr(serr)
+			denyDownloadTrailer(wireClass, mapDeny(wireClass).WireCode, "object not found")
+			return
+		}
+		length = size
+	}
+
 	// --- audit ALLOW before any data frame (audit-before-ack, SEC-79) ---
 	allow := d.streamDownloadAuditEvent(sc.ps, req, grant, sc.reqID)
 	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
@@ -587,14 +623,6 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	}
 
 	// --- stream bytes: ReadRange → framed data frames ---
-	// Derive the read window from the request's optional Range field.
-	// A nil Range is a full read (offset 0, length 0 → ReadRange reads to EOF).
-	var offset, length int64
-	if params.Range != nil {
-		offset = params.Range.Offset
-		length = params.Range.Length
-	}
-
 	rel := enginePath(req.Path)
 	pr, pw := io.Pipe()
 	readErrCh := make(chan error, 1)
@@ -653,6 +681,30 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 
 	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.
 	_ = writeEndStream(sc.w, nil)
+}
+
+// statSizeContained resolves the object's current size for a whole-object
+// download via engine.Stat, recovering a panicking engine into errInternalPanic.
+// The download handler runs Stat on the MAIN handler goroutine (not the
+// ReadRange pipe goroutine, which has its own recoverReadStream), so without
+// this guard a Stat panic would unwind to recoverDispatch and surface as a
+// unary error AFTER the HTTP-200 stream header was already committed — breaking
+// the always-framed-trailer streaming contract. A recovered panic returns a
+// zero size and errInternalPanic, which the caller classifies through
+// denyClassForEngineErr (→ denyInternal → wireCodeInternal), the same path as
+// any other unrecognised engine fault.
+func statSizeContained(ctx context.Context, e Engine, scope, path string) (size int64, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			size = 0
+			err = errInternalPanic
+		}
+	}()
+	fi, serr := e.Stat(ctx, scope, path)
+	if serr != nil {
+		return 0, serr
+	}
+	return fi.Size, nil
 }
 
 // decodeChunkFrame strict-decodes one chunk data frame: unknown fields are

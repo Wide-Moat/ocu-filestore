@@ -203,8 +203,11 @@ func TestPanicContainmentStreamDownloadPath(t *testing.T) {
 	// listing handler, which is the engine path with "/" prepended).
 	uuid := d.ids.idFor(scope, "/"+filePath)
 
-	// Build a valid download request: params frame carrying the uuid.
-	paramsJSON := `{"filesystem_id":"` + scope + `","uuid":"` + uuid + `","authorization_metadata":{"intent":"read","downloadable":true}}`
+	// Build a valid download request: params frame carrying the uuid. A RANGE
+	// is supplied so the handler skips the whole-object Stat size probe and
+	// drives straight to ReadRange — the verb whose pipe-goroutine panic
+	// containment (recoverReadStream) this test exercises.
+	paramsJSON := `{"filesystem_id":"` + scope + `","uuid":"` + uuid + `","range":{"offset":0,"length":16},"authorization_metadata":{"intent":"read","downloadable":true}}`
 	var buf bytes.Buffer
 	if err := writeFrame(&buf, dataFlag, []byte(paramsJSON)); err != nil {
 		t.Fatalf("params frame: %v", err)
@@ -225,6 +228,65 @@ func TestPanicContainmentStreamDownloadPath(t *testing.T) {
 	}
 
 	// Guard was called (allow Mandate fired before the engine goroutine).
+	g.mu.Lock()
+	evCount := len(g.events)
+	g.mu.Unlock()
+	if evCount == 0 {
+		t.Fatal("guard.Mandate was never called — deny audit was not attempted (NFR-SEC-79)")
+	}
+}
+
+// TestPanicContainmentStreamDownloadStatPath drives a panicking-fake-engine on
+// the WHOLE-OBJECT download path, where the handler runs engine.Stat on the
+// MAIN goroutine to resolve the read length (a nil Range = whole object). A
+// Stat panic must be contained INTO a framed end-stream error trailer — never
+// escape to recoverDispatch and surface as a unary error after the HTTP-200
+// stream header is already committed (the streaming always-framed-trailer
+// contract). The deny audit must still be attempted (NFR-SEC-79).
+func TestPanicContainmentStreamDownloadStatPath(t *testing.T) {
+	g := &fakeGuard{}
+	d := newDispatcherWithEngine(
+		&fakeResolver{grant: Grant{Downloadable: true}},
+		g,
+		okCeilings(),
+		1<<20,
+		panicEngine{},
+	)
+
+	const (
+		scope    = "fs-panic-stat"
+		filePath = "panic-stat.bin"
+	)
+	uuid := d.ids.idFor(scope, "/"+filePath)
+
+	// NO range field → whole-object read → the handler calls engine.Stat, which
+	// panics on panicEngine.
+	paramsJSON := `{"filesystem_id":"` + scope + `","uuid":"` + uuid + `","authorization_metadata":{"intent":"read","downloadable":true}}`
+	var buf bytes.Buffer
+	if err := writeFrame(&buf, dataFlag, []byte(paramsJSON)); err != nil {
+		t.Fatalf("params frame: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	d.ServeHTTP(w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
+
+	if w.Code != 200 {
+		t.Fatalf("streaming response status = %d, want 200", w.Code)
+	}
+
+	// The verdict must be a framed END-STREAM (0x02) error trailer, proving the
+	// Stat panic was contained inside the stream rather than escaping to the
+	// unary recoverDispatch net.
+	flag, resp := streamTrailer(t, w)
+	if flag != endStreamFlag {
+		t.Fatalf("last frame flag = %#x, want end-stream %#x (Stat panic escaped the stream)", flag, endStreamFlag)
+	}
+	if resp.Error == nil {
+		t.Fatal("trailer = success, want error (engine Stat panicked)")
+	}
+
+	// Deny audit was attempted (the contained panic flows through
+	// denyDownloadTrailer → guard.Mandate before the trailer).
 	g.mu.Lock()
 	evCount := len(g.events)
 	g.mu.Unlock()
