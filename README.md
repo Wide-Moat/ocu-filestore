@@ -39,6 +39,8 @@ What is complete and operational:
   `deploy/docker-compose.yml` solo deployment.
 - Full CI gate: secrets scan, naming denylist, SAST, SCA, race detector,
   conventional-commits, 86 % coverage floor.
+- Supply chain: SHA-pinned actions, SBOM, keyless `cosign` signing and SLSA
+  build provenance on tagged releases, Dependabot, `govulncheck`.
 
 What is not yet in scope:
 
@@ -46,8 +48,9 @@ What is not yet in scope:
   bound in any release. Deferred per the roadmap.
 - Multi-tenant admission: the current shelf admits `trusted_operator` /
   `single-tenant` / `host_local_long_lived` or `sts_per_session` only.
-- SBOM, cosign, SLSA provenance: scheduled for the next tier.
-- Kubernetes deployment examples and seccomp profile.
+- Kubernetes deployment examples and a shipped seccomp profile.
+- First tagged release: the signing/SBOM/provenance jobs are wired but run on
+  the first `v*` tag, not yet cut.
 
 ## Shape
 
