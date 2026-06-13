@@ -51,13 +51,18 @@ func TestPropVerbContainment(t *testing.T) {
 		}
 		scopeDir := filepath.Join(base, string(scope))
 
-		// Sibling dir OUTSIDE the base dir with a secret marker — the
-		// untouchable world.
-		outside := filepath.Join(filepath.Dir(base), "outside")
+		// Sibling dir OUTSIDE the scope with a secret marker — the untouchable
+		// world. It lives alongside base (not derived from filepath.Dir(base)
+		// which is shared across all rapid iterations) so each iteration gets
+		// its own outside directory and its own inode for the marker file.
+		// Using filepath.Dir(base) would produce the same path for every rapid
+		// call (rapid issues t.TempDir() as .../001, .../002, …, all children
+		// of the same parent), causing the deferred os.RemoveAll to race with
+		// the next iteration's os.WriteFile and flip the marker's inode mid-run.
+		outside := filepath.Join(base, "outside")
 		if err := os.MkdirAll(outside, 0o755); err != nil {
 			rt.Fatalf("mkdir outside: %v", err)
 		}
-		defer os.RemoveAll(outside)
 		secretPath := filepath.Join(outside, "secret")
 		if err := os.WriteFile(secretPath, []byte("escaped"), 0o644); err != nil {
 			rt.Fatalf("write secret: %v", err)
