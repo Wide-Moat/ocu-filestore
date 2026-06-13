@@ -828,3 +828,111 @@ func TestReadFileDeferredOpsUnimplemented(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditHandleCanonicalForCopyMove pins bypass-02b (audit-truth, NFR-SEC-79):
+// a copy or move whose Destination (or Source on a move) carries traversal
+// segments ("/pub/../priv/stolen") must record the BROKER-RESOLVED canonical
+// path ("/priv/stolen") in the audit ObjectHandle — the same canonicalization
+// the spine applies to the primary path at STAGE 1b/2. A raw wire path in the
+// durable record would let the audit claim a different object than the engine
+// actually wrote.
+func TestAuditHandleCanonicalForCopyMove(t *testing.T) {
+	// copyFile: non-canonical destination. The destination "/pub/../dst.txt"
+	// canonicalizes to "/dst.txt". The engine receives the raw form, rejects
+	// it as an invalid path (errInvalidPath → not_found), so the response is
+	// 404. The STAGE-3 allow event (events[0]) is emitted BEFORE the engine
+	// call and must record the canonical "/dst.txt" in ObjectHandle.
+	t.Run("copyFile_non_canonical_destination_is_cleaned_in_audit_handle", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putFile(opScope, "src.txt", 10)
+		g := &fakeGuard{}
+		d := newEngineDispatcher(&fakeResolver{}, g, okCeilings(), eng)
+
+		body := fmt.Sprintf(
+			`{"filesystem_id":%q,"source":"/src.txt","destination":"/pub/../dst.txt","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+			opScope)
+		w := serveOp(d, OpCopyFile, body, opScope, okIntents())
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (raw destination invalid at engine); body %s", w.Code, w.Body.String())
+		}
+
+		if len(g.events) < 1 {
+			t.Fatalf("copyFile emitted %d audit events, want at least 1 (the STAGE-3 allow)", len(g.events))
+		}
+		ev, ok := g.events[0].(auditgate.FileActivityEvent)
+		if !ok {
+			t.Fatalf("first audit event type = %T, want auditgate.FileActivityEvent", g.events[0])
+		}
+		// STAGE-3 allow event: ObjectHandle must name the canonical destination,
+		// not the raw "/pub/../dst.txt" traversal form.
+		wantHandle := opScope + ":/dst.txt"
+		if ev.ObjectHandle != wantHandle {
+			t.Fatalf("copyFile STAGE-3 audit ObjectHandle = %q, want the canonical %q", ev.ObjectHandle, wantHandle)
+		}
+	})
+
+	// moveFile: non-canonical destination
+	t.Run("moveFile_non_canonical_destination_is_cleaned_in_audit_handle", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putFile(opScope, "mv-src.txt", 7)
+		g := &fakeGuard{}
+		d := newEngineDispatcher(&fakeResolver{}, g, okCeilings(), eng)
+
+		body := fmt.Sprintf(
+			`{"filesystem_id":%q,"source":"/mv-src.txt","destination":"/a/b/../moved.txt","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+			opScope)
+		// The destination parent "a" does not exist, so the engine returns not_found
+		// and the handler emits a deny event. We assert the ALLOW event (events[0])
+		// which is the STAGE-3 pre-handler record: ObjectHandle is built from the
+		// parsed body destination BEFORE the engine is called.
+		w := serveOp(d, OpMoveFile, body, opScope, okIntents())
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (dst parent missing); body %s", w.Code, w.Body.String())
+		}
+
+		if len(g.events) < 1 {
+			t.Fatalf("moveFile emitted %d audit events, want at least 1 (the STAGE-3 allow)", len(g.events))
+		}
+		ev, ok := g.events[0].(auditgate.FileActivityEvent)
+		if !ok {
+			t.Fatalf("first audit event type = %T, want auditgate.FileActivityEvent", g.events[0])
+		}
+		// STAGE-3 allow event: ObjectHandle must name the canonical destination
+		// "/a/moved.txt", not the raw "/a/b/../moved.txt".
+		wantHandle := opScope + ":/a/moved.txt"
+		if ev.ObjectHandle != wantHandle {
+			t.Fatalf("moveFile STAGE-3 audit ObjectHandle = %q, want the canonical %q", ev.ObjectHandle, wantHandle)
+		}
+	})
+
+	// moveDirectory: non-canonical destination
+	t.Run("moveDirectory_non_canonical_destination_is_cleaned_in_audit_handle", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.mkdirSeed(opScope, "srcdir")
+		g := &fakeGuard{}
+		d := newEngineDispatcher(&fakeResolver{}, g, okCeilings(), eng)
+
+		// Destination "/x/y/../dstdir" canonicalizes to "/x/dstdir".
+		// The destination parent "x" does not exist, so the engine returns
+		// not_found and we assert the STAGE-3 allow event.
+		body := fmt.Sprintf(
+			`{"filesystem_id":%q,"source":"/srcdir","destination":"/x/y/../dstdir","authorization_metadata":{"intent":"write","downloadable":false}}`,
+			opScope)
+		w := serveOp(d, OpMoveDirectory, body, opScope, okIntents())
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (dst parent missing); body %s", w.Code, w.Body.String())
+		}
+
+		if len(g.events) < 1 {
+			t.Fatalf("moveDirectory emitted %d audit events, want at least 1", len(g.events))
+		}
+		ev, ok := g.events[0].(auditgate.FileActivityEvent)
+		if !ok {
+			t.Fatalf("first audit event type = %T, want auditgate.FileActivityEvent", g.events[0])
+		}
+		wantHandle := opScope + ":/x/dstdir"
+		if ev.ObjectHandle != wantHandle {
+			t.Fatalf("moveDirectory STAGE-3 audit ObjectHandle = %q, want the canonical %q", ev.ObjectHandle, wantHandle)
+		}
+	})
+}

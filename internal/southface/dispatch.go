@@ -586,24 +586,42 @@ func activityForOp(op Op) int {
 // others it is the envelope path. The destination is read from the buffered
 // body so the audit record names the produced handle even though the spine
 // envelope carries no destination field.
+//
+// The destination path is canonicalized through canonicalizePath — the same
+// canonicalizer the dispatch boundary applies to the primary path at STAGE
+// 1b/2 (bypass-01/03) — so the durable audit record names the
+// broker-resolved truth and never a raw wire path that could encode traversal
+// segments ("/pub/../priv/stolen") while the engine wrote a different object
+// ("/priv/stolen"). If the body cannot be decoded or the destination is
+// lexically invalid, the handle falls back to the canonicalized primary path
+// (req.Path), which the spine already cleaned at STAGE 1b (NFR-SEC-79).
 func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) string {
 	path := req.Path
+	var rawDst string
+	var gotDst bool
 	switch op {
 	case OpMoveDirectory:
 		var b moveDirectoryRequest
 		if json.Unmarshal(body, &b) == nil {
-			path = b.Destination
+			rawDst, gotDst = b.Destination, true
 		}
 	case OpCopyFile:
 		var b copyFileRequest
 		if json.Unmarshal(body, &b) == nil {
-			path = b.Destination
+			rawDst, gotDst = b.Destination, true
 		}
 	case OpMoveFile:
 		var b moveFileRequest
 		if json.Unmarshal(body, &b) == nil {
-			path = b.Destination
+			rawDst, gotDst = b.Destination, true
 		}
+	}
+	if gotDst {
+		if clean, err := canonicalizePath(rawDst); err == nil {
+			path = clean
+		}
+		// If canonicalizePath rejects the destination (lexically invalid), path
+		// stays as req.Path — the already-canonical primary path.
 	}
 	return scope + ":" + path
 }
