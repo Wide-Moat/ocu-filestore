@@ -338,10 +338,14 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 }
 
 // socketPathForScope derives the per-session socket path from the scope,
-// refusing a scope unfit for a single filename (empty, or one that contains a
-// path separator or a parent reference) so the path can never escape dir.
+// refusing a scope unfit for a single filename so the joined path can never
+// escape dir: an empty scope, the exact dot or dot-dot components, or any
+// scope carrying a path separator. A scope that merely embeds ".." as a
+// substring (e.g. "tenant..eu") is legitimate — with no separator it joins to
+// a single child filename and cannot traverse upward.
 func socketPathForScope(dir, scope string) (string, error) {
-	if scope == "" || strings.ContainsRune(scope, '/') || strings.ContainsRune(scope, filepath.Separator) || scope == ".." || strings.Contains(scope, "..") {
+	if scope == "" || scope == "." || scope == ".." ||
+		strings.ContainsRune(scope, '/') || strings.ContainsRune(scope, filepath.Separator) {
 		return "", fmt.Errorf("%w: %q", errBadScopeName, scope)
 	}
 	return filepath.Join(dir, scope+".sock"), nil
