@@ -297,7 +297,9 @@ func TestMapCeilingsErr(t *testing.T) {
 		{"bytes", ceilings.ErrBytesExceeded, southface.ErrBytesExceeded},
 		{"bytes_wrapped", fmt.Errorf("acquire: %w", ceilings.ErrBytesExceeded), southface.ErrBytesExceeded},
 		{"fd", ceilings.ErrFDExceeded, southface.ErrFDExceeded},
-		{"size", ceilings.ErrSizeExceeded, southface.ErrSizeExceeded},
+		// ErrSizeExceeded is intentionally absent: the declared-size ceiling is
+		// a free-function check, not a CeilingsSession method, so it never
+		// transits mapCeilingsErr (broker-01).
 		{"non_sentinel_passthrough", errors.New("boom"), nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -313,8 +315,7 @@ func TestMapCeilingsErr(t *testing.T) {
 				// mirror; it passes through so the spine denies internal.
 				if errors.Is(got, southface.ErrThrottleExceeded) ||
 					errors.Is(got, southface.ErrBytesExceeded) ||
-					errors.Is(got, southface.ErrFDExceeded) ||
-					errors.Is(got, southface.ErrSizeExceeded) {
+					errors.Is(got, southface.ErrFDExceeded) {
 					t.Fatalf("non-sentinel %v was remapped to a quota mirror (got %v)", tc.in, got)
 				}
 				if got == nil {
@@ -327,10 +328,10 @@ func TestMapCeilingsErr(t *testing.T) {
 			}
 		})
 	}
-	// Mirror distinctness across the four quota verdicts.
+	// Mirror distinctness across the three quota verdicts mapCeilingsErr emits.
 	mirrors := []error{
 		southface.ErrThrottleExceeded, southface.ErrBytesExceeded,
-		southface.ErrFDExceeded, southface.ErrSizeExceeded,
+		southface.ErrFDExceeded,
 	}
 	for i, a := range mirrors {
 		for j, b := range mirrors {

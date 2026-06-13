@@ -52,7 +52,13 @@ jobs:
         with:
           go-version-file: go.mod
       - name: install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+        # Pin to the exact commit the 2026.1 tag points to, not the bare
+        # calendar tag: govulncheck/cosign pin exact versions, and the bare
+        # 2026.1 tag would float onto later 2026.1.x patches so a rule change
+        # could flip this lint gate red/green between two runs of the same
+        # commit. The 2026.1 release ships no separate patch tag yet, so the
+        # immutable commit SHA is the tightest pin available.
+        run: go install honnef.co/go/tools/cmd/staticcheck@5a501ea53df483ea698b8a046cd3a8e8b6ae7620 # 2026.1
       - name: staticcheck
         run: staticcheck ./...
 
@@ -105,7 +111,34 @@ jobs:
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
-        run: go test ./internal/objectstore/ -run 'Conformance|S3' -v -timeout 600s -count=1
+        # Capture -json so we can both surface a readable log AND positively
+        # assert the LIVE S3 leg actually ran. The live S3 cases t.Skip when
+        # the rig env is unset/mistyped, and a skip counts as a pass — an
+        # endpoint-var typo would otherwise report green while exercising
+        # nothing. Run once, tee the json to disk, render a readable log from
+        # its Output fields, then gate on the captured stream.
+        run: |
+          set -uo pipefail
+          code=0
+          go test ./internal/objectstore/ -run 'Conformance|S3' -json -timeout 600s -count=1 \
+            | tee /tmp/s3-conformance.json >/dev/null || code=$?
+          # Render a readable log from the captured stream for the job output.
+          grep -oE '"Output":"[^"]*"' /tmp/s3-conformance.json \
+            | sed -E 's/^"Output":"//; s/"$//' | sed -E 's/\\n$//; s/\\t/\t/g' || true
+          # Fail the job unless at least one LIVE S3 case reached a real pass
+          # (not a skip). The top-level TestConformance_S3 parent reports pass
+          # even when all its subtests skip, so it is NOT a liveness signal;
+          # the conformance SUBTESTS (TestConformance_S3/...) and the
+          # top-level TestS3Live_* cases pass only when the rig was reached.
+          passed=$(grep -E '"Action":"pass"' /tmp/s3-conformance.json \
+            | grep -cE '"Test":"(TestConformance_S3/[^"]+|TestS3Live_[A-Za-z0-9_]+)"' || true)
+          if [ "${passed:-0}" -eq 0 ]; then
+            echo "::error::no live S3 case passed — the MinIO rig env did not reach the suite (every live case skipped)"
+            exit 1
+          fi
+          echo "live S3 leg ran: $passed live S3 case(s) passed against real MinIO"
+          # Propagate any real test failure from the single run above.
+          exit "$code"
       - name: tear the rig down
         if: always()
         run: docker compose -f deploy/docker-compose.test.yml down -v
@@ -192,9 +225,23 @@ jobs:
       # Check out the canonical architecture repo so the byte-identity gate
       # actually enforces in CI; without this the script's skip branch would
       # make the gate dead on every runner.
+      #
+      # PIN the canon to the immutable commit SHA whose contracts/storage/
+      # tree is byte-identical to our vendored copies (file-ops.schema.json
+      # and file-artifact-api.schema.json; we do not vendor mount-config).
+      # We vendor only those two files — mount-config belongs to the guest.
+      #
+      # The prior pin (0ebf93e) was the commit the v0.9.6.0 tag pointed to
+      # when we first vendored; the canon remote later moved that tag to a
+      # different commit (23ffdc9) that does not contain contracts/storage/
+      # at all, and the old 0ebf93e ref was dropped from the remote. The
+      # new pin below is the canon HEAD that does carry those contracts and
+      # is verified byte-identical. Bump this SHA deliberately when
+      # re-vendoring; verify byte-identity (sha256) before bumping.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: Wide-Moat/open-computer-use
+          ref: 73e82c66a2df834683276ead83aa1571a1476ed0
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh

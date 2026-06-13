@@ -11,8 +11,10 @@
 // telemetry, and cmd can all depend on it cycle-free.
 //
 // Redaction rule (see also redact.go): no log line at any level carries a
-// credential value or payload bytes. File paths appear ONLY at DEBUG level;
-// use PathAttr for any path attribute so the rule is mechanically enforced.
+// credential value or payload bytes. File paths appear ONLY when the
+// destination logger is enabled at DEBUG; use PathAttr for any path attribute
+// so the gate reads the logger's own enablement and a caller cannot leak a
+// path by mismatching a level argument.
 package observ
 
 import (
@@ -25,15 +27,16 @@ import (
 
 // Attribute key constants. Every log call that emits a structured attribute
 // MUST use these constants — never a raw string — so key names are stable
-// across refactors and the T2-18 request-id threading can drop in without
-// touching call sites.
+// across refactors and the request-id threading stays uniform across call
+// sites.
 //
-// keyRequestID is the T2-18 request-correlation seam: it is RESERVED here
-// and NEVER set by any code in this plan. When T2-18 threads a request id
-// through the pipeline it adds one With(keyRequestID, id) derivation at
-// dispatch STAGE 0 and the constant is already in place.
+// KeyRequestID is the request-correlation key: the dispatch layer derives a
+// per-request child logger at STAGE 0 (With(KeyRequestID, id)), so every log
+// line emitted while handling that request carries the same request_id. Use
+// the constant rather than the raw string anywhere a request id is logged.
 const (
-	// KeyRequestID is the T2-18 seam — reserved, never set in this plan.
+	// KeyRequestID is the request-correlation key set by the dispatch layer
+	// at STAGE 0; every per-request log line carries it.
 	KeyRequestID = "request_id"
 	// KeyDenyClass names the broker deny class in a deny WARN.
 	KeyDenyClass = "deny_class"
@@ -84,11 +87,18 @@ func NewLogger(w io.Writer, level slog.Level) *slog.Logger {
 }
 
 // ErrorLog returns a *log.Logger that routes every log.Print* call through
-// the given slog.Logger at ERROR level. Wire it into http.Server.ErrorLog
-// so the http.Server's internal errors enter the JSON stream rather than
+// the given slog.Logger at WARN level. Wire it into http.Server.ErrorLog so
+// the http.Server's internal chatter enters the JSON stream rather than
 // landing as bare text on a raw writer.
+//
+// The bridge is deliberately WARN, not ERROR: http.Server emits log.Print for
+// benign, recoverable conditions (peer connection resets, superfluous
+// WriteHeader calls, request-line read timeouts) as well as genuine faults,
+// and it gives no way to tell them apart at this seam. Classifying all of it
+// as ERROR would inflate the error rate and risk false pages, so it lands at
+// WARN; real broker faults are logged at ERROR by the broker's own call sites.
 func ErrorLog(l *slog.Logger) *log.Logger {
-	return slog.NewLogLogger(l.Handler(), slog.LevelError)
+	return slog.NewLogLogger(l.Handler(), slog.LevelWarn)
 }
 
 // IsBadLogLevel reports whether err is (or wraps) errBadLogLevel. Exported

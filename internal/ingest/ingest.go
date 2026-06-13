@@ -182,6 +182,17 @@ var ErrSymlinkUnsupported = errors.New("ingest: symlink entries unsupported")
 // (NFR-SEC-81). Match it with errors.Is.
 var ErrTypeDenied = errors.New("ingest: content type denied by policy")
 
+// ErrUnclassifiableEntry — the entry cannot be confidently classified as a
+// regular file: its raw Unix mode bits (carried in the central-directory
+// external attributes regardless of the archive's creator host) encode a
+// non-regular, non-directory file type — a symlink, device, FIFO, or socket.
+// Such an entry is rejected fail-closed rather than staged as inert file
+// content, which would defeat the classify-and-reject invariant: relying on
+// the decoded FileInfo mode alone misses a symlink smuggled in a non-Unix
+// creator archive, where the symlink bit never surfaces. Match it with
+// errors.Is.
+var ErrUnclassifiableEntry = errors.New("ingest: entry is not a regular file (non-regular Unix type)")
+
 // ErrorCode is the sentinel class an ArchiveError carries and unwraps to;
 // callers match it with errors.Is against the Err... sentinels above.
 type ErrorCode = error

@@ -95,8 +95,9 @@ func TestNewLogger(t *testing.T) {
 }
 
 // TestErrorLog verifies that a plain log.Print call through the bridge
-// becomes exactly one ERROR JSON line and that the printed text is preserved
-// in the msg field.
+// becomes exactly one WARN JSON line and that the printed text is preserved
+// in the msg field. The bridge is WARN, not ERROR: http.Server chatter is
+// largely benign and must not inflate the error rate or page operators.
 func TestErrorLog(t *testing.T) {
 	var buf bytes.Buffer
 	l := NewLogger(&buf, slog.LevelDebug)
@@ -112,8 +113,8 @@ func TestErrorLog(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &obj); err != nil {
 		t.Fatalf("ErrorLog output not valid JSON: %v\n%s", err, lines[0])
 	}
-	if obj["level"] != "ERROR" {
-		t.Errorf("level = %q, want ERROR", obj["level"])
+	if obj["level"] != "WARN" {
+		t.Errorf("level = %q, want WARN", obj["level"])
 	}
 	msg, _ := obj["msg"].(string)
 	if !strings.Contains(msg, "http server error: dial refused") {

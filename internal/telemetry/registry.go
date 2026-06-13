@@ -9,9 +9,18 @@
 // Dependency discipline: telemetry is a leaf package that does NOT import
 // internal/southface or any package that would create a cycle. southface
 // depends on telemetry so it can accept a *BrokerMetrics for instrumentation.
-// Southface op/deny class names are mirrored here as const strings; the test
-// cross-checks that every name in KnownOps/KnownDenyClasses is a value that
-// the real southface package uses.
+//
+// Label-enum provenance differs by axis:
+//   - Op names are mirrored here as a const slice (knownOps in metrics.go);
+//     KnownOps() exposes it and TestClosedLabelAllOpsAccepted asserts every
+//     mirrored name records without panic. The mirror is kept in sync by the
+//     documented sync rule on knownOps.
+//   - Deny classes are NOT mirrored: the deny_class enum is derived directly
+//     from the shared zero-dependency internal/denyclass package (denyclass.All(),
+//     which both the south face's deny table and this label set consume), so
+//     there is no second list to drift and no KnownDenyClasses symbol here.
+//     TestEveryDenyClassIsAnAcceptedLabel exercises the derived set against
+//     the recorder.
 package telemetry
 
 import (
@@ -88,13 +97,6 @@ func labelKey(labels Labels) string {
 	return key
 }
 
-// HistogramSnapshot is a point-in-time snapshot of a histogram cell.
-type HistogramSnapshot struct {
-	Count   uint64
-	Sum     float64
-	Buckets []uint64 // len == len(declared buckets), parallel to bucket boundaries
-}
-
 // --- Counter ---
 
 // Counter is a concurrency-safe monotonically increasing counter.
@@ -146,15 +148,6 @@ func (g *Gauge) Set(labels Labels, value float64) {
 	g.mu.Unlock()
 }
 
-// Current returns the current value for the given labels.
-func (g *Gauge) Current(labels Labels) float64 {
-	validateLabels(g.idx, labels)
-	k := labelKey(labels)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.cells[k]
-}
-
 // --- Histogram ---
 
 // histCell is one per-label-combination accumulator.
@@ -193,21 +186,6 @@ func (h *Histogram) Observe(labels Labels, value float64) {
 		}
 	}
 	h.mu.Unlock()
-}
-
-// Snapshot returns a point-in-time copy of the histogram cell for labels.
-func (h *Histogram) Snapshot(labels Labels) HistogramSnapshot {
-	validateLabels(h.idx, labels)
-	k := labelKey(labels)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	cell, ok := h.cells[k]
-	if !ok {
-		return HistogramSnapshot{Buckets: make([]uint64, len(h.bounds))}
-	}
-	bs := make([]uint64, len(cell.buckets))
-	copy(bs, cell.buckets)
-	return HistogramSnapshot{Count: cell.count, Sum: cell.sum, Buckets: bs}
 }
 
 // --- Registry ---
@@ -308,22 +286,34 @@ func (r *Registry) NewBuildInfo(version string) *Gauge {
 	return g
 }
 
-// countingWriter wraps an io.Writer and counts bytes written.
+// countingWriter wraps an io.Writer, counts bytes written, and latches the
+// first non-nil write error. Once latched, subsequent Writes are no-ops that
+// return the captured error, so the per-family writers stop emitting after a
+// failure without each fmt.Fprintf needing to check.
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w   io.Writer
+	n   int64
+	err error
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	if err != nil {
+		c.err = err
+	}
 	return n, err
 }
 
 // WriteTo renders all registered metric families in Prometheus text format
-// 0.0.4 to w. It satisfies io.WriterTo. It holds only the per-family read
-// locks; callers must not register new metrics concurrently (registration
-// is startup-only).
+// 0.0.4 to w. It satisfies io.WriterTo, including its error contract: on a
+// partial/aborted write it returns the bytes written so far and the first
+// non-nil write error, and it stops emitting further families. It holds only
+// the per-family read locks; callers must not register new metrics
+// concurrently (registration is startup-only).
 func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	r.mu.RLock()
 	metrics := make([]metric, len(r.metrics))
@@ -342,6 +332,9 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 		case "build_info":
 			writeBuildInfo(cw, m.gauge)
 		}
+		if cw.err != nil {
+			break
+		}
 	}
-	return cw.n, nil
+	return cw.n, cw.err
 }

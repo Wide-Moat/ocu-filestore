@@ -7,21 +7,27 @@
 # quality gate (run everywhere), not a leak guard.
 #
 # Scope: tracked files only. Pass paths as arguments to limit the scan;
-# with no arguments, scan the whole tracked tree. The stale address is
-# assembled from parts so this very script does not trip its own gate.
+# with no arguments, scan the whole tracked tree. This script holds the
+# stale literal as a plain string and excludes its own path from the scan
+# with a git-grep pathspec, so the literal here never reports as a hit.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly STALE="i@yambr"".com"
+readonly STALE='i@yambr.com'
 readonly CANON='developer@widemoat.ai'
+
+# Exclude this script's own path: it carries the stale literal by design as
+# the pattern to search for, and must not flag itself. The pathspec is
+# relative to the repo root (we cd'd there above).
+readonly SELF_EXCLUDE=':!scripts/check-doc-identity.sh'
 
 # Limit to provided paths, else the whole tracked tree. -F fixed string;
 # --no-color so the grep output is clean for CI logs.
 if [ "$#" -gt 0 ]; then
-  hits=$(git grep -n --no-color -F -e "$STALE" -- "$@" || true)
+  hits=$(git grep -n --no-color -F -e "$STALE" -- "$@" "$SELF_EXCLUDE" || true)
 else
-  hits=$(git grep -n --no-color -F -e "$STALE" || true)
+  hits=$(git grep -n --no-color -F -e "$STALE" -- "$SELF_EXCLUDE" || true)
 fi
 
 if [ -n "$hits" ]; then

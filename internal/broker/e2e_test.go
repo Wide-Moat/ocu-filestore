@@ -208,9 +208,16 @@ func startDaemon(t *testing.T, opt daemonOptions) *daemon {
 	t.Cleanup(func() { d.stop() })
 
 	if opt.auditSinkUnwritable {
-		// The daemon is expected to exit non-zero before binding; wait briefly
-		// and return so the caller can assert the refusal.
-		time.Sleep(150 * time.Millisecond)
+		// The daemon is expected to exit non-zero before binding. Synchronize on
+		// the observable exit (a bounded Wait) rather than a wall-clock sleep so
+		// the caller's refusal assertion is deterministic.
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("daemon did not exit with an unwritable audit sink within the deadline; stderr:\n%s", stderr.String())
+		}
 		return d
 	}
 
@@ -875,8 +882,13 @@ func TestE2EUploadMidStreamCancel(t *testing.T) {
 	req.Header.Set("Content-Type", contentTypeConnectJSON)
 	req.Header.Set(connectVersionHeader, connectVersion)
 
-	// Issue the request in a goroutine; cancel shortly after so the body is
-	// half-delivered (params + chunk, no end-stream) and the connection drops.
+	// Issue the request in a goroutine; cancel once the server has made
+	// observable progress so the body is half-delivered (params + chunk, no
+	// end-stream) and the connection drops mid-stream. The ALLOW audit event is
+	// Mandated after the params frame and BEFORE the first chunk is consumed
+	// (audit-before-ack, SEC-79), so its appearance in the sink is a
+	// deterministic, cross-engine signal that the server has entered the
+	// chunk-read phase — far stronger than a wall-clock sleep.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -886,7 +898,7 @@ func TestE2EUploadMidStreamCancel(t *testing.T) {
 			resp.Body.Close()
 		}
 	}()
-	time.Sleep(100 * time.Millisecond)
+	d.waitForAuditContains(t, "/pub/torn.bin")
 	cancel()
 	select {
 	case <-done:
@@ -916,18 +928,56 @@ func mustChunk(t *testing.T, b []byte) []byte {
 	return cj
 }
 
-// assertNothingStaged fails if any regular file exists anywhere under root.
+// waitForAuditContains blocks until the audit sink file contains needle, or
+// fails the test on a deadline. The audit ALLOW event is written before the op
+// is acknowledged (audit-before-ack, SEC-79), so polling the sink is a
+// deterministic, engine-agnostic way to synchronize on observable server
+// progress without a wall-clock sleep.
+func (d *daemon) waitForAuditContains(t *testing.T, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// A not-yet-created sink is not an error: the daemon creates it on the
+		// first Mandate. Any OTHER read error is surfaced.
+		blob, err := os.ReadFile(d.auditSink)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read audit sink %q: %v", d.auditSink, err)
+		}
+		if bytes.Contains(blob, []byte(needle)) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("audit sink %q did not contain %q within the deadline", d.auditSink, needle)
+}
+
+// assertNothingStaged fails if any regular file exists anywhere under root. A
+// traversal error inside an EXISTING tree is surfaced (t.Fatalf), never
+// swallowed: a fail-closed security assertion must not pass vacuously because a
+// subtree was unreadable (broker-06). An absent root is the one benign case —
+// when the daemon refuses before provisioning a scope the engine root is never
+// created, which is itself "nothing staged" — so a root-level ErrNotExist is
+// accepted while every other error fails the assertion.
 func assertNothingStaged(t *testing.T, root string) {
 	t.Helper()
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	if _, err := os.Lstat(root); err != nil {
+		if os.IsNotExist(err) {
+			return // root never created => nothing staged
+		}
+		t.Fatalf("assertNothingStaged could not stat root %q: %v", root, err)
+	}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return fmt.Errorf("walk %q: %w", path, err)
 		}
 		if info.Mode().IsRegular() {
 			t.Fatalf("a file %q was staged; want nothing staged", path)
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("assertNothingStaged could not fully traverse %q: %v", root, err)
+	}
 }
 
 // TestE2ES3CredentialRedaction closes the composed redaction check on the s3

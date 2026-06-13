@@ -15,8 +15,6 @@
 // throttle fail-closed per session, not broker-wide (NFR-SEC-46).
 package southface
 
-import "errors"
-
 // Op names one south-face file operation, mirroring the file-ops contract
 // enum. The set is frozen there; adding an op is a contract change in the
 // architecture repo first.
@@ -42,10 +40,6 @@ const (
 	OpMigrateFilesystem Op = "migrateFilesystem"
 	OpRemoveFilesystem  Op = "removeFilesystem"
 )
-
-// ErrNotImplemented is the scaffold sentinel: the south face has no
-// implementation in this build. Match it with errors.Is.
-var ErrNotImplemented = errors.New("southface: not implemented in this build")
 
 // Server is the south-face listener seam. The implementation PR binds it to
 // the host-side per-session channel, wires the authz resolver and the

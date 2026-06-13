@@ -51,15 +51,26 @@ func TestGuardAdapterRemapsAuditUnavailable(t *testing.T) {
 // resource_exhausted/429 instead of internal/500.
 func TestCeilingsAdapterRemapsSentinels(t *testing.T) {
 	fixed := time.Unix(0, 0)
+	// OpsPerSecond:1, OpsBurst:1 satisfies the fail-loud contract.
+	// The clock is frozen so no tokens refill between calls. We drain the
+	// single burst token with the first TryConsumeOp call; every subsequent
+	// call then returns ErrThrottleExceeded deterministically — no wall-time
+	// dependency, no flake.
 	reg := ceilings.NewRegistry(ceilings.Config{
-		OpsPerSecond:         0,
-		OpsBurst:             0, // bucket starts and stays empty
+		OpsPerSecond:         1,
+		OpsBurst:             1,
 		InFlightBytesCeiling: 4,
-		FDCeiling:            0,
+		FDCeiling:            0, // zero is valid (>= 0); TryAcquireFD fails immediately
 		Clock:                func() time.Time { return fixed },
 	})
 	sess := NewCeilings(reg).Session("fs-exhausted")
 
+	// Drain the single burst token so the bucket is now empty.
+	if err := sess.TryConsumeOp(); err != nil {
+		t.Fatalf("pre-drain TryConsumeOp: got %v, want nil", err)
+	}
+
+	// Bucket is empty — the next op must remap to the southface sentinel.
 	if err := sess.TryConsumeOp(); !errors.Is(err, southface.ErrThrottleExceeded) {
 		t.Fatalf("TryConsumeOp: got %v, want the southface.ErrThrottleExceeded mirror", err)
 	}
@@ -165,13 +176,25 @@ func TestUnaryAuditDownIs503(t *testing.T) {
 // works.
 func TestUnaryThrottleIs429(t *testing.T) {
 	fixed := time.Unix(0, 0)
+	// OpsPerSecond:1, OpsBurst:1 satisfies the fail-loud contract. The clock
+	// is frozen so no tokens refill. The dispatch path keys its session on the
+	// filesystem ID ("fs-wire" from the Entry in serveSouthface). We pre-drain
+	// that session's single burst token here, before the HTTP request, so the
+	// live request finds an empty bucket and returns 429 deterministically.
 	reg := ceilings.NewRegistry(ceilings.Config{
-		OpsPerSecond:         0,
-		OpsBurst:             0,
+		OpsPerSecond:         1,
+		OpsBurst:             1,
 		InFlightBytesCeiling: 1 << 20,
 		FDCeiling:            8,
 		Clock:                func() time.Time { return fixed },
 	})
+	// Pre-drain: the dispatch path will look up session key "fs-wire"
+	// (= Entry.FilesystemID set in serveSouthface). Draining it here, before
+	// the request is sent, guarantees the bucket is empty when the handler
+	// calls TryConsumeOp — no timing dependency, no flake.
+	if err := reg.Session(ceilings.SessionKey("fs-wire")).TryConsumeOp(); err != nil {
+		t.Fatalf("pre-drain TryConsumeOp: got %v, want nil", err)
+	}
 	client := serveSouthface(t, stubGuard{}, reg)
 	resp := postReadFile(t, client)
 	defer resp.Body.Close()

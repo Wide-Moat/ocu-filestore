@@ -20,7 +20,7 @@ STATICCHECK_VERSION := 2026.1
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
-.PHONY: help build test test-race cover spdx contract identity vet fmt \
+.PHONY: help build bin test test-race cover spdx contract identity vet fmt \
         staticcheck check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
@@ -28,6 +28,7 @@ COVERAGE_FLOOR := 86.0
 help: ## Print this target list
 	@printf '\nUsage:  make <target>\n\n'
 	@printf '  %-20s  %s\n' build       "CGO_ENABLED=0 go build ./..."
+	@printf '  %-20s  %s\n' bin         "Build the daemon into build/ocu-filestored (gitignored)"
 	@printf '  %-20s  %s\n' test        "go test ./...  (live-S3/e2e legs loud-skip without rig env vars)"
 	@printf '  %-20s  %s\n' test-race   "go test -race ./..."
 	@printf '  %-20s  %s\n' cover       "Coverage floor ($(COVERAGE_FLOOR)%%) over ./internal/..."
@@ -48,6 +49,10 @@ help: ## Print this target list
 build: ## Build all packages (static, no cgo) — mirrors e2e.yml build-broker step
 	CGO_ENABLED=0 go build ./...
 
+bin: ## Build the daemon into build/ocu-filestored (gitignored — never the repo root)
+	mkdir -p build
+	CGO_ENABLED=0 go build -trimpath -o build/ocu-filestored ./cmd/ocu-filestored
+
 # ── test ────────────────────────────────────────────────────────────────────
 #
 # Live-S3 leg: without the rig env vars the S3 conformance and live e2e legs
@@ -60,7 +65,9 @@ build: ## Build all packages (static, no cgo) — mirrors e2e.yml build-broker s
 #   OCU_S3_TEST_SECRET_KEY       (keep out of shell history; export from a file)
 #
 # E2e leg: OCU_BROKER_BIN must point to the static daemon binary.  Build it
-# first with `make build` or `CGO_ENABLED=0 go build -o ocu-filestored ./cmd/ocu-filestored`.
+# first with `make bin`, which writes build/ocu-filestored (a gitignored dir),
+# then export OCU_BROKER_BIN=$(PWD)/build/ocu-filestored.  Building into build/
+# keeps the daemon out of the repo root so a local build never litters the tree.
 # Without OCU_BROKER_BIN the Integration|E2E slice loud-skips.
 #
 # Use `make s3-rig-up` to bring up the MinIO test rig, then run `make test`.

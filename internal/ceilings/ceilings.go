@@ -18,7 +18,6 @@ package ceilings
 
 import (
 	"errors"
-	"math"
 	"sync"
 	"time"
 )
@@ -155,6 +154,28 @@ func (g *ByteGauge) ReleaseBytes(n int64) {
 	g.current -= n
 }
 
+// Per-session ceiling defaults for the minimal trusted_operator shelf
+// (NFR-SEC-46). They are deliberately split by tunability:
+//
+//   - The ops/s token-bucket pair (rate and burst) is operator-tunable and
+//     therefore lives as flag defaults in the wiring layer, validated there
+//     and again fail-loud in NewRegistry.
+//   - The in-flight-bytes and open-fd ceilings are FIXED this phase: the
+//     single-tenant trusted_operator shelf has one session class, so a
+//     per-deployment knob would add a tuning surface with no operator to
+//     turn it. They are exported here so the wiring layer references one
+//     named, documented home instead of an inline magic literal, and so a
+//     later phase can promote them to validated flags (same >0 guard the
+//     ops knobs already get) without changing the values.
+const (
+	// DefaultInFlightBytesCeiling bounds one session's concurrently
+	// in-flight bytes. 2 GiB.
+	DefaultInFlightBytesCeiling int64 = 1 << 31
+	// DefaultFDCeiling bounds one session's concurrently open file
+	// descriptors.
+	DefaultFDCeiling int32 = 256
+)
+
 // Config holds the per-session ceiling values a Registry stamps onto each
 // new Session. Callers validate the values before constructing a Registry.
 type Config struct {
@@ -171,6 +192,14 @@ type Config struct {
 	// Clock supplies the bucket's notion of now. It must be non-nil: the
 	// wiring layer injects the runtime wall clock, tests inject a fake.
 	Clock ClockFunc
+
+	// nonEnforcing marks a deliberately non-enforcing registry: every
+	// limiter admission short-circuits to nil and the numeric ceilings are
+	// not validated. It is unexported so only NewNopRegistry can set it — a
+	// production Config built by a caller can never accidentally disable
+	// enforcement, and the bypass is a structural flag rather than a
+	// too-large-to-dent magnitude.
+	nonEnforcing bool
 }
 
 // Session groups one session's three limiters under a single mutex. Obtain
@@ -182,49 +211,27 @@ type Session struct {
 	gauge     ByteGauge
 	fdCount   int32
 	fdCeiling int32
+	// nonEnforcing short-circuits every admission call to nil; set only on
+	// sessions minted by a NewNopRegistry registry. See Config.nonEnforcing.
+	nonEnforcing bool
 }
 
 func newSession(cfg Config) *Session {
 	return &Session{
-		clock:     cfg.Clock,
-		bucket:    NewTokenBucket(cfg.OpsPerSecond, cfg.OpsBurst),
-		gauge:     ByteGauge{ceiling: cfg.InFlightBytesCeiling},
-		fdCeiling: cfg.FDCeiling,
+		clock:        cfg.Clock,
+		bucket:       NewTokenBucket(cfg.OpsPerSecond, cfg.OpsBurst),
+		gauge:        ByteGauge{ceiling: cfg.InFlightBytesCeiling},
+		fdCeiling:    cfg.FDCeiling,
+		nonEnforcing: cfg.nonEnforcing,
 	}
-}
-
-// SessionSnapshot is a point-in-time read of a session's limiter state.
-// It is a pure read under the session's mutex — it does not mutate any
-// limiter. The values are advisory; they may be stale by the time the caller
-// acts on them.
-type SessionSnapshot struct {
-	// InFlightBytes is the number of bytes currently held in the in-flight
-	// gauge (bytes currently being read or written by the session).
-	InFlightBytes int64
-	// FDInUse is the number of open file descriptor slots currently in use.
-	FDInUse int32
-	// OpsTokens is the current token count in the rate-limiter bucket.
-	// This is a float because the bucket does sub-integer refill arithmetic.
-	OpsTokens float64
-}
-
-// Snapshot returns a point-in-time read of the session's limiter state.
-// This is a pure read — no limiter is mutated. The caller may use the
-// snapshot to update metrics gauges without holding the session lock.
-func (s *Session) Snapshot() SessionSnapshot {
-	s.mu.Lock()
-	snap := SessionSnapshot{
-		InFlightBytes: s.gauge.current,
-		FDInUse:       s.fdCount,
-		OpsTokens:     s.bucket.tokens,
-	}
-	s.mu.Unlock()
-	return snap
 }
 
 // TryConsumeOp consumes one ops/s token, returning ErrThrottleExceeded when
 // the session's bucket is empty.
 func (s *Session) TryConsumeOp() error {
+	if s.nonEnforcing {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.bucket.TryConsume(s.clock())
@@ -233,6 +240,9 @@ func (s *Session) TryConsumeOp() error {
 // AcquireBytes reserves n in-flight bytes for this session; see
 // ByteGauge.AcquireBytes for the refusal and overflow semantics.
 func (s *Session) AcquireBytes(n int64) error {
+	if s.nonEnforcing {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gauge.AcquireBytes(n)
@@ -242,6 +252,11 @@ func (s *Session) AcquireBytes(n int64) error {
 // to the matching AcquireBytes (defer it immediately after a successful
 // acquire). Panics on a broken pairing; see ByteGauge.ReleaseBytes.
 func (s *Session) ReleaseBytes(n int64) {
+	if s.nonEnforcing {
+		// AcquireBytes reserved nothing, so there is nothing to release and
+		// the broken-pairing panic must not fire.
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gauge.ReleaseBytes(n)
@@ -251,6 +266,9 @@ func (s *Session) ReleaseBytes(n int64) {
 // session is at its ceiling. Every successful TryAcquireFD must be paired
 // with exactly one ReleaseFD.
 func (s *Session) TryAcquireFD() error {
+	if s.nonEnforcing {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fdCount >= s.fdCeiling {
@@ -264,6 +282,11 @@ func (s *Session) TryAcquireFD() error {
 // acquire/release pairing — it panics rather than going silently negative
 // (T-06-04).
 func (s *Session) ReleaseFD() {
+	if s.nonEnforcing {
+		// TryAcquireFD claimed nothing, so there is nothing to release and
+		// the broken-pairing panic must not fire.
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fdCount == 0 {
@@ -281,12 +304,37 @@ type Registry struct {
 }
 
 // NewRegistry creates a Registry that stamps cfg onto every session it
-// creates. cfg.Clock must be non-nil — a nil clock is a wiring error and
-// panics (fail-loud, never a silent fallback): this package keeps the wall
-// clock behind the injected seam, so the caller decides what "now" means.
+// creates. The numeric ceilings are validated fail-loud here — the single
+// place "callers validate" is enforced — so a misconfigured limiter is a
+// loud wiring panic, never a silent permanent throttle (a rate of 0 would
+// drain a real bucket once and then deny forever):
+//
+//   - cfg.Clock must be non-nil: this package keeps the wall clock behind
+//     the injected seam, so the caller decides what "now" means.
+//   - cfg.OpsPerSecond must be > 0 and cfg.OpsBurst must be >= 1: a bucket
+//     that can never refill or never holds a token is unservable.
+//   - cfg.InFlightBytesCeiling and cfg.FDCeiling must not be negative.
+//
+// The deliberately non-enforcing NewNopRegistry sets cfg.nonEnforcing, which
+// skips the numeric checks (its sessions short-circuit every admission to
+// nil); the nil-clock check always runs.
 func NewRegistry(cfg Config) *Registry {
 	if cfg.Clock == nil {
 		panic("ceilings: NewRegistry: Config.Clock is nil (the wiring layer must inject a clock)")
+	}
+	if !cfg.nonEnforcing {
+		if cfg.OpsPerSecond <= 0 {
+			panic("ceilings: NewRegistry: Config.OpsPerSecond must be > 0 (a non-positive rate never refills)")
+		}
+		if cfg.OpsBurst < 1 {
+			panic("ceilings: NewRegistry: Config.OpsBurst must be >= 1 (a sub-one burst can never hold a token)")
+		}
+		if cfg.InFlightBytesCeiling < 0 {
+			panic("ceilings: NewRegistry: Config.InFlightBytesCeiling must not be negative")
+		}
+		if cfg.FDCeiling < 0 {
+			panic("ceilings: NewRegistry: Config.FDCeiling must not be negative")
+		}
 	}
 	return &Registry{
 		sessions: make(map[SessionKey]*Session),
@@ -324,22 +372,23 @@ func (r *Registry) Release(key SessionKey) {
 	r.mu.Unlock()
 }
 
-// NewNopRegistry returns an obviously NON-ENFORCING registry for test and
-// wiring use ONLY (the phase 8-11 consumers): every limiter call succeeds.
-// The bucket's burst is math.MaxFloat64 (consuming one token cannot dent
-// it), the bytes ceiling is math.MaxInt64, and the fd ceiling is
-// math.MaxInt32; the clock is a fixed instant because no limiter here ever
-// depends on time. Broken acquire/release pairings still panic — the no-op
-// property covers admission only, never accounting bugs. Never deploy it:
-// a production Registry comes from NewRegistry with validated ceilings.
+// NewNopRegistry returns an explicitly NON-ENFORCING registry for test and
+// wiring use ONLY (the phase 8-11 consumers): every admission call
+// short-circuits to nil. Non-enforcement is a structural flag
+// (Config.nonEnforcing), not a too-large-to-dent magnitude — it cannot flip
+// to enforcing because a ceiling was tuned. The ceiling fields are left at
+// their zero values precisely because they are never read in this mode; the
+// clock is a fixed instant only to satisfy the non-nil-clock invariant, as
+// no limiter here ever depends on time. The accounting panics on a broken
+// acquire/release pairing do NOT fire here either: a non-enforcing acquire
+// reserves nothing, so its matching release has nothing to return. Never
+// deploy it: a production Registry comes from NewRegistry with validated
+// ceilings.
 func NewNopRegistry() *Registry {
 	fixed := time.Unix(0, 0)
 	return NewRegistry(Config{
-		OpsPerSecond:         0,
-		OpsBurst:             math.MaxFloat64,
-		InFlightBytesCeiling: math.MaxInt64,
-		FDCeiling:            math.MaxInt32,
-		Clock:                func() time.Time { return fixed },
+		Clock:        func() time.Time { return fixed },
+		nonEnforcing: true,
 	})
 }
 

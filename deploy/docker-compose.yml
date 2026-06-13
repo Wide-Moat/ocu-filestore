@@ -19,8 +19,16 @@
 #   the same path to dial the per-session unix socket. The broker's accept
 #   gate admits ONLY a peer whose kernel-attested uid equals the broker's
 #   own uid (NFR-SEC-76), so the peer container must also run as 65532.
-# - No network: the south face serves over unix sockets only and the north
-#   face is deferred, so the broker joins no network at all.
+# - Network isolation: `network_mode: none` gives the container its own empty
+#   network namespace with loopback only — no veth, no external reachability.
+#   The south face serves over unix sockets and the north face is deferred, so
+#   no traffic ever leaves the container. The daemon DOES bind a loopback-only
+#   TCP ops listener (127.0.0.1:9464: /metrics, /healthz, /readyz) inside that
+#   isolated netns; the healthcheck below dials it via the daemon's own
+#   -health-check self-probe. It is reachable only from within the container's
+#   own loopback, never from any other namespace. The -ops-listen address is
+#   pinned explicitly in the command block so this posture does not ride on a
+#   flag default.
 # - stop_grace_period is 30s, above the daemon's bounded 25s in-flight
 #   drain, so `docker compose stop` always lets the graceful path (drain,
 #   erase-before-reuse teardown, socket removal — NFR-SEC-54) finish before
@@ -68,6 +76,11 @@ services:
       - trusted_operator
       - -tenancy
       - single-tenant
+      # Loopback-only ops listener (/metrics, /healthz, /readyz). Pinned
+      # explicitly so the healthcheck target and the posture documented above
+      # do not ride on the daemon's flag default.
+      - -ops-listen
+      - 127.0.0.1:9464
       # -downloadable-prefixes is deliberately absent: empty means nothing
       # resolves downloadable (deny-by-default, NFR-SEC-73). Opt prefixes in
       # explicitly when the deployment needs them.

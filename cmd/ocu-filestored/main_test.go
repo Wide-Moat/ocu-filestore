@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,11 +274,15 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 		{"s3 without region refused", "s3", "", "b", "http://e", "", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := validate(tc.engine, tc.engineRoot, "/y", "/s", "fs1",
-				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				defaultOpsPerSecond, defaultOpsBurst, "", "", "",
-				"", "", tc.engine == "s3", // dev-direct posture for the s3 rows
-				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle, "info", "")
+			_, err := validate(rawFlags{
+				engine: tc.engine, engineRoot: tc.engineRoot, auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+				profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+				maxFileSize: 1024, maxRequestBytes: 4096,
+				opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+				laneDevDirect: tc.engine == "s3", // dev-direct posture for the s3 rows
+				s3Bucket:      tc.s3Bucket, s3Endpoint: tc.s3Endpoint, s3Region: tc.s3Region, s3PathStyle: tc.s3PathStyle,
+				logLevelStr: "info",
+			})
 			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
 				t.Fatalf("validate(%s) = %v, want errMissingRequiredFlag", tc.name, err)
 			}
@@ -298,11 +303,15 @@ func TestValidateStorageLaneMatrix(t *testing.T) {
 		if engine == "s3" {
 			engineRoot, bucket, endpoint = "", "ocu-bucket", "http://127.0.0.1:9000"
 		}
-		_, err := validate(engine, engineRoot, "/y", "/s", "fs1",
-			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
-			lane, bundle, devDirect,
-			bucket, endpoint, "us-east-1", false, "info", "")
+		_, err := validate(rawFlags{
+			engine: engine, engineRoot: engineRoot, auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+			profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+			maxFileSize: 1024, maxRequestBytes: 4096,
+			opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+			storageLane: lane, caBundle: bundle, laneDevDirect: devDirect,
+			s3Bucket: bucket, s3Endpoint: endpoint, s3Region: "us-east-1",
+			logLevelStr: "info",
+		})
 		return err
 	}
 
@@ -348,20 +357,29 @@ func TestValidateStorageLaneMatrix(t *testing.T) {
 // parsed engine kind into brokerConfig (it was previously discarded) and that
 // local-volume remains the composed default.
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
-	cfg, err := validate("s3", "", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
+	cfg, err := validate(rawFlags{
+		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		laneDevDirect: true,
+		s3Bucket:      "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		logLevelStr: "info",
+	})
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
 	if cfg.engineKind != objectstore.S3 {
 		t.Fatalf("validate(engine=s3) stored kind %q, want %q", cfg.engineKind, objectstore.S3)
 	}
-	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false,
-		"", "", "us-east-1", false, "info", "")
+	cfg, err = validate(rawFlags{
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3Region:    "us-east-1",
+		logLevelStr: "info",
+	})
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -375,10 +393,15 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 // into brokerConfig for the s3 engine, and REFUSES on a non-s3 engine — a
 // silently inert credential flag would lie about the deployment posture.
 func TestValidateS3CredentialFileFlagGate(t *testing.T) {
-	cfg, err := validate("s3", "", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
+	cfg, err := validate(rawFlags{
+		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3CredentialFile: "/etc/ocu/s3.cred", laneDevDirect: true,
+		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		logLevelStr: "info",
+	})
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -386,10 +409,15 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 		t.Fatalf("config carries credential file %q, want the flag path", cfg.s3CredentialFile)
 	}
 
-	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false,
-		"", "", "us-east-1", false, "info", "")
+	_, err = validate(rawFlags{
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3CredentialFile: "/etc/ocu/s3.cred",
+		s3Region:         "us-east-1",
+		logLevelStr:      "info",
+	})
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
@@ -401,10 +429,15 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 func TestValidateSTSFlagGate(t *testing.T) {
 	const arn = "arn:aws:iam::000000000000:role/ocu-session"
 
-	cfg, err := validate("s3", "", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
+	cfg, err := validate(rawFlags{
+		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3STSRoleARN: arn, s3STSEndpoint: "http://sts.local:9000", laneDevDirect: true,
+		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		logLevelStr: "info",
+	})
 	if err != nil {
 		t.Fatalf("validate(s3 + sts pair): %v", err)
 	}
@@ -412,22 +445,37 @@ func TestValidateSTSFlagGate(t *testing.T) {
 		t.Fatalf("config carries sts %q/%q, want the flag values", cfg.s3STSRoleARN, cfg.s3STSEndpoint)
 	}
 
-	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false,
-		"", "", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
+	if _, err := validate(rawFlags{
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3STSRoleARN: arn,
+		s3Region:     "us-east-1",
+		logLevelStr:  "info",
+	}); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
 	}
-	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"", "", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
+	if _, err := validate(rawFlags{
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3STSEndpoint: "http://sts.local:9000",
+		s3Region:      "us-east-1",
+		logLevelStr:   "info",
+	}); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
 	}
-	if _, err := validate("s3", "", "/y", "/s", "fs1",
-		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
+	if _, err := validate(rawFlags{
+		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+		maxFileSize: 1024, maxRequestBytes: 4096,
+		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+		s3STSEndpoint: "http://sts.local:9000",
+		s3Bucket:      "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		logLevelStr: "info",
+	}); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
 	}
 }
@@ -594,10 +642,14 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 		{"tiny_bucket_one_one", 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
-				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-				tc.rate, tc.brst, "", "", "", "", "", false,
-				"", "", "us-east-1", false, "info", "")
+			cfg, err := validate(rawFlags{
+				engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+				profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+				maxFileSize: 1024, maxRequestBytes: 4096,
+				opsPerSecond: tc.rate, opsBurst: tc.brst,
+				s3Region:    "us-east-1",
+				logLevelStr: "info",
+			})
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}
@@ -675,6 +727,162 @@ func (s *fakeLifecycleServer) Serve() error {
 func (s *fakeLifecycleServer) Close() error {
 	close(s.closeCalled)
 	return s.closeErr
+}
+
+// TestRunOpsListenerServesHealthRoutes pins the Handle-before-Serve fix: run()
+// must register /healthz and /readyz on the ops listener BEFORE its Serve
+// goroutine starts accepting connections, so a probe never hits an unregistered
+// route (404) during startup. Once the daemon is up, both routes must answer
+// with a non-404 status (200 liveness; 200/503 readiness — never 404).
+func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
+	root := shortDir(t)
+	sockDir := shortDir(t)
+	auditSink := filepath.Join(root, "audit.jsonl")
+	engineRoot := filepath.Join(root, "engine")
+
+	// A free loopback port for the ops listener.
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	opsAddr := probeLn.Addr().String()
+	_ = probeLn.Close() // release so the daemon can bind it
+
+	args := []string{
+		"--engine-root", engineRoot,
+		"--audit-sink", auditSink,
+		"--filesystem-id", "fs-health-01",
+		"--broker-max-file-size", "1024",
+		"--south-socket-dir", sockDir,
+		"--ops-listen", opsAddr,
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(args) }()
+
+	client := &http.Client{Timeout: time.Second}
+	probe := func(path string) (int, error) {
+		resp, err := client.Get("http://" + opsAddr + path)
+		if err != nil {
+			return 0, err
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+
+	// Poll /healthz until the listener answers; once it answers it must never be
+	// a 404 (the routes are registered before Serve accepts).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		code, perr := probe("/healthz")
+		if perr == nil {
+			if code == http.StatusNotFound {
+				t.Fatalf("/healthz returned 404 — routes were not registered before Serve")
+			}
+			if code != http.StatusOK {
+				t.Fatalf("/healthz returned %d, want 200", code)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ops listener never answered /healthz: %v", perr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// /readyz must also be a registered route (200 or 503, never 404).
+	if code, perr := probe("/readyz"); perr != nil {
+		t.Fatalf("/readyz probe: %v", perr)
+	} else if code == http.StatusNotFound {
+		t.Fatalf("/readyz returned 404 — readiness route was not registered before Serve")
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("self-SIGTERM: %v", err)
+	}
+	select {
+	case <-runErr:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return within 10s of SIGTERM")
+	}
+}
+
+// TestRunPinsAuditSinkDirTo0700 pins the lock-dir hardening: run() creates the
+// audit-sink's parent directory and Chmods it to 0700 unconditionally. os.MkdirAll
+// applies the requested mode through the process umask (so a fresh directory would
+// land at 0755 under the default umask 022), so the explicit Chmod is the
+// load-bearing step that keeps the hash-chained audit log out of a
+// world-traversable directory. The test forces a permissive umask, runs the
+// daemon against a fresh audit-sink subdirectory, and asserts the created
+// directory is 0700.
+func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
+	// Force a permissive umask so an unpinned MkdirAll would yield 0777, making
+	// the regression visible. Restore it afterwards.
+	oldUmask := syscall.Umask(0)
+	defer syscall.Umask(oldUmask)
+
+	root := shortDir(t)
+	sockDir := shortDir(t)
+	// The audit-sink lives in a not-yet-existing subdirectory so run() must
+	// create (and pin) it.
+	auditDir := filepath.Join(root, "audit-sink-dir")
+	auditSink := filepath.Join(auditDir, "audit.jsonl")
+	engineRoot := filepath.Join(root, "engine")
+
+	// A free loopback port: probing /healthz on it proves the daemon is serving,
+	// which means its signal handler is armed before we send SIGTERM.
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	opsAddr := probeLn.Addr().String()
+	_ = probeLn.Close()
+
+	args := []string{
+		"--engine-root", engineRoot,
+		"--audit-sink", auditSink,
+		"--filesystem-id", "fs-chmod-01",
+		"--broker-max-file-size", "1024",
+		"--south-socket-dir", sockDir,
+		"--ops-listen", opsAddr,
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(args) }()
+
+	// Wait until the daemon is serving (the audit-sink directory is created well
+	// before this point), so the signal handler is armed before SIGTERM.
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resp, perr := client.Get("http://" + opsAddr + "/healthz")
+		if perr == nil {
+			_ = resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon never began serving: %v", perr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	info, statErr := os.Stat(auditDir)
+	if statErr != nil {
+		t.Fatalf("stat audit-sink directory: %v", statErr)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("audit-sink directory mode = %o, want 0700 (the Chmod must pin 0700 regardless of umask)", got)
+	}
+
+	// Unwind the daemon: SIGTERM triggers the bounded drain + teardown.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("self-SIGTERM: %v", err)
+	}
+	select {
+	case <-runErr:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not return within 10s of SIGTERM")
+	}
 }
 
 // TestServeUntilSignalSigtermRunsTeardown pins T1-9/SEC-54 stop path: a real
@@ -942,11 +1150,14 @@ func TestStartupEchoNoCredential(t *testing.T) {
 //   - The default value is "127.0.0.1:9464".
 func TestOpsListenFlagBehavior(t *testing.T) {
 	call := func(addr string) (brokerConfig, error) {
-		return validate("local-volume", "/x", "/y", "/s", "fs1",
-			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
-			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
-			"", "", false,
-			"", "", "us-east-1", false, "info", addr)
+		return validate(rawFlags{
+			engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+			profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
+			maxFileSize: 1024, maxRequestBytes: 4096,
+			opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
+			s3Region:    "us-east-1",
+			logLevelStr: "info", opsListenAddr: addr,
+		})
 	}
 
 	// Empty disables the listener — no error.

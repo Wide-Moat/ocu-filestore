@@ -103,6 +103,18 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 		return &ArchiveError{Code: ErrSymlinkUnsupported, EntryName: f.Name}
 	}
 
+	// Defence in depth against a symlink (or other special file) smuggled in
+	// a non-Unix creator archive: the decoded FileInfo mode only carries the
+	// symlink bit when the creator host is Unix, so the branch above can miss
+	// a crafted entry whose Unix mode bits are present in the central
+	// directory but not surfaced by the standard-library decode. Read the raw
+	// Unix file-type out of the external attributes directly; if it names any
+	// non-regular, non-directory type, refuse to classify it as a regular
+	// file rather than stage its target/payload as inert content.
+	if t := unixFileType(f.ExternalAttrs); t != 0 && t != unixModeRegular && t != unixModeDir {
+		return &ArchiveError{Code: ErrUnclassifiableEntry, EntryName: f.Name}
+	}
+
 	rc, err := f.Open()
 	if err != nil {
 		return fmt.Errorf("ingest: open entry %q: %w", cleanName, err)
@@ -136,6 +148,25 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 		return fmt.Errorf("ingest: stage entry %q: %w", cleanName, err)
 	}
 	return nil
+}
+
+// Unix S_IFMT file-type bits as carried in the high 16 bits of a zip entry's
+// central-directory external attributes. They are present whenever a creator
+// stamped a Unix mode, independent of the CreatorVersion host byte, so they
+// expose a non-regular type even when the standard-library FileInfo decode
+// (which only reads the symlink bit for a Unix creator host) does not.
+const (
+	unixModeIFMT    = 0o170000 // S_IFMT: the file-type field mask
+	unixModeRegular = 0o100000 // S_IFREG
+	unixModeDir     = 0o040000 // S_IFDIR
+)
+
+// unixFileType returns the S_IFMT file-type field from a zip entry's external
+// attributes, or 0 when no Unix mode is recorded (a pure MS-DOS attribute
+// word leaves the high bits clear). The caller treats a recorded type that is
+// neither regular nor directory as unclassifiable.
+func unixFileType(externalAttrs uint32) uint32 {
+	return (externalAttrs >> 16) & unixModeIFMT
 }
 
 // countingWriter enforces the cross-entry decompressed-total ceiling. It

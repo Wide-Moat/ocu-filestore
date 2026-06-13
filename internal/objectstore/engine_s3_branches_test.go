@@ -330,13 +330,11 @@ func TestS3Live_ReadRange_NegativeGuard(t *testing.T) {
 	liveSeed(t, e, string(scope)+"/z.bin", []byte("0123456789"))
 
 	var buf bytes.Buffer
-	if err := e.ReadRange(ctx, scope, "z.bin", -1, 5, &buf); err == nil ||
-		!strings.Contains(err.Error(), "negative") {
-		t.Fatalf("ReadRange(offset=-1) = %v, want negative-window refusal", err)
+	if err := e.ReadRange(ctx, scope, "z.bin", -1, 5, &buf); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("ReadRange(offset=-1) = %v, want ErrInvalidRange", err)
 	}
-	if err := e.ReadRange(ctx, scope, "z.bin", 0, -1, &buf); err == nil ||
-		!strings.Contains(err.Error(), "negative") {
-		t.Fatalf("ReadRange(length=-1) = %v, want negative-window refusal", err)
+	if err := e.ReadRange(ctx, scope, "z.bin", 0, -1, &buf); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("ReadRange(length=-1) = %v, want ErrInvalidRange", err)
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("negative-window refusal wrote %d bytes, want 0", buf.Len())

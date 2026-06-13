@@ -174,6 +174,71 @@ func TestNilClockPanics(t *testing.T) {
 	})
 }
 
+// TestNewRegistryFailLoudOnBadCeilings pins the single-place "callers
+// validate" contract: a real (enforcing) Registry refuses a non-positive
+// rate, a sub-one burst, or a negative byte/fd ceiling with a panic, so a
+// misconfigured limiter is a loud wiring failure rather than a silent
+// permanent throttle (rate=0 would drain once then deny forever).
+func TestNewRegistryFailLoudOnBadCeilings(t *testing.T) {
+	base := func() Config {
+		return Config{
+			OpsPerSecond:         1,
+			OpsBurst:             1,
+			InFlightBytesCeiling: 1,
+			FDCeiling:            1,
+			Clock:                frozenClock(),
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"zero_rate", func(c *Config) { c.OpsPerSecond = 0 }},
+		{"negative_rate", func(c *Config) { c.OpsPerSecond = -1 }},
+		{"zero_burst", func(c *Config) { c.OpsBurst = 0 }},
+		{"fractional_burst", func(c *Config) { c.OpsBurst = 0.5 }},
+		{"negative_bytes_ceiling", func(c *Config) { c.InFlightBytesCeiling = -1 }},
+		{"negative_fd_ceiling", func(c *Config) { c.FDCeiling = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(&cfg)
+			mustPanic(t, "NewRegistry "+tc.name, func() {
+				NewRegistry(cfg)
+			})
+		})
+	}
+
+	// A fully valid enforcing config must NOT panic.
+	if reg := NewRegistry(base()); reg == nil {
+		t.Fatal("NewRegistry with a valid config returned nil")
+	}
+}
+
+// TestFixedCeilingDefaults pins the fixed-this-phase byte and fd ceiling
+// defaults to their documented values and confirms a Registry built from
+// them passes the fail-loud validation (the defaults are servable, never a
+// silent permanent throttle).
+func TestFixedCeilingDefaults(t *testing.T) {
+	if DefaultInFlightBytesCeiling != 1<<31 {
+		t.Errorf("DefaultInFlightBytesCeiling: got %d, want %d (2 GiB)", DefaultInFlightBytesCeiling, int64(1)<<31)
+	}
+	if DefaultFDCeiling != 256 {
+		t.Errorf("DefaultFDCeiling: got %d, want 256", DefaultFDCeiling)
+	}
+	reg := NewRegistry(Config{
+		OpsPerSecond:         1,
+		OpsBurst:             1,
+		InFlightBytesCeiling: DefaultInFlightBytesCeiling,
+		FDCeiling:            DefaultFDCeiling,
+		Clock:                frozenClock(),
+	})
+	if reg == nil {
+		t.Fatal("NewRegistry with the fixed defaults returned nil")
+	}
+}
+
 // TestNopRegistryAdmitsEverything pins the non-enforcing constructor for
 // downstream wiring: ops, bytes, and fd admission all succeed repeatedly —
 // it must never throttle a phase 8-11 test harness.
@@ -246,70 +311,6 @@ func TestSizeLimitsParity(t *testing.T) {
 	// unset, a deployment must configure it explicitly.
 	if got.BrokerMaxFileSizeBytes != 0 {
 		t.Errorf("BrokerMaxFileSizeBytes: got %d, want 0 (unset policy)", got.BrokerMaxFileSizeBytes)
-	}
-}
-
-// TestSnapshot verifies that Snapshot returns a point-in-time copy of the
-// limiter state without mutating it: acquire N bytes, snapshot shows N;
-// release, snapshot shows 0.
-func TestSnapshot(t *testing.T) {
-	cfg := Config{
-		OpsPerSecond:         10,
-		OpsBurst:             5,
-		InFlightBytesCeiling: 1024,
-		FDCeiling:            4,
-		Clock:                frozenClock(),
-	}
-	reg := NewRegistry(cfg)
-	s := reg.Session("test-snap")
-
-	// Initial snapshot: all zero (bucket starts full at OpsBurst).
-	snap0 := s.Snapshot()
-	if snap0.InFlightBytes != 0 {
-		t.Errorf("initial InFlightBytes: want 0, got %d", snap0.InFlightBytes)
-	}
-	if snap0.FDInUse != 0 {
-		t.Errorf("initial FDInUse: want 0, got %d", snap0.FDInUse)
-	}
-	if snap0.OpsTokens != 5 {
-		t.Errorf("initial OpsTokens: want 5 (burst), got %f", snap0.OpsTokens)
-	}
-
-	// Acquire 256 bytes.
-	if err := s.AcquireBytes(256); err != nil {
-		t.Fatalf("AcquireBytes: %v", err)
-	}
-	snap1 := s.Snapshot()
-	if snap1.InFlightBytes != 256 {
-		t.Errorf("after AcquireBytes(256): want 256, got %d", snap1.InFlightBytes)
-	}
-
-	// Acquire an FD slot.
-	if err := s.TryAcquireFD(); err != nil {
-		t.Fatalf("TryAcquireFD: %v", err)
-	}
-	snap2 := s.Snapshot()
-	if snap2.FDInUse != 1 {
-		t.Errorf("after TryAcquireFD: want 1, got %d", snap2.FDInUse)
-	}
-
-	// Release — snapshot reverts.
-	s.ReleaseBytes(256)
-	s.ReleaseFD()
-	snap3 := s.Snapshot()
-	if snap3.InFlightBytes != 0 {
-		t.Errorf("after ReleaseBytes: want 0, got %d", snap3.InFlightBytes)
-	}
-	if snap3.FDInUse != 0 {
-		t.Errorf("after ReleaseFD: want 0, got %d", snap3.FDInUse)
-	}
-
-	// Snapshot does not mutate: run it twice, state unchanged.
-	_ = s.Snapshot()
-	_ = s.Snapshot()
-	snap4 := s.Snapshot()
-	if snap4.InFlightBytes != 0 || snap4.FDInUse != 0 {
-		t.Errorf("repeated snapshots mutated state: %+v", snap4)
 	}
 }
 

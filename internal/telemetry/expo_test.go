@@ -113,6 +113,14 @@ func TestExpoHistogramGolden(t *testing.T) {
 	if !strings.Contains(out, `stage_latency_seconds_bucket{le="0.01",stage="authz"} 1`) {
 		t.Fatalf("bucket 0.01 missing or wrong:\n%s", out)
 	}
+	// The remaining bounds above the observation are cumulative and must stay
+	// at 1 (one observation total) — not re-summed past the count.
+	if !strings.Contains(out, `stage_latency_seconds_bucket{le="0.1",stage="authz"} 1`) {
+		t.Fatalf("bucket 0.1 must be cumulative 1, not re-summed:\n%s", out)
+	}
+	if !strings.Contains(out, `stage_latency_seconds_bucket{le="1",stage="authz"} 1`) {
+		t.Fatalf("bucket 1 must be cumulative 1, not re-summed:\n%s", out)
+	}
 	if !strings.Contains(out, `stage_latency_seconds_bucket{le="+Inf",stage="authz"} 1`) {
 		t.Fatalf("+Inf bucket missing:\n%s", out)
 	}
