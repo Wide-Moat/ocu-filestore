@@ -164,12 +164,12 @@ type dispatcher struct {
 	// while being streamed in many sub-ceiling frames, so the two ceilings
 	// cannot be the same value.
 	//
-	// PHASE-11 PLACEHOLDER (W1): the real ceiling is the control-plane's
-	// BrokerMaxFileSizeBytes, bound in the wiring phase. Until then this is
-	// defaulted to sizeCeiling in newDispatcherWithEngine, so an unwired
-	// deployment caps uploads at the per-message ceiling — conservative and
-	// fail-closed, but not the real whole-object limit. Tests set a small
-	// value directly (the package is in-package).
+	// The real ceiling is the control-plane's BrokerMaxFileSizeBytes, bound by
+	// Serve from cfg.BrokerMaxFileSize (validated positive there). A dispatcher
+	// built without that wiring leaves this 0, so checkDeclaredSize refuses any
+	// non-empty upload (declared > 0 > ceiling) — an unwired dispatcher fails
+	// CLOSED and loudly rather than silently inheriting a placeholder ceiling.
+	// Tests set a small value directly (the package is in-package).
 	maxFileSize int64
 	// frameReadTimeout bounds the wait for EACH inbound stream frame
 	// (NFR-SEC-46): a peer that opens an upload and stalls would otherwise
@@ -220,10 +220,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		engine:      engine,
 		ids:         newObjectIDStore(),
 		sizeCeiling: sizeCeiling,
-		// PHASE-11 PLACEHOLDER (W1): default the whole-object upload ceiling
-		// to the per-message ceiling until the real BrokerMaxFileSizeBytes is
-		// wired. See the maxFileSize field doc.
-		maxFileSize:      sizeCeiling,
+		// maxFileSize is intentionally left 0 here: Serve sets it from the
+		// validated cfg.BrokerMaxFileSize. An unwired dispatcher therefore
+		// refuses any non-empty upload (fail-closed). See the field doc.
+		maxFileSize:      0,
 		frameReadTimeout: defaultFrameReadTimeout,
 		logger:           slog.New(slog.DiscardHandler),
 	}
