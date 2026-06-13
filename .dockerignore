@@ -1,0 +1,47 @@
+# .dockerignore — shrink the build context sent to the Docker daemon.
+#
+# The Dockerfile does `COPY . .` into the builder. Without this file the whole
+# repo (history, planning notes, coverage artifacts, docs, CI config) is shipped
+# into the build context and baked into the builder layer — slow, and it leaks
+# non-build material into the image cache.
+#
+# The build only needs the Go module graph (go.mod/go.sum) and the Go packages
+# under cmd/ and internal/. There is no go:embed, so no other tree is required.
+# Everything excluded below is verified NOT to be a build input; if a future
+# change adds a go:embed of a path listed here, un-ignore that path.
+
+# Version control and local planning notes
+.git
+.gitignore
+.gitleaks.toml
+.github
+.planning
+
+# Reference material (never a build input; must never enter any layer)
+.refs
+references
+.claude
+
+# Compiled / build output that must not pollute the build context
+/ocu-filestored
+*.bin
+*.coverprofile
+cover.out
+coverage
+testdata/rapid
+
+# Docs and project meta — not compiled into the binary
+docs
+*.md
+LICENSE
+LICENSE-APACHE
+LICENSE-MIT
+NOTICE
+
+# Deploy/runtime assets consumed at deploy time, not at build time
+examples
+contrib
+deploy
+
+# Local instruction files (also untracked, but exclude defensively)
+CLAUDE.local.md
