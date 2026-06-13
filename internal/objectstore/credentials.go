@@ -22,6 +22,61 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/admission"
 )
 
+// arnPartition returns the IAM ARN partition string for the given AWS region.
+// sts_per_session targets real AWS infrastructure (commercial, GovCloud, or
+// China); S3-compatible rigs (MinIO, Ceph RGW) that supply a custom Endpoint
+// bypass this path entirely — they use the host_local_long_lived credential
+// source, which does not evaluate inline IAM session policies at all.
+//
+//   - GovCloud regions (prefix "us-gov-") → "aws-us-gov"
+//   - China regions    (prefix "cn-")      → "aws-cn"
+//   - All others                           → "aws"
+func arnPartition(region string) string {
+	switch {
+	case strings.HasPrefix(region, "us-gov-"):
+		return "aws-us-gov"
+	case strings.HasPrefix(region, "cn-"):
+		return "aws-cn"
+	default:
+		return "aws"
+	}
+}
+
+// validateBucketName enforces the S3 bucket-name character set and length
+// constraints. It mirrors validateScopeID's error idiom (wraps errSTSConfig).
+// In addition to the standard S3 rules (lowercase letters, digits, hyphens,
+// dots; 3–63 characters; no leading/trailing hyphen or dot), it rejects any
+// character that is meaningful in an IAM Resource glob ('*', '/', whitespace)
+// so that a hostile bucket value can never widen the Resource pattern beyond
+// the intended scope cell.
+func validateBucketName(bucket string) error {
+	if bucket == "" {
+		return fmt.Errorf("%w: bucket is required for the scope-prefix policy", errSTSConfig)
+	}
+	if len(bucket) < 3 || len(bucket) > 63 {
+		return fmt.Errorf("%w: bucket name %q is not between 3 and 63 characters", errSTSConfig, bucket)
+	}
+	for i, ch := range bucket {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			// lowercase letter — always valid
+		case ch >= '0' && ch <= '9':
+			// digit — always valid
+		case ch == '-':
+			if i == 0 || i == len(bucket)-1 {
+				return fmt.Errorf("%w: bucket name %q must not start or end with a hyphen", errSTSConfig, bucket)
+			}
+		case ch == '.':
+			if i == 0 || i == len(bucket)-1 {
+				return fmt.Errorf("%w: bucket name %q must not start or end with a dot", errSTSConfig, bucket)
+			}
+		default:
+			return fmt.Errorf("%w: bucket name %q contains an invalid character %q (require lowercase letters, digits, hyphens, or dots)", errSTSConfig, bucket, ch)
+		}
+	}
+	return nil
+}
+
 // Backend credential intake (T1-7). The credential NEVER arrives as a flag
 // VALUE — a flag-carried secret leaks through the process argument list.
 // Two sources, in precedence order:
@@ -251,8 +306,8 @@ func NewSTSCredentialSource(cfg STSConfig) (*STSCredentialSource, error) {
 	if cfg.RoleARN == "" {
 		return nil, fmt.Errorf("%w: role ARN is required", errSTSConfig)
 	}
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("%w: bucket is required for the scope-prefix policy", errSTSConfig)
+	if err := validateBucketName(cfg.Bucket); err != nil {
+		return nil, err
 	}
 	if cfg.Region == "" {
 		return nil, fmt.Errorf("%w: region is required", errSTSConfig)
@@ -271,7 +326,7 @@ func (s *STSCredentialSource) Provider(ctx context.Context) (aws.CredentialsProv
 	if err != nil {
 		return nil, err
 	}
-	policy, err := scopePrefixPolicy(s.cfg.Bucket, s.cfg.Scope)
+	policy, err := scopePrefixPolicy(s.cfg.Bucket, s.cfg.Scope, s.cfg.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -319,20 +374,27 @@ type stsPolicyStatement struct {
 // listing confined by an s3:prefix condition. No statement ever names a
 // wildcard bucket or an unconditioned bucket-wide read.
 //
+// The region parameter is used to derive the correct ARN partition (aws,
+// aws-us-gov, or aws-cn). This function targets real AWS STS; S3-compatible
+// rigs with a custom Endpoint use the host_local_long_lived path and never
+// call scopePrefixPolicy.
+//
 // One deliberate exception: ListBucketMultipartUploads carries NO prefix
 // condition — the engine's orphan-MPU sweep lists bucket-wide and filters
 // client-side (a directory-style Prefix on that call is not honored by
 // every S3-compatible backend), so a prefix condition would deny the SEC-54
 // sweep. The exposure is upload-key METADATA only; every mutating MPU verb
 // stays prefix-confined.
-func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
+func scopePrefixPolicy(bucket string, scope ScopeID, region string) (string, error) {
 	if err := validateScopeID(scope); err != nil {
 		return "", err
 	}
-	if bucket == "" {
-		return "", fmt.Errorf("%w: bucket is required for the scope-prefix policy", errSTSConfig)
+	if err := validateBucketName(bucket); err != nil {
+		return "", err
 	}
+	partition := arnPartition(region)
 	prefix := string(scope) + "/"
+	bucketARN := "arn:" + partition + ":s3:::" + bucket
 	doc := stsPolicyDocument{
 		Version: "2012-10-17",
 		Statement: []stsPolicyStatement{
@@ -350,7 +412,7 @@ func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
 					"s3:AbortMultipartUpload",
 					"s3:ListMultipartUploadParts",
 				},
-				Resource: "arn:aws:s3:::" + bucket + "/" + prefix + "*",
+				Resource: bucketARN + "/" + prefix + "*",
 			},
 			{
 				Sid:    "ScopeList",
@@ -359,7 +421,7 @@ func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
 					"s3:ListBucket",
 					"s3:ListBucketVersions",
 				},
-				Resource: "arn:aws:s3:::" + bucket,
+				Resource: bucketARN,
 				Condition: map[string]map[string]string{
 					"StringLike": {"s3:prefix": prefix + "*"},
 				},
@@ -370,7 +432,7 @@ func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
 				Action: []string{
 					"s3:ListBucketMultipartUploads",
 				},
-				Resource: "arn:aws:s3:::" + bucket,
+				Resource: bucketARN,
 			},
 			{
 				Sid:    "BucketVersioningProbe",
@@ -378,7 +440,7 @@ func scopePrefixPolicy(bucket string, scope ScopeID) (string, error) {
 				Action: []string{
 					"s3:GetBucketVersioning",
 				},
-				Resource: "arn:aws:s3:::" + bucket,
+				Resource: bucketARN,
 			},
 		},
 	}
