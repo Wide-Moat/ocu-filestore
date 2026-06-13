@@ -536,21 +536,32 @@ func TestEngineDenyMap(t *testing.T) {
 		}
 	})
 
-	t.Run("escape degrades to not_found wire, audits escape truth", func(t *testing.T) {
+	t.Run("redundant-slash path is canonicalized before the engine, resolves not_found", func(t *testing.T) {
 		eng := newFakeEngine()
 		g := &fakeGuard{}
 		d := newEngineDispatcher(&fakeResolver{}, g, okCeilings(), eng)
-		// A lexically-rejected path (embedded "" component) drives the engine
-		// fake's errInvalidPath, which degrades to not_found on the wire while
-		// auditing the escape truth.
+		// Pre-fix, "/a//b" reached the engine raw and drove its errInvalidPath
+		// (degraded to not_found, audited as the escape truth). Post-fix
+		// (bypass-01/03), the spine canonicalizes the path ONCE at the boundary,
+		// so the redundant "//" is collapsed to the in-scope "/a/b" BEFORE the
+		// engine — a redundant-slash path is no longer treated as an escape; it
+		// resolves like any other absent object (not_found), and the engine sees
+		// the SINGLE canonical form, never the raw "a//b".
 		body := fmt.Sprintf(`{"filesystem_id":%q,"path":"/a//b","authorization_metadata":{"intent":"write","downloadable":false}}`, opScope)
 		w := serveOp(d, OpRemoveFile, body, opScope, okIntents())
 		if w.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404 (degraded)", w.Code)
+			t.Fatalf("status = %d, want 404; body %s", w.Code, w.Body.String())
 		}
 		second := g.events[1].(auditgate.FileActivityEvent)
-		if second.Outcome.XDenyReason != denyScopeMismatch {
-			t.Fatalf("audit reason = %q, want the escape truth (scope_mismatch)", second.Outcome.XDenyReason)
+		// not_found, NOT scope_mismatch: the audited path is the canonical
+		// in-scope "/a/b", proving the spine cleaned the redundant "//" before
+		// the engine (raw "a//b" would have driven the engine's errInvalidPath
+		// and audited the escape truth scope_mismatch).
+		if second.Outcome.XDenyReason != denyNotFound {
+			t.Fatalf("audit reason = %q, want not_found (a canonicalized in-scope path, not an escape)", second.Outcome.XDenyReason)
+		}
+		if second.ObjectHandle != opScope+":/a/b" {
+			t.Fatalf("audit ObjectHandle = %q, want the canonical %q", second.ObjectHandle, opScope+":/a/b")
 		}
 	})
 }

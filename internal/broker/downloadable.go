@@ -5,6 +5,7 @@ package broker
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/authz"
@@ -53,6 +54,17 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 		if path == "" {
 			return false, nil
 		}
+		// Belt-and-suspenders (bypass-01): the egress gate decides on a
+		// path-boundary PREFIX match, so it MUST never grant on a non-canonical
+		// path. The wire boundary now canonicalizes once before authz, so a
+		// dirty path should never reach here; if a future caller forgets, refuse
+		// to grant rather than match a traversal segment against a prefix. A
+		// path that still carries a ".." component or that does not equal its
+		// own filepath.Clean form is fail-closed to non-downloadable — the
+		// cleaned object it actually names may sit OUTSIDE the prefix.
+		if filepath.Clean(path) != path || hasDotDotComponent(path) {
+			return false, nil
+		}
 		for _, prefix := range norm {
 			if pathUnderPrefix(path, prefix) {
 				return true, nil
@@ -60,6 +72,20 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 		}
 		return false, nil
 	}
+}
+
+// hasDotDotComponent reports whether path carries a ".." as a whole
+// "/"-delimited component (not merely as a substring of a legitimate name such
+// as "..config"). It is the fail-closed companion to the filepath.Clean
+// equality check: a path that is already clean cannot carry a ".." component,
+// but the explicit test documents the egress-gate invariant in one place.
+func hasDotDotComponent(path string) bool {
+	for _, c := range strings.Split(path, "/") {
+		if c == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // pathUnderPrefix reports whether path is the prefix itself or lies beneath it

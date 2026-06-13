@@ -263,7 +263,8 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	}
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
-	rootRel := enginePath(req.Path)
+	// Use the spine-canonicalized path (bypass-01/03), never the raw body path.
+	rootRel := enginePath(hc.canonPath)
 
 	after, err := decodeCursor(req.Cursor)
 	if err != nil {
@@ -302,7 +303,7 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 			resp.Cursor = encodeCursor(lastEmitted)
 			return false
 		}
-		gp := guestPath(wr.rel)
+		gp := guestPathFromRel(wr.rel)
 		if wr.info.IsDir {
 			resp.Entries = append(resp.Entries, entry{Directory: &directory{
 				Path:  gp,
@@ -366,7 +367,8 @@ func handleMakeDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
 	}
-	rel := enginePath(req.Path)
+	// Spine-canonicalized path (bypass-01/03), never the raw body path.
+	rel := enginePath(hc.canonPath)
 	if err := d.makeDirs(hc.ctxOrBackground(), hc.ps.FilesystemID, rel, req.MakeParents); err != nil {
 		denyEngine(hc, err)
 		return outcomeDenyRecorded()
@@ -396,7 +398,7 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	// The moved-away subtree's uuid records are now stale: evict them so the
 	// session-scoped store stays bounded (N8). The destination subtree mints
 	// fresh ids on its next observation.
-	d.ids.evictTree(hc.ps.FilesystemID, guestPath(src))
+	d.ids.evictTree(hc.ps.FilesystemID, guestPathFromRel(src))
 	writeAck(hc.w)
 	return outcomeAllow()
 }
@@ -417,7 +419,8 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	}
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
-	rel := enginePath(req.Path)
+	// Spine-canonicalized path (bypass-01/03), never the raw body path.
+	rel := enginePath(hc.canonPath)
 
 	if !req.Recursive {
 		entries, err := d.engine.List(ctx, scope, rel)
@@ -439,7 +442,7 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	}
 	// Evict the removed subtree's uuid records (N8): the store stays bounded
 	// by the live namespace; the read path re-validates existence anyway.
-	d.ids.evictTree(scope, guestPath(rel))
+	d.ids.evictTree(scope, guestPathFromRel(rel))
 	writeAck(hc.w)
 	return outcomeAllow()
 }
@@ -487,7 +490,7 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	// The source path no longer names an object: evict its uuid record (N8).
 	// The destination keeps any existing record — its (scope, path) pair
 	// still names a live object and identity is re-validated at read.
-	d.ids.evict(hc.ps.FilesystemID, guestPath(src))
+	d.ids.evict(hc.ps.FilesystemID, guestPathFromRel(src))
 	writeAck(hc.w)
 	return outcomeAllow()
 }
@@ -504,13 +507,14 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
 	}
-	rel := enginePath(req.Path)
+	// Spine-canonicalized path (bypass-01/03), never the raw body path.
+	rel := enginePath(hc.canonPath)
 	if err := d.engine.RemoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, rel); err != nil {
 		denyEngine(hc, err)
 		return outcomeDenyRecorded()
 	}
 	// Evict the removed object's uuid record (N8).
-	d.ids.evict(hc.ps.FilesystemID, guestPath(rel))
+	d.ids.evict(hc.ps.FilesystemID, guestPathFromRel(rel))
 	writeAck(hc.w)
 	return outcomeAllow()
 }
@@ -550,7 +554,8 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
-	rel := enginePath(req.Path)
+	// Spine-canonicalized path (bypass-01/03), never the raw body path.
+	rel := enginePath(hc.canonPath)
 
 	// Stat-only validation: existence and metadata, zero content bytes read,
 	// O(1) memory regardless of object size or the guest-declared range.
@@ -565,7 +570,7 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 		hc.mandateDeny(denyNotFound, denyNotFound, "object is not a file")
 		return outcomeDenyRecorded()
 	}
-	gp := guestPath(rel)
+	gp := guestPathFromRel(rel)
 	writeJSON(hc.w, readFileResponse{File: file{
 		Path:  gp,
 		Size:  info.Size,

@@ -20,6 +20,15 @@ import (
 // fatal only to a stalled one.
 const defaultFrameReadTimeout = 30 * time.Second
 
+// defaultFrameWriteTimeout is the conservative per-frame OUTBOUND write budget
+// for the download stream (crutch-01) — the symmetric mirror of
+// defaultFrameReadTimeout. Generous for any live reader draining a 256-KiB data
+// frame, fatal only to a stalled one. Without it, a wedged reader fills the
+// kernel send buffer and writeFrame blocks forever, pinning the download
+// goroutine and the engine fd (IdleTimeout never fires mid-request and the
+// request context is not cancelled).
+const defaultFrameWriteTimeout = 30 * time.Second
+
 // requestIDHeader is the response header name for the per-request correlation
 // id (T2-18). It is present on EVERY response — allow AND deny, unary AND
 // streaming — and must never be used as a metric label (T2-2 cardinality rule).
@@ -180,6 +189,14 @@ type dispatcher struct {
 	// existing hard-abort path. Defaulted in newDispatcherWithEngine; tests
 	// shrink it.
 	frameReadTimeout time.Duration
+	// frameWriteTimeout bounds the wait for EACH outbound data frame on the
+	// download stream (NFR-SEC-46, crutch-01): the symmetric mirror of
+	// frameReadTimeout for the egress leg. The download handler arms a
+	// per-connection write deadline by this much before every writeFrame; a
+	// stalled reader makes the next writeFrame error and aborts through the
+	// existing drain path that closes the ReadRange pipe and releases the fd
+	// slot. Defaulted in newDispatcherWithEngine; tests shrink it.
+	frameWriteTimeout time.Duration
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -223,9 +240,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// maxFileSize is intentionally left 0 here: Serve sets it from the
 		// validated cfg.BrokerMaxFileSize. An unwired dispatcher therefore
 		// refuses any non-empty upload (fail-closed). See the field doc.
-		maxFileSize:      0,
-		frameReadTimeout: defaultFrameReadTimeout,
-		logger:           slog.New(slog.DiscardHandler),
+		maxFileSize:       0,
+		frameReadTimeout:  defaultFrameReadTimeout,
+		frameWriteTimeout: defaultFrameWriteTimeout,
+		logger:            slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -383,6 +401,24 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// carries no op field in this build; the route op is authoritative and
 	// the body scope/intent are the only cross-checked fields.
 
+	// STAGE 1b -> 2 BOUNDARY: canonicalize the decoded path ONCE (bypass-01/03).
+	// Nothing trusts the body before STAGE 1b; now that the channel-scope
+	// cross-check has cleared, clean the path a SINGLE time so authz, the
+	// downloadable tag, the engine, the uuid store, and the audit record all
+	// see the SAME object. This is an additive step WITHIN the boundary — the
+	// LOCKED STAGE 0->4 order is unchanged — and it runs BEFORE STAGE 2 so a
+	// `<downloadable-prefix>/../<private>` wire path can never have its egress
+	// axis decided on the raw bytes while a different object is read. A path
+	// the canonicalizer rejects is invalid_argument at the boundary; the
+	// handler is never reached. From here, env.Path is the canonical form and
+	// every downstream consumer derives from it.
+	canonPath, perr := canonicalizePath(env.Path)
+	if perr != nil {
+		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
+		return
+	}
+	env.Path = canonPath
+
 	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
 	// The route op is AUTHORITATIVE for what the request does; the wire
 	// authorization_metadata.intent is an untrusted hint. The authz intent
@@ -486,6 +522,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w:           w,
 		op:          op,
 		body:        bodyBytes,
+		canonPath:   env.Path, // the spine-canonicalized primary path (bypass-01/03)
 		ps:          ps,
 		grant:       grant,
 		mandateDeny: mandateDeny,

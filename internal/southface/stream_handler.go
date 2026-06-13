@@ -296,6 +296,19 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		return
 	}
 
+	// --- canonicalize the decoded path ONCE (bypass-01/03) ---
+	// Mirror the unary spine boundary: clean params.Path a single time after the
+	// scope cross-check and before authz/audit/engine so the resolver, the
+	// audit ObjectHandle, and the engine WriteStream target all name the SAME
+	// object. A path the canonicalizer rejects is a pre-allow invalid_argument
+	// deny — nothing is staged.
+	canonUpload, cerr := canonicalizePath(params.Path)
+	if cerr != nil {
+		denyTrailer(denyMalformed, wireCodeInvalidArgument, "invalid or unsafe path")
+		return
+	}
+	params.Path = canonUpload
+
 	// --- authz Resolve(intent=write) from the channel scope ---
 	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: params.Path, Intent: IntentWrite}
 	evidence := CallerEvidence{Scope: sc.ps.FilesystemID, GrantedIntents: sc.ps.GrantedIntents}
@@ -606,9 +619,22 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		_ = writeEndStream(sc.w, &connectError{Code: wireCodeNotFound, Message: "object not found"})
 		return
 	}
+	// Canonicalize the resolved path ONCE before authz/audit/engine
+	// (bypass-01/03). The uuid store is now keyed off canonical paths (the
+	// listing and readFile emitters mint against the spine-canonicalized
+	// req.Path), so this is normally a no-op identity; it is the belt-and-
+	// suspenders that guarantees the downloadable tag, the engine ReadRange
+	// target, and the audit ObjectHandle all name the SAME object even for any
+	// record minted before this boundary existed. A non-canonical record is a
+	// not_found-class refusal — never an egress grant on a dirty path.
+	canonDownload, cerr := canonicalizePath(rec.path)
+	if cerr != nil {
+		denyDownloadTrailer(denyNotFound, wireCodeNotFound, "object not found")
+		return
+	}
 	// Populate req from the resolved (scope, path) for the remainder of the
 	// audit and resolver calls.
-	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: rec.path, Intent: IntentRead}
+	req = ResolveRequest{Filesystem: sc.ps.FilesystemID, Path: canonDownload, Intent: IntentRead}
 
 	// --- authz Resolve(intent=read) from the channel scope ---
 	evidence := CallerEvidence{Scope: sc.ps.FilesystemID, GrantedIntents: sc.ps.GrantedIntents}
@@ -667,6 +693,19 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		return
 	}
 
+	// --- fd ceiling around the engine read window (NFR-SEC-46, conc-02) ---
+	// The download opens a real engine fd for the whole stream (ReadRange ->
+	// OpenScopeRoot). Acquire the per-session fd slot BEFORE launching the
+	// ReadRange goroutine and release it on every exit, exactly as the upload
+	// path does — without this the session-fd ceiling governs uploads but is a
+	// no-op for downloads, and (with crutch-01) a stalled reader's held fds
+	// would accrue unbounded.
+	if err := sc.sess.TryAcquireFD(); err != nil {
+		denyDownloadTrailer(denyThrottle, wireCodeResourceExhausted, "file-descriptor ceiling exceeded")
+		return
+	}
+	defer sc.sess.ReleaseFD()
+
 	// --- stream bytes: ReadRange → framed data frames ---
 	// engineStart times the engine read window (ReadRange -> last data frame)
 	// for the stage_latency_seconds "engine" histogram, mirroring the unary
@@ -687,6 +726,18 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		readErrCh <- err
 	}()
 
+	// Per-frame WRITE deadline (NFR-SEC-46, crutch-01): armed before EVERY
+	// outbound data frame so a stalled reader's filled send buffer makes the
+	// next writeFrame error instead of blocking forever. The errored writeFrame
+	// runs the existing drain path below (CloseWithError on the read pipe ->
+	// the ReadRange goroutine unblocks and returns -> the deferred ReleaseFD
+	// fires). Best-effort: a transport without deadline support (the in-memory
+	// test recorder) is tolerated exactly as the upload read deadline is — the
+	// live unix-socket server supports it.
+	extendWriteDeadline := func() {
+		_ = rc.SetWriteDeadline(time.Now().Add(d.frameWriteTimeout))
+	}
+
 	buf := make([]byte, downloadChunkSize)
 	for {
 		n, rerr := io.ReadFull(pr, buf)
@@ -702,6 +753,7 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 				_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "frame encode failed"})
 				return
 			}
+			extendWriteDeadline()
 			if werr := writeFrame(sc.w, dataFlag, frame); werr != nil {
 				// Client disconnected; drain and return without a trailer
 				// (connection is gone; writing a trailer would also fail). Book

@@ -115,3 +115,87 @@ func TestStalledUploadStreamAborts(t *testing.T) {
 			sess.acquired, sess.released, sess.fdAcquired, sess.fdReleased)
 	}
 }
+
+// TestStalledDownloadStreamAborts pins the crutch-01 fix over a REAL socket,
+// the symmetric mirror of TestStalledUploadStreamAborts: a client that opens a
+// fileDownload and then STOPS reading the response socket would, pre-fix, wedge
+// the handler in writeFrame forever once the kernel send buffer filled — the
+// download goroutine and its engine fd pinned, ReleaseFD never running
+// (IdleTimeout never fires mid-request and the request context is not
+// cancelled). With a per-frame WRITE deadline the next writeFrame errors, the
+// handler runs the existing drain path that closes the ReadRange pipe, and the
+// deferred ReleaseFD fires. The test asserts the fd gauge re-balances (the
+// handler returned and released its fd) well within the test budget.
+func TestStalledDownloadStreamAborts(t *testing.T) {
+	const scope = "fs-dl-stall"
+	// A multi-MiB object so the first data frames fill the kernel send buffer
+	// and writeFrame blocks once the client stops reading — the condition the
+	// write deadline must break.
+	big := bytes.Repeat([]byte("X"), 8<<20)
+
+	dir := filepath.Join(shortSocketDir(t), "dlstall")
+	reg := NewSessionRegistry()
+	entry := SessionEntry{FilesystemID: scope, GrantedIntents: []Intent{IntentRead, IntentWrite}}
+
+	eng := newFakeEngine()
+	eng.putBytes(scope, "big.bin", big)
+
+	resolver := &fakeResolver{grant: Grant{Downloadable: true}}
+	sess := &recordingCeilingsSession{}
+	d := newDispatcherWithEngine(resolver, &fakeGuard{}, &recordingRegistry{sess: sess}, 1<<20, eng)
+	d.maxFileSize = 1 << 20
+	d.frameWriteTimeout = 200 * time.Millisecond // shrink the budget for the test
+
+	// Mint the uuid directly in the session store (this session owns the
+	// dispatcher) so the download resolves without a prior listing round-trip.
+	uuid := d.ids.idFor(scope, "/big.bin")
+
+	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("provisionSession: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+
+	conn, err := net.Dial("unix", s.SocketPath())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Raw HTTP/1.1 chunked request: headers, then the download params frame as
+	// one chunk, then STALL — never read the response body. The server fills the
+	// send buffer and blocks in writeFrame until the write deadline fires.
+	params := downloadParamsFrame(t, scope, uuid, nil)
+	var reqBuf bytes.Buffer
+	fmt.Fprintf(&reqBuf, "POST %sfileDownload HTTP/1.1\r\n", servicePrefix)
+	fmt.Fprintf(&reqBuf, "Host: session\r\n")
+	fmt.Fprintf(&reqBuf, "Content-Type: %s\r\n", connContentTypeStream)
+	fmt.Fprintf(&reqBuf, "%s: %s\r\n", connectProtocolVersionHeader, connectProtocolVersion)
+	fmt.Fprintf(&reqBuf, "Transfer-Encoding: chunked\r\n\r\n")
+	fmt.Fprintf(&reqBuf, "%x\r\n", len(params))
+	reqBuf.Write(params)
+	reqBuf.WriteString("\r\n0\r\n\r\n") // terminal chunk: the request body is complete
+	if _, err := conn.Write(reqBuf.Bytes()); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// Do NOT read the response. Poll the fd gauge: ReleaseFD must fire (the
+	// handler returned after the write deadline broke writeFrame) well within a
+	// small multiple of the 200ms write budget. 5s is the hard failure line.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		acq, rel := sess.fdCounts()
+		if acq > 0 && acq == rel {
+			// The fd was acquired for the read window and released on the abort.
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	acq, rel := sess.fdCounts()
+	if acq == 0 {
+		t.Fatalf("download never acquired an fd slot; the fd ceiling is a no-op for downloads (conc-02)")
+	}
+	t.Fatalf("stalled download did not release its fd within 5s (write deadline 200ms): fd %d/%d — writeFrame wedged",
+		acq, rel)
+}

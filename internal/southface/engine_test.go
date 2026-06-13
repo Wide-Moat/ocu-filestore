@@ -46,8 +46,8 @@ func TestGuestPath(t *testing.T) {
 		{"golden-dir", "/golden-dir"},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
-			if got := guestPath(tc.in); got != tc.want {
-				t.Fatalf("guestPath(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := guestPathFromRel(tc.in); got != tc.want {
+				t.Fatalf("guestPathFromRel(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
