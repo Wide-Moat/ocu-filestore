@@ -260,6 +260,12 @@ jobs:
 
       # cosign keyless sign the GHCR image by digest (not by tag, which is
       # mutable). The image digest comes from the ghcr-image job output.
+      # OCI registry references must be fully lowercase; github.repository
+      # may contain mixed case (e.g. "Wide-Moat/ocu-filestore"). Derive the
+      # lowercased name once and reuse it for every image-ref construction in
+      # this job so all consumers stay in sync.
+      - name: derive lowercase image name
+        run: echo "IMAGE_NAME_LC=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: docker login for cosign image signing
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
@@ -269,11 +275,12 @@ jobs:
       - name: cosign keyless sign — GHCR image by digest
         env:
           COSIGN_EXPERIMENTAL: "1"
-          IMAGE_REF: ghcr.io/${{ github.repository }}@${{ needs.ghcr-image.outputs.digest }}
         run: |
           set -euo pipefail
           # Sign by digest so the signature is immutable.
-          cosign sign --yes "${IMAGE_REF}"
+          # IMAGE_NAME_LC was written to GITHUB_ENV by the preceding step;
+          # the registry reference must be lowercase or cosign cannot parse it.
+          cosign sign --yes "${IMAGE_NAME_LC}@${{ needs.ghcr-image.outputs.digest }}"
 
       # SLSA build provenance attestation over the release binaries.
       # actions/attest-build-provenance records the provenance in the
@@ -291,7 +298,7 @@ jobs:
       - name: attest build provenance — GHCR image
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ${{ env.IMAGE_NAME_LC }}
           subject-digest: ${{ needs.ghcr-image.outputs.digest }}
           push-to-registry: true
 
