@@ -52,7 +52,13 @@ while IFS= read -r file; do
 done < <(git ls-files "${IN_SCOPE[@]}")
 
 if [ "${#misses[@]}" -gt 0 ]; then
-  printf '::error::missing SPDX header (%s): %s\n' "$TOKEN" "${misses[@]}"
+  # One annotation per miss: printf reuses its format across every remaining
+  # argument, so a single format with two placeholders fed the whole array
+  # would pair the token with the wrong file from the second miss on. Loop
+  # instead so each file is named correctly in its own ::error:: line.
+  for f in "${misses[@]}"; do
+    printf '::error::missing SPDX header (%s): %s\n' "$TOKEN" "$f"
+  done
   echo "Add the SPDX FSL-1.1-Apache-2.0 header to the files above (see CLAUDE.md)." >&2
   exit 1
 fi
