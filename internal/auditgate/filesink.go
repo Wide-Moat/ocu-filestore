@@ -63,12 +63,43 @@ type FileSink struct {
 	w writeSyncer
 	// failed latches true after any write or sync error; it never resets.
 	failed bool
+	// onLatch is an optional callback invoked EXACTLY ONCE on the transition
+	// from healthy to latched. It is observation-only: it fires after failed
+	// is set and after the mutex is released (to avoid deadlock on re-entry).
+	// The composition layer sets it via SetOnLatch to emit an ERROR log line
+	// and flip the audit_sink_latched gauge (SEC-79 made observable).
+	onLatch func()
 	// prevLineHash is the SHA-256 of the exact bytes of the last written
 	// line, including its trailing newline; genesis when no line exists.
 	prevLineHash [sha256.Size]byte
 }
 
 var _ Guard = (*FileSink)(nil)
+
+// Latched reports whether the sink has permanently failed. It returns false on
+// a healthy sink and true after any write or sync error. Once latched the value
+// never resets — recovery is a daemon restart (NewFileSink re-scans the chain).
+// Latched is safe for concurrent use.
+func (s *FileSink) Latched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+// SetOnLatch registers an optional callback that is invoked EXACTLY ONCE on
+// the transition from healthy to latched. The callback is observation-only: it
+// fires after s.failed is set, after the mutex is released (to avoid deadlock
+// or re-entrant Mandate calls from inside the callback). Calling SetOnLatch
+// after the sink is already latched is a no-op — the latch has already fired.
+// The composition layer supplies a callback that emits an ERROR slog line and
+// flips the audit_sink_latched gauge to 1 (SEC-79 made observable).
+func (s *FileSink) SetOnLatch(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.failed {
+		s.onLatch = fn
+	}
+}
 
 // NewFileSink opens (or creates) the JSONL sink at path.
 //
@@ -208,11 +239,25 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	// which could hold bytes a file Sync does not flush. Either fault
 	// latches the sink: see the method comment.
 	if _, err := s.w.Write(line); err != nil {
+		cb := s.onLatch
 		s.failed = true
+		s.onLatch = nil // fire at most once
+		s.mu.Unlock()
+		if cb != nil {
+			cb()
+		}
+		s.mu.Lock() // reacquire for the deferred Unlock
 		return ErrAuditUnavailable
 	}
 	if err := s.w.Sync(); err != nil {
+		cb := s.onLatch
 		s.failed = true
+		s.onLatch = nil // fire at most once
+		s.mu.Unlock()
+		if cb != nil {
+			cb()
+		}
+		s.mu.Lock() // reacquire for the deferred Unlock
 		return ErrAuditUnavailable
 	}
 
