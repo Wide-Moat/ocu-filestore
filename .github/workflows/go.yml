@@ -224,15 +224,24 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Check out the canonical architecture repo so the byte-identity gate
       # actually enforces in CI; without this the script's skip branch would
-      # make the gate dead on every runner. PIN the canon to the exact commit
-      # the vendored contracts were re-vendored from (tag v0.9.6.0). An
-      # unpinned checkout floats on the canon default-branch HEAD, so a benign
-      # canon edit would redden unrelated PRs here and a canon revert could
-      # hide real drift. Bump this ref deliberately when re-vendoring.
+      # make the gate dead on every runner.
+      #
+      # PIN the canon to the immutable commit SHA whose contracts/storage/
+      # tree is byte-identical to our vendored copies (file-ops.schema.json
+      # and file-artifact-api.schema.json; we do not vendor mount-config).
+      # We vendor only those two files — mount-config belongs to the guest.
+      #
+      # The prior pin (0ebf93e) was the commit the v0.9.6.0 tag pointed to
+      # when we first vendored; the canon remote later moved that tag to a
+      # different commit (23ffdc9) that does not contain contracts/storage/
+      # at all, and the old 0ebf93e ref was dropped from the remote. The
+      # new pin below is the canon HEAD that does carry those contracts and
+      # is verified byte-identical. Bump this SHA deliberately when
+      # re-vendoring; verify byte-identity (sha256) before bumping.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: Wide-Moat/open-computer-use
-          ref: 0ebf93e9e12ba5e192c72c7a0e43335bcf73248c # v0.9.6.0
+          ref: 73e82c66a2df834683276ead83aa1571a1476ed0
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
