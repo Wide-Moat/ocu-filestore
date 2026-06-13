@@ -116,6 +116,7 @@ for the full test guide including the MinIO rig and the darwin escape hatch.
 
 | Document | Contents |
 |---|---|
+| [docs/architecture/README.md](docs/architecture/README.md) | Architecture entry point: the broker as component-04, the 10 invariants, the whole-system diagram, and the reading order over the 7 area design docs |
 | [docs/operations.md](docs/operations.md) | Operator runbook: full flag/env table, exit codes, signal contract, audit-latch recovery, log-rotation rules |
 | [docs/engines.md](docs/engines.md) | Local-volume vs S3 engine selection, IAM policy, MinIO/RGW path-style, storage-lane requirement |
 | [docs/configuration.md](docs/configuration.md) | Flag → environment variable reference (complete mapping table) |
