@@ -136,14 +136,16 @@ var errMissingRequiredFlag = errors.New("ocu-filestored: required flag missing o
 // vocabulary. Match it with errors.Is.
 var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 
-// lockFileName is the name of the exclusive flock file placed in the socket
-// directory. It guards the audit hash chain from interleaved writes by a
-// second daemon instance (T2-7, LIFE-07).
-const lockFileName = ".ocu-filestored.lock"
+// auditLockSuffix names the exclusive flock file that guards the audit hash
+// chain. It is the audit-sink path plus this suffix, so the lock is keyed on
+// the very resource it protects: two daemons pointed at the same -audit-sink
+// collide on this lock regardless of their -south-socket-dir, and a daemon
+// pointed at a different sink takes a distinct lock (T2-7, LIFE-07).
+const auditLockSuffix = ".lock"
 
 // errAlreadyRunning wraps flock.ErrAlreadyRunning with a human message that
-// names the lock file so the operator knows which file to inspect.
-var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (flock held on socket directory)")
+// names the resource so the operator knows which lock to inspect.
+var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the audit-sink lock)")
 
 // errStorageLaneRequired refuses `-engine s3` without a storage lane: the
 // s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
@@ -398,40 +400,56 @@ func run(args []string) error {
 		slog.String("s3_credential_file", cfg.s3CredentialFile),
 	)
 
-	// Single-instance flock guard (T2-7, LIFE-07): acquire an exclusive
-	// non-blocking flock on <south-socket-dir>/.ocu-filestored.lock BEFORE
-	// removing any stale socket and binding. Two concurrent daemon instances
-	// would interleave writes into the same audit hash chain and corrupt it;
-	// the flock prevents that. The lock is released on process exit even on
-	// SIGKILL (kernel releases fds on process termination), so there is no
-	// stale-lock problem across crashes.
+	// Single-instance flock guard (T2-7, LIFE-07): acquire one exclusive
+	// non-blocking flock BEFORE removing any stale socket and binding. The lock
+	// is keyed on the -audit-sink resource (<audit-sink>.lock) and is sufficient
+	// to prevent two daemons on the SAME scope from interleaving appends and
+	// corrupting the hash chain: one daemon = one filesystem_id = one audit-sink,
+	// so two daemons on the same scope share the same sink and collide here.
 	//
-	// The socket directory may not exist yet (provisionSession creates it);
-	// use os.MkdirAll here so the lock file path is always valid, consistent
-	// with provisionSession's own MkdirAll.
-	if err := os.MkdirAll(cfg.socketDir, 0o700); err != nil {
+	// A per-socket-directory lock was intentionally removed: the legitimate
+	// deployment topology is N daemons (one per filesystem_id) sharing ONE
+	// socket directory, each binding its own <filesystem_id>.sock there. A
+	// per-directory lock over-restricts to one daemon per directory, refusing
+	// the second through Nth daemons in that topology. The per-scope
+	// audit-sink lock fully preserves the no-interleaved-chain guarantee
+	// without imposing that topology restriction.
+	//
+	// The lock releases on process exit even on SIGKILL (the kernel releases
+	// fds on process termination), so there is no stale-lock problem across
+	// crashes. The sink's parent directory is the audit sink's own;
+	// NewFileSink creates the sink and fsyncs that directory, but the lock
+	// file is opened first, so ensure the directory exists.
+	auditSinkAbs, absErr := filepath.Abs(cfg.auditSink)
+	if absErr != nil {
+		if opsListener != nil {
+			_ = opsListener.Close()
+		}
+		return absErr
+	}
+	if err := os.MkdirAll(filepath.Dir(auditSinkAbs), 0o700); err != nil {
 		if opsListener != nil {
 			_ = opsListener.Close()
 		}
 		return err
 	}
-	lockPath := filepath.Join(cfg.socketDir, lockFileName)
-	fl, lockErr := flock.Acquire(lockPath)
-	if lockErr != nil {
+	auditLockPath := auditSinkAbs + auditLockSuffix
+	afl, auditLockErr := flock.Acquire(auditLockPath)
+	if auditLockErr != nil {
 		if opsListener != nil {
 			_ = opsListener.Close()
 		}
-		if errors.Is(lockErr, flock.ErrAlreadyRunning) {
-			l.Error("single-instance guard: another daemon holds the lock; refusing to start",
-				slog.String("lock_file", lockPath),
+		if errors.Is(auditLockErr, flock.ErrAlreadyRunning) {
+			l.Error("single-instance guard: another daemon holds the audit-sink lock; refusing to start",
+				slog.String("lock_file", auditLockPath),
 			)
 			return errAlreadyRunning
 		}
-		return lockErr
+		return auditLockErr
 	}
-	// Release the lock when the daemon exits (after teardown).
-	defer fl.Release()
-	l.Info("single-instance lock acquired", slog.String("lock_file", lockPath))
+	// Release the audit-sink lock when the daemon exits (after teardown).
+	defer afl.Release()
+	l.Info("single-instance audit-sink lock acquired", slog.String("lock_file", auditLockPath))
 
 	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {

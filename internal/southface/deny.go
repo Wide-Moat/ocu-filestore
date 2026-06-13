@@ -54,6 +54,11 @@ const (
 	// truth from denyAuditDown — the audit gate is healthy; the storage
 	// backend is not — though both map to the unavailable wire code.
 	denyBackendUnavailable = denyclass.BackendUnavailable
+
+	// denyclassNone is the deny_class label value an ALLOW outcome carries in
+	// ops_total ("none"). It is the shared denyclass sentinel, used by the
+	// streaming allow-recording path so the literal is not duplicated.
+	denyclassNone = denyclass.None
 )
 
 // Connect wire codes (closed set).

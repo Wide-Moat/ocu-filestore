@@ -20,6 +20,16 @@ metadata:
     app.kubernetes.io/component: storage-broker
     app.kubernetes.io/part-of: open-computer-use
 spec:
+  # Recreate, NOT the default RollingUpdate: the engine-root and audit PVCs are
+  # RWO and the audit-chain flock guard (T2-7) is per-pod (an emptyDir lock, no
+  # cross-pod protection). RollingUpdate would start the new pod before the old
+  # terminates — both would contend for the same RWO PVC (the rollout stalls on
+  # the volume attach) and could momentarily double-write the audit chain.
+  # Recreate fully terminates the old pod and detaches its PVCs before the new
+  # pod starts, so there is exactly one writer at every instant.
+  strategy:
+    type: Recreate
+
   # One replica per tenant — see README and NFR-SEC-76.
   # Do NOT increase replicas: the local-volume engine uses RWO PVCs that cannot
   # be safely shared, and the flock guard (T2-7) enforces single-writer at the
@@ -34,11 +44,22 @@ spec:
         app.kubernetes.io/name: ocu-filestored
         app.kubernetes.io/component: storage-broker
     spec:
-      # 35 seconds — 10 s above the daemon's bounded 25-second drain so a
-      # SIGTERM always lets graceful drain + erase-before-reuse (NFR-SEC-54)
-      # finish before the pod is force-killed. Matches the systemd unit's
+      # Graceful stop is TWO phases, not one:
+      #   phase 1 — bounded connection drain (25 s): in-flight south-face
+      #             operations finish or fail-closed.
+      #   phase 2 — TeardownScope erase-before-reuse (NFR-SEC-54), bounded by
+      #             the daemon's teardownTimeout (10 min = 600 s): the whole
+      #             scope under the engine-root is securely erased so no
+      #             customer bytes are left on the persistent PVC.
+      # The grace period must cover BOTH phases, or the kubelet sends SIGKILL
+      # mid-erase and orphans customer bytes on the PVC. 625 s = 25 s drain +
+      # 600 s teardown, with no extra slack so the value tracks the two
+      # constants exactly. On the local-volume shelf the erase is a single
+      # directory subtree; if your engine-root is small and you want a shorter
+      # grace period, lower the daemon's teardownTimeout accordingly and keep
+      # this value at drain + that bound. Must match the systemd unit's
       # TimeoutStopSec (see contrib/systemd/ocu-filestored.service).
-      terminationGracePeriodSeconds: 35
+      terminationGracePeriodSeconds: 625
 
       securityContext:
         runAsNonRoot: true
@@ -115,10 +136,18 @@ spec:
             - 127.0.0.1:9464
 
           env:
+            # filesystem-id MUST be STABLE across pod recreations. In a
+            # Deployment, metadata.name is the GENERATED pod name (e.g.
+            # ocu-filestored-7d9f8c-abc12), which changes on every rollout and
+            # restart. Sourcing the id from it would give each new pod a fresh
+            # scope directory on the persistent RWO PVC while the previous
+            # pod's scope dir is never swept — a silent PVC fill. Use a literal
+            # instead, scoped one-per-tenant like the broker (NFR-SEC-76).
+            # (The bare Pod in sandbox-peer-pod.yaml may use metadata.name
+            # because a Pod's name is operator-set and stable across its
+            # lifetime — only a Deployment's pod name is generated/unstable.)
             - name: OCU_FILESYSTEM_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
+              value: "ocu-filestored-tenant"
 
           securityContext:
             runAsNonRoot: true

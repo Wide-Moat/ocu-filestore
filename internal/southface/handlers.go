@@ -252,10 +252,10 @@ func (d *handlerDeps) walk(ctx context.Context, scope, rootRel string, recursive
 // with guest-convention paths, and mints the next cursor from the last
 // emitted entry (empty on the last page). The walk stops as soon as the page
 // is satisfied — limit+1 emitted entries visited, never the whole subtree.
-func handleListDirectory(d *handlerDeps, hc handlerCtx) {
+func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req listDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
@@ -264,9 +264,10 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) {
 	after, err := decodeCursor(req.Cursor)
 	if err != nil {
 		// A malformed cursor is a request fault, not an engine error: deny
-		// invalid_argument (no header), no engine touch.
+		// invalid_argument (no header), no engine touch. Written directly (no
+		// mandateDeny hook), so the spine records the single deny entry.
 		writeConnectError(hc.w, mapDeny(denyMalformed), "malformed cursor")
-		return
+		return outcomeDeny(denyMalformed)
 	}
 
 	limit := req.Limit
@@ -316,9 +317,10 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) {
 	})
 	if walkErr != nil {
 		denyEngine(hc, walkErr)
-		return
+		return outcomeDenyRecorded()
 	}
 	writeJSON(hc.w, resp)
+	return outcomeAllow()
 }
 
 // mimeForPath returns a guest-read mime hint derived from the path extension.
@@ -348,56 +350,58 @@ func mimeForPath(rel string) string {
 
 // handleMakeDirectory implements OPS-02 makeDirectory: compose make_parents
 // over the single-level engine MakeDir; bare ack on success.
-func handleMakeDirectory(d *handlerDeps, hc handlerCtx) {
+func handleMakeDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req makeDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	rel := enginePath(req.Path)
 	if err := d.makeDirs(hc.ctxOrBackground(), hc.ps.FilesystemID, rel, req.MakeParents); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleMoveDirectory implements OPS-02 moveDirectory: engine MoveDir with
 // overwrite=false (no overwrite field on this op); bare ack on success.
-func handleMoveDirectory(d *handlerDeps, hc handlerCtx) {
+func handleMoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req moveDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
 	if err := d.engine.MoveDir(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, false); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	// The moved-away subtree's uuid records are now stale: evict them so the
 	// session-scoped store stays bounded (N8). The destination subtree mints
 	// fresh ids on its next observation.
 	d.ids.evictTree(hc.ps.FilesystemID, guestPath(src))
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleRemoveDirectory implements OPS-02 removeDirectory with the non-empty
 // guard (Pattern 4): recursive=false on a non-empty directory refuses
 // invalid_argument WITHOUT deleting (the audited truth is denyDirNotEmpty, a
 // distinct token from malformed_envelope); recursive=true deletes the subtree.
-func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) {
+func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req removeDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
@@ -407,86 +411,90 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) {
 		entries, err := d.engine.List(ctx, scope, rel)
 		if err != nil {
 			denyEngine(hc, err)
-			return
+			return outcomeDenyRecorded()
 		}
 		if len(entries) > 0 {
 			// Refuse WITHOUT deleting: the audited truth is directory_not_empty,
 			// the wire class invalid_argument (no header). The engine RemoveDir
 			// is never called on the non-empty path.
 			hc.mandateDeny(denyDirNotEmpty, denyDirNotEmpty, "directory not empty")
-			return
+			return outcomeDenyRecorded()
 		}
 	}
 	if err := d.engine.RemoveDir(ctx, scope, rel); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	// Evict the removed subtree's uuid records (N8): the store stays bounded
 	// by the live namespace; the read path re-validates existence anyway.
 	d.ids.evictTree(scope, guestPath(rel))
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleCopyFile implements OPS-03 copyFile: engine CopyFile with
 // overwrite=OverwriteExisting; bare ack on success.
-func handleCopyFile(d *handlerDeps, hc handlerCtx) {
+func handleCopyFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req copyFileRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
 	if err := d.engine.CopyFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleMoveFile implements OPS-03 moveFile: engine MoveFile with
 // overwrite=OverwriteExisting; bare ack on success.
-func handleMoveFile(d *handlerDeps, hc handlerCtx) {
+func handleMoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req moveFileRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	src := enginePath(req.Source)
 	dst := enginePath(req.Destination)
 	if err := d.engine.MoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	// The source path no longer names an object: evict its uuid record (N8).
 	// The destination keeps any existing record — its (scope, path) pair
 	// still names a live object and identity is re-validated at read.
 	d.ids.evict(hc.ps.FilesystemID, guestPath(src))
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleRemoveFile implements OPS-03 removeFile: engine RemoveFile; bare ack
 // on success.
-func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
+func handleRemoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req removeFileRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 	if !assertWriteGrant(hc) {
-		return
+		return outcomeDenyRecorded()
 	}
 	rel := enginePath(req.Path)
 	if err := d.engine.RemoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, rel); err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	// Evict the removed object's uuid record (N8).
 	d.ids.evict(hc.ps.FilesystemID, guestPath(rel))
 	writeAck(hc.w)
+	return outcomeAllow()
 }
 
 // handleReadFile implements OPS-04 readFile: a UNARY op on the existing
@@ -504,10 +512,10 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) {
 // short-read anyway, so a range can never fail validation that Stat passes.
 // The guest range is accepted and intentionally unused here; bulk bytes are
 // the deferred fileDownload server-stream's job.
-func handleReadFile(d *handlerDeps, hc handlerCtx) {
+func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req readFileRequest
 	if !decodeOp(hc, &req) {
-		return
+		return outcomeDeny(denyMalformed)
 	}
 
 	// DOWNLOADABLE@READ, FIRST (SEC-73 wire half, A2). The spine's STAGE-2
@@ -517,7 +525,7 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) {
 	// tag. The handler reads ONLY hc.grant.Downloadable — never the wire flag.
 	if !hc.grant.Downloadable {
 		hc.mandateDeny(denyNotDownloadable, denyNotDownloadable, "object not downloadable")
-		return
+		return outcomeDenyRecorded()
 	}
 
 	ctx := hc.ctxOrBackground()
@@ -529,13 +537,13 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) {
 	info, err := d.engine.Stat(ctx, scope, rel)
 	if err != nil {
 		denyEngine(hc, err)
-		return
+		return outcomeDenyRecorded()
 	}
 	if info.IsDir {
 		// readFile names a file; a directory target is not_found (the same
 		// class the read path surfaced for a directory before).
 		hc.mandateDeny(denyNotFound, denyNotFound, "object is not a file")
-		return
+		return outcomeDenyRecorded()
 	}
 	gp := guestPath(rel)
 	writeJSON(hc.w, readFileResponse{File: file{
@@ -545,4 +553,5 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) {
 		MIME:  mimeForPath(rel),
 		UUID:  d.ids.idFor(scope, gp),
 	}})
+	return outcomeAllow()
 }
