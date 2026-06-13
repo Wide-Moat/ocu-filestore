@@ -46,19 +46,27 @@ func isLoopbackAddr(addr string) (bool, error) {
 	}
 
 	// Parse the literal IP.
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// Could be a hostname — try to resolve it to check loopback.
-		addrs, err := net.LookupHost(host)
-		if err != nil || len(addrs) == 0 {
-			return false, nil
-		}
-		ip = net.ParseIP(addrs[0])
-		if ip == nil {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback(), nil
+	}
+
+	// Not an IP literal — resolve the hostname and require EVERY resolved
+	// address to be loopback. A hostname whose first record is loopback but
+	// which also resolves to a routable interface must be refused: net.Listen
+	// may bind an address the check would otherwise never inspect, exposing the
+	// unauthenticated /metrics endpoint. Reject on any non-loopback or
+	// unparseable record (fail-closed).
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return false, nil
+	}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil || !ip.IsLoopback() {
 			return false, nil
 		}
 	}
-	return ip.IsLoopback(), nil
+	return true, nil
 }
 
 // OpsListener is a loopback-only HTTP listener serving the ops plane
@@ -134,7 +142,13 @@ func NewOpsListener(addr string, metrics *BrokerMetrics, logger *slog.Logger) (*
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		reg.WriteTo(w)
+		// Status and headers are already committed by the first WriteTo write,
+		// so a mid-scrape failure cannot change the HTTP status; the scraper
+		// detects the truncated body and the missing `up` sample. Log it at
+		// DEBUG so a flapping scrape connection does not spam the error stream.
+		if _, err := reg.WriteTo(w); err != nil {
+			ol.logger.Debug("metrics scrape write aborted", slog.String("err", err.Error()))
+		}
 	})
 
 	return ol, nil

@@ -168,7 +168,6 @@ func writeHistogram(w io.Writer, h *Histogram) {
 
 	for _, snap := range snaps {
 		labels := formatLabelsFromKey(snap.key, sortedK)
-		labelBase := snap.key
 
 		// Build the label string without outer braces for extended labels.
 		innerLabels := ""
@@ -177,10 +176,12 @@ func writeHistogram(w io.Writer, h *Histogram) {
 			innerLabels = labels[1 : len(labels)-1] // remove { and }
 		}
 
-		// Bucket lines: one per bound + +Inf.
-		cumulativeCount := uint64(0)
+		// Bucket lines: one per bound + +Inf. snap.cell.buckets[i] is already
+		// the cumulative count of observations <= bounds[i] (Observe increments
+		// every bucket whose bound is >= the value), so it is emitted directly
+		// as the Prometheus le=<bound> cumulative bucket — re-summing here would
+		// double-count.
 		for i, bound := range bounds {
-			cumulativeCount += snap.cell.buckets[i]
 			leStr := formatFloat(bound)
 			var bucketLabel string
 			if innerLabels != "" {
@@ -188,7 +189,7 @@ func writeHistogram(w io.Writer, h *Histogram) {
 			} else {
 				bucketLabel = fmt.Sprintf(`{le="%s"}`, leStr)
 			}
-			fmt.Fprintf(w, "%s_bucket%s %d\n", h.name, bucketLabel, cumulativeCount)
+			fmt.Fprintf(w, "%s_bucket%s %d\n", h.name, bucketLabel, snap.cell.buckets[i])
 		}
 		// +Inf bucket equals the total count.
 		var infLabel string
@@ -200,7 +201,6 @@ func writeHistogram(w io.Writer, h *Histogram) {
 		fmt.Fprintf(w, "%s_bucket%s %d\n", h.name, infLabel, snap.cell.count)
 
 		// _sum and _count with original label set.
-		_ = labelBase
 		fmt.Fprintf(w, "%s_sum%s %s\n", h.name, labels, formatFloat(snap.cell.sum))
 		fmt.Fprintf(w, "%s_count%s %d\n", h.name, labels, snap.cell.count)
 	}
