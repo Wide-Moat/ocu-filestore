@@ -44,6 +44,7 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
+	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
 // version is the build tag stamped by the release pipeline via
@@ -202,6 +203,10 @@ type brokerConfig struct {
 	tenancy          admission.Tenancy
 	// logLevel is the validated slog.Level for the daemon's JSON logger.
 	logLevel slog.Level
+	// opsListen is the bind address for the loopback-only ops listener
+	// (/metrics). An empty string disables the ops listener entirely.
+	// A non-loopback address is refused pre-bind (errOpsListenNotLoopback).
+	opsListen string
 }
 
 // run parses and validates the frozen flag surface, then composes and serves
@@ -216,6 +221,8 @@ func run(args []string) error {
 		"print the version, VCS revision, and Go toolchain, then exit 0")
 	logLevel := fs.String("log-level", "info",
 		"structured log level: debug | info | warn | error (default info)")
+	opsListen := fs.String("ops-listen", "127.0.0.1:9464",
+		"loopback-only bind address for the ops listener (/metrics); empty disables; non-loopback refused pre-bind")
 	fs.String("north-listen", "127.0.0.1:7080",
 		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
 	engine := fs.String("engine", "local-volume",
@@ -285,7 +292,7 @@ func run(args []string) error {
 		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
 		*storageLane, *caBundle, *laneDevDirect,
 		*s3Bucket, *s3Endpoint, *s3Region, *s3PathStyle,
-		*logLevel)
+		*logLevel, *opsListen)
 	if err != nil {
 		return err
 	}
@@ -294,6 +301,24 @@ func run(args []string) error {
 	// and BEFORE compose (which binds sockets). The logger is the first
 	// real infrastructure; everything from here on emits structured JSON.
 	l := observ.NewLogger(os.Stderr, cfg.logLevel)
+
+	// Build the broker metric set from the current version string. The set is
+	// passed into compose (so the dispatcher records ops_total and stage
+	// latencies) and into the ops listener (so /metrics serves it).
+	m := telemetry.NewBrokerMetrics(version)
+
+	// Start the loopback-only ops listener BEFORE the south face, so /metrics
+	// is available as soon as the daemon is "ready". An empty -ops-listen
+	// disables the listener; a non-loopback address was refused in validate.
+	var opsListener *telemetry.OpsListener
+	if cfg.opsListen != "" {
+		opsListener, err = telemetry.NewOpsListener(cfg.opsListen, m, l)
+		if err != nil {
+			return err
+		}
+		go opsListener.Serve()
+		l.Info("ops listener started", slog.String("addr", opsListener.Addr()))
+	}
 
 	// Startup echo at INFO: operator configuration summary. NEVER includes
 	// a credential byte — only the validated, non-secret flag surface.
@@ -316,14 +341,17 @@ func run(args []string) error {
 		slog.String("s3_credential_file", cfg.s3CredentialFile),
 	)
 
-	srv, err := compose(cfg, l)
+	srv, err := compose(cfg, l, m)
 	if err != nil {
+		if opsListener != nil {
+			_ = opsListener.Close()
+		}
 		return err
 	}
 	l.Info("session provisioned",
 		slog.String(observ.KeyScope, cfg.filesystemID),
 	)
-	return serveUntilSignal(srv, l)
+	return serveUntilSignal(srv, l, opsListener)
 }
 
 // serveUntilSignal serves srv until either Serve returns on its own (a
@@ -338,7 +366,10 @@ func run(args []string) error {
 // l is the structured logger. Lifecycle events (signal received, drain
 // starting, teardown done) are emitted at INFO so operators following the
 // daemon's log stream can track shutdown without parsing the binary.
-func serveUntilSignal(srv southface.Server, l *slog.Logger) error {
+//
+// opsListener is the loopback ops listener; if non-nil it is shut down
+// alongside the south face server. A nil opsListener is a no-op.
+func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemetry.OpsListener) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
@@ -347,13 +378,21 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 
+	shutdownOpsListener := func() error {
+		if opsListener == nil {
+			return nil
+		}
+		return opsListener.Close()
+	}
+
 	select {
 	case err := <-serveErr:
 		// Serve ended without a signal (listener fault): teardown still runs.
 		l.Info("serve returned early; running teardown")
 		closeErr := srv.Close()
+		opsErr := shutdownOpsListener()
 		l.Info("teardown complete")
-		return errors.Join(err, closeErr)
+		return errors.Join(err, closeErr, opsErr)
 	case <-ctx.Done():
 		// Signal received. Stop intercepting FIRST so a second
 		// SIGTERM/SIGINT during a wedged drain kills the process hard
@@ -361,11 +400,12 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger) error {
 		l.Info("signal received; starting bounded drain")
 		stop()
 		closeErr := srv.Close()
+		opsErr := shutdownOpsListener()
 		// Close shut the listener down, so Serve returns promptly (a clean
 		// shutdown collapses to nil); drain the goroutine and surface both.
 		serveResult := <-serveErr
 		l.Info("teardown complete")
-		return errors.Join(serveResult, closeErr)
+		return errors.Join(serveResult, closeErr, opsErr)
 	}
 }
 
@@ -383,7 +423,7 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string,
 	storageLane, caBundle string, laneDevDirect bool,
 	s3Bucket, s3Endpoint, s3Region string, s3PathStyle bool,
-	logLevelStr string) (brokerConfig, error) {
+	logLevelStr, opsListenAddr string) (brokerConfig, error) {
 	var cfg brokerConfig
 
 	// -log-level is validated FIRST — before any engine or socket flag — so
@@ -393,6 +433,14 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		return cfg, err
 	}
 	cfg.logLevel = level
+
+	// -ops-listen is validated BEFORE any bind: a non-loopback address is
+	// refused fail-closed (no socket opened). An empty value disables the
+	// listener — no error.
+	if err := telemetry.ValidateOpsListenAddr(opsListenAddr); err != nil {
+		return cfg, fmt.Errorf("ocu-filestored: -ops-listen %q: %w", opsListenAddr, err)
+	}
+	cfg.opsListen = opsListenAddr
 
 	kind, err := objectstore.ParseEngine(engine)
 	if err != nil {
@@ -528,6 +576,7 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		profile:          prof,
 		tenancy:          ten,
 		logLevel:         level,
+		opsListen:        opsListenAddr,
 	}
 	return cfg, nil
 }
@@ -597,7 +646,12 @@ func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstor
 // l is threaded into the southface.Config so the session's dispatcher, the
 // accept gate, and the http.Server ErrorLog all emit structured JSON via the
 // same handler.
-func compose(cfg brokerConfig, l *slog.Logger) (southface.Server, error) {
+//
+// m is the broker metric set; it is wired into the southface dispatcher for
+// ops_total and stage-latency instrumentation, and into the accept gate for
+// peer counters. Peer counter callbacks are wired via Config.OnPeerAccepted
+// and Config.OnPeerDropped.
+func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics) (southface.Server, error) {
 	// Engine-kind construction inputs FIRST — both ADR-0010 kinds are real.
 	// For s3: the dial path is the storage-lane transport (or the loud
 	// dev-direct rig client), the credential arrives through the
@@ -699,6 +753,9 @@ func compose(cfg brokerConfig, l *slog.Logger) (southface.Server, error) {
 		CheckPeer:         southface.HostPeerChecker(),
 		HostUID:           uint32(os.Getuid()),
 		Logger:            l,
+		BrokerMetrics:     m,
+		OnPeerAccepted:    m.PeerAccepted,
+		OnPeerDropped:     m.PeerDropped,
 	})
 	if err != nil {
 		return nil, err

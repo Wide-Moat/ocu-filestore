@@ -71,6 +71,24 @@ type OpsListener struct {
 	logger *slog.Logger
 }
 
+// ValidateOpsListenAddr validates that addr is a loopback address suitable
+// for the ops listener, without binding a socket. An empty addr returns nil
+// (empty disables the listener). A non-loopback or unparseable addr returns
+// errOpsListenNotLoopback.
+func ValidateOpsListenAddr(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	ok, err := isLoopbackAddr(addr)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errOpsListenNotLoopback, err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s", errOpsListenNotLoopback, addr)
+	}
+	return nil
+}
+
 // NewOpsListener creates an OpsListener bound to addr. addr must resolve to a
 // loopback address; any non-loopback addr returns errOpsListenNotLoopback and
 // binds nothing (fail-closed). An empty addr is refused too — use

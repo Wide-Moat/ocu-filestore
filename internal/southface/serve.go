@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
 // ErrBrokerMaxFileSizeUnset — the whole-object upload ceiling
@@ -87,6 +89,11 @@ type Config struct {
 	// value is a no-op. The composition layer supplies a telemetry counter
 	// increment here alongside the plan-01 logger-based onPeerDrop callback.
 	OnPeerDropped func()
+	// BrokerMetrics is the telemetry metric set for ops_total, stage-latency
+	// histograms, and (via OnPeerAccepted/OnPeerDropped) peer counters. A nil
+	// value leaves the dispatcher instrumentation as no-ops so existing tests
+	// that do not supply metrics compile and pass unchanged.
+	BrokerMetrics *telemetry.BrokerMetrics
 }
 
 // Serve is the sole exported south-face constructor. It validates the wiring
@@ -116,6 +123,7 @@ func Serve(cfg Config) (Server, error) {
 	// is the one place a flag value reaches the unexported maxFileSize field.
 	d.maxFileSize = cfg.BrokerMaxFileSize
 	d.logger = logger
+	d.brokerMetrics = cfg.BrokerMetrics
 
 	s, err := provisionSession(cfg.Dir, cfg.Entry, cfg.Registry, d, cfg.CheckPeer, cfg.HostUID, logger, cfg.OnPeerAccepted, cfg.OnPeerDropped)
 	if err != nil {

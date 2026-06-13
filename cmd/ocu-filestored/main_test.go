@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
+	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
 // testLogger returns a discard logger for use in tests; it avoids polluting
@@ -65,7 +67,7 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 // tears down cleanly (engine TeardownScope + registry/ceilings release).
 func TestComposeAdmittedServesAndCloses(t *testing.T) {
 	cfg := validBrokerConfig(t)
-	srv, err := compose(cfg, testLogger())
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
 		t.Fatalf("compose(admitted): %v", err)
 	}
@@ -88,7 +90,7 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	cfg.opsPerSecond = 1
 	cfg.opsBurst = 1
-	srv, err := compose(cfg, testLogger())
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
 		t.Fatalf("compose(ops 1/1): %v", err)
 	}
@@ -108,7 +110,7 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 // erases it, so the restarted daemon never re-serves prior-session bytes.
 func TestComposeCrashRestartErasesScope(t *testing.T) {
 	cfg := validBrokerConfig(t)
-	srv1, err := compose(cfg, testLogger())
+	srv1, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
 		t.Fatalf("compose (session one): %v", err)
 	}
@@ -121,7 +123,7 @@ func TestComposeCrashRestartErasesScope(t *testing.T) {
 		t.Fatalf("plant prior-session file: %v", err)
 	}
 
-	srv2, err := compose(cfg, testLogger())
+	srv2, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
 		t.Fatalf("compose (restart): %v", err)
 	}
@@ -140,7 +142,7 @@ func TestComposeRefusedTripleBindsNoSocket(t *testing.T) {
 	// trusted_operator + single_tenant + host_local_long_lived is).
 	cfg.tenancy = admission.TenancyMultiTenant
 
-	_, err := compose(cfg, testLogger())
+	_, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if !errors.Is(err, admission.ErrAdmissionRefused) && !errors.Is(err, admission.ErrTenancyRefused) {
 		t.Fatalf("compose(refused triple): got %v, want an admission refusal", err)
 	}
@@ -168,7 +170,7 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 	cfg.s3Region = "us-east-1"
 	cfg.laneDevDirect = true
 
-	_, err := compose(cfg, testLogger())
+	_, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if !errors.Is(err, objectstore.ErrCredentialMissing) {
 		t.Fatalf("compose(engine=s3, no credential): got %v, want ErrCredentialMissing", err)
 	}
@@ -206,7 +208,7 @@ func TestComposeS3RealEngineServes(t *testing.T) {
 	cfg.s3PathStyle = true
 	cfg.laneDevDirect = true
 
-	srv, err := compose(cfg, testLogger())
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
 		t.Fatalf("compose(real s3): %v", err)
 	}
@@ -274,7 +276,7 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 				defaultOpsPerSecond, defaultOpsBurst, "", "", "",
 				"", "", tc.engine == "s3", // dev-direct posture for the s3 rows
-				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle, "info")
+				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle, "info", "")
 			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
 				t.Fatalf("validate(%s) = %v, want errMissingRequiredFlag", tc.name, err)
 			}
@@ -299,7 +301,7 @@ func TestValidateStorageLaneMatrix(t *testing.T) {
 			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
 			lane, bundle, devDirect,
-			bucket, endpoint, "us-east-1", false, "info")
+			bucket, endpoint, "us-east-1", false, "info", "")
 		return err
 	}
 
@@ -348,7 +350,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -358,7 +360,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false,
-		"", "", "us-east-1", false, "info")
+		"", "", "us-east-1", false, "info", "")
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -375,7 +377,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -386,7 +388,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false,
-		"", "", "us-east-1", false, "info")
+		"", "", "us-east-1", false, "info", "")
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
@@ -401,7 +403,7 @@ func TestValidateSTSFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", "")
 	if err != nil {
 		t.Fatalf("validate(s3 + sts pair): %v", err)
 	}
@@ -412,19 +414,19 @@ func TestValidateSTSFlagGate(t *testing.T) {
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false,
-		"", "", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
+		"", "", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
 	}
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"", "", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
+		"", "", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
 	}
 	if _, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info", ""); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
 	}
 }
@@ -594,7 +596,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 				tc.rate, tc.brst, "", "", "", "", "", false,
-				"", "", "us-east-1", false, "info")
+				"", "", "us-east-1", false, "info", "")
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}
@@ -687,7 +689,7 @@ func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
 		closeErr:     teardownErr,
 	}
 	result := make(chan error, 1)
-	go func() { result <- serveUntilSignal(srv, testLogger()) }()
+	go func() { result <- serveUntilSignal(srv, testLogger(), nil) }()
 
 	// Serve has started, therefore signal.NotifyContext is already armed
 	// (it is registered before the Serve goroutine launches).
@@ -723,7 +725,7 @@ func TestServeUntilSignalServeFaultStillTearsDown(t *testing.T) {
 		serveErr:     serveFault,
 		closeErr:     teardownErr,
 	}
-	err := serveUntilSignal(srv, testLogger())
+	err := serveUntilSignal(srv, testLogger(), nil)
 	select {
 	case <-srv.closeCalled:
 	default:
@@ -928,5 +930,87 @@ func TestStartupEchoNoCredential(t *testing.T) {
 	// The credential FILE PATH should appear (it is operator-visible config).
 	if !strings.Contains(logged, credFile.Name()) {
 		t.Errorf("startup echo log does not contain the credential file path %q (operator should see which credential file is configured)", credFile.Name())
+	}
+}
+
+// TestOpsListenFlagBehavior pins the -ops-listen flag surface (T2-2):
+//   - An empty value disables the ops listener (no error from validate).
+//   - A non-loopback address is refused fail-closed (errOpsListenNotLoopback
+//     wrapped in the validate error) BEFORE any socket is bound.
+//   - A loopback address is accepted and carried into brokerConfig.
+//   - The default value is "127.0.0.1:9464".
+func TestOpsListenFlagBehavior(t *testing.T) {
+	call := func(addr string) (brokerConfig, error) {
+		return validate("local-volume", "/x", "/y", "/s", "fs1",
+			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
+			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
+			"", "", false,
+			"", "", "us-east-1", false, "info", addr)
+	}
+
+	// Empty disables the listener — no error.
+	cfg, err := call("")
+	if err != nil {
+		t.Fatalf("validate(ops-listen=\"\"): got %v, want nil", err)
+	}
+	if cfg.opsListen != "" {
+		t.Fatalf("validate(ops-listen=\"\") stored %q, want empty (disabled)", cfg.opsListen)
+	}
+
+	// Loopback literal is accepted and stored.
+	cfg, err = call("127.0.0.1:9464")
+	if err != nil {
+		t.Fatalf("validate(ops-listen=127.0.0.1:9464): got %v, want nil", err)
+	}
+	if cfg.opsListen != "127.0.0.1:9464" {
+		t.Fatalf("validate(ops-listen=127.0.0.1:9464) stored %q, want the addr", cfg.opsListen)
+	}
+
+	// "localhost" is accepted.
+	_, err = call("localhost:9464")
+	if err != nil {
+		t.Fatalf("validate(ops-listen=localhost:9464): got %v, want nil", err)
+	}
+
+	// Non-loopback is refused fail-closed.
+	_, err = call("0.0.0.0:9464")
+	if err == nil {
+		t.Fatal("validate(ops-listen=0.0.0.0:9464): got nil, want non-loopback refusal")
+	}
+	if !telemetry.IsOpsListenNotLoopback(err) {
+		t.Fatalf("validate(ops-listen=0.0.0.0:9464): err = %v, does not wrap errOpsListenNotLoopback", err)
+	}
+
+	// All-interfaces short form is also refused (":port" binds all interfaces).
+	_, err = call(":9464")
+	if err == nil {
+		t.Fatal("validate(ops-listen=:9464): got nil, want all-interface refusal")
+	}
+	if !telemetry.IsOpsListenNotLoopback(err) {
+		t.Fatalf("validate(ops-listen=:9464): err = %v, does not wrap errOpsListenNotLoopback", err)
+	}
+
+	// The default flag value is the documented loopback address.
+	fs := flag.NewFlagSet("check-default", flag.ContinueOnError)
+	opsListen := fs.String("ops-listen", "127.0.0.1:9464", "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("flagset parse: %v", err)
+	}
+	if *opsListen != "127.0.0.1:9464" {
+		t.Fatalf("-ops-listen default = %q, want 127.0.0.1:9464", *opsListen)
+	}
+}
+
+// TestOpsListenNonLoopbackRefusedViaRun pins the end-to-end path: a
+// non-loopback -ops-listen value causes run() to return a typed error before
+// any serving flag is validated (the ops-listen check runs after -log-level,
+// before engine checks).
+func TestOpsListenNonLoopbackRefusedViaRun(t *testing.T) {
+	err := run([]string{"--ops-listen", "0.0.0.0:9464"})
+	if err == nil {
+		t.Fatal("run(--ops-listen 0.0.0.0:9464): got nil, want refusal")
+	}
+	if !telemetry.IsOpsListenNotLoopback(err) {
+		t.Fatalf("run(--ops-listen 0.0.0.0:9464): err = %v, does not wrap errOpsListenNotLoopback", err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
+	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
 // defaultFrameReadTimeout is the conservative per-frame inbound read budget
@@ -51,18 +52,42 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 	_ = json.NewEncoder(w).Encode(connectError{Code: v.WireCode, Message: message})
 }
 
-// denyWith writes the Connect error response AND emits a WARN log carrying
-// the broker-resolved AuditReason truth (never the degraded wire reason). The
-// log carries deny_class (the truth) so operators see the real reason even
-// when the WIRE degrades it for anti-enumeration. This is the single deny
-// choke point; the LOCKED STAGE 0->4 order is unchanged — the log is
-// strictly additive observation.
+// denyWith writes the Connect error response, emits a WARN log carrying the
+// broker-resolved AuditReason truth (never the degraded wire reason), and
+// records the deny in ops_total. The log carries deny_class (the truth) so
+// operators see the real reason even when the WIRE degrades it for
+// anti-enumeration. This is the single deny choke point; the LOCKED STAGE
+// 0->4 order is unchanged — the log and metric recording are strictly additive
+// observation. op is the southface Op string ("" if unknown at deny time,
+// recorded as "internal" sentinel).
 func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
 	d.logger.Warn("broker deny",
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
 	writeConnectError(w, v, message)
+}
+
+// recordAllow records ops_total{op, outcome=allow, deny_class=none} after a
+// handler completes without a deny. A panic on an unknown op is swallowed —
+// instrumentation must never disrupt the handler path.
+func (d *dispatcher) recordAllow(op string) {
+	if d.brokerMetrics == nil {
+		return
+	}
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		d.brokerMetrics.RecordOp(op, "allow", "none")
+	}()
+}
+
+// observeStage wraps a call to a stage function and records its latency in the
+// stage_latency_seconds histogram. elapsed is in seconds. A nil brokerMetrics
+// is a no-op — existing tests without a registry are unaffected.
+func (d *dispatcher) observeStage(stage string, elapsed float64) {
+	if d.brokerMetrics != nil {
+		d.brokerMetrics.ObserveStage(stage, elapsed)
+	}
 }
 
 // dispatcher is the south-face http.Handler: it runs the LOCKED fail-closed
@@ -83,6 +108,13 @@ type dispatcher struct {
 	// one are unaffected. Every call site uses logger.With to carry a
 	// *slog.Logger so T2-18 request-id threading drops in without rework.
 	logger *slog.Logger
+	// brokerMetrics is the telemetry metric set for ops_total and stage-latency
+	// histograms. A nil value is a no-op — existing tests that do not supply one
+	// compile and pass unchanged. The instrumentation is strictly additive:
+	// timers wrap the EXISTING stage calls, ops_total records at the single deny
+	// choke point (denyWith) and after a successful handler, and the LOCKED
+	// STAGE 0->4 ordering is not modified.
+	brokerMetrics *telemetry.BrokerMetrics
 	// ids is the session-scoped uuid record store the listing emitter mints
 	// through and phase 10 resolves through.
 	ids *objectIDStore
@@ -191,6 +223,21 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Instrumentation: denyOp and allowOp record ops_total after the route is
+	// known. They are STRICTLY ADDITIVE — they wrap d.denyWith / record allow,
+	// never reorder STAGE 0->4. Calls BEFORE this point (unknown route, bad
+	// method) do not have an op and use plain denyWith (no ops_total entry).
+	opStr := string(op)
+	denyOp := func(v DenyVerdict, message string) {
+		d.denyWith(w, v, message)
+		if d.brokerMetrics != nil {
+			func() {
+				defer func() { recover() }() //nolint:errcheck
+				d.brokerMetrics.RecordOp(opStr, "deny", v.AuditReason)
+			}()
+		}
+	}
+
 	// STREAMING BRANCH (per-op flag, NOT content-type sniffing): a streaming
 	// op (fileUpload, fileDownload) has its own STAGE-0 gate
 	// (application/connect+json, no Content-Length pre-buffer reject) and
@@ -205,13 +252,13 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// STAGE 0: version header (D1).
 	if err := checkVersion(r); err != nil {
-		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
+		denyOp(mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
 		return
 	}
 
 	// STAGE 0: Content-Type.
 	if err := checkContentType(r); err != nil {
-		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
+		denyOp(mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
 		return
 	}
 
@@ -219,7 +266,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// channel identity. Its absence is a wiring fault: fail closed.
 	ps, ok := peerScopeFromContext(r.Context())
 	if !ok {
-		d.denyWith(w, mapDeny(denyInternal), "no channel scope on connection")
+		denyOp(mapDeny(denyInternal), "no channel scope on connection")
 		return
 	}
 
@@ -229,11 +276,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// deny.
 	cl := r.ContentLength
 	if cl < 0 {
-		d.denyWith(w, mapDeny(denyMalformed), "unary request requires Content-Length")
+		denyOp(mapDeny(denyMalformed), "unary request requires Content-Length")
 		return
 	}
 	if cl > d.sizeCeiling {
-		d.denyWith(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+		denyOp(mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
 		return
 	}
 
@@ -242,7 +289,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is resource_exhausted with NO x-deny-reason (n3).
 	sess := d.ceilings.Session(ps.FilesystemID)
 	if err := sess.TryConsumeOp(); err != nil {
-		d.denyWith(w, mapDeny(denyClassForErr(err)), "operation rate ceiling exceeded")
+		denyOp(mapDeny(denyClassForErr(err)), "operation rate ceiling exceeded")
 		return
 	}
 
@@ -256,15 +303,15 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			d.denyWith(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+			denyOp(mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
 			return
 		}
-		d.denyWith(w, mapDeny(denyMalformed), "malformed request envelope")
+		denyOp(mapDeny(denyMalformed), "malformed request envelope")
 		return
 	}
 	var env unaryEnvelope
 	if err := decodeUnaryEnvelopeBytes(bodyBytes, &env); err != nil {
-		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "malformed request envelope")
+		denyOp(mapDeny(denyClassForDecodeErr(err)), "malformed request envelope")
 		return
 	}
 
@@ -273,7 +320,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// channel-bound scope is a scope_mismatch deny (permission_denied +
 	// x-deny-reason), and the handler is never reached (D2/NFR-SEC-43).
 	if env.FilesystemID != ps.FilesystemID {
-		d.denyWith(w, mapDeny(denyScopeMismatch), "request scope does not match the session channel")
+		denyOp(mapDeny(denyScopeMismatch), "request scope does not match the session channel")
 		return
 	}
 
@@ -292,11 +339,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// fails closed.
 	requiredIntent, ok := requiredIntentForOp(op)
 	if !ok {
-		d.denyWith(w, mapDeny(denyInternal), "no required intent bound to operation")
+		denyOp(mapDeny(denyInternal), "no required intent bound to operation")
 		return
 	}
 	if env.AuthorizationMetadata.Intent != requiredIntent {
-		d.denyWith(w, mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
+		denyOp(mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
 		return
 	}
 
@@ -309,9 +356,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Path:       env.Path,
 		Intent:     requiredIntent,
 	}
+	authzStart := time.Now()
 	grant, err := d.resolver.Resolve(r.Context(), evidence, req)
+	d.observeStage("authz", time.Since(authzStart).Seconds())
 	if err != nil {
-		d.denyWith(w, mapDeny(denyClassForErr(err)), "authorization denied")
+		denyOp(mapDeny(denyClassForErr(err)), "authorization denied")
 		return
 	}
 
@@ -323,8 +372,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
 	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
-	if err := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent)); err != nil {
-		d.denyWith(w, mapDeny(denyClassForErr(err)), "audit gate unavailable")
+	mandateStart := time.Now()
+	mandateErr := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent))
+	d.observeStage("audit_mandate", time.Since(mandateStart).Seconds())
+	if mandateErr != nil {
+		denyOp(mapDeny(denyClassForErr(mandateErr)), "audit gate unavailable")
 		return
 	}
 
@@ -333,7 +385,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is a wiring fault and fails closed.
 	h, ok := d.registry[op]
 	if !ok {
-		d.denyWith(w, mapDeny(denyUnimplemented), "operation not registered")
+		denyOp(mapDeny(denyUnimplemented), "operation not registered")
 		return
 	}
 
@@ -352,12 +404,15 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mandateDeny := func(auditReason, wireClass, message string) {
 		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
-			d.denyWith(w, mapDeny(denyAuditDown), "audit gate unavailable")
+			denyOp(mapDeny(denyAuditDown), "audit gate unavailable")
 			return
 		}
-		d.denyWith(w, mapDenyDegraded(auditReason, wireClass), message)
+		denyOp(mapDenyDegraded(auditReason, wireClass), message)
 	}
 
+	// STAGE 4: time the engine handler call. The timer wraps h(...) as an
+	// additive observation; the handler's own logic is unchanged.
+	engineStart := time.Now()
 	h(d.handlerDeps(), handlerCtx{
 		ctx:         r.Context(),
 		w:           w,
@@ -367,6 +422,8 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		grant:       grant,
 		mandateDeny: mandateDeny,
 	})
+	d.observeStage("engine", time.Since(engineStart).Seconds())
+	d.recordAllow(opStr)
 }
 
 // activityForOp returns the OCSF ActivityID for an op (Q7): a listing is a

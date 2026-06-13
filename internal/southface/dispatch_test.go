@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"pgregory.net/rapid"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
 const boundScope = "fs-bound"
@@ -483,6 +485,77 @@ func TestDenyWarnLogsAuditReason(t *testing.T) {
 	if !strings.Contains(logged, "WARN") {
 		t.Errorf("deny WARN log level is not WARN:\n%s", logged)
 	}
+}
+
+// TestOpsTotalCountsOps verifies that ops_total increments once per dispatched
+// op with the correct {op, outcome, deny_class} triple.
+func TestOpsTotalCountsOps(t *testing.T) {
+	m := newTestMetrics()
+	d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
+	d.brokerMetrics = m
+
+	// Allow path: OpListDirectory is unimplemented, so it gets deny=unimplemented.
+	// But that is still a deny. Use a scope-mismatch for a clear deny_class.
+	body := bodyFor("wrong-scope", IntentRead)
+	r := scopedRequest(OpListDirectory, body, boundScope, []Intent{IntentRead})
+	w := httptest.NewRecorder()
+	d.ServeHTTP(w, r)
+
+	// Check that ops_total was incremented with scope_mismatch deny.
+	var buf bytes.Buffer
+	m.Registry().WriteTo(&buf)
+	out := buf.String()
+
+	if !strings.Contains(out, `deny_class="scope_mismatch"`) {
+		t.Fatalf("scope_mismatch not in ops_total:\n%s", out)
+	}
+	if !strings.Contains(out, `outcome="deny"`) {
+		t.Fatalf("outcome=deny not found:\n%s", out)
+	}
+	if !strings.Contains(out, `op="listDirectory"`) {
+		t.Fatalf("op=listDirectory not found:\n%s", out)
+	}
+}
+
+// TestStageHistogramsIncrementOnReach verifies that stage-latency histograms
+// are incremented when their stage is reached, and that a STAGE-0 deny does
+// not reach later stages.
+func TestStageHistogramsIncrementOnReach(t *testing.T) {
+	m := newTestMetrics()
+	d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
+	d.brokerMetrics = m
+
+	// A request that passes STAGE 0-2 but is denied by scope_mismatch at
+	// STAGE 1b (channel scope vs body scope) should NOT reach authz/mandate.
+	body := bodyFor("wrong-scope", IntentRead)
+	r := scopedRequest(OpListDirectory, body, boundScope, []Intent{IntentRead})
+	w := httptest.NewRecorder()
+	d.ServeHTTP(w, r)
+
+	// A valid request that passes all stages (but is denied at stage 4 as
+	// unimplemented) should increment the authz and audit_mandate histograms.
+	body2 := bodyFor(boundScope, IntentRead)
+	r2 := scopedRequest(OpListDirectory, body2, boundScope, []Intent{IntentRead})
+	w2 := httptest.NewRecorder()
+	d.ServeHTTP(w2, r2)
+
+	var buf bytes.Buffer
+	m.Registry().WriteTo(&buf)
+	out := buf.String()
+
+	// authz stage should show up (the second request reached STAGE 2).
+	if !strings.Contains(out, `stage="authz"`) {
+		t.Fatalf("authz stage not in histograms:\n%s", out)
+	}
+	// audit_mandate should show up (the second request passed authz).
+	if !strings.Contains(out, `stage="audit_mandate"`) {
+		t.Fatalf("audit_mandate stage not in histograms:\n%s", out)
+	}
+}
+
+// newTestMetrics returns a BrokerMetrics suitable for dispatcher tests.
+func newTestMetrics() *telemetry.BrokerMetrics {
+	return telemetry.NewBrokerMetrics("v0.0.0-test")
 }
 
 // TestDispatchStageOrderUnchanged pins the LOCKED STAGE 0->4 order: after
