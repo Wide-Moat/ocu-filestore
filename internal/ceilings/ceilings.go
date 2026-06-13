@@ -204,35 +204,6 @@ func newSession(cfg Config) *Session {
 	}
 }
 
-// SessionSnapshot is a point-in-time read of a session's limiter state.
-// It is a pure read under the session's mutex — it does not mutate any
-// limiter. The values are advisory; they may be stale by the time the caller
-// acts on them.
-type SessionSnapshot struct {
-	// InFlightBytes is the number of bytes currently held in the in-flight
-	// gauge (bytes currently being read or written by the session).
-	InFlightBytes int64
-	// FDInUse is the number of open file descriptor slots currently in use.
-	FDInUse int32
-	// OpsTokens is the current token count in the rate-limiter bucket.
-	// This is a float because the bucket does sub-integer refill arithmetic.
-	OpsTokens float64
-}
-
-// Snapshot returns a point-in-time read of the session's limiter state.
-// This is a pure read — no limiter is mutated. The caller may use the
-// snapshot to update metrics gauges without holding the session lock.
-func (s *Session) Snapshot() SessionSnapshot {
-	s.mu.Lock()
-	snap := SessionSnapshot{
-		InFlightBytes: s.gauge.current,
-		FDInUse:       s.fdCount,
-		OpsTokens:     s.bucket.tokens,
-	}
-	s.mu.Unlock()
-	return snap
-}
-
 // TryConsumeOp consumes one ops/s token, returning ErrThrottleExceeded when
 // the session's bucket is empty.
 func (s *Session) TryConsumeOp() error {
