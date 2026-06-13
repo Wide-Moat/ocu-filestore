@@ -53,14 +53,16 @@ func writeJSON(w http.ResponseWriter, body any) {
 
 // decodeOp strict-decodes the op body from the buffered request into out; a
 // malformed body or unknown field denies invalid_argument (no header) — the
-// same strict discipline as the spine envelope. On failure it writes the
-// deny and returns false; no audit deny event is emitted for a malformed body
-// (the spine already mandated the allow event on the well-formed envelope, and
-// a body that fails the op-level strict decode is a request fault, mapped to
-// the malformed-envelope wire class).
+// same strict discipline as the spine envelope. On failure it routes the
+// refusal through hc.mandateDeny(denyMalformed, ...) so a compensating deny
+// audit event lands AFTER the spine's STAGE-3 allow (southface-05): without it
+// the durable chain's terminal record would assert allow for an op that was
+// refused, asymmetric with every other handler-stage refusal. mandateDeny also
+// writes the wire deny and records the single ops_total deny entry, so on
+// failure the caller returns outcomeDenyRecorded.
 func decodeOp(hc handlerCtx, out any) bool {
 	if err := decodeStrictBytes(hc.body, out); err != nil {
-		writeConnectError(hc.w, mapDeny(denyMalformed), "malformed request body")
+		hc.mandateDeny(denyMalformed, denyMalformed, "malformed request body")
 		return false
 	}
 	return true
@@ -255,7 +257,9 @@ func (d *handlerDeps) walk(ctx context.Context, scope, rootRel string, recursive
 func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req listDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	ctx := hc.ctxOrBackground()
 	scope := hc.ps.FilesystemID
@@ -264,10 +268,12 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	after, err := decodeCursor(req.Cursor)
 	if err != nil {
 		// A malformed cursor is a request fault, not an engine error: deny
-		// invalid_argument (no header), no engine touch. Written directly (no
-		// mandateDeny hook), so the spine records the single deny entry.
-		writeConnectError(hc.w, mapDeny(denyMalformed), "malformed cursor")
-		return outcomeDeny(denyMalformed)
+		// invalid_argument (no header), no engine touch. Routed through the
+		// mandateDeny hook so a compensating deny audit event lands after the
+		// spine's STAGE-3 allow (southface-05); the hook also writes the wire
+		// deny and records the single ops_total deny entry.
+		hc.mandateDeny(denyMalformed, denyMalformed, "malformed cursor")
+		return outcomeDenyRecorded()
 	}
 
 	limit := req.Limit
@@ -353,7 +359,9 @@ func mimeForPath(rel string) string {
 func handleMakeDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req makeDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -372,7 +380,9 @@ func handleMakeDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleMoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req moveDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -398,7 +408,9 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req removeDirectoryRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -437,7 +449,9 @@ func handleRemoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleCopyFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req copyFileRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -457,7 +471,9 @@ func handleCopyFile(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleMoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req moveFileRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -481,7 +497,9 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleRemoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req removeFileRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
@@ -515,7 +533,9 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	var req readFileRequest
 	if !decodeOp(hc, &req) {
-		return outcomeDeny(denyMalformed)
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
 	}
 
 	// DOWNLOADABLE@READ, FIRST (SEC-73 wire half, A2). The spine's STAGE-2

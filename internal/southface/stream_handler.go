@@ -498,9 +498,12 @@ func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, 
 //     flag is NEVER trusted; a non-downloadable grant denies.
 //   - Mandate the ALLOW event BEFORE the first data frame (audit-before-ack,
 //     SEC-79); an audit-write failure denies before any byte is sent.
+//   - Resolve the read window: a length of 0 is an EMPTY window (zero bytes),
+//     never a read-to-EOF. A nil Range is the WHOLE object — its length is the
+//     object's current size from a Stat run BEFORE the ALLOW Mandate, so a
+//     vanished object records one deny, not an allow-then-deny pair.
 //   - Stream bytes via engine.ReadRange(offset, length) in downloadChunkSize
-//     chunks, each framed as a 0x00 data frame {"data":"<base64>"}. A nil Range
-//     is a full read (offset 0, length 0 → ReadRange reads to EOF).
+//     chunks, each framed as a 0x00 data frame {"data":"<base64>"}.
 //   - Finish with a 0x02 end-stream success trailer. A mid-stream engine error
 //     terminates with a 0x02 error trailer; the stream is ALWAYS HTTP 200.
 func (d *dispatcher) handleFileDownload(sc streamCtx) {
@@ -585,7 +588,14 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		// ops_total deny_class is the audited TRUTH (scope_mismatch), not the
 		// degraded wire class — the metric carries the same truth the audit
 		// record does (southface-02).
-		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, denyScopeMismatch)
+		//
+		// Populate req from the resolved record (which holds the real path and
+		// the probed scope) BEFORE building the deny event so the scope_mismatch
+		// audit names the handle that was actually probed — an empty handle would
+		// blind the anti-enumeration trail this deny exists to capture
+		// (southface-06).
+		probed := ResolveRequest{Filesystem: rec.scope, Path: rec.path, Intent: IntentRead}
+		ev := d.denyAuditEvent(OpFileDownload, sc.ps, probed, grant, nil, denyScopeMismatch)
 		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
 			d.recordOp(string(OpFileDownload), "deny", denyAuditDown)
