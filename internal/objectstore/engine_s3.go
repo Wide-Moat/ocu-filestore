@@ -1047,7 +1047,9 @@ func (e *s3Engine) digestTagOf(ctx context.Context, key string) (string, error) 
 // mid-move leaves duplicates, never losses. NOT atomic — an observer can
 // see both trees mid-move; this is a documented divergence from the local
 // engine's rename. Every destination key re-runs the FULL validator via
-// the joined relative path — a move is not a containment hole.
+// the joined relative path — a move is not a containment hole. A move of a
+// directory into its OWN SUBTREE is refused with syscall.EINVAL before any
+// destructive step, exactly as the local engine's rename(2) refuses it.
 func (e *s3Engine) MoveDir(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
 	srcKey, err := e.objectKey(scope, src)
 	if err != nil {
@@ -1076,6 +1078,19 @@ func (e *s3Engine) MoveDir(ctx context.Context, scope ScopeID, src, dst string, 
 		if dstExists {
 			return fmt.Errorf("objectstore: s3 movedir: %w", ErrAlreadyExists)
 		}
+	}
+	// Refuse moving a directory INTO ITS OWN SUBTREE before any destructive
+	// step. The walk below copies-then-deletes per object; if the destination
+	// were inside the source prefix, keys moved in on one page would reappear
+	// under the still-matching source prefix on later listing pages, an
+	// unbounded re-copy/re-delete sweep on attacker-influenced names. The
+	// local engine's rename(2) refuses this same case with EINVAL; surface the
+	// identical sentinel so both engines present one semantics to the broker.
+	// The trailing-slash join makes "a/b" inside "a" match while "ab" does
+	// not. The src==dst and dst-exists rows are decided above first, mirroring
+	// the local engine's refusal ordering exactly.
+	if strings.HasPrefix(dstKey+"/", srcKey+"/") {
+		return &fs.PathError{Op: "movedir", Path: dst, Err: syscall.EINVAL}
 	}
 	if ok, perr := e.parentExists(ctx, dstKey); perr != nil {
 		return perr
