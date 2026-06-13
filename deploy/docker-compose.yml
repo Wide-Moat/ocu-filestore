@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# One-click-solo deployment: the storage broker on the local-volume engine,
+# zero external dependencies. Bring it up with a single command from the
+# repo root:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# (With a published release image available, drop --build and set
+# OCU_FILESTORE_TAG to the release tag.)
+#
+# Posture notes:
+# - The root filesystem is read-only; the ONLY writable surfaces are the
+#   three named volumes the daemon needs: the engine root (customer
+#   workspace bytes), the audit sink (fail-closed OCSF records,
+#   NFR-SEC-79), and the per-session socket directory.
+# - `sessions` is the shared socket volume: the sandbox peer mounts it at
+#   the same path to dial the per-session unix socket. The broker's accept
+#   gate admits ONLY a peer whose kernel-attested uid equals the broker's
+#   own uid (NFR-SEC-76), so the peer container must also run as 65532.
+# - No network: the south face serves over unix sockets only and the north
+#   face is deferred, so the broker joins no network at all.
+# - stop_grace_period is 30s, above the daemon's bounded 25s in-flight
+#   drain, so `docker compose stop` always lets the graceful path (drain,
+#   erase-before-reuse teardown, socket removal — NFR-SEC-54) finish before
+#   the SIGKILL fallback.
+# - The healthcheck execs `-version` (exit 0) as a liveness proxy: it
+#   proves the binary and the container runtime are sound. A real health
+#   probe endpoint arrives with T2-3.
+
+services:
+  broker:
+    image: ghcr.io/wide-moat/ocu-filestore:${OCU_FILESTORE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    stop_grace_period: 30s
+    command:
+      - -engine
+      - local-volume
+      - -engine-root
+      - /var/lib/ocu-filestore/engine-root
+      - -audit-sink
+      - /var/log/ocu-filestore/audit.ocsf.jsonl
+      - -south-socket-dir
+      - /run/ocu-filestore/sessions
+      - -filesystem-id
+      - ${OCU_FILESYSTEM_ID:-solo-session}
+      - -broker-max-file-size
+      - ${OCU_BROKER_MAX_FILE_SIZE:-1073741824}
+      - -granted-intents
+      - ${OCU_GRANTED_INTENTS:-read,write}
+      - -profile
+      - trusted_operator
+      - -tenancy
+      - single-tenant
+      # -downloadable-prefixes is deliberately absent: empty means nothing
+      # resolves downloadable (deny-by-default, NFR-SEC-73). Opt prefixes in
+      # explicitly when the deployment needs them.
+    volumes:
+      - engine-root:/var/lib/ocu-filestore/engine-root
+      - audit:/var/log/ocu-filestore
+      - sessions:/run/ocu-filestore/sessions
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ocu-filestored", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  # Customer workspace bytes for the local-volume engine. Ephemeral
+  # workspace by design: the broker never takes on durable retention —
+  # long-term retention belongs to the customer's store.
+  engine-root:
+  # Fail-closed audit sink: an audit-write failure denies the file
+  # operation, so this volume filling up stops file activity, not auditing.
+  audit:
+  # Shared per-session socket directory. Mount this same volume into the
+  # sandbox peer (read access to the directory is enough to connect; the
+  # peer must run as uid 65532 to pass the accept gate).
+  sessions:
