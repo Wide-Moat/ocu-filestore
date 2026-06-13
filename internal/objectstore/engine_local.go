@@ -5,11 +5,12 @@ package objectstore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -539,8 +540,16 @@ func writeTempAndCommit(sr *ScopeRoot, cleanDst string, r io.Reader, replace boo
 	if err := sr.root.Mkdir(stagingDirName, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("objectstore: create staging area: %w", err)
 	}
+	// Use crypto/rand for the temp-file suffix: a predictable suffix is a
+	// symlink-race vector (a guest who can predict the next temp name could
+	// pre-place a symlink and redirect the write). Eight bytes from the OS
+	// CSPRNG gives 2^64 names, making the suffix practically unguessable.
+	var rawSuffix [8]byte
+	if _, err := rand.Read(rawSuffix[:]); err != nil {
+		return fmt.Errorf("objectstore: temp suffix: %w", err)
+	}
 	tmpName := filepath.Join(stagingDirName,
-		filepath.Base(cleanDst)+".tmp."+strconv.FormatUint(rand.Uint64(), 36))
+		filepath.Base(cleanDst)+".tmp."+strconv.FormatUint(binary.LittleEndian.Uint64(rawSuffix[:]), 36))
 
 	f, err := sr.root.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
