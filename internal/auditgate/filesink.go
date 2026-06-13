@@ -63,6 +63,11 @@ type FileSink struct {
 	w writeSyncer
 	// failed latches true after any write or sync error; it never resets.
 	failed bool
+	// closed is set by Close after the descriptor is released; a Mandate on a
+	// closed sink is denied fail-closed instead of writing to a nil seam. It
+	// is distinct from failed: a clean Close is orderly shutdown, not chain
+	// corruption.
+	closed bool
 	// onLatch is an optional callback invoked EXACTLY ONCE on the transition
 	// from healthy to latched. It is observation-only: it fires after failed
 	// is set and after the mutex is released (to avoid deadlock on re-entry).
@@ -75,6 +80,32 @@ type FileSink struct {
 }
 
 var _ Guard = (*FileSink)(nil)
+
+// Close releases the append file descriptor. It is idempotent: a second
+// call (or a call after a prior Close error) is a no-op returning nil. Close
+// is for orderly daemon shutdown — every acked record is already on stable
+// storage (each Mandate fsyncs before returning), so closing loses no acked
+// data; an in-flight Mandate completes under the same mutex before Close
+// proceeds. After Close, the sink owns no descriptor and must not be reused:
+// recovery is a fresh NewFileSink, which re-scans the chain.
+func (s *FileSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.f == nil {
+		return nil
+	}
+	err := s.f.Close()
+	s.f = nil
+	s.w = nil
+	if err != nil {
+		return fmt.Errorf("auditgate: close sink: %w", err)
+	}
+	return nil
+}
 
 // Latched reports whether the sink has permanently failed. It returns false on
 // a healthy sink and true after any write or sync error. Once latched the value
@@ -148,7 +179,7 @@ func NewFileSink(path string) (*FileSink, error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("auditgate: open sink for chain scan: %w", err)
 		}
-		last, _, torn, scanErr := chainScan(rf)
+		last, torn, scanErr := chainScan(rf)
 		_ = rf.Close()
 		if scanErr != nil {
 			_ = f.Close()
@@ -213,10 +244,21 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 		return ErrAuditUnavailable
 	}
 
+	// Cheap early-out for an already-disconnected client: if the request
+	// context is done before we take the lock, deny without queuing behind
+	// (or starting) a durable write. This is best-effort — the durable write
+	// itself is intentionally uninterruptible (an os.File.Sync cannot be
+	// cancelled, and abandoning a write mid-flight would risk the torn-write
+	// chain divergence the design forbids), so ctx is never consulted once
+	// the append has begun.
+	if err := ctx.Err(); err != nil {
+		return ErrAuditUnavailable
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.failed {
+	if s.failed || s.closed {
 		return ErrAuditUnavailable
 	}
 
@@ -289,19 +331,20 @@ func Verify(path string) error {
 	}
 	defer f.Close()
 
-	_, _, _, err = chainScan(f)
+	_, _, err = chainScan(f)
 	return err
 }
 
 // chainScan walks a JSONL stream recomputing the hash chain from genesis.
-// It returns the hash of the last complete line (genesis when none), the
-// number of complete lines verified, and the byte length of a trailing
-// partial line with no newline (0 when the stream ends cleanly). Each
-// complete line is hashed as the exact written bytes including the
-// trailing newline — ReadBytes preserves the delimiter, so the hash input
-// needs no reassembly. Any prev_hash mismatch or unparseable complete
-// line is an error naming the line.
-func chainScan(r io.Reader) (last [sha256.Size]byte, lines int, torn int, err error) {
+// It returns the hash of the last complete line (genesis when none) and the
+// byte length of a trailing partial line with no newline (0 when the stream
+// ends cleanly). Each complete line is hashed as the exact written bytes
+// including the trailing newline — ReadBytes preserves the delimiter, so the
+// hash input needs no reassembly. Any prev_hash mismatch or unparseable
+// complete line is an error naming the line. lineNum tracks the current line
+// only to name it in those errors; it is not part of the security-critical
+// result, so it is not returned.
+func chainScan(r io.Reader) (last [sha256.Size]byte, torn int, err error) {
 	br := bufio.NewReader(r)
 	prev := genesisHash()
 	lineNum := 0
@@ -313,22 +356,22 @@ func chainScan(r io.Reader) (last [sha256.Size]byte, lines int, torn int, err er
 				PrevHash string `json:"prev_hash"`
 			}
 			if jerr := json.Unmarshal(chunk, &rec); jerr != nil {
-				return prev, lineNum - 1, 0, fmt.Errorf("auditgate: chain line %d: parse: %w", lineNum, jerr)
+				return prev, 0, fmt.Errorf("auditgate: chain line %d: parse: %w", lineNum, jerr)
 			}
 			want := hex.EncodeToString(prev[:])
 			if rec.PrevHash != want {
-				return prev, lineNum - 1, 0, fmt.Errorf("auditgate: chain broken at line %d: want prev_hash %s got %s", lineNum, want, rec.PrevHash)
+				return prev, 0, fmt.Errorf("auditgate: chain broken at line %d: want prev_hash %s got %s", lineNum, want, rec.PrevHash)
 			}
 			prev = sha256.Sum256(chunk)
 		} else if len(chunk) > 0 {
 			// Torn un-acked tail: the intact prefix is the chain.
-			return prev, lineNum, len(chunk), nil
+			return prev, len(chunk), nil
 		}
 		if readErr == io.EOF {
-			return prev, lineNum, 0, nil
+			return prev, 0, nil
 		}
 		if readErr != nil {
-			return prev, lineNum, 0, fmt.Errorf("auditgate: chain read: %w", readErr)
+			return prev, 0, fmt.Errorf("auditgate: chain read: %w", readErr)
 		}
 	}
 }

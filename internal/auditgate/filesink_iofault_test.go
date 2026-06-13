@@ -171,7 +171,7 @@ func TestVerify_OpenErrorPropagates(t *testing.T) {
 // scan never treats a read fault as a clean end-of-stream).
 func TestChainScan_ReadErrorPropagates(t *testing.T) {
 	sentinel := errors.New("injected disk read fault")
-	_, lines, torn, err := chainScan(errReader{err: sentinel})
+	_, torn, err := chainScan(errReader{err: sentinel})
 	if err == nil {
 		t.Fatal("chainScan(faulting reader) = nil error, want a wrapped read fault")
 	}
@@ -181,7 +181,7 @@ func TestChainScan_ReadErrorPropagates(t *testing.T) {
 	if !strings.Contains(err.Error(), "chain read") {
 		t.Fatalf("chainScan error = %v, want a chain-read wrapping", err)
 	}
-	if lines != 0 || torn != 0 {
-		t.Fatalf("chainScan(faulting reader) lines=%d torn=%d, want 0, 0", lines, torn)
+	if torn != 0 {
+		t.Fatalf("chainScan(faulting reader) torn=%d, want 0", torn)
 	}
 }

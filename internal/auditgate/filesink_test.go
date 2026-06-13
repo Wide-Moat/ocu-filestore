@@ -542,3 +542,63 @@ func TestRestartTornTailTolerated(t *testing.T) {
 		t.Fatalf("Verify after torn-tail continuation: got %v, want nil", err)
 	}
 }
+
+// TestCloseIdempotentAndReleases pins the shutdown contract: Close releases
+// the descriptor, every acked record stays on disk and verifies, a second
+// Close is a no-op (nil), and a Mandate after Close is denied fail-closed
+// rather than writing to a released descriptor.
+func TestCloseIdempotentAndReleases(t *testing.T) {
+	path, s := newTestSink(t)
+	for i := 0; i < 3; i++ {
+		if err := s.Mandate(context.Background(), testEvent()); err != nil {
+			t.Fatalf("Mandate #%d: %v", i, err)
+		}
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: got %v, want nil", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: got %v, want nil (idempotent)", err)
+	}
+
+	// Every acked record survives the close and the chain still verifies.
+	if got := len(completeLines(t, path)); got != 3 {
+		t.Fatalf("line count after Close: got %d, want 3", got)
+	}
+	if err := Verify(path); err != nil {
+		t.Fatalf("Verify after Close: got %v, want nil", err)
+	}
+
+	// A Mandate after Close must not write to the released descriptor.
+	if err := s.Mandate(context.Background(), testEvent()); !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("Mandate after Close: got %v, want ErrAuditUnavailable", err)
+	}
+	if got := len(completeLines(t, path)); got != 3 {
+		t.Fatalf("line count after post-Close Mandate: got %d, want 3 (no new write)", got)
+	}
+}
+
+// TestMandateCancelledContextEarlyOut pins the cheap ctx early-out: a Mandate
+// whose context is already cancelled is denied fail-closed without writing,
+// so an already-disconnected client never queues behind a durable write.
+func TestMandateCancelledContextEarlyOut(t *testing.T) {
+	path, s := newTestSink(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := s.Mandate(ctx, testEvent()); !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("Mandate(cancelled ctx): got %v, want ErrAuditUnavailable", err)
+	}
+	if got := len(completeLines(t, path)); got != 0 {
+		t.Fatalf("line count after cancelled Mandate: got %d, want 0 (no write)", got)
+	}
+	// The sink is not latched by a pre-write early-out; a fresh Mandate works.
+	if s.Latched() {
+		t.Fatal("sink latched after a pre-write ctx early-out; want healthy")
+	}
+	if err := s.Mandate(context.Background(), testEvent()); err != nil {
+		t.Fatalf("Mandate after early-out: got %v, want nil", err)
+	}
+}
