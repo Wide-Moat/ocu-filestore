@@ -229,6 +229,14 @@ func (s *recordingCeilingsSession) balanced() bool {
 	return s.acquired == s.released && s.fdAcquired == s.fdReleased
 }
 
+// fdCounts returns the fd acquire/release tallies under the lock so a test that
+// polls the gauge while the handler goroutine still runs reads them race-free.
+func (s *recordingCeilingsSession) fdCounts() (acquired, released int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fdAcquired, s.fdReleased
+}
+
 // recordingRegistry returns a fixed recording session for every key and
 // records the keys requested (the channel-scope-keying witness).
 type recordingRegistry struct {

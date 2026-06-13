@@ -20,6 +20,15 @@ import (
 // fatal only to a stalled one.
 const defaultFrameReadTimeout = 30 * time.Second
 
+// defaultFrameWriteTimeout is the conservative per-frame OUTBOUND write budget
+// for the download stream (crutch-01) — the symmetric mirror of
+// defaultFrameReadTimeout. Generous for any live reader draining a 256-KiB data
+// frame, fatal only to a stalled one. Without it, a wedged reader fills the
+// kernel send buffer and writeFrame blocks forever, pinning the download
+// goroutine and the engine fd (IdleTimeout never fires mid-request and the
+// request context is not cancelled).
+const defaultFrameWriteTimeout = 30 * time.Second
+
 // requestIDHeader is the response header name for the per-request correlation
 // id (T2-18). It is present on EVERY response — allow AND deny, unary AND
 // streaming — and must never be used as a metric label (T2-2 cardinality rule).
@@ -180,6 +189,14 @@ type dispatcher struct {
 	// existing hard-abort path. Defaulted in newDispatcherWithEngine; tests
 	// shrink it.
 	frameReadTimeout time.Duration
+	// frameWriteTimeout bounds the wait for EACH outbound data frame on the
+	// download stream (NFR-SEC-46, crutch-01): the symmetric mirror of
+	// frameReadTimeout for the egress leg. The download handler arms a
+	// per-connection write deadline by this much before every writeFrame; a
+	// stalled reader makes the next writeFrame error and aborts through the
+	// existing drain path that closes the ReadRange pipe and releases the fd
+	// slot. Defaulted in newDispatcherWithEngine; tests shrink it.
+	frameWriteTimeout time.Duration
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -223,9 +240,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// maxFileSize is intentionally left 0 here: Serve sets it from the
 		// validated cfg.BrokerMaxFileSize. An unwired dispatcher therefore
 		// refuses any non-empty upload (fail-closed). See the field doc.
-		maxFileSize:      0,
-		frameReadTimeout: defaultFrameReadTimeout,
-		logger:           slog.New(slog.DiscardHandler),
+		maxFileSize:       0,
+		frameReadTimeout:  defaultFrameReadTimeout,
+		frameWriteTimeout: defaultFrameWriteTimeout,
+		logger:            slog.New(slog.DiscardHandler),
 	}
 }
 
