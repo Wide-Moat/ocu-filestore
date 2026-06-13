@@ -6,8 +6,10 @@ on:
   push:
     tags: ['v*']
 
+# Top-level permissions: least-privilege default. Jobs that push packages,
+# sign artifacts, or write attestations elevate only what they need.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # tag-format gates the whole pipeline: only well-formed SemVer release
@@ -84,8 +86,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [tag-format]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: full test suite
@@ -110,7 +112,7 @@ jobs:
       - name: run the Integration + E2E slice
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
       - name: upload the release coverage profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-coverage-profile
           path: cover.out
@@ -185,15 +187,128 @@ jobs:
           exit-code: "1"
           ignore-unfixed: "false"
 
+  # sbom-and-sign generates a CycloneDX SBOM, signs all release artifacts
+  # with cosign keyless (OIDC, no stored key), and attests build provenance
+  # via the GitHub Sigstore integration (T2-9, SUPPLY-02, NFR-SEC-07).
+  # Runs after image-scan so the image digest is available from ghcr-image.
+  sbom-and-sign:
+    runs-on: ubuntu-latest
+    needs: [tag-format, security-gates, verify, ghcr-image, image-scan]
+    permissions:
+      contents: read
+      packages: write
+      # Required for cosign keyless (OIDC token exchange) and
+      # attest-build-provenance (Sigstore attestation write).
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      # Install cosign for keyless signing (OIDC, no stored key).
+      - name: install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Rebuild the release binaries exactly as the release job does so the
+      # SBOM and signatures cover the same build outputs.
+      - name: build the release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${tag}" \
+              -o "dist/ocu-filestored_linux_${arch}" ./cmd/ocu-filestored
+          done
+          (cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt)
+
+      # Generate a CycloneDX SBOM over the Go module (captures all
+      # transitive dependencies at the versions pinned in go.sum).
+      - name: generate CycloneDX SBOM (Go module)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cyclonedx.json
+          artifact-name: sbom.cyclonedx.json
+
+      # cosign keyless: sign the release binaries and the sha256sums file.
+      # OIDC identity is the GitHub Actions workflow — no long-lived key is
+      # stored or managed. Signatures are recorded in the public Rekor
+      # transparency log.
+      - name: cosign keyless sign — binaries and sha256sums
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for f in dist/ocu-filestored_linux_amd64 dist/ocu-filestored_linux_arm64 dist/sha256sums.txt; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${f}.cosign.bundle" \
+              "$f"
+          done
+
+      # cosign keyless sign the GHCR image by digest (not by tag, which is
+      # mutable). The image digest comes from the ghcr-image job output.
+      - name: docker login for cosign image signing
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: cosign keyless sign — GHCR image by digest
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          IMAGE_REF: ghcr.io/${{ github.repository }}@${{ needs.ghcr-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Sign by digest so the signature is immutable.
+          cosign sign --yes "${IMAGE_REF}"
+
+      # SLSA build provenance attestation over the release binaries.
+      # actions/attest-build-provenance records the provenance in the
+      # GitHub attestation store (gh attestation verify).
+      - name: attest build provenance — linux/amd64 binary
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/ocu-filestored_linux_amd64
+
+      - name: attest build provenance — linux/arm64 binary
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/ocu-filestored_linux_arm64
+
+      - name: attest build provenance — GHCR image
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.ghcr-image.outputs.digest }}
+          push-to-registry: true
+
+      # Upload signing bundles and SBOM for attachment to the GitHub Release.
+      - name: upload signing bundles and SBOM as artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-signing-artifacts
+          path: |
+            dist/sbom.cyclonedx.json
+            dist/*.cosign.bundle
+          retention-days: 7
+
   release:
     runs-on: ubuntu-latest
-    needs: [tag-format, security-gates, verify, image-scan]
+    needs: [tag-format, security-gates, verify, image-scan, sbom-and-sign]
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -234,7 +349,13 @@ jobs:
           echo "$CHANGES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - uses: softprops/action-gh-release@v2
+      - name: download signing artifacts (SBOM + cosign bundles)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-signing-artifacts
+          path: dist/
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           prerelease: ${{ needs.tag-format.outputs.is_prerelease == 'true' }}
@@ -242,6 +363,8 @@ jobs:
             dist/ocu-filestored_linux_amd64
             dist/ocu-filestored_linux_arm64
             dist/sha256sums.txt
+            dist/sbom.cyclonedx.json
+            dist/*.cosign.bundle
           body: |
             ## Binaries
 
@@ -250,6 +373,44 @@ jobs:
 
             ```bash
             sha256sum -c sha256sums.txt --ignore-missing
+            ```
+
+            ## Supply-chain verification
+
+            Every release artifact is signed with cosign keyless (GitHub OIDC,
+            no stored key) and the provenance is recorded in the public Rekor
+            transparency log. SLSA build provenance is attested via GitHub's
+            Sigstore integration.
+
+            **Verify a binary:**
+            ```bash
+            # Download the binary and its cosign bundle from the release assets.
+            cosign verify-blob \
+              --bundle ocu-filestored_linux_amd64.cosign.bundle \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ocu-filestored_linux_amd64
+            ```
+
+            **Verify the container image:**
+            ```bash
+            cosign verify \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            **Verify SLSA build provenance (GitHub attestation):**
+            ```bash
+            gh attestation verify \
+              --owner ${{ github.repository_owner }} \
+              ocu-filestored_linux_amd64
+            ```
+
+            **Inspect the SBOM:**
+            ```bash
+            # sbom.cyclonedx.json is attached to this release.
+            cat sbom.cyclonedx.json | jq '.components | length'
             ```
 
             ## Changes
