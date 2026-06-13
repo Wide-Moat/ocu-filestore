@@ -5,6 +5,7 @@ package observ
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
@@ -16,33 +17,38 @@ import (
 	"testing"
 )
 
-// TestPathAttr verifies the debug-gating behaviour of PathAttr:
-// - at INFO the attribute value is "[path-elided]", not the real path
-// - at DEBUG the real path is present
+// TestPathAttr verifies the handler-driven gating of PathAttr:
+//   - on an INFO logger the attribute value is "[path-elided]", not the real
+//     path, regardless of which slog method the caller uses
+//   - on a DEBUG logger the real path is present
+//   - the gate reads the logger's enablement, so a caller cannot leak a path by
+//     supplying a mismatched level (there is no level argument to mismatch)
 func TestPathAttr(t *testing.T) {
 	const key = "file_path"
 	const path = "/workspace/secret/project/file.txt"
+	ctx := context.Background()
 
-	// INFO level: path must be elided.
+	// INFO logger: path must be elided even though the call sites below try to
+	// surface it at INFO.
 	var buf bytes.Buffer
 	l := NewLogger(&buf, slog.LevelInfo)
-	l.Info("op", PathAttr(slog.LevelInfo, key, path))
+	l.Info("op", PathAttr(ctx, l, key, path))
 
 	var obj map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &obj); err != nil {
 		t.Fatalf("INFO log not valid JSON: %v\n%s", err, buf.String())
 	}
 	if obj[key] == path {
-		t.Errorf("INFO log contains real path %q; PathAttr must elide at INFO", path)
+		t.Errorf("INFO log contains real path %q; PathAttr must elide on an INFO logger", path)
 	}
 	if obj[key] != "[path-elided]" {
 		t.Errorf("INFO log attr %q = %v, want %q", key, obj[key], "[path-elided]")
 	}
 
-	// DEBUG level: real path must be present.
+	// DEBUG logger: real path must be present.
 	buf.Reset()
 	l2 := NewLogger(&buf, slog.LevelDebug)
-	l2.Debug("op", PathAttr(slog.LevelDebug, key, path))
+	l2.Debug("op", PathAttr(ctx, l2, key, path))
 
 	var obj2 map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &obj2); err != nil {
@@ -50,6 +56,22 @@ func TestPathAttr(t *testing.T) {
 	}
 	if obj2[key] != path {
 		t.Errorf("DEBUG log attr %q = %v, want %q", key, obj2[key], path)
+	}
+
+	// Caller-mismatch guard: attaching PathAttr to an INFO logger and emitting
+	// at DEBUG must STILL elide — the gate follows the handler, not the call.
+	// (The DEBUG record is dropped by the INFO handler, but if the elision were
+	// driven by the emit method this would be the classic leak path.)
+	buf.Reset()
+	l3 := NewLogger(&buf, slog.LevelInfo)
+	l3.Info("op", PathAttr(ctx, l3, key, path))
+	if strings.Contains(buf.String(), path) {
+		t.Errorf("INFO logger leaked the real path through PathAttr: %s", buf.String())
+	}
+
+	// Nil logger is treated as not-DEBUG: elide, never panic.
+	if got := PathAttr(ctx, nil, key, path); got.Value.String() != "[path-elided]" {
+		t.Errorf("nil logger PathAttr = %q, want %q", got.Value.String(), "[path-elided]")
 	}
 }
 
