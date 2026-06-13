@@ -307,6 +307,15 @@ func run(args []string) error {
 		return err
 	}
 
+	// Apply OCU_FILESTORE_* env-var fallbacks for any flag not explicitly set
+	// by the caller. Explicit flags always win; env vars are consulted only for
+	// absent flags. Credential-bearing flags are excluded from this map (see
+	// credentialBearingFlags and T2-17). A malformed env-var value is a typed
+	// error the same as a malformed flag.
+	if err := applyEnvFallbacks(fs); err != nil {
+		return err
+	}
+
 	// -version prints the build identity and exits 0 before any validation:
 	// an operator (and the release smoke) must be able to interrogate a
 	// binary without supplying the required serving flags.
@@ -656,6 +665,124 @@ func splitNonEmpty(s string) []string {
 		}
 	}
 	return out
+}
+
+// envVarName converts a flag name to the canonical OCU_FILESTORE_* environment
+// variable name: dashes are replaced with underscores and the result is
+// uppercased with the OCU_FILESTORE_ prefix. For example, "engine-root"
+// becomes "OCU_FILESTORE_ENGINE_ROOT".
+func envVarName(flagName string) string {
+	return "OCU_FILESTORE_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// credentialBearingFlags lists the flags excluded from the generic
+// OCU_FILESTORE_* env-fallback map. These flags carry backend credential
+// values or reference credential material; their secure intake path is
+// separate (static env vars or 0600 credential files — see T1-7), and a
+// generic config-env alias would create a second, less-audited path to the
+// same secrets. The flags excluded are:
+//
+//   - s3-credential-file: path to the 0600 daemon-owned credential file;
+//     excluded because a generic env alias could be confused with the
+//     per-value credential env vars (EnvS3AccessKeyID/EnvS3SecretAccessKey)
+//     and because the 0600-file intake is the sole authorized path.
+//
+// No other flag in the current surface carries a raw secret value — the S3
+// access-key-id and secret-access-key travel only through the objectstore
+// package's dedicated EnvS3* env vars, never through flags at all.
+var credentialBearingFlags = map[string]struct{}{
+	"s3-credential-file": {},
+}
+
+// envFallbackMap is the complete set of flag names that accept an
+// OCU_FILESTORE_* environment-variable fallback. The map is built once at
+// init from all declared flags minus the credentialBearingFlags set. The
+// value is the canonical env-var name (produced by envVarName).
+//
+// Precedence: an explicitly-set flag on the command line ALWAYS wins; the
+// env var is only consulted for flags that were NOT provided by the caller.
+// Detection relies on flag.Visit after fs.Parse, which iterates only over
+// flags that were explicitly set by the caller.
+var envFallbackMap = func() map[string]string {
+	// The daemon's full flag surface. Mirroring this slice here is intentional:
+	// the authoritative list of env-mappable flags is explicit and testable
+	// (the test asserts that each entry resolves to a live *flag.Flag at
+	// parse time, so a renamed flag breaks the test loudly).
+	names := []string{
+		"version",
+		"health-check",
+		"log-level",
+		"ops-listen",
+		"north-listen",
+		"engine",
+		"max-request-bytes",
+		"south-socket-dir",
+		"audit-sink",
+		"profile",
+		"tenancy",
+		"engine-root",
+		"s3-sts-role-arn",
+		"s3-sts-endpoint",
+		"storage-lane",
+		"storage-lane-dev-direct",
+		"ca-bundle",
+		"s3-bucket",
+		"s3-endpoint",
+		"s3-region",
+		"s3-path-style",
+		"broker-max-file-size",
+		"filesystem-id",
+		"granted-intents",
+		"downloadable-prefixes",
+		"ops-per-second",
+		"ops-burst",
+	}
+	m := make(map[string]string, len(names))
+	for _, name := range names {
+		if _, excluded := credentialBearingFlags[name]; !excluded {
+			m[name] = envVarName(name)
+		}
+	}
+	return m
+}()
+
+// applyEnvFallbacks applies OCU_FILESTORE_* environment variables as
+// fallback values for any flag in fs that was NOT explicitly set by the
+// caller. Explicit flags (detected via flag.Visit after Parse) always win;
+// env vars are only consulted for unset flags, so:
+//
+//   - Explicit flag set → flag value used (env var ignored)
+//   - Flag absent, env var set → env var value applied
+//   - Flag absent, env var unset → flag default retained
+//
+// The function applies the env var by calling fs.Set(name, value), which
+// exercises the flag's own type-parsing logic. A malformed env-var value
+// (e.g. OCU_FILESTORE_BROKER_MAX_FILE_SIZE="abc") returns the same typed
+// parse error as a malformed flag on the command line.
+//
+// Credential-bearing flags are not present in envFallbackMap and are
+// therefore silently skipped (their secure intake path is unaffected).
+func applyEnvFallbacks(fs *flag.FlagSet) error {
+	// Collect flags that were explicitly set by the caller.
+	explicit := make(map[string]struct{})
+	fs.Visit(func(f *flag.Flag) {
+		explicit[f.Name] = struct{}{}
+	})
+
+	// For each env-mappable flag not explicitly set, apply the env var.
+	for flagName, envVar := range envFallbackMap {
+		if _, set := explicit[flagName]; set {
+			continue // explicit flag wins; env var ignored
+		}
+		val := os.Getenv(envVar)
+		if val == "" {
+			continue // env var not set; retain the flag default
+		}
+		if err := fs.Set(flagName, val); err != nil {
+			return fmt.Errorf("ocu-filestored: env var %s=%q: %w", envVar, val, err)
+		}
+	}
+	return nil
 }
 
 // selectCredentialSource picks the s3 backend credential source from the

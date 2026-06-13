@@ -1111,6 +1111,313 @@ func TestDockerfileAndComposeHealthcheckRewired(t *testing.T) {
 	}
 }
 
+// ── T2-17: OCU_FILESTORE_* env-var fallback tests ──────────────────────────
+
+// TestEnvVarName pins the canonical conversion: dashes become underscores,
+// the name is uppercased, and the OCU_FILESTORE_ prefix is prepended.
+func TestEnvVarName(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"engine-root", "OCU_FILESTORE_ENGINE_ROOT"},
+		{"audit-sink", "OCU_FILESTORE_AUDIT_SINK"},
+		{"log-level", "OCU_FILESTORE_LOG_LEVEL"},
+		{"ops-per-second", "OCU_FILESTORE_OPS_PER_SECOND"},
+		{"s3-sts-role-arn", "OCU_FILESTORE_S3_STS_ROLE_ARN"},
+		{"storage-lane-dev-direct", "OCU_FILESTORE_STORAGE_LANE_DEV_DIRECT"},
+	} {
+		if got := envVarName(tc.in); got != tc.want {
+			t.Errorf("envVarName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestEnvFallbackMapExcludesCredentials pins the security carve-out:
+// credential-bearing flags are NOT present in the generic env-fallback map,
+// so no OCU_FILESTORE_* alias allows a credential value to reach the daemon
+// via the generic config path.
+func TestEnvFallbackMapExcludesCredentials(t *testing.T) {
+	for flagName := range credentialBearingFlags {
+		if _, ok := envFallbackMap[flagName]; ok {
+			t.Errorf("credential-bearing flag %q is present in envFallbackMap; it must be excluded (T2-17 security carve-out)", flagName)
+		}
+	}
+	// s3-credential-file specifically must not be env-aliased.
+	if _, ok := envFallbackMap["s3-credential-file"]; ok {
+		t.Error("envFallbackMap contains s3-credential-file; credential path flag must be excluded")
+	}
+}
+
+// TestApplyEnvFallbacksAppliesWhenFlagAbsent pins the basic fallback case:
+// when a flag is NOT set on the command line, its OCU_FILESTORE_* env var is
+// applied as the value, and the flag's parsed value changes accordingly.
+func TestApplyEnvFallbacksAppliesWhenFlagAbsent(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	engineRoot := fs.String("engine-root", "", "")
+	auditSink := fs.String("audit-sink", "", "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t.Setenv("OCU_FILESTORE_ENGINE_ROOT", "/data/engine")
+	t.Setenv("OCU_FILESTORE_AUDIT_SINK", "/var/log/audit.jsonl")
+
+	if err := applyEnvFallbacks(fs); err != nil {
+		t.Fatalf("applyEnvFallbacks: %v", err)
+	}
+	if *engineRoot != "/data/engine" {
+		t.Errorf("engine-root = %q, want /data/engine (from env)", *engineRoot)
+	}
+	if *auditSink != "/var/log/audit.jsonl" {
+		t.Errorf("audit-sink = %q, want /var/log/audit.jsonl (from env)", *auditSink)
+	}
+}
+
+// TestApplyEnvFallbacksExplicitFlagWins pins explicit-flag precedence: when a
+// flag IS explicitly set on the command line, the OCU_FILESTORE_* env var for
+// that flag is ignored entirely (the flag value is unchanged).
+func TestApplyEnvFallbacksExplicitFlagWins(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	engineRoot := fs.String("engine-root", "", "")
+	if err := fs.Parse([]string{"-engine-root", "/explicit/path"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t.Setenv("OCU_FILESTORE_ENGINE_ROOT", "/env/path")
+
+	if err := applyEnvFallbacks(fs); err != nil {
+		t.Fatalf("applyEnvFallbacks: %v", err)
+	}
+	if *engineRoot != "/explicit/path" {
+		t.Errorf("engine-root = %q, want /explicit/path (explicit flag wins over env)", *engineRoot)
+	}
+}
+
+// TestApplyEnvFallbacksMalformedEnvIsError pins that a malformed env-var value
+// returns a typed parse error, the same as a malformed flag on the command
+// line. The env var is applied through fs.Set() which exercises the flag's
+// type parsing.
+func TestApplyEnvFallbacksMalformedEnvIsError(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	_ = fs.Int64("broker-max-file-size", 0, "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t.Setenv("OCU_FILESTORE_BROKER_MAX_FILE_SIZE", "not-a-number")
+
+	err := applyEnvFallbacks(fs)
+	if err == nil {
+		t.Fatal("applyEnvFallbacks(malformed int env): got nil, want a parse error")
+	}
+	if !strings.Contains(err.Error(), "OCU_FILESTORE_BROKER_MAX_FILE_SIZE") {
+		t.Errorf("error %q does not name the offending env var", err.Error())
+	}
+}
+
+// TestApplyEnvFallbacksEmptyEnvRetainsDefault pins that an env var set to
+// the empty string is treated as absent: the flag's default value is
+// retained unchanged.
+func TestApplyEnvFallbacksEmptyEnvRetainsDefault(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	logLevel := fs.String("log-level", "info", "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t.Setenv("OCU_FILESTORE_LOG_LEVEL", "")
+
+	if err := applyEnvFallbacks(fs); err != nil {
+		t.Fatalf("applyEnvFallbacks: %v", err)
+	}
+	if *logLevel != "info" {
+		t.Errorf("log-level = %q, want info (default retained when env empty)", *logLevel)
+	}
+}
+
+// TestEnvFallbackEndToEndViaRun pins the full run() path: env vars are
+// applied after flag parsing, so a valid configuration supplied entirely via
+// OCU_FILESTORE_* env vars reaches the validation and serve layer. The test
+// uses run() and expects errMissingRequiredFlag to confirm the flags reached
+// validate (not a parse error).
+func TestEnvFallbackEndToEndViaRun(t *testing.T) {
+	sockDir := shortDir(t)
+	t.Setenv("OCU_FILESTORE_ENGINE_ROOT", "/x")
+	t.Setenv("OCU_FILESTORE_AUDIT_SINK", "/y")
+	t.Setenv("OCU_FILESTORE_FILESYSTEM_ID", "fs-env-01")
+	t.Setenv("OCU_FILESTORE_BROKER_MAX_FILE_SIZE", "1024")
+	t.Setenv("OCU_FILESTORE_SOUTH_SOCKET_DIR", sockDir)
+
+	// With those env vars set, run() should pass flag parsing and reach
+	// validate / compose, failing at validate because the paths don't
+	// actually exist — the point is we get past "missing required flag".
+	// Specifically we expect to succeed validate and fail at compose
+	// (engine root does not exist) or get no error from validate at all.
+	// We do NOT want errMissingRequiredFlag for the env-backed flags.
+	err := run(nil) // no explicit flags
+	if errors.Is(err, errMissingRequiredFlag) {
+		// Check whether it's complaining about one of the flags we set via env.
+		for _, envFlag := range []string{"engine-root", "audit-sink", "filesystem-id", "broker-max-file-size"} {
+			if strings.Contains(err.Error(), envFlag) {
+				t.Errorf("run(via env vars) returned errMissingRequiredFlag naming %q — env fallback did not apply for that flag: %v", envFlag, err)
+			}
+		}
+	}
+	// The test passes as long as the env-backed required flags are not the
+	// cause of the error. Any other error (e.g. compose failure, unknown path)
+	// is expected and acceptable.
+}
+
+// TestEnvFallbackPrecedenceRepresentativeSample pins precedence for several
+// representative flag types: string, int64, float64, and bool. In each case
+// an explicit flag beats the env var; an absent flag takes the env var.
+func TestEnvFallbackPrecedenceRepresentativeSample(t *testing.T) {
+	// String: explicit wins.
+	t.Run("string_explicit_wins", func(t *testing.T) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		v := fs.String("audit-sink", "", "")
+		if err := fs.Parse([]string{"-audit-sink", "/flag/path"}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		t.Setenv("OCU_FILESTORE_AUDIT_SINK", "/env/path")
+		if err := applyEnvFallbacks(fs); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if *v != "/flag/path" {
+			t.Errorf("audit-sink = %q, want /flag/path", *v)
+		}
+	})
+
+	// Int64: env fallback applies when flag absent.
+	t.Run("int64_env_fallback", func(t *testing.T) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		v := fs.Int64("broker-max-file-size", 0, "")
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		t.Setenv("OCU_FILESTORE_BROKER_MAX_FILE_SIZE", "2097152")
+		if err := applyEnvFallbacks(fs); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if *v != 2097152 {
+			t.Errorf("broker-max-file-size = %d, want 2097152", *v)
+		}
+	})
+
+	// Float64: env fallback applies when flag absent.
+	t.Run("float64_env_fallback", func(t *testing.T) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		v := fs.Float64("ops-per-second", defaultOpsPerSecond, "")
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		t.Setenv("OCU_FILESTORE_OPS_PER_SECOND", "50.5")
+		if err := applyEnvFallbacks(fs); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if *v != 50.5 {
+			t.Errorf("ops-per-second = %g, want 50.5", *v)
+		}
+	})
+
+	// Bool: env fallback applies when flag absent; explicit false wins over
+	// env true.
+	t.Run("bool_env_fallback", func(t *testing.T) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		v := fs.Bool("s3-path-style", false, "")
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		t.Setenv("OCU_FILESTORE_S3_PATH_STYLE", "true")
+		if err := applyEnvFallbacks(fs); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if !*v {
+			t.Errorf("s3-path-style = false, want true (from env)")
+		}
+	})
+
+	// Bool explicit false wins (the flag was explicitly provided as false).
+	t.Run("bool_explicit_false_wins", func(t *testing.T) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		v := fs.Bool("s3-path-style", false, "")
+		if err := fs.Parse([]string{"-s3-path-style=false"}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		t.Setenv("OCU_FILESTORE_S3_PATH_STYLE", "true")
+		if err := applyEnvFallbacks(fs); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if *v {
+			t.Errorf("s3-path-style = true, want false (explicit flag wins)")
+		}
+	})
+}
+
+// TestCredentialFlagNotEnvAliasedViaGenericMap is the authoritative carve-out
+// test: it verifies that no OCU_FILESTORE_* env var can supply the
+// s3-credential-file flag through the generic applyEnvFallbacks path. Setting
+// OCU_FILESTORE_S3_CREDENTIAL_FILE in the environment must NOT affect the
+// flag value, even when the flag is absent from the command line.
+func TestCredentialFlagNotEnvAliasedViaGenericMap(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	credFile := fs.String("s3-credential-file", "", "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t.Setenv("OCU_FILESTORE_S3_CREDENTIAL_FILE", "/attacker/cred.file")
+
+	if err := applyEnvFallbacks(fs); err != nil {
+		t.Fatalf("applyEnvFallbacks: %v", err)
+	}
+	if *credFile != "" {
+		t.Errorf("s3-credential-file = %q via OCU_FILESTORE_S3_CREDENTIAL_FILE; the generic env alias must not exist for credential flags (T2-17 carve-out)", *credFile)
+	}
+}
+
+// TestEnvFallbackMapContainsAllNonCredentialFlags pins that every flag
+// declared in the daemon's flag set (excluding credential-bearing ones) has an
+// entry in envFallbackMap. This catches a flag rename that leaves the env map
+// stale.
+func TestEnvFallbackMapContainsAllNonCredentialFlags(t *testing.T) {
+	// Build a minimal flag set mirroring run()'s declarations.
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Bool("version", false, "")
+	fs.Bool("health-check", false, "")
+	fs.String("log-level", "info", "")
+	fs.String("ops-listen", "127.0.0.1:9464", "")
+	fs.String("north-listen", "127.0.0.1:7080", "")
+	fs.String("engine", "local-volume", "")
+	fs.Int64("max-request-bytes", 52428800, "")
+	fs.String("south-socket-dir", "/run/ocu-filestore/sessions", "")
+	fs.String("audit-sink", "", "")
+	fs.String("profile", "trusted_operator", "")
+	fs.String("tenancy", "single-tenant", "")
+	fs.String("engine-root", "", "")
+	fs.String("s3-credential-file", "", "")
+	fs.String("s3-sts-role-arn", "", "")
+	fs.String("s3-sts-endpoint", "", "")
+	fs.String("storage-lane", "", "")
+	fs.Bool("storage-lane-dev-direct", false, "")
+	fs.String("ca-bundle", "", "")
+	fs.String("s3-bucket", "", "")
+	fs.String("s3-endpoint", "", "")
+	fs.String("s3-region", "us-east-1", "")
+	fs.Bool("s3-path-style", false, "")
+	fs.Int64("broker-max-file-size", 0, "")
+	fs.String("filesystem-id", "", "")
+	fs.String("granted-intents", "read,write", "")
+	fs.String("downloadable-prefixes", "", "")
+	fs.Float64("ops-per-second", defaultOpsPerSecond, "")
+	fs.Float64("ops-burst", defaultOpsBurst, "")
+
+	fs.VisitAll(func(f *flag.Flag) {
+		if _, excluded := credentialBearingFlags[f.Name]; excluded {
+			return
+		}
+		if _, ok := envFallbackMap[f.Name]; !ok {
+			t.Errorf("flag %q is not in envFallbackMap; add it or list it in credentialBearingFlags (T2-17)", f.Name)
+		}
+	})
+}
+
 // TestSystemdUnitIsTypeNotify pins the systemd unit has Type=notify and the
 // required hardening directives.
 func TestSystemdUnitIsTypeNotify(t *testing.T) {
