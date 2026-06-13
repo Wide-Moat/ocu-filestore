@@ -717,6 +717,17 @@ func (e *s3Engine) completeMultipart(ctx context.Context, in *s3.CompleteMultipa
 		if herr == nil && aws.ToInt64(head.ContentLength) == wantSize {
 			return nil // the earlier Complete landed; the retry saw its wake
 		}
+		if herr != nil {
+			// When the HEAD itself is transient or throttled, surface that so
+			// the caller can retry the verification — only fall back to the
+			// original NoSuchUpload when the HEAD authoritatively reports the
+			// object absent (fs.ErrNotExist). A spurious HEAD failure must not
+			// trigger the deferred abort against a genuinely-completed upload.
+			mapped := mapS3Err("complete multipart verify", herr)
+			if errors.Is(mapped, ErrTransient) || errors.Is(mapped, ErrThrottled) {
+				return mapped
+			}
+		}
 	}
 	return mapS3Err("complete multipart", err)
 }

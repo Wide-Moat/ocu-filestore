@@ -1930,3 +1930,54 @@ func TestS3Live_MoveFile_BadCopyMessage(t *testing.T) {
 		t.Fatalf("size-mismatch message = %q; must not contain \"; bad copy deleted\" (false-removal claim)", szErr.Error())
 	}
 }
+
+// --- leak-mpu-03: completeMultipart HEAD transient-error classification -----
+
+// TestS3_CompleteMultipart_HeadTransientClassification pins the
+// completeMultipart HEAD-error branch (leak-mpu-03 fix): when HeadObject
+// itself returns a transient or throttling error during NoSuchUpload
+// verification, mapS3Err must map it to ErrTransient or ErrThrottled so
+// the caller can retry — the original NoSuchUpload is only surfaced when
+// the HEAD authoritatively confirms the object is absent.
+//
+// This pins the mapper classifications consumed by the new branch. The live
+// round-trip through completeMultipart's full happy-path and aborted-upload
+// paths remains covered by TestS3_CompleteRetry_NoSuchUploadVerified.
+func TestS3_CompleteMultipart_HeadTransientClassification(t *testing.T) {
+	// Transient/throttled HEAD errors must NOT fall through to NoSuchUpload.
+	for _, tc := range []struct {
+		name string
+		in   error
+	}{
+		{"HTTP 500 -> ErrTransient", httpRespErr(500)},
+		{"HTTP 503 -> ErrThrottled", httpRespErr(503)},
+		{"HTTP 429 -> ErrThrottled", httpRespErr(429)},
+		{"transport timeout -> ErrTransient", opErr(timeoutNetError{})},
+		{"InternalError code -> ErrTransient", opErr(&smithy.GenericAPIError{Code: "InternalError"})},
+		{"SlowDown code -> ErrThrottled", opErr(&smithy.GenericAPIError{Code: "SlowDown"})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mapped := mapS3Err("complete multipart verify", tc.in)
+			if !errors.Is(mapped, ErrTransient) && !errors.Is(mapped, ErrThrottled) {
+				t.Fatalf("mapS3Err(%v) = %v; want ErrTransient or ErrThrottled so the HEAD branch surfaces it instead of hiding behind NoSuchUpload", tc.in, mapped)
+			}
+		})
+	}
+
+	// A genuine "not found" HEAD result must NOT classify as transient — the
+	// branch must fall through so the original NoSuchUpload is returned.
+	for _, tc := range []struct {
+		name string
+		in   error
+	}{
+		{"HTTP 404 -> fs.ErrNotExist (not transient)", httpRespErr(404)},
+		{"NoSuchKey -> fs.ErrNotExist (not transient)", opErr(&types.NoSuchKey{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mapped := mapS3Err("complete multipart verify", tc.in)
+			if errors.Is(mapped, ErrTransient) || errors.Is(mapped, ErrThrottled) {
+				t.Fatalf("mapS3Err(%v) = %v; a not-found HEAD must not classify as transient (would mask real NoSuchUpload)", tc.in, mapped)
+			}
+		})
+	}
+}
