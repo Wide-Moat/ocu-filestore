@@ -94,6 +94,7 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 	if !ok {
 		// x-request-id is already set on w.Header() by ServeHTTP before this
 		// call, so it will appear on this unary error response too.
+		d.recordOp(string(op), "deny", denyInternal)
 		writeConnectError(w, mapDeny(denyInternal), "no channel scope on connection")
 		return
 	}
@@ -104,11 +105,17 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 	w.Header().Set("Content-Type", connContentTypeStream)
 	w.WriteHeader(http.StatusOK)
 
+	// Streaming STAGE-0 denies record ops_total directly (southface-02): they
+	// precede the op-specific handler's own deny/allow accounting, mirroring the
+	// unary denyOp choke point for the throttle/header faults.
+	opStr := string(op)
 	if err := checkVersion(r); err != nil {
+		d.recordOp(opStr, "deny", denyClassForDecodeErr(err))
 		_ = writeEndStream(w, &connectError{Code: wireCodeInvalidArgument, Message: "missing or wrong Connect-Protocol-Version"})
 		return
 	}
 	if !checkStreamContentType(r) {
+		d.recordOp(opStr, "deny", denyMalformed)
 		_ = writeEndStream(w, &connectError{Code: wireCodeInvalidArgument, Message: "Content-Type must be application/connect+json"})
 		return
 	}
@@ -116,6 +123,7 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 	// ops/s throttle, keyed on the CHANNEL scope (never any body field).
 	sess := d.ceilings.Session(ps.FilesystemID)
 	if err := sess.TryConsumeOp(); err != nil {
+		d.recordOp(opStr, "deny", denyClassForErr(err))
 		_ = writeEndStream(w, &connectError{Code: wireCodeResourceExhausted, Message: "operation rate ceiling exceeded"})
 		return
 	}
@@ -235,9 +243,14 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 		ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, auditReason)
 		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			// Deny-Mandate failure degrades the verdict to audit_down; book the
+			// metric as audit_down too so ops_total matches the wire verdict
+			// (southface-02).
+			d.recordOp(string(OpFileUpload), "deny", denyAuditDown)
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
 		}
+		d.recordOp(string(OpFileUpload), "deny", auditReason)
 		_ = writeEndStream(sc.w, &connectError{Code: wireCode, Message: message})
 	}
 	// ReleaseBytes balances AcquireBytes on EVERY exit (Pitfall 6). The
@@ -305,6 +318,8 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
 		// The allow Mandate itself failed (audit down). Deny before any chunk;
 		// do NOT re-Mandate a deny (the gate is unavailable) — just frame it.
+		// Book the metric as audit_down (southface-02).
+		d.recordOp(string(OpFileUpload), "deny", denyAuditDown)
 		_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 		return
 	}
@@ -319,6 +334,12 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	// --- reassembly: single io.Pipe -> WriteStream(overwrite=params.OverwriteExisting) ---
 	// overwrite_existing defaults to false when the field is absent (JSON zero
 	// value), which preserves today's behaviour for any sender that omits it.
+	//
+	// engineStart times the engine write window (reassembly -> WriteStream
+	// commit) for the stage_latency_seconds "engine" histogram, mirroring the
+	// unary STAGE-4 timer (southface-02). It is observed once the WriteStream
+	// outcome is known on the success commit below.
+	engineStart := time.Now()
 	pr, pw := io.Pipe()
 	writeErrCh := make(chan error, 1)
 	go func() {
@@ -426,13 +447,16 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	// Commit: closing the pipe writer signals EOF; WriteStream's temp+rename
 	// makes the object visible only now.
 	pw.Close()
-	if werr := <-writeErrCh; werr != nil {
+	werr := <-writeErrCh
+	d.observeStage("engine", time.Since(engineStart).Seconds())
+	if werr != nil {
 		v := mapDeny(denyClassForEngineErr(werr))
 		denyTrailer(auditTruthForEngineErr(werr), v.WireCode, "upload refused")
 		return
 	}
 
 	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.
+	d.recordOp(string(OpFileUpload), "allow", denyclassNone)
 	_ = writeEndStream(sc.w, nil)
 }
 
@@ -497,9 +521,13 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, auditReason)
 		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			// Deny-Mandate failure degrades to audit_down; book the metric to
+			// match the wire verdict (southface-02).
+			d.recordOp(string(OpFileDownload), "deny", denyAuditDown)
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
 		}
+		d.recordOp(string(OpFileDownload), "deny", auditReason)
 		_ = writeEndStream(sc.w, &connectError{Code: wireCode, Message: message})
 	}
 
@@ -553,13 +581,18 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 		return
 	}
 	if rec.scope != sc.ps.FilesystemID {
-		// Cross-scope: audit scope_mismatch truth, wire not_found (D8).
+		// Cross-scope: audit scope_mismatch truth, wire not_found (D8). The
+		// ops_total deny_class is the audited TRUTH (scope_mismatch), not the
+		// degraded wire class — the metric carries the same truth the audit
+		// record does (southface-02).
 		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, denyScopeMismatch)
 		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
+			d.recordOp(string(OpFileDownload), "deny", denyAuditDown)
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
 		}
+		d.recordOp(string(OpFileDownload), "deny", denyScopeMismatch)
 		_ = writeEndStream(sc.w, &connectError{Code: wireCodeNotFound, Message: "object not found"})
 		return
 	}
@@ -617,12 +650,19 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	allow := d.streamDownloadAuditEvent(sc.ps, req, grant, sc.reqID)
 	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
 		// The allow Mandate failed (audit down). Deny before any byte is sent;
-		// do NOT re-Mandate a deny (the gate is unavailable).
+		// do NOT re-Mandate a deny (the gate is unavailable). Book the metric as
+		// audit_down (southface-02).
+		d.recordOp(string(OpFileDownload), "deny", denyAuditDown)
 		_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 		return
 	}
 
 	// --- stream bytes: ReadRange → framed data frames ---
+	// engineStart times the engine read window (ReadRange -> last data frame)
+	// for the stage_latency_seconds "engine" histogram, mirroring the unary
+	// STAGE-4 timer (southface-02). It is observed at each terminal exit of the
+	// streaming loop.
+	engineStart := time.Now()
 	rel := enginePath(req.Path)
 	pr, pw := io.Pipe()
 	readErrCh := make(chan error, 1)
@@ -647,14 +687,20 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 				// Treat as internal; drain the reader and terminate with error.
 				pr.CloseWithError(merr)
 				<-readErrCh
+				d.observeStage("engine", time.Since(engineStart).Seconds())
+				d.recordOp(string(OpFileDownload), "deny", denyInternal)
 				_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "frame encode failed"})
 				return
 			}
 			if werr := writeFrame(sc.w, dataFlag, frame); werr != nil {
 				// Client disconnected; drain and return without a trailer
-				// (connection is gone; writing a trailer would also fail).
+				// (connection is gone; writing a trailer would also fail). Book
+				// the verdict as aborted so a dropped download is still visible
+				// in ops_total (southface-02).
 				pr.CloseWithError(werr)
 				<-readErrCh
+				d.observeStage("engine", time.Since(engineStart).Seconds())
+				d.recordOp(string(OpFileDownload), "deny", denyAborted)
 				return
 			}
 		}
@@ -664,6 +710,8 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 				// at the natural end of a non-multiple-of-chunk-size object).
 				// Drain the engine goroutine, then write the success trailer.
 				if engErr := <-readErrCh; engErr != nil {
+					d.observeStage("engine", time.Since(engineStart).Seconds())
+					d.recordOp(string(OpFileDownload), "deny", auditTruthForEngineErr(engErr))
 					_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "read error"})
 					return
 				}
@@ -677,12 +725,16 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 				engErr = rerr
 			}
 			sc.reqLog.Error("download engine fault", slog.String("err", engErr.Error()))
+			d.observeStage("engine", time.Since(engineStart).Seconds())
+			d.recordOp(string(OpFileDownload), "deny", auditTruthForEngineErr(engErr))
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeInternal, Message: "read error"})
 			return
 		}
 	}
 
 	// SUCCESS: the ack IS the trailer. The allow Mandate already preceded it.
+	d.observeStage("engine", time.Since(engineStart).Seconds())
+	d.recordOp(string(OpFileDownload), "allow", denyclassNone)
 	_ = writeEndStream(sc.w, nil)
 }
 
