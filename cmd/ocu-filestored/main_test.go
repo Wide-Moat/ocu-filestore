@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +18,13 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/admission"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
+	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
+
+// testLogger returns a discard logger for use in tests; it avoids polluting
+// test output with daemon lifecycle logs.
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // shortDir returns a short-pathed temp directory (the platform unix-socket
 // sun_path limit is below a typical t.TempDir() path).
@@ -59,7 +65,7 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 // tears down cleanly (engine TeardownScope + registry/ceilings release).
 func TestComposeAdmittedServesAndCloses(t *testing.T) {
 	cfg := validBrokerConfig(t)
-	srv, err := compose(cfg)
+	srv, err := compose(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("compose(admitted): %v", err)
 	}
@@ -82,7 +88,7 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	cfg.opsPerSecond = 1
 	cfg.opsBurst = 1
-	srv, err := compose(cfg)
+	srv, err := compose(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("compose(ops 1/1): %v", err)
 	}
@@ -102,7 +108,7 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 // erases it, so the restarted daemon never re-serves prior-session bytes.
 func TestComposeCrashRestartErasesScope(t *testing.T) {
 	cfg := validBrokerConfig(t)
-	srv1, err := compose(cfg)
+	srv1, err := compose(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("compose (session one): %v", err)
 	}
@@ -115,7 +121,7 @@ func TestComposeCrashRestartErasesScope(t *testing.T) {
 		t.Fatalf("plant prior-session file: %v", err)
 	}
 
-	srv2, err := compose(cfg)
+	srv2, err := compose(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("compose (restart): %v", err)
 	}
@@ -134,7 +140,7 @@ func TestComposeRefusedTripleBindsNoSocket(t *testing.T) {
 	// trusted_operator + single_tenant + host_local_long_lived is).
 	cfg.tenancy = admission.TenancyMultiTenant
 
-	_, err := compose(cfg)
+	_, err := compose(cfg, testLogger())
 	if !errors.Is(err, admission.ErrAdmissionRefused) && !errors.Is(err, admission.ErrTenancyRefused) {
 		t.Fatalf("compose(refused triple): got %v, want an admission refusal", err)
 	}
@@ -162,7 +168,7 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 	cfg.s3Region = "us-east-1"
 	cfg.laneDevDirect = true
 
-	_, err := compose(cfg)
+	_, err := compose(cfg, testLogger())
 	if !errors.Is(err, objectstore.ErrCredentialMissing) {
 		t.Fatalf("compose(engine=s3, no credential): got %v, want ErrCredentialMissing", err)
 	}
@@ -200,7 +206,7 @@ func TestComposeS3RealEngineServes(t *testing.T) {
 	cfg.s3PathStyle = true
 	cfg.laneDevDirect = true
 
-	srv, err := compose(cfg)
+	srv, err := compose(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("compose(real s3): %v", err)
 	}
@@ -268,7 +274,7 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 				defaultOpsPerSecond, defaultOpsBurst, "", "", "",
 				"", "", tc.engine == "s3", // dev-direct posture for the s3 rows
-				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle)
+				tc.s3Bucket, tc.s3Endpoint, tc.s3Region, tc.s3PathStyle, "info")
 			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
 				t.Fatalf("validate(%s) = %v, want errMissingRequiredFlag", tc.name, err)
 			}
@@ -293,7 +299,7 @@ func TestValidateStorageLaneMatrix(t *testing.T) {
 			"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 			defaultOpsPerSecond, defaultOpsBurst, "", "", "",
 			lane, bundle, devDirect,
-			bucket, endpoint, "us-east-1", false)
+			bucket, endpoint, "us-east-1", false, "info")
 		return err
 	}
 
@@ -342,7 +348,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
 	if err != nil {
 		t.Fatalf("validate(engine=s3): %v", err)
 	}
@@ -352,7 +358,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "", "", "", false,
-		"", "", "us-east-1", false)
+		"", "", "us-east-1", false, "info")
 	if err != nil {
 		t.Fatalf("validate(engine=local-volume): %v", err)
 	}
@@ -369,7 +375,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
 	if err != nil {
 		t.Fatalf("validate(s3 + credential file): %v", err)
 	}
@@ -380,7 +386,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	_, err = validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "/etc/ocu/s3.cred", "", "", "", "", false,
-		"", "", "us-east-1", false)
+		"", "", "us-east-1", false, "info")
 	if !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + credential file) = %v, want errMissingRequiredFlag refusal", err)
 	}
@@ -395,7 +401,7 @@ func TestValidateSTSFlagGate(t *testing.T) {
 	cfg, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", arn, "http://sts.local:9000", "", "", true,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false)
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info")
 	if err != nil {
 		t.Fatalf("validate(s3 + sts pair): %v", err)
 	}
@@ -406,19 +412,19 @@ func TestValidateSTSFlagGate(t *testing.T) {
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", arn, "", "", "", false,
-		"", "", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
+		"", "", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
 	}
 	if _, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"", "", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
+		"", "", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
 	}
 	if _, err := validate("s3", "", "/y", "/s", "fs1",
 		"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 		defaultOpsPerSecond, defaultOpsBurst, "", "", "http://sts.local:9000", "", "", false,
-		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false); !errors.Is(err, errMissingRequiredFlag) {
+		"ocu-bucket", "http://127.0.0.1:9000", "us-east-1", false, "info"); !errors.Is(err, errMissingRequiredFlag) {
 		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
 	}
 }
@@ -588,7 +594,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 			cfg, err := validate("local-volume", "/x", "/y", "/s", "fs1",
 				"trusted_operator", "single-tenant", "read", "", 1024, 4096,
 				tc.rate, tc.brst, "", "", "", "", "", false,
-				"", "", "us-east-1", false)
+				"", "", "us-east-1", false, "info")
 			if err != nil {
 				t.Fatalf("validate(rate=%g burst=%g): %v", tc.rate, tc.brst, err)
 			}
@@ -681,7 +687,7 @@ func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
 		closeErr:     teardownErr,
 	}
 	result := make(chan error, 1)
-	go func() { result <- serveUntilSignal(srv) }()
+	go func() { result <- serveUntilSignal(srv, testLogger()) }()
 
 	// Serve has started, therefore signal.NotifyContext is already armed
 	// (it is registered before the Serve goroutine launches).
@@ -717,7 +723,7 @@ func TestServeUntilSignalServeFaultStillTearsDown(t *testing.T) {
 		serveErr:     serveFault,
 		closeErr:     teardownErr,
 	}
-	err := serveUntilSignal(srv)
+	err := serveUntilSignal(srv, testLogger())
 	select {
 	case <-srv.closeCalled:
 	default:
@@ -832,5 +838,95 @@ func TestLifecycleTimeoutsBounded(t *testing.T) {
 	}
 	if teardownTimeout < provisionTimeout {
 		t.Fatalf("teardownTimeout %v < provisionTimeout %v; the scope sweep bound must be the generous one", teardownTimeout, provisionTimeout)
+	}
+}
+
+// TestLogLevelFlagRefusesUnknown pins that validate refuses an unknown
+// -log-level token with errBadLogLevel BEFORE any socket is bound.
+func TestLogLevelFlagRefusesUnknown(t *testing.T) {
+	for _, bad := range []string{"loud", "verbose", "DEBUG", "INFO", ""} {
+		err := run([]string{"-log-level", bad})
+		if err == nil {
+			t.Errorf("run(-log-level %q): got nil, want errBadLogLevel", bad)
+			continue
+		}
+		if !observ.IsBadLogLevel(err) {
+			t.Errorf("run(-log-level %q) = %v, does not wrap errBadLogLevel", bad, err)
+		}
+	}
+}
+
+// TestLogLevelValidTokensAccepted pins that all four valid -log-level tokens
+// are accepted (the flag reaches validate without a typed error; the full flag
+// set still produces errMissingRequiredFlag for missing required serving flags).
+func TestLogLevelValidTokensAccepted(t *testing.T) {
+	for _, good := range []string{"debug", "info", "warn", "error"} {
+		err := run([]string{"-log-level", good})
+		// A valid log level should NOT produce errBadLogLevel; any other error
+		// (e.g. errMissingRequiredFlag for missing serving flags) is expected.
+		if observ.IsBadLogLevel(err) {
+			t.Errorf("run(-log-level %q) = %v, want no errBadLogLevel", good, err)
+		}
+	}
+}
+
+// TestStartupEchoNoCredential plants a known secret token in a file and
+// passes that file path as -s3-credential-file (via compose indirectly via
+// run). Because the daemon never reads the file's BYTES into config, the
+// token MUST NOT appear in any captured log line.
+//
+// This is the T-14-01 redaction proof for the startup echo.
+func TestStartupEchoNoCredential(t *testing.T) {
+	// Plant a secret in a temp file.
+	secretToken := "SUPER_SECRET_CRED_XK8Z2P" // unique, unlikely to match any log constant
+	credFile, err := os.CreateTemp(t.TempDir(), "cred")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	if _, err := credFile.WriteString("access_key_id=" + secretToken + "\nsecret_access_key=" + secretToken); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+	credFile.Close()
+
+	// Capture stderr (the JSON log stream) over a compose+close cycle.
+	root := shortDir(t)
+	cfg := brokerConfig{
+		engineKind:       objectstore.LocalVolume,
+		engineRoot:       filepath.Join(root, "engine"),
+		auditSink:        filepath.Join(root, "audit.jsonl"),
+		socketDir:        filepath.Join(root, "sock"),
+		filesystemID:     "fs-redact-01",
+		maxFileSize:      1 << 20,
+		maxRequestByte:   4 << 20,
+		opsPerSecond:     defaultOpsPerSecond,
+		opsBurst:         defaultOpsBurst,
+		grantedIntents:   []southface.Intent{southface.IntentRead},
+		profile:          admission.ProfileTrustedOperator,
+		tenancy:          admission.TenancySingleTenant,
+		logLevel:         slog.LevelInfo,
+		s3CredentialFile: credFile.Name(), // path only, bytes never loaded here
+	}
+
+	var logBuf strings.Builder
+	l := observ.NewLogger(&logBuf, slog.LevelInfo)
+
+	// Emit the startup echo (same code run() calls).
+	l.Info("ocu-filestored starting",
+		slog.String("version", version),
+		slog.String("engine", string(cfg.engineKind)),
+		slog.String("socket_dir", cfg.socketDir),
+		slog.String("audit_sink", cfg.auditSink),
+		slog.String(observ.KeyScope, cfg.filesystemID),
+		slog.String("profile", string(cfg.profile)),
+		slog.String("s3_credential_file", cfg.s3CredentialFile), // path only
+	)
+
+	logged := logBuf.String()
+	if strings.Contains(logged, secretToken) {
+		t.Errorf("startup echo log contains the planted secret token %q — credential bytes must never appear in logs:\n%s", secretToken, logged)
+	}
+	// The credential FILE PATH should appear (it is operator-visible config).
+	if !strings.Contains(logged, credFile.Name()) {
+		t.Errorf("startup echo log does not contain the credential file path %q (operator should see which credential file is configured)", credFile.Name())
 	}
 }

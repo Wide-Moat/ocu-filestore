@@ -5,6 +5,7 @@ package southface
 
 import (
 	"errors"
+	"log/slog"
 	"net"
 )
 
@@ -72,6 +73,10 @@ type Config struct {
 	// HostUID is the broker's own uid; the accept gate drops any peer whose
 	// uid does not match (NFR-SEC-76).
 	HostUID uint32
+	// Logger is the structured logger for the session. A nil value is
+	// treated as a discard-all logger so existing callers and tests that
+	// construct Config by literal need not supply one.
+	Logger *slog.Logger
 }
 
 // Serve is the sole exported south-face constructor. It validates the wiring
@@ -90,13 +95,19 @@ func Serve(cfg Config) (Server, error) {
 		return nil, ErrSeamMissing
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
 	d := newDispatcherWithEngine(cfg.Resolver, cfg.Guard, cfg.Ceilings, cfg.SizeCeiling, cfg.Engine)
 	// Finding #2: the whole-object upload ceiling is the control plane's
 	// BrokerMaxFileSizeBytes, distinct from the per-message SizeCeiling. This
 	// is the one place a flag value reaches the unexported maxFileSize field.
 	d.maxFileSize = cfg.BrokerMaxFileSize
+	d.logger = logger
 
-	s, err := provisionSession(cfg.Dir, cfg.Entry, cfg.Registry, d, cfg.CheckPeer, cfg.HostUID)
+	s, err := provisionSession(cfg.Dir, cfg.Entry, cfg.Registry, d, cfg.CheckPeer, cfg.HostUID, logger)
 	if err != nil {
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 )
 
 // errBadScopeName — a session's filesystem_id is unfit for a socket filename
@@ -102,6 +105,12 @@ type gatedListener struct {
 	inner     net.Listener
 	checkPeer peerChecker
 	hostUID   uint32
+	// onPeerDrop is an optional callback invoked BEFORE conn.Close() on each
+	// rejected connection. It receives the extracted uid, pid, and a reason
+	// string ("uid_mismatch" or "peercred_error"). A nil value is a no-op —
+	// existing tests that construct gatedListener by literal need not supply
+	// one and continue to compile and pass unchanged.
+	onPeerDrop func(uid uint32, pid int32, reason string)
 }
 
 // Accept returns the next host-peer connection, closing and skipping any
@@ -117,7 +126,17 @@ func (g *gatedListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		uid, pid, err := g.checkPeer(conn)
-		if err != nil || uid != g.hostUID {
+		if err != nil {
+			if g.onPeerDrop != nil {
+				g.onPeerDrop(0, 0, "peercred_error")
+			}
+			_ = conn.Close()
+			continue
+		}
+		if uid != g.hostUID {
+			if g.onPeerDrop != nil {
+				g.onPeerDrop(uid, pid, "uid_mismatch")
+			}
 			_ = conn.Close()
 			continue
 		}
@@ -155,7 +174,12 @@ func (s *session) SocketPath() string { return s.socketPath }
 // peer-cred accept gate, and builds an HTTP/1.1 server whose ConnContext
 // stashes the bound PeerScope into every connection's context. The server does
 // not serve until Serve is called.
-func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, handler http.Handler, checkPeer peerChecker, hostUID uint32) (*session, error) {
+//
+// logger is used to wire the peer-drop WARN callback on the accept gate and
+// to route the http.Server's internal error log into the JSON stream. A nil
+// logger produces a discard-all logger (the caller must ensure non-nil; Serve
+// normalises the Logger field before calling here).
+func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, handler http.Handler, checkPeer peerChecker, hostUID uint32, logger *slog.Logger) (*session, error) {
 	socketPath, err := socketPathForScope(dir, entry.FilesystemID)
 	if err != nil {
 		return nil, err
@@ -186,7 +210,18 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 		return nil, err
 	}
 
-	gl := &gatedListener{inner: ln, checkPeer: checkPeer, hostUID: hostUID}
+	gl := &gatedListener{
+		inner:     ln,
+		checkPeer: checkPeer,
+		hostUID:   hostUID,
+		onPeerDrop: func(uid uint32, pid int32, reason string) {
+			logger.Warn("peer-cred gate: connection dropped",
+				slog.String(observ.KeyReason, reason),
+				slog.Uint64(observ.KeyPeerUID, uint64(uid)),
+				slog.Int64(observ.KeyPeerPID, int64(pid)),
+			)
+		},
+	}
 
 	s := &session{
 		socketPath: socketPath,
@@ -208,6 +243,7 @@ func provisionSession(dir string, entry SessionEntry, reg *SessionRegistry, hand
 	// body deadline never poisons the next request on the connection.
 	s.srv = &http.Server{
 		Handler:           handler,
+		ErrorLog:          observ.ErrorLog(logger),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {

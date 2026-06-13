@@ -25,6 +25,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,6 +42,7 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
+	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
 
@@ -198,6 +200,8 @@ type brokerConfig struct {
 	dlPrefixes       []string
 	profile          admission.WorkloadTrustProfile
 	tenancy          admission.Tenancy
+	// logLevel is the validated slog.Level for the daemon's JSON logger.
+	logLevel slog.Level
 }
 
 // run parses and validates the frozen flag surface, then composes and serves
@@ -210,6 +214,8 @@ func run(args []string) error {
 
 	showVersion := fs.Bool("version", false,
 		"print the version, VCS revision, and Go toolchain, then exit 0")
+	logLevel := fs.String("log-level", "info",
+		"structured log level: debug | info | warn | error (default info)")
 	fs.String("north-listen", "127.0.0.1:7080",
 		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
 	engine := fs.String("engine", "local-volume",
@@ -278,16 +284,46 @@ func run(args []string) error {
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
 		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
 		*storageLane, *caBundle, *laneDevDirect,
-		*s3Bucket, *s3Endpoint, *s3Region, *s3PathStyle)
+		*s3Bucket, *s3Endpoint, *s3Region, *s3PathStyle,
+		*logLevel)
 	if err != nil {
 		return err
 	}
 
-	srv, err := compose(cfg)
+	// Build the structured logger AFTER validate (which refused bad flags)
+	// and BEFORE compose (which binds sockets). The logger is the first
+	// real infrastructure; everything from here on emits structured JSON.
+	l := observ.NewLogger(os.Stderr, cfg.logLevel)
+
+	// Startup echo at INFO: operator configuration summary. NEVER includes
+	// a credential byte — only the validated, non-secret flag surface.
+	l.Info("ocu-filestored starting",
+		slog.String("version", version),
+		slog.String("engine", string(cfg.engineKind)),
+		slog.String("socket_dir", cfg.socketDir),
+		slog.String("audit_sink", cfg.auditSink),
+		slog.String(observ.KeyScope, cfg.filesystemID),
+		slog.String("profile", string(cfg.profile)),
+		slog.String("tenancy", string(cfg.tenancy)),
+		slog.Int64("max_file_size", cfg.maxFileSize),
+		slog.Int64("max_request_bytes", cfg.maxRequestByte),
+		slog.Float64("ops_per_second", cfg.opsPerSecond),
+		slog.Float64("ops_burst", cfg.opsBurst),
+		// NOTE: s3CredentialFile is logged as a PATH only (not the file
+		// contents). Path logging at INFO is safe: the file path is
+		// operator-visible deployment configuration, not a secret value.
+		// The file's credential bytes never enter a log line.
+		slog.String("s3_credential_file", cfg.s3CredentialFile),
+	)
+
+	srv, err := compose(cfg, l)
 	if err != nil {
 		return err
 	}
-	return serveUntilSignal(srv)
+	l.Info("session provisioned",
+		slog.String(observ.KeyScope, cfg.filesystemID),
+	)
+	return serveUntilSignal(srv, l)
 }
 
 // serveUntilSignal serves srv until either Serve returns on its own (a
@@ -298,9 +334,15 @@ func run(args []string) error {
 // exit path combines the serve and close results with errors.Join, so a
 // teardown error is never silently dropped behind a serve error (or vice
 // versa).
-func serveUntilSignal(srv southface.Server) error {
+//
+// l is the structured logger. Lifecycle events (signal received, drain
+// starting, teardown done) are emitted at INFO so operators following the
+// daemon's log stream can track shutdown without parsing the binary.
+func serveUntilSignal(srv southface.Server, l *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	l.Info("south face listening; waiting for signal")
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
@@ -308,16 +350,22 @@ func serveUntilSignal(srv southface.Server) error {
 	select {
 	case err := <-serveErr:
 		// Serve ended without a signal (listener fault): teardown still runs.
-		return errors.Join(err, srv.Close())
+		l.Info("serve returned early; running teardown")
+		closeErr := srv.Close()
+		l.Info("teardown complete")
+		return errors.Join(err, closeErr)
 	case <-ctx.Done():
 		// Signal received. Stop intercepting FIRST so a second
 		// SIGTERM/SIGINT during a wedged drain kills the process hard
 		// (default disposition) instead of being swallowed.
+		l.Info("signal received; starting bounded drain")
 		stop()
 		closeErr := srv.Close()
 		// Close shut the listener down, so Serve returns promptly (a clean
 		// shutdown collapses to nil); drain the goroutine and surface both.
-		return errors.Join(<-serveErr, closeErr)
+		serveResult := <-serveErr
+		l.Info("teardown complete")
+		return errors.Join(serveResult, closeErr)
 	}
 }
 
@@ -327,14 +375,24 @@ func serveUntilSignal(srv southface.Server) error {
 // The optional ops token-bucket pair defaults to 100/200; an explicit
 // non-positive -ops-per-second or an -ops-burst below one whole token (which
 // would wedge the bucket) is a wiring fault and refuses with the same typed
-// error.
+// error. An unknown -log-level token refuses with errBadLogLevel (via
+// observ.ParseLevel) BEFORE any socket is bound.
 func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 	profile, tenancy, grantedIntents, downloadablePrefixes string,
 	maxFileSize, maxRequestBytes int64, opsPerSecond, opsBurst float64,
 	s3CredentialFile, s3STSRoleARN, s3STSEndpoint string,
 	storageLane, caBundle string, laneDevDirect bool,
-	s3Bucket, s3Endpoint, s3Region string, s3PathStyle bool) (brokerConfig, error) {
+	s3Bucket, s3Endpoint, s3Region string, s3PathStyle bool,
+	logLevelStr string) (brokerConfig, error) {
 	var cfg brokerConfig
+
+	// -log-level is validated FIRST — before any engine or socket flag — so
+	// an unknown level token is refused pre-bind with a clear typed error.
+	level, err := observ.ParseLevel(logLevelStr)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.logLevel = level
 
 	kind, err := objectstore.ParseEngine(engine)
 	if err != nil {
@@ -469,6 +527,7 @@ func validate(engine, engineRoot, auditSink, socketDir, filesystemID,
 		dlPrefixes:       splitNonEmpty(downloadablePrefixes),
 		profile:          prof,
 		tenancy:          ten,
+		logLevel:         level,
 	}
 	return cfg, nil
 }
@@ -534,7 +593,11 @@ func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstor
 // admission refusal BEFORE any socket is bound (NFR-SEC-60); the caller serves
 // the returned Server and Closes it for teardown (engine TeardownScope +
 // registry/ceilings Release).
-func compose(cfg brokerConfig) (southface.Server, error) {
+//
+// l is threaded into the southface.Config so the session's dispatcher, the
+// accept gate, and the http.Server ErrorLog all emit structured JSON via the
+// same handler.
+func compose(cfg brokerConfig, l *slog.Logger) (southface.Server, error) {
 	// Engine-kind construction inputs FIRST — both ADR-0010 kinds are real.
 	// For s3: the dial path is the storage-lane transport (or the loud
 	// dev-direct rig client), the credential arrives through the
@@ -635,6 +698,7 @@ func compose(cfg brokerConfig) (southface.Server, error) {
 		BrokerMaxFileSize: cfg.maxFileSize,
 		CheckPeer:         southface.HostPeerChecker(),
 		HostUID:           uint32(os.Getuid()),
+		Logger:            l,
 	})
 	if err != nil {
 		return nil, err

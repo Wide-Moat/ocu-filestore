@@ -20,7 +20,7 @@ import (
 func TestServerTimeoutsConfigured(t *testing.T) {
 	dir := filepath.Join(shortSocketDir(t), "timeouts")
 	reg := NewSessionRegistry()
-	s, err := provisionSession(dir, SessionEntry{FilesystemID: "fs-to"}, reg, scopeEchoHandler(), allowAllPeer, 4242)
+	s, err := provisionSession(dir, SessionEntry{FilesystemID: "fs-to"}, reg, scopeEchoHandler(), allowAllPeer, 4242, discardLogger())
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestStalledUploadStreamAborts(t *testing.T) {
 	d.maxFileSize = 1 << 20
 	d.frameReadTimeout = 200 * time.Millisecond // shrink the budget for the test
 
-	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242)
+	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger())
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}

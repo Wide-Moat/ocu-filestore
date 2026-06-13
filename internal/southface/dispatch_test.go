@@ -4,8 +4,10 @@
 package southface
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -441,5 +443,70 @@ func TestD8Split(t *testing.T) {
 	same := mapDenyDegraded(denyScopeMismatch, denyScopeMismatch)
 	if same.CorrelationID != "" {
 		t.Fatalf("CorrelationID = %q on agreement, want empty", same.CorrelationID)
+	}
+}
+
+// TestDenyWarnLogsAuditReason pins T-14-02: the deny WARN log carries the
+// broker-resolved AuditReason (the TRUTH) while the wire response carries the
+// degraded wire code. This verifies the two surfaces stay separated. A
+// scope-mismatch deny (which in normal anti-enumeration would degrade to
+// not_found on the wire) is tested here: both the log and the wire body are
+// asserted.
+func TestDenyWarnLogsAuditReason(t *testing.T) {
+	var logBuf bytes.Buffer
+	l := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
+	d.logger = l
+
+	// Scope-mismatch: body scope differs from PeerScope.
+	body := bodyFor("wrong-scope", IntentRead)
+	r := scopedRequest(OpListDirectory, body, boundScope, []Intent{IntentRead})
+	w := httptest.NewRecorder()
+	d.ServeHTTP(w, r)
+
+	// Wire body must still be the standard deny (unchanged anti-enumeration).
+	var ce connectError
+	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
+		t.Fatalf("wire body not valid JSON: %v", err)
+	}
+	// The scope_mismatch deny maps to permission_denied wire code.
+	if ce.Code != wireCodePermissionDenied {
+		t.Errorf("wire code = %q, want %q", ce.Code, wireCodePermissionDenied)
+	}
+
+	// Log must carry the TRUTH (deny_class = scope_mismatch).
+	logged := logBuf.String()
+	if !strings.Contains(logged, "scope_mismatch") {
+		t.Errorf("deny WARN log does not contain audit reason %q:\n%s", "scope_mismatch", logged)
+	}
+	if !strings.Contains(logged, "WARN") {
+		t.Errorf("deny WARN log level is not WARN:\n%s", logged)
+	}
+}
+
+// TestDispatchStageOrderUnchanged pins the LOCKED STAGE 0->4 order: after
+// adding logging to the dispatcher the existing ordering test still passes
+// with a logger set.
+func TestDispatchStageOrderUnchangedWithLogger(t *testing.T) {
+	var logBuf bytes.Buffer
+	l := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
+	d.logger = l
+
+	// A well-formed request still passes stages 0-2 and hits the audit
+	// guard (stage 3) before the registry (stage 4). This matches the
+	// ordering test logic.
+	body := bodyFor(boundScope, IntentRead)
+	r := scopedRequest(OpListDirectory, body, boundScope, []Intent{IntentRead})
+	w := httptest.NewRecorder()
+	d.ServeHTTP(w, r)
+
+	// A logger being set must not change the response code: OpListDirectory
+	// is unimplemented in the default registry (no engine), so the response
+	// is 501 unimplemented.
+	if w.Code != http.StatusNotImplemented {
+		t.Errorf("response code = %d, want 501 (unimplemented); logger must not alter dispatch ordering", w.Code)
 	}
 }

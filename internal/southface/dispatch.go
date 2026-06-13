@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 )
 
 // defaultFrameReadTimeout is the conservative per-frame inbound read budget
@@ -48,6 +51,20 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 	_ = json.NewEncoder(w).Encode(connectError{Code: v.WireCode, Message: message})
 }
 
+// denyWith writes the Connect error response AND emits a WARN log carrying
+// the broker-resolved AuditReason truth (never the degraded wire reason). The
+// log carries deny_class (the truth) so operators see the real reason even
+// when the WIRE degrades it for anti-enumeration. This is the single deny
+// choke point; the LOCKED STAGE 0->4 order is unchanged — the log is
+// strictly additive observation.
+func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
+	d.logger.Warn("broker deny",
+		slog.String(observ.KeyDenyClass, v.AuditReason),
+		slog.String(observ.KeyReason, message),
+	)
+	writeConnectError(w, v, message)
+}
+
 // dispatcher is the south-face http.Handler: it runs the LOCKED fail-closed
 // pipeline for every accepted request and routes the cleared request to the
 // per-op handler. The seam dependencies (resolver, guard, ceilings) are
@@ -61,6 +78,11 @@ type dispatcher struct {
 	// engine is the consumer-side storage seam the seven phase-9 handlers
 	// call; the wiring phase binds the real local-volume engine.
 	engine Engine
+	// logger is the structured logger for deny WARNs and other diagnostic
+	// events. Defaults to slog.DiscardHandler so tests that do not supply
+	// one are unaffected. Every call site uses logger.With to carry a
+	// *slog.Logger so T2-18 request-id threading drops in without rework.
+	logger *slog.Logger
 	// ids is the session-scoped uuid record store the listing emitter mints
 	// through and phase 10 resolves through.
 	ids *objectIDStore
@@ -137,6 +159,7 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// wired. See the maxFileSize field doc.
 		maxFileSize:      sizeCeiling,
 		frameReadTimeout: defaultFrameReadTimeout,
+		logger:           slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -161,10 +184,10 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if err == errBadMethod {
 			w.Header().Set("Allow", http.MethodPost)
-			writeConnectError(w, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
+			d.denyWith(w, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
 			return
 		}
-		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "unknown route")
+		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "unknown route")
 		return
 	}
 
@@ -182,13 +205,13 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// STAGE 0: version header (D1).
 	if err := checkVersion(r); err != nil {
-		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
+		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
 		return
 	}
 
 	// STAGE 0: Content-Type.
 	if err := checkContentType(r); err != nil {
-		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
+		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
 		return
 	}
 
@@ -196,7 +219,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// channel identity. Its absence is a wiring fault: fail closed.
 	ps, ok := peerScopeFromContext(r.Context())
 	if !ok {
-		writeConnectError(w, mapDeny(denyInternal), "no channel scope on connection")
+		d.denyWith(w, mapDeny(denyInternal), "no channel scope on connection")
 		return
 	}
 
@@ -206,11 +229,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// deny.
 	cl := r.ContentLength
 	if cl < 0 {
-		writeConnectError(w, mapDeny(denyMalformed), "unary request requires Content-Length")
+		d.denyWith(w, mapDeny(denyMalformed), "unary request requires Content-Length")
 		return
 	}
 	if cl > d.sizeCeiling {
-		writeConnectError(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+		d.denyWith(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
 		return
 	}
 
@@ -219,7 +242,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is resource_exhausted with NO x-deny-reason (n3).
 	sess := d.ceilings.Session(ps.FilesystemID)
 	if err := sess.TryConsumeOp(); err != nil {
-		writeConnectError(w, mapDeny(denyClassForErr(err)), "operation rate ceiling exceeded")
+		d.denyWith(w, mapDeny(denyClassForErr(err)), "operation rate ceiling exceeded")
 		return
 	}
 
@@ -233,15 +256,15 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeConnectError(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
+			d.denyWith(w, mapDeny(denySizeExceeded), "declared body size exceeds ceiling")
 			return
 		}
-		writeConnectError(w, mapDeny(denyMalformed), "malformed request envelope")
+		d.denyWith(w, mapDeny(denyMalformed), "malformed request envelope")
 		return
 	}
 	var env unaryEnvelope
 	if err := decodeUnaryEnvelopeBytes(bodyBytes, &env); err != nil {
-		writeConnectError(w, mapDeny(denyClassForDecodeErr(err)), "malformed request envelope")
+		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "malformed request envelope")
 		return
 	}
 
@@ -250,7 +273,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// channel-bound scope is a scope_mismatch deny (permission_denied +
 	// x-deny-reason), and the handler is never reached (D2/NFR-SEC-43).
 	if env.FilesystemID != ps.FilesystemID {
-		writeConnectError(w, mapDeny(denyScopeMismatch), "request scope does not match the session channel")
+		d.denyWith(w, mapDeny(denyScopeMismatch), "request scope does not match the session channel")
 		return
 	}
 
@@ -269,11 +292,11 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// fails closed.
 	requiredIntent, ok := requiredIntentForOp(op)
 	if !ok {
-		writeConnectError(w, mapDeny(denyInternal), "no required intent bound to operation")
+		d.denyWith(w, mapDeny(denyInternal), "no required intent bound to operation")
 		return
 	}
 	if env.AuthorizationMetadata.Intent != requiredIntent {
-		writeConnectError(w, mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
+		d.denyWith(w, mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
 		return
 	}
 
@@ -288,7 +311,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	grant, err := d.resolver.Resolve(r.Context(), evidence, req)
 	if err != nil {
-		writeConnectError(w, mapDeny(denyClassForErr(err)), "authorization denied")
+		d.denyWith(w, mapDeny(denyClassForErr(err)), "authorization denied")
 		return
 	}
 
@@ -301,7 +324,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
 	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
 	if err := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent)); err != nil {
-		writeConnectError(w, mapDeny(denyClassForErr(err)), "audit gate unavailable")
+		d.denyWith(w, mapDeny(denyClassForErr(err)), "audit gate unavailable")
 		return
 	}
 
@@ -310,7 +333,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is a wiring fault and fails closed.
 	h, ok := d.registry[op]
 	if !ok {
-		writeConnectError(w, mapDeny(denyUnimplemented), "operation not registered")
+		d.denyWith(w, mapDeny(denyUnimplemented), "operation not registered")
 		return
 	}
 
@@ -329,10 +352,10 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mandateDeny := func(auditReason, wireClass, message string) {
 		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
-			writeConnectError(w, mapDeny(denyAuditDown), "audit gate unavailable")
+			d.denyWith(w, mapDeny(denyAuditDown), "audit gate unavailable")
 			return
 		}
-		writeConnectError(w, mapDenyDegraded(auditReason, wireClass), message)
+		d.denyWith(w, mapDenyDegraded(auditReason, wireClass), message)
 	}
 
 	h(d.handlerDeps(), handlerCtx{
