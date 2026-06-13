@@ -237,10 +237,7 @@ func TestUploadThrottleAtomicAndSignalled(t *testing.T) {
 		index     int
 		throttled bool
 	}
-	var (
-		results    []outcome
-		successIdx []int
-	)
+	var results []outcome
 
 	for i := 0; i < burst; i++ {
 		body := concat(
@@ -263,7 +260,6 @@ func TestUploadThrottleAtomicAndSignalled(t *testing.T) {
 				t.Fatalf("upload %d: success trailer but staged %q, want %q", i, got, payload)
 			}
 			results = append(results, outcome{index: i, throttled: false})
-			successIdx = append(successIdx, i)
 			continue
 		}
 
