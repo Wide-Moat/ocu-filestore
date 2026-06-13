@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
 # ocu-filestored.service — systemd unit for the storage-broker daemon
 #
 # Requires systemd >= 207 (Type=notify). Tested on systemd >= 240.
