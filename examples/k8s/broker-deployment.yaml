@@ -162,20 +162,22 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
 
-          # Readiness probe — /readyz returns 200 only when the audit sink is
-          # not latched and the engine root is listable. A 503 on /readyz means
-          # the broker is running but 100% of file operations will be denied.
-          # Kubernetes will stop routing traffic to this pod until /readyz passes.
-          # Note: the -health-check flag probes /healthz; there is no separate
-          # -readiness-check flag in the current release. Use httpGet instead,
-          # which works because the ops listener binds loopback TCP (127.0.0.1:9464).
-          # (httpGet from the kubelet is initiated from the node, not from inside
-          # the container, and reaches 127.0.0.1 on the pod's network namespace.)
+          # Readiness probe — exec the daemon's own -health-check self-probe,
+          # NOT httpGet. The ops listener binds loopback only (127.0.0.1:9464).
+          # A kubelet httpGet probe is issued from the node and dials the pod IP,
+          # so host:127.0.0.1 would hit the node's own loopback, never the pod's
+          # network namespace — /readyz could never be reached and the pod would
+          # never become Ready. An exec probe runs inside the container, where
+          # 127.0.0.1 is the pod's loopback, so the self-probe reaches the ops
+          # listener. The self-probe targets /healthz (the only endpoint the
+          # -health-check mode dials); it confirms the daemon is serving on the
+          # loopback ops listener. The distroless image has no shell or curl,
+          # so the daemon binary serves as its own prober.
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 9464
-              host: 127.0.0.1
+            exec:
+              command:
+                - /usr/local/bin/ocu-filestored
+                - -health-check
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

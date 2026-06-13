@@ -88,16 +88,16 @@ func (d *dispatcher) denyWithLog(w http.ResponseWriter, l *slog.Logger, v DenyVe
 }
 
 // recordAllow records ops_total{op, outcome=allow, deny_class=none} after a
-// handler completes without a deny. A panic on an unknown op is swallowed —
-// instrumentation must never disrupt the handler path.
+// handler completes without a deny. RecordOp's deny_class enum is now derived
+// from the shared denyclass vocabulary and "none" is always a valid label, so
+// no recover() crutch guards this call: a panic here would be a genuine
+// label-drift wiring bug (a new Op not added to knownOps) and MUST surface
+// loudly in tests rather than be silently swallowed into an undercount.
 func (d *dispatcher) recordAllow(op string) {
 	if d.brokerMetrics == nil {
 		return
 	}
-	func() {
-		defer func() { recover() }() //nolint:errcheck
-		d.brokerMetrics.RecordOp(op, "allow", "none")
-	}()
+	d.brokerMetrics.RecordOp(op, "allow", "none")
 }
 
 // observeStage wraps a call to a stage function and records its latency in the
@@ -269,10 +269,12 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	denyOp := func(v DenyVerdict, message string) {
 		d.denyWithLog(w, reqLog, v, message)
 		if d.brokerMetrics != nil {
-			func() {
-				defer func() { recover() }() //nolint:errcheck
-				d.brokerMetrics.RecordOp(opStr, "deny", v.AuditReason)
-			}()
+			// No recover() crutch: every AuditReason a refusal can carry is a
+			// member of the shared denyclass vocabulary, which is exactly the
+			// deny_class label enum RecordOp accepts. A panic here would be a
+			// genuine label-drift wiring bug and MUST surface loudly in tests
+			// rather than be swallowed into a silently-wrong deny counter.
+			d.brokerMetrics.RecordOp(opStr, "deny", v.AuditReason)
 		}
 	}
 

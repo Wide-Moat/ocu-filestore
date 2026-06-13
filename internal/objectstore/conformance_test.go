@@ -726,4 +726,69 @@ func runConformance(t *testing.T, f confFactory) {
 	t.Run("Divergence_CASUpdateNotApplicable", func(t *testing.T) {
 		t.Skip("section-3 CAS-update sub-item is non-applicable: the Engine interface exposes no conditional-update mode (create-if-absent is covered by Overwrite_Refused and NoReplaceRace_Prop)")
 	})
+
+	// MoveDir into its OWN SUBTREE is refused IDENTICALLY on both engines with
+	// syscall.EINVAL, and the refusal is non-destructive: it lands before any
+	// copy/delete step, so the source tree survives byte-exact. The S3 engine's
+	// walk copies-then-deletes per object; without this guard a destination
+	// inside the source prefix would re-match moved-in keys on later listing
+	// pages, an unbounded destructive sweep on attacker-influenced names. The
+	// local engine's rename(2) refuses the same case with EINVAL — sentinel
+	// parity proves the broker sees one semantics across engines.
+	t.Run("MoveDirIntoOwnSubtree_Refused", func(t *testing.T) {
+		tg := f(t)
+		e, sc := tg.eng, tg.scope
+
+		// Seed a subtree with a file at every level the destination would
+		// straddle, so a runaway re-copy would have material to corrupt.
+		if err := e.MakeDir(ctx, sc, "a"); err != nil {
+			t.Fatalf("MakeDir(a): %v", err)
+		}
+		confWrite(t, e, sc, "a/top.txt", "TOP", false)
+		if err := e.MakeDir(ctx, sc, "a/b"); err != nil {
+			t.Fatalf("MakeDir(a/b): %v", err)
+		}
+		confWrite(t, e, sc, "a/b/deep.txt", "DEEP", false)
+
+		// dst is strictly inside src's subtree (a NON-existing destination
+		// whose parent already exists, so neither engine short-circuits on the
+		// dst-exists row first): must refuse with EINVAL on BOTH engines (not
+		// ErrAlreadyExists, not ErrNotExist).
+		for _, dst := range []string{"a/sub", "a/b/sub"} {
+			if err := e.MoveDir(ctx, sc, "a", dst, false); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("MoveDir(a -> %q into own subtree) = %v, want syscall.EINVAL", dst, err)
+			}
+		}
+
+		// Non-destructive: every source path survives byte-exact — no partial
+		// copy and no partial delete occurred.
+		for path, want := range map[string]string{"a/top.txt": "TOP", "a/b/deep.txt": "DEEP"} {
+			if got := confRead(t, e, sc, path); got != want {
+				t.Fatalf("source %q after refused subtree move = %q, want %q (no partial copy/delete)", path, got, want)
+			}
+		}
+		if fi, err := e.Stat(ctx, sc, "a/b"); err != nil || !fi.IsDir {
+			t.Fatalf("Stat(a/b after refused subtree move) = %+v, %v; want surviving dir", fi, err)
+		}
+		// The straddled destinations were never materialized as new trees.
+		for _, ghost := range []string{"a/sub", "a/b/sub"} {
+			if _, err := e.Stat(ctx, sc, ghost); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("Stat(%q after refused subtree move) = %v, want fs.ErrNotExist", ghost, err)
+			}
+		}
+
+		// dst is src itself: the src==dst row resolves to ErrAlreadyExists on
+		// both engines (decided before the subtree guard), never EINVAL.
+		if err := e.MoveDir(ctx, sc, "a", "a", false); !errors.Is(err, ErrAlreadyExists) {
+			t.Fatalf("MoveDir(a -> a) = %v, want ErrAlreadyExists", err)
+		}
+
+		// Sibling-prefix is NOT a subtree: "ab" shares a textual prefix with
+		// "a" but is not inside it, so the move must NOT be refused as a
+		// subtree (it proceeds; the empty "ab" parent does not exist, so it
+		// surfaces the ordinary missing-parent refusal, never EINVAL).
+		if err := e.MoveDir(ctx, sc, "a", "ab", false); errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("MoveDir(a -> ab sibling-prefix) = EINVAL, want non-subtree handling")
+		}
+	})
 }

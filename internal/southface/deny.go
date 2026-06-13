@@ -8,28 +8,37 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/denyclass"
 )
 
-// Deny classes. The first six are the contract's deny vocabulary — the only
-// values that may ever surface in an x-deny-reason header. The rest are
-// capacity, conflict, registry, and system states that never carry the
-// header; their names exist for the audit record and the wire-code mapping
-// only.
+// Deny classes. The token strings are owned by the shared, zero-dependency
+// internal/denyclass package — the SINGLE source of truth consumed by both the
+// south face (here) and the telemetry deny_class label enum. The local short
+// names below are aliases for use throughout this package; adding a deny class
+// happens in internal/denyclass, and the drift-guard test
+// (TestDenyTableMatchesSharedVocabulary) fails if the denyTable below loses a
+// class the shared vocabulary defines.
+//
+// The first six are the contract's deny vocabulary — the only values that may
+// ever surface in an x-deny-reason header. The rest are capacity, conflict,
+// registry, and system states that never carry the header; their names exist
+// for the audit record and the wire-code mapping only.
 const (
-	denyScopeMismatch   = "scope_mismatch"
-	denyIntentDenied    = "intent_denied"
-	denyNotDownloadable = "not_downloadable"
-	denyLeaseExpired    = "lease_expired"
-	denySizeExceeded    = "size_exceeded"
-	denyNotFound        = "not_found"
+	denyScopeMismatch   = denyclass.ScopeMismatch
+	denyIntentDenied    = denyclass.IntentDenied
+	denyNotDownloadable = denyclass.NotDownloadable
+	denyLeaseExpired    = denyclass.LeaseExpired
+	denySizeExceeded    = denyclass.SizeExceeded
+	denyNotFound        = denyclass.NotFound
 
-	denyMalformed     = "malformed_envelope"
-	denyThrottle      = "throttle"
-	denyAuditDown     = "audit_down"
-	denyAlreadyExists = "already_exists"
-	denyAborted       = "aborted"
-	denyUnimplemented = "unimplemented"
-	denyInternal      = "internal"
+	denyMalformed     = denyclass.Malformed
+	denyThrottle      = denyclass.Throttle
+	denyAuditDown     = denyclass.AuditDown
+	denyAlreadyExists = denyclass.AlreadyExists
+	denyAborted       = denyclass.Aborted
+	denyUnimplemented = denyclass.Unimplemented
+	denyInternal      = denyclass.Internal
 
 	// denyDirNotEmpty is the audited TRUTH for a non-recursive removeDirectory
 	// on a non-empty directory (phase 9, W1). It is a distinct audit-reason
@@ -37,14 +46,14 @@ const (
 	// names the real operational refusal; its WIRE class is
 	// invalid_argument/400 with no x-deny-reason header (a request fault, not
 	// an authorization verdict).
-	denyDirNotEmpty = "directory_not_empty"
+	denyDirNotEmpty = denyclass.DirNotEmpty
 
 	// denyBackendUnavailable is the audited TRUTH for a transient backend
 	// failure surviving the engine's bounded retries (a network engine's
 	// backend leg failed; the caller may retry). It is a DISTINCT audited
 	// truth from denyAuditDown — the audit gate is healthy; the storage
 	// backend is not — though both map to the unavailable wire code.
-	denyBackendUnavailable = "backend_unavailable"
+	denyBackendUnavailable = denyclass.BackendUnavailable
 )
 
 // Connect wire codes (closed set).

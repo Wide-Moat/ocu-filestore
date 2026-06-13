@@ -3,13 +3,19 @@
 
 package telemetry
 
-// This file declares the concrete broker metric set. Op names and deny-class
-// names are mirrored here as string constants — telemetry is a leaf package
-// that does NOT import internal/southface. The sync rule: whenever
-// internal/southface/southface.go or internal/southface/deny.go adds or
-// renames an Op or deny-class constant, the mirror slices below MUST be
-// updated to match. TestClosedLabelAllOpsAccepted in metrics_test.go pins
-// the ops mirror by calling KnownOps().
+import "github.com/Wide-Moat/ocu-filestore/internal/denyclass"
+
+// This file declares the concrete broker metric set. Op names are mirrored
+// here as string constants — telemetry is a leaf package that does NOT import
+// internal/southface (which would create an import cycle, since southface
+// imports telemetry). The op-name sync rule: whenever
+// internal/southface/southface.go adds or renames an Op constant, the knownOps
+// slice below MUST be updated to match; TestClosedLabelAllOpsAccepted pins it.
+//
+// The deny_class label enum is NOT mirrored: it is derived directly from the
+// shared, zero-dependency internal/denyclass package — the SINGLE source of
+// truth that southface's deny table also consumes. There is no second list to
+// drift.
 
 // knownOps is the closed set of southface Op names used as label values in
 // ops_total{op,...}. Mirrored from internal/southface/southface.go.
@@ -36,22 +42,11 @@ var knownOps = []string{
 }
 
 // knownDenyClasses is the closed set of deny-class audit-reason values used as
-// label values in ops_total{deny_class,...}. Mirrored from
-// internal/southface/deny.go. "none" is the sentinel used for allow outcomes.
-var knownDenyClasses = []string{
-	"none",
-	"scope_mismatch",
-	"intent_mismatch",
-	"not_found",
-	"audit_down",
-	"unimplemented",
-	"internal",
-	"throttle_exceeded",
-	"size_exceeded",
-	"fd_exceeded",
-	"bytes_exceeded",
-	"route_op_mismatch",
-}
+// label values in ops_total{deny_class,...}. It is derived — not mirrored —
+// from the shared internal/denyclass vocabulary, so every value southface can
+// emit as a refusal's AuditReason is a valid label and the set can never drift.
+// denyclass.All() includes the "none" sentinel used for allow outcomes.
+var knownDenyClasses = denyclass.All()
 
 // knownOutcomes is the closed set of outcome label values in ops_total.
 var knownOutcomes = []string{"allow", "deny"}
