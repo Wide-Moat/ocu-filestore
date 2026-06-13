@@ -24,14 +24,14 @@ jobs:
   build-broker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: static build of ocu-filestored
         run: CGO_ENABLED=0 go build -trimpath -o ocu-filestored ./cmd/ocu-filestored
       - name: upload the broker binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ocu-filestored
           path: ocu-filestored
@@ -49,17 +49,21 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-broker
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: download the broker binary (same run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ocu-filestored
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
-      - name: smoke — the real binary refuses with the scaffold sentinel
+      - name: smoke — the real daemon refuses a missing required flag
+        # The daemon now composes a real stack; invoked with only -engine and
+        # no required flags it refuses BEFORE binding any socket with the typed
+        # required-flag error. Asserts exit 1 plus a stable substring of the
+        # committed error text main.go emits for the first missing flag.
         # The runner's default shell is bash -e; capture the expected non-zero
         # exit with || so the assertion below judges it, not -e.
         run: |
@@ -68,11 +72,15 @@ jobs:
           out=$(./ocu-filestored -engine local-volume 2>&1) || code=$?
           echo "$out"
           if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 from the scaffold build, got $code"
+            echo "::error::expected exit 1 on a missing required flag, got $code"
             exit 1
           fi
-          echo "$out" | grep -q "not implemented in this build" || {
-            echo "::error::scaffold refusal sentinel missing from output"
+          echo "$out" | grep -q "required flag missing or invalid" || {
+            echo "::error::missing-required-flag error text missing from output"
+            exit 1
+          }
+          echo "$out" | grep -q "engine-root" || {
+            echo "::error::expected the first missing required flag (-engine-root) to be named"
             exit 1
           }
       - name: smoke — unknown engine is refused, never silently defaulted
@@ -89,5 +97,74 @@ jobs:
             echo "::error::unknown-engine sentinel missing from output"
             exit 1
           }
-      - name: run the Integration + E2E slice
+      - name: smoke — -engine s3 without a storage lane refuses naming ADR-0011
+        # T1-8: with the FULL s3 flag set and NO lane posture the daemon
+        # passes flag validation and then refuses pre-bind with the typed
+        # lane requirement naming ADR-0011 — the bypass dial does not exist
+        # (NFR-SEC-16/85), and no socket is ever bound.
+        run: |
+          set -uo pipefail
+          tmp=$(mktemp -d)
+          code=0
+          out=$(./ocu-filestored -engine s3 \
+            -s3-bucket ocu-smoke \
+            -s3-endpoint http://127.0.0.1:9 \
+            -audit-sink "$tmp/audit.jsonl" \
+            -south-socket-dir "$tmp/sock" \
+            -filesystem-id fs-smoke \
+            -broker-max-file-size 1 2>&1) || code=$?
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 on -engine s3 without a lane, got $code"
+            exit 1
+          fi
+          echo "$out" | grep -q "ADR-0011" || {
+            echo "::error::the lane refusal must name ADR-0011"
+            exit 1
+          }
+          if ls "$tmp/sock"/*.sock >/dev/null 2>&1; then
+            echo "::error::a socket was bound despite the lane refusal"
+            exit 1
+          fi
+      - name: run the Integration + E2E slice (local-volume leg)
+        env:
+          OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+
+  # e2e-s3 is the same release-gating live-binary slice re-pointed at the
+  # REAL s3 engine against the committed MinIO rig: `-engine s3` serves live
+  # MinIO through the full daemon (ADR-0010 — both kinds real). The
+  # dev-direct dial is the rig posture only; the production lane refusal is
+  # pinned by the smoke above. The slice includes the composed
+  # credential-redaction check (TestE2ES3CredentialRedaction).
+  e2e-s3:
+    runs-on: ubuntu-latest
+    needs: build-broker
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: download the broker binary (same run)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ocu-filestored
+      - name: make the broker binary executable
+        run: chmod +x ocu-filestored
+      - name: boot the MinIO rig
+        run: |
+          docker compose -f deploy/docker-compose.test.yml up -d --wait minio
+          docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
+      - name: run the Integration + E2E slice (s3 leg, live MinIO)
+        env:
+          OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
+          OCU_E2E_ENGINE: s3
+          OCU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          OCU_S3_TEST_BUCKET: ocu-conformance
+          OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
+          OCU_S3_TEST_ACCESS_KEY: ocu-test-root
+          OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
+        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+      - name: tear the rig down
+        if: always()
+        run: docker compose -f deploy/docker-compose.test.yml down -v

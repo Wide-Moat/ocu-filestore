@@ -64,7 +64,7 @@ dependency reference texts, not ours.
 
 ## Git
 
-- Identity: `i@yambr.com`. Verify before committing.
+- Identity: `developer@widemoat.ai`. Verify before committing.
 - Conventional commits. End commit messages with:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - Branch off `main`; one PR per logical change. No merge without an explicit

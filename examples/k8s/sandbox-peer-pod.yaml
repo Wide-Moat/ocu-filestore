@@ -1,0 +1,182 @@
+---
+# examples/k8s/sandbox-peer-pod.yaml
+#
+# Example colocation of the storage broker with a sandbox peer container
+# in a single Pod. This is the canonical single-tenant deployment pattern.
+#
+# WHY A POD, NOT SEPARATE DEPLOYMENTS:
+# The south face serves exclusively over per-session Unix sockets in
+# -south-socket-dir (/run/ocu-filestore/sessions). Unix sockets are bound to
+# the filesystem — they cannot cross pod boundaries. The broker and its guest
+# peer must share the same socket-dir volume, which is an emptyDir scoped to
+# the pod lifetime. Co-locating them in one Pod is therefore the correct
+# architectural choice for the south face.
+#
+# ONE BROKER PER TENANT (NFR-SEC-76):
+# The broker's accept gate uses SO_PEERCRED to extract the kernel-attested uid
+# of every connecting peer. It admits ONLY a peer whose uid equals the broker's
+# own uid (65532). This is enforced at every accept(), not just at startup. As
+# a result, a single broker instance serves one guest peer — do not share a
+# broker instance across tenants. Deploy one Pod (or Deployment with replicas:1)
+# per tenant, each with its own socket-dir emptyDir and its own PVCs.
+#
+# PEER UID REQUIREMENT:
+# The sandbox peer container MUST run as uid 65532 to pass the broker's accept
+# gate. If the peer runs as any other uid, the connection is closed without
+# reading a byte. The peer's securityContext must match.
+#
+# This file is a template. Replace the sandbox-peer image and args with your
+# actual guest workload. The broker container spec here mirrors
+# broker-deployment.yaml; refer to that file for field-level comments.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ocu-session
+  labels:
+    app.kubernetes.io/name: ocu-session
+    app.kubernetes.io/component: storage-session
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  terminationGracePeriodSeconds: 35
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+
+  volumes:
+    - name: engine-root
+      persistentVolumeClaim:
+        claimName: ocu-filestored-engine-root
+    - name: audit
+      persistentVolumeClaim:
+        claimName: ocu-filestored-audit
+    # socket-dir is an emptyDir: it exists only for the lifetime of this Pod.
+    # Both the broker and the sandbox peer mount it. The broker creates per-session
+    # sockets here; the peer dials them. Neither container can create sockets in
+    # the other's filesystem namespace — the emptyDir is the only shared surface.
+    - name: socket-dir
+      emptyDir: {}
+
+  containers:
+    # ── Storage broker ────────────────────────────────────────────────────────
+    - name: ocu-filestored
+      image: ghcr.io/wide-moat/ocu-filestore:latest
+      imagePullPolicy: Always
+
+      args:
+        - -engine
+        - local-volume
+        - -engine-root
+        - /var/lib/ocu-filestore/engine-root
+        - -audit-sink
+        - /var/log/ocu-filestore/audit.ocsf.jsonl
+        - -south-socket-dir
+        - /run/ocu-filestore/sessions
+        - -filesystem-id
+        - $(OCU_FILESYSTEM_ID)
+        - -broker-max-file-size
+        - "1073741824"
+        - -granted-intents
+        - read,write
+        - -profile
+        - trusted_operator
+        - -tenancy
+        - single-tenant
+        - -ops-listen
+        - 127.0.0.1:9464
+
+      env:
+        - name: OCU_FILESYSTEM_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+
+      volumeMounts:
+        - name: engine-root
+          mountPath: /var/lib/ocu-filestore/engine-root
+        - name: audit
+          mountPath: /var/log/ocu-filestore
+        - name: socket-dir
+          mountPath: /run/ocu-filestore/sessions
+
+      livenessProbe:
+        exec:
+          command:
+            - /usr/local/bin/ocu-filestored
+            - -health-check
+        initialDelaySeconds: 5
+        periodSeconds: 15
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 9464
+          host: 127.0.0.1
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+
+    # ── Sandbox peer (guest workload) ─────────────────────────────────────────
+    # Replace this with your actual sandbox/guest container image and args.
+    # The peer MUST run as uid 65532 to pass the broker's SO_PEERCRED accept gate.
+    - name: sandbox-peer
+      # Replace with your actual sandbox peer image.
+      image: your-org/your-sandbox-peer:latest
+      imagePullPolicy: Always
+
+      securityContext:
+        # uid 65532 is mandatory — the broker's accept gate checks SO_PEERCRED
+        # and closes any connection from a peer with a different uid.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+
+      volumeMounts:
+        # Mount the socket-dir read-only: the peer only needs to dial the socket,
+        # not create one. Read access to the directory is enough to connect.
+        - name: socket-dir
+          mountPath: /run/ocu-filestore/sessions
+          readOnly: true
+
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 1000m
+          memory: 512Mi

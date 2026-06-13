@@ -5,9 +5,45 @@ package objectstore
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
 )
+
+// TestParseEngine pins that both engine kinds named by the seam parse from
+// their deployment-config strings and that an unknown kind wraps
+// ErrUnknownEngine — never a silent default (ENG-03, ADR-0010).
+func TestParseEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		want    EngineKind
+		wantErr error
+	}{
+		{"local_volume", "local-volume", LocalVolume, nil},
+		{"s3", "s3", S3, nil},
+		{"unknown", "nfs", "", ErrUnknownEngine},
+		{"empty", "", "", ErrUnknownEngine},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseEngine(tc.in)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("ParseEngine(%q): got %v, want ErrUnknownEngine", tc.in, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseEngine(%q): got err %v, want nil", tc.in, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseEngine(%q): got %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
 
 // TestParseEngineKnownKinds asserts both day-one engines parse to their
 // declared kind (ADR-0010: local-volume and s3, both present from day one).
@@ -38,6 +74,66 @@ func TestParseEngineUnknownIsRefused(t *testing.T) {
 		for _, valid := range []string{string(LocalVolume), string(S3)} {
 			if !strings.Contains(err.Error(), valid) {
 				t.Errorf("ParseEngine(%q) error %q does not list valid kind %q", bogus, err, valid)
+			}
+		}
+	}
+}
+
+// TestIsPathEscape pins the normalize helper that collapses the two os.Root
+// escape wrappers into ONE caller-visible class: a rename escape arrives as
+// *os.LinkError (renameat path family), every other escape as *fs.PathError
+// (openat path family). The lexical sentinel and nil are NOT in the class.
+// This pin exists BEFORE any verb relies on the helper because mapping code
+// that checks only *fs.PathError silently misses rename escapes.
+func TestIsPathEscape(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"path_error", &fs.PathError{Op: "openat", Path: "x", Err: errors.New("path escapes from parent")}, true},
+		{"link_error", &os.LinkError{Op: "renameat", Old: "a", New: "../b", Err: errors.New("path escapes from parent")}, true},
+		{"wrapped_path_error", errors.Join(errors.New("ctx"), &fs.PathError{Op: "open", Path: "x", Err: errors.New("e")}), true},
+		{"lexical_sentinel", ErrInvalidPath, false},
+		{"nil", nil, false},
+		{"plain_error", errors.New("boring"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPathEscape(tc.err); got != tc.want {
+				t.Fatalf("isPathEscape(%v): got %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTransientThrottledSentinels pins the W1 resilience sentinels: each is
+// errors.Is-matchable through a wrap, and the two are distinct identities
+// from each other and from every earlier sentinel (a throttle is a pacing
+// verdict, a transient is a retryable failure — they map to different deny
+// classes downstream).
+func TestTransientThrottledSentinels(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sentinel error
+	}{
+		{"transient", ErrTransient},
+		{"throttled", ErrThrottled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapped := fmt.Errorf("verb context: %w", tc.sentinel)
+			if !errors.Is(wrapped, tc.sentinel) {
+				t.Fatalf("wrapped %v does not errors.Is-match its sentinel", tc.sentinel)
+			}
+		})
+	}
+	distinct := []error{
+		ErrTransient, ErrThrottled, ErrAlreadyExists, ErrNotADirectory,
+		ErrUnknownEngine, ErrInvalidPath, ErrInvalidScopeID,
+	}
+	for i, a := range distinct {
+		for j, b := range distinct {
+			if i != j && errors.Is(a, b) {
+				t.Fatalf("sentinel %v unexpectedly matches %v", a, b)
 			}
 		}
 	}

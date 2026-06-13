@@ -11,6 +11,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly cron: Sunday at 02:00 UTC (T2-10, SUPPLY-03)
+    - cron: '0 2 * * 0'
 
 permissions:
   contents: read
@@ -25,9 +28,7 @@ jobs:
   lexicon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: naming denylist
         # The project keeps a denylist of terms that must not appear in the
         # tree (working names, third-party naming). The list is maintained as
@@ -62,7 +63,7 @@ jobs:
   secrets-gitleaks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -76,7 +77,7 @@ jobs:
   secrets-trufflehog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -93,13 +94,9 @@ jobs:
   sast-semgrep:
     runs-on: ubuntu-latest
     container:
-      # Pinned to a version tag + its digest (not the moving `latest`) so a
-      # security scanner cannot change under us between runs. Bump deliberately.
-      image: semgrep/semgrep:1.166.0@sha256:c180f0c93a17b420c0af5006214a29d3c747c5459c732b740191adf657dd0068
+      image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: semgrep
         # Emit SARIF for the Security tab AND keep the blocking exit code: run
         # the SARIF pass non-blocking, then a second gating pass. `|| true` on
@@ -119,7 +116,7 @@ jobs:
           SEMGREP_SUPPRESS_ERRORS: "false"
       - name: upload semgrep SARIF to the Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
         with:
           sarif_file: semgrep.sarif
         continue-on-error: true
@@ -127,9 +124,7 @@ jobs:
   sca-trivy-fs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: trivy filesystem — CRITICAL blocks
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
         with:
@@ -143,8 +138,6 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      # Third-party action pinned to a commit SHA (v5) — larger supply-chain
-      # surface than GitHub-owned actions; bump the SHA deliberately on upgrade.
-      - uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825  # v5
+      - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017 # v5.5.3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
