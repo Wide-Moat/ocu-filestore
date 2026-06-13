@@ -41,6 +41,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+      - seccomp:./seccomp/ocu-filestored.json
     network_mode: none
     stop_grace_period: 30s
     command:
