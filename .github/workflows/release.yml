@@ -110,6 +110,13 @@ jobs:
           echo "$out"
           [ "$code" -eq 1 ] || { echo "::error::expected exit 1, got $code"; exit 1; }
       - name: run the Integration + E2E slice
+        # The e2e helper finds the real daemon via OCU_BROKER_BIN; without it
+        # every live case t.Skip's (a skip counts as a pass) and this
+        # release-gating slice goes vacuous. The build step above writes the
+        # binary to the workspace root, so point at that absolute path — mirror
+        # the e2e.yml working pattern.
+        env:
+          OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
       - name: upload the release coverage profile
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
