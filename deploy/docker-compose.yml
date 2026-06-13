@@ -41,7 +41,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      - seccomp:./seccomp/ocu-filestored.json
+      # Compose resolves a relative seccomp path against the CWD of the
+      # `docker compose` invocation, which the docs pin to the repo root
+      # (`docker compose -f deploy/docker-compose.yml ...`). The profile lives
+      # at deploy/seccomp/, so it must be referenced as ./deploy/seccomp/ for
+      # the default-deny hardening (T2-15, NFR-SEC-02) to actually apply.
+      - seccomp:./deploy/seccomp/ocu-filestored.json
     network_mode: none
     stop_grace_period: 30s
     command:
