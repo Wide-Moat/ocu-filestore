@@ -1,0 +1,190 @@
+---
+# examples/k8s/broker-deployment.yaml
+#
+# Storage-broker Deployment for the ocu-filestored daemon (component-04).
+#
+# SINGLE-TENANT trusted_operator SHELF ONLY.
+# This manifest targets the initial deployment shelf: one trusted_operator
+# profile, local-volume engine, one broker instance per tenant
+# (NFR-SEC-76 — see README for the one-broker-per-tenant rule).
+#
+# Apply order: PVCs first, then this Deployment.
+# See examples/k8s/README.md for full apply instructions.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocu-filestored
+  labels:
+    app.kubernetes.io/name: ocu-filestored
+    app.kubernetes.io/component: storage-broker
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  # One replica per tenant — see README and NFR-SEC-76.
+  # Do NOT increase replicas: the local-volume engine uses RWO PVCs that cannot
+  # be safely shared, and the flock guard (T2-7) enforces single-writer at the
+  # filesystem level. More than one replica on the same PVC is undefined.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ocu-filestored
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ocu-filestored
+        app.kubernetes.io/component: storage-broker
+    spec:
+      # 35 seconds — 10 s above the daemon's bounded 25-second drain so a
+      # SIGTERM always lets graceful drain + erase-before-reuse (NFR-SEC-54)
+      # finish before the pod is force-killed. Matches the systemd unit's
+      # TimeoutStopSec (see contrib/systemd/ocu-filestored.service).
+      terminationGracePeriodSeconds: 35
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          # RuntimeDefault is the portable choice: it applies the container
+          # runtime's default seccomp profile (runc/containerd default allowlist)
+          # on every node without needing the shipped profile to be present on
+          # the node filesystem.
+          #
+          # For tighter confinement, replace with the Localhost reference below
+          # (requires the seccomp profile to be copied to each node's seccomp
+          # directory — see README for instructions):
+          #
+          #   type: Localhost
+          #   localhostProfile: ocu-filestored/ocu-filestored.json
+          #
+          # The shipped deploy/seccomp/ocu-filestored.json is the broker-specific
+          # default-deny allowlist (T2-15, NFR-SEC-02). RuntimeDefault is the
+          # recommended default for portability; Localhost provides the tightest
+          # confinement when the profile is deployed to all nodes.
+          type: RuntimeDefault
+
+      volumes:
+        # engine-root PVC — customer workspace bytes for the local-volume engine.
+        # RWO (ReadWriteOnce): only a single pod may mount this volume at a time,
+        # which is the storage-level guarantee that enforces single-writer. The
+        # flock guard adds a second layer at the filesystem level (T2-7).
+        - name: engine-root
+          persistentVolumeClaim:
+            claimName: ocu-filestored-engine-root
+
+        # audit PVC — fail-closed hash-chained OCSF JSONL audit sink (NFR-SEC-79).
+        # RWO for the same reason: the hash chain must have exactly one writer.
+        - name: audit
+          persistentVolumeClaim:
+            claimName: ocu-filestored-audit
+
+        # socket-dir emptyDir — per-session Unix sockets. Both the broker and
+        # the sandbox peer container share this volume. The broker's accept gate
+        # admits only a peer whose kernel-attested uid matches the broker's own
+        # uid (NFR-SEC-76), so the peer container MUST also run as uid 65532.
+        # See examples/k8s/sandbox-peer-pod.yaml for the colocation example.
+        - name: socket-dir
+          emptyDir: {}
+
+      containers:
+        - name: ocu-filestored
+          image: ghcr.io/wide-moat/ocu-filestore:latest
+          imagePullPolicy: Always
+
+          args:
+            - -engine
+            - local-volume
+            - -engine-root
+            - /var/lib/ocu-filestore/engine-root
+            - -audit-sink
+            - /var/log/ocu-filestore/audit.ocsf.jsonl
+            - -south-socket-dir
+            - /run/ocu-filestore/sessions
+            - -filesystem-id
+            - $(OCU_FILESYSTEM_ID)
+            - -broker-max-file-size
+            - "1073741824"
+            - -granted-intents
+            - read,write
+            - -profile
+            - trusted_operator
+            - -tenancy
+            - single-tenant
+            - -ops-listen
+            - 127.0.0.1:9464
+
+          env:
+            - name: OCU_FILESYSTEM_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              # Container-level seccompProfile overrides the pod-level setting
+              # for this container. Same choice: RuntimeDefault for portability
+              # or Localhost for the tighter broker-specific allowlist.
+              # See the pod-level seccompProfile comment above.
+              type: RuntimeDefault
+
+          volumeMounts:
+            # Only the three mutable surfaces are writable. Everything else
+            # is covered by readOnlyRootFilesystem: true.
+            - name: engine-root
+              mountPath: /var/lib/ocu-filestore/engine-root
+            - name: audit
+              mountPath: /var/log/ocu-filestore
+            - name: socket-dir
+              mountPath: /run/ocu-filestore/sessions
+
+          # Liveness probe — /healthz returns 200 whenever the process is
+          # serving, regardless of audit-latch state. Uses the daemon's own
+          # -health-check self-probe mode because distroless has no shell or
+          # curl. The daemon dials its own ops listener /healthz and exits 0
+          # (alive) or non-zero (unreachable). Matches the Dockerfile HEALTHCHECK
+          # and compose healthcheck.
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/ocu-filestored
+                - -health-check
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness probe — /readyz returns 200 only when the audit sink is
+          # not latched and the engine root is listable. A 503 on /readyz means
+          # the broker is running but 100% of file operations will be denied.
+          # Kubernetes will stop routing traffic to this pod until /readyz passes.
+          # Note: the -health-check flag probes /healthz; there is no separate
+          # -readiness-check flag in the current release. Use httpGet instead,
+          # which works because the ops listener binds loopback TCP (127.0.0.1:9464).
+          # (httpGet from the kubelet is initiated from the node, not from inside
+          # the container, and reaches 127.0.0.1 on the pod's network namespace.)
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9464
+              host: 127.0.0.1
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

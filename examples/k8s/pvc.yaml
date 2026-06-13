@@ -1,0 +1,73 @@
+---
+# examples/k8s/pvc.yaml
+#
+# PersistentVolumeClaims for the ocu-filestored storage broker.
+#
+# IMPORTANT — ReadWriteOnce (RWO):
+# Both PVCs use ReadWriteOnce, which is the storage-level guarantee that only
+# a single pod may mount the volume at a time. This is required because:
+#
+#   1. The local-volume engine's hash-chained audit sink has exactly one writer;
+#      two pods writing the same audit file would corrupt the chain (NFR-SEC-79).
+#   2. The flock guard (T2-7) provides a second layer at the filesystem level
+#      (LOCK_EX|LOCK_NB on startup), but RWO is the storage-level guarantee that
+#      prevents a second pod from even reaching the flock.
+#   3. The local-volume engine's scope directory operations (rename, link, unlink)
+#      are not safe for concurrent access from two processes.
+#
+# Never change these to ReadWriteMany (RWX). A distributed filesystem that
+# allows concurrent mounts does not provide the single-writer guarantee the
+# broker depends on.
+#
+# Apply this file before broker-deployment.yaml.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ocu-filestored-engine-root
+  labels:
+    app.kubernetes.io/name: ocu-filestored
+    app.kubernetes.io/component: storage-broker
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  # ReadWriteOnce: single-writer guarantee at the storage level.
+  # The local-volume engine stores customer workspace bytes here.
+  # Ephemeral workspace by design: long-term retention belongs to the
+  # customer's store, not the broker.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Size for the local-volume engine workspace. Adjust for your deployment.
+      # The broker enforces -broker-max-file-size per object; this PVC bounds
+      # the total workspace. A typical solo deployment needs 10–100 Gi.
+      storage: 20Gi
+  # Uncomment and set storageClassName to use a specific storage class.
+  # Omit to use the cluster default. Use a storage class backed by a local
+  # volume (e.g. local-path provisioner) for lowest latency; avoid network
+  # filesystems that do not guarantee single-writer semantics.
+  # storageClassName: local-path
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ocu-filestored-audit
+  labels:
+    app.kubernetes.io/name: ocu-filestored
+    app.kubernetes.io/component: storage-broker
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  # ReadWriteOnce: the hash-chained audit sink must have exactly one writer.
+  # The chain's integrity (tamper detection, NFR-SEC-79) requires that records
+  # are appended in a single, ordered sequence. RWX or concurrent mounting would
+  # silently break the chain.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Size for the OCSF JSONL audit sink. Each file-operation event is roughly
+      # 512–1024 bytes; size according to your retention period and expected
+      # operation volume. 10 Gi is a conservative starting point.
+      storage: 10Gi
+  # storageClassName: local-path
