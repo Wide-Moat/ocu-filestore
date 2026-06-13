@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -172,10 +173,16 @@ func mapDenyDegraded(auditReason, wireClass string) DenyVerdict {
 }
 
 // denyClassForErr names the deny class for a consumer-side seam sentinel.
-// An error outside the known sentinel set is a wiring fault and fails
-// closed to internal.
+// context.Canceled and context.DeadlineExceeded are classified FIRST as
+// denyAborted (T2-5, RES-03): a client disconnect or deadline is a clean
+// "aborted/canceled" verdict, not a generic error that would pollute the
+// audit chain or be misclassified as a backend transient. An error outside
+// the known sentinel set is a wiring fault and fails closed to internal.
 func denyClassForErr(err error) string {
 	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return denyAborted
 	case errors.Is(err, ErrScopeMismatch):
 		return denyScopeMismatch
 	case errors.Is(err, ErrIntentDenied):

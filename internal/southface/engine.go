@@ -170,12 +170,18 @@ func guestPath(rel string) string {
 // denyClassForEngineErr maps an engine error to a deny class in EXACTLY this
 // order (the order is load-bearing — see Pitfall 2):
 //
-//  1. errAlreadyExists OR fs.ErrExist -> denyAlreadyExists
-//  2. fs.ErrNotExist                  -> denyNotFound
-//  3. errBackendThrottled             -> denyThrottle
-//  4. errBackendTransient             -> denyBackendUnavailable
-//  5. errInvalidPath OR isPathEscape  -> denyNotFound (wire degrade, D8)
-//  6. anything else                   -> denyInternal
+//  0. context.Canceled / DeadlineExceeded -> denyAborted (T2-5, RES-03)
+//  1. errAlreadyExists OR fs.ErrExist     -> denyAlreadyExists
+//  2. fs.ErrNotExist                      -> denyNotFound
+//  3. errBackendThrottled                 -> denyThrottle
+//  4. errBackendTransient                 -> denyBackendUnavailable
+//  5. errInvalidPath OR isPathEscape      -> denyNotFound (wire degrade, D8)
+//  6. anything else                       -> denyInternal
+//
+// Context cancellation / deadline are classified FIRST (step 0): a client
+// disconnect or deadline is a clean "aborted/canceled" verdict, not a
+// generic error that would pollute the audit chain or be misclassified as a
+// backend transient (RES-03).
 //
 // MakeDir surfaces EEXIST, missing-parent ENOENT, AND a containment escape ALL
 // as *fs.PathError, and isPathEscape matches any *fs.PathError; testing the
@@ -189,6 +195,9 @@ func guestPath(rel string) string {
 // handler's deny-audit event.
 func denyClassForEngineErr(err error) string {
 	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return denyAborted
 	case errors.Is(err, errAlreadyExists), errors.Is(err, fs.ErrExist):
 		return denyAlreadyExists
 	case errors.Is(err, fs.ErrNotExist):

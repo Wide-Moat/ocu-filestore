@@ -96,8 +96,11 @@ func TestWalkCancelledContextAborts(t *testing.T) {
 	w := httptest.NewRecorder()
 	d.ServeHTTP(w, r.WithContext(ctx))
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("cancelled walk status = %d, want 500 (aborted); body %s", w.Code, w.Body.String())
+	// T2-5 (RES-03): context cancellation maps to denyAborted (409) not
+	// internal (500). The status here reflects the correct classification of
+	// a client disconnect as an aborted operation.
+	if w.Code != http.StatusConflict {
+		t.Fatalf("cancelled walk status = %d, want 409 (aborted); body %s", w.Code, w.Body.String())
 	}
 	if got := len(eng.listed); got > 1 {
 		t.Fatalf("cancelled walk drove %d engine List calls, want <= 1 (abort on cancel)", got)

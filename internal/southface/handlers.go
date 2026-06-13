@@ -96,12 +96,18 @@ func denyEngine(hc handlerCtx, err error) {
 }
 
 // auditTruthForEngineErr names the broker-resolved AUDIT truth for an engine
-// error — distinct from the wire class when the wire degrades (D8). An escape
+// error — distinct from the wire class when the wire degrades (D8).
+// context.Canceled and context.DeadlineExceeded are classified FIRST as
+// denyAborted (T2-5, RES-03): a client disconnect or deadline is a clean
+// "aborted" verdict, audited as such, not as an internal error. An escape
 // or lexical reject audits as the escape truth even though the wire shows
 // not_found (anti-enumeration); EEXIST audits already_exists; ENOENT audits
 // not_found.
 func auditTruthForEngineErr(err error) string {
 	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return denyAborted
 	case errors.Is(err, errAlreadyExists), errors.Is(err, fs.ErrExist):
 		return denyAlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
