@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // stagingDirName is the broker-internal staging area at the scope root:
@@ -99,6 +100,46 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+// removeAllCtx is a cancellation-aware os.RemoveAll for a PLAIN filesystem
+// path (the erase verbs operate on scopePath under baseDir, after a symlink
+// pre-check, so there is no os.Root containment leg to preserve here). It
+// recurses depth-first, checking ctx.Err() before descending into each
+// directory's entries, so an erase of a HUGE scope can be interrupted promptly
+// (the Engine context contract) instead of blocking until os.RemoveAll walks
+// the whole tree. On a clean run it is equivalent to os.RemoveAll. A
+// cancellation surfaces ctx.Err() (errors.Is-matchable); the partially-erased
+// tree is reclaimed by the next Provision/Teardown sweep.
+func removeAllCtx(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // RemoveAll semantics: a missing path is a no-op.
+		}
+		return err
+	}
+	// A non-directory (or a symlink, which Lstat does NOT follow) is removed
+	// directly — never descended — so the erase cannot escape through a link.
+	if !info.IsDir() {
+		return os.Remove(path)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := removeAllCtx(ctx, filepath.Join(path, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return os.Remove(path)
+}
+
 // toFileInfo maps an os.FileInfo to the engine's minimal internal struct.
 func toFileInfo(fi os.FileInfo) FileInfo {
 	return FileInfo{
@@ -118,7 +159,10 @@ func toFileInfo(fi os.FileInfo) FileInfo {
 // entry refuses BEFORE any removal, exactly as in TeardownScope (T-03-05).
 // OpenScopeRoot refuses an absent directory, so this must run before any
 // data verb on a fresh scope.
-func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) error {
+func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validateScopeID(scope); err != nil {
 		return err
 	}
@@ -133,7 +177,7 @@ func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) err
 		if !info.IsDir() {
 			return fmt.Errorf("%w: scope %q", ErrNotADirectory, scope)
 		}
-		if err := os.RemoveAll(scopePath); err != nil {
+		if err := removeAllCtx(ctx, scopePath); err != nil {
 			return fmt.Errorf("objectstore: erase scope %q at provision: %w", scope, err)
 		}
 	case !errors.Is(err, fs.ErrNotExist):
@@ -168,7 +212,10 @@ func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) err
 // recreated here: after teardown the scope directory is fully empty. The
 // next ProvisionScope — or, defensively, the next write's on-demand
 // creation — restores it.
-func (e *localVolumeEngine) TeardownScope(_ context.Context, scope ScopeID) error {
+func (e *localVolumeEngine) TeardownScope(ctx context.Context, scope ScopeID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validateScopeID(scope); err != nil {
 		return err
 	}
@@ -192,7 +239,7 @@ func (e *localVolumeEngine) TeardownScope(_ context.Context, scope ScopeID) erro
 		return fmt.Errorf("%w: scope %q", ErrNotADirectory, scope)
 	}
 
-	if err := os.RemoveAll(scopePath); err != nil {
+	if err := removeAllCtx(ctx, scopePath); err != nil {
 		return fmt.Errorf("objectstore: remove scope %q: %w", scope, err)
 	}
 	if err := os.MkdirAll(scopePath, 0o700); err != nil {
@@ -214,7 +261,10 @@ func (e *localVolumeEngine) TeardownScope(_ context.Context, scope ScopeID) erro
 // scope root: ValidatePath rejects "." because a data path must name an
 // object inside the scope, so the scope root is special-cased here — it is
 // the containment root itself and cannot escape.
-func (e *localVolumeEngine) List(_ context.Context, scope ScopeID, path string) ([]FileInfo, error) {
+func (e *localVolumeEngine) List(ctx context.Context, scope ScopeID, path string) ([]FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return nil, err
@@ -231,6 +281,13 @@ func (e *localVolumeEngine) List(_ context.Context, scope ScopeID, path string) 
 
 	entries, err := fs.ReadDir(sr.root.FS(), cleanPath)
 	if err != nil {
+		// Listing a path that is a FILE surfaces the platform's ENOTDIR; wrap it
+		// into the typed sentinel so a guest who lists a file gets the SAME
+		// not-a-directory class on both engines (the s3 engine returns
+		// ErrNotADirectory for the same edge), instead of a raw syscall error.
+		if errors.Is(err, syscall.ENOTDIR) {
+			return nil, fmt.Errorf("objectstore: list %q: %w", path, ErrNotADirectory)
+		}
 		return nil, fmt.Errorf("objectstore: list: %w", err)
 	}
 	out := make([]FileInfo, 0, len(entries))
@@ -250,7 +307,10 @@ func (e *localVolumeEngine) List(_ context.Context, scope ScopeID, path string) 
 }
 
 // Stat returns metadata for the named object.
-func (e *localVolumeEngine) Stat(_ context.Context, scope ScopeID, path string) (FileInfo, error) {
+func (e *localVolumeEngine) Stat(ctx context.Context, scope ScopeID, path string) (FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return FileInfo{}, err
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return FileInfo{}, err
@@ -270,7 +330,10 @@ func (e *localVolumeEngine) Stat(_ context.Context, scope ScopeID, path string) 
 
 // MakeDir creates the named directory, single level (Mkdir, not MkdirAll):
 // a missing parent refuses, mirroring POSIX mkdir semantics.
-func (e *localVolumeEngine) MakeDir(_ context.Context, scope ScopeID, path string) error {
+func (e *localVolumeEngine) MakeDir(ctx context.Context, scope ScopeID, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -289,13 +352,19 @@ func (e *localVolumeEngine) MakeDir(_ context.Context, scope ScopeID, path strin
 
 // MoveDir renames a directory within the scope. See renameWithin for the
 // overwrite and escape semantics.
-func (e *localVolumeEngine) MoveDir(_ context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+func (e *localVolumeEngine) MoveDir(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return e.renameWithin(scope, src, dst, overwrite)
 }
 
 // MoveFile renames a file within the scope. See renameWithin for the
 // overwrite and escape semantics.
-func (e *localVolumeEngine) MoveFile(_ context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+func (e *localVolumeEngine) MoveFile(ctx context.Context, scope ScopeID, src, dst string, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return e.renameWithin(scope, src, dst, overwrite)
 }
 
@@ -377,7 +446,10 @@ func (e *localVolumeEngine) renameWithin(scope ScopeID, src, dst string, overwri
 // default (RemoveAll), chosen because the wire verb tears down a subtree and
 // a non-recursive rmdir is expressible as List+guard by the caller if ever
 // needed. Removing a missing path is a no-op, per RemoveAll semantics.
-func (e *localVolumeEngine) RemoveDir(_ context.Context, scope ScopeID, path string) error {
+func (e *localVolumeEngine) RemoveDir(ctx context.Context, scope ScopeID, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -388,14 +460,56 @@ func (e *localVolumeEngine) RemoveDir(_ context.Context, scope ScopeID, path str
 	if err != nil {
 		return err
 	}
-	if err := sr.root.RemoveAll(cleanPath); err != nil {
+	if err := removeAllUnderRoot(ctx, sr, cleanPath); err != nil {
 		return fmt.Errorf("objectstore: remove dir: %w", err)
 	}
 	return nil
 }
 
+// removeAllUnderRoot is a cancellation-aware recursive remove CONFINED to the
+// scope's os.Root: it reads each directory level through sr.root.FS() and
+// removes entries bottom-up with sr.root.Remove, so containment is enforced by
+// the same os.Root that every other data verb uses (no removal can escape the
+// scope). ctx.Err() is checked before each level and each entry so an
+// interior-heavy subtree removal can be interrupted promptly (the Engine
+// context contract). A missing path is a no-op, matching RemoveAll semantics.
+func removeAllUnderRoot(ctx context.Context, sr *ScopeRoot, cleanPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := sr.root.Lstat(cleanPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// A non-directory (or a symlink, which Lstat does NOT follow) is removed
+	// directly — never descended — so the sweep cannot traverse a link.
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return sr.root.Remove(cleanPath)
+	}
+	entries, err := fs.ReadDir(sr.root.FS(), cleanPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		child := cleanPath + string(filepath.Separator) + entry.Name()
+		if err := removeAllUnderRoot(ctx, sr, child); err != nil {
+			return err
+		}
+	}
+	return sr.root.Remove(cleanPath)
+}
+
 // RemoveFile removes the named file (or empty directory, per remove(2)).
-func (e *localVolumeEngine) RemoveFile(_ context.Context, scope ScopeID, path string) error {
+func (e *localVolumeEngine) RemoveFile(ctx context.Context, scope ScopeID, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err
@@ -454,8 +568,14 @@ func (e *localVolumeEngine) CopyFile(ctx context.Context, scope ScopeID, src, ds
 // ReadRange streams the half-open byte range [offset, offset+length) of the
 // named file into w. A range extending past EOF short-reads to EOF without
 // error (io.LimitReader absorbs the EOF); an offset at or past EOF yields
-// zero bytes without error. No whole-object buffering.
+// zero bytes without error. A negative offset or length is a malformed window
+// and refuses with ErrInvalidRange BEFORE any open — the same refusal the s3
+// engine gives, so the same hostile {offset,length} cannot succeed here while
+// erroring there. No whole-object buffering.
 func (e *localVolumeEngine) ReadRange(ctx context.Context, scope ScopeID, path string, offset, length int64, w io.Writer) error {
+	if offset < 0 || length < 0 {
+		return fmt.Errorf("%w: negative offset or length", ErrInvalidRange)
+	}
 	sr, err := e.openScope(scope)
 	if err != nil {
 		return err

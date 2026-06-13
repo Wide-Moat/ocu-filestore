@@ -607,6 +607,24 @@ func (e *s3Engine) List(ctx context.Context, scope ScopeID, p string) ([]FileInf
 	}
 
 	if p != "." && !sawAny {
+		// Nothing lived under the "<key>/" prefix. Distinguish a path that is a
+		// FILE from one that is truly absent: if the plain object key exists,
+		// the caller listed a file, which the local engine refuses with ENOTDIR
+		// (classified internal), NOT not-found. HeadObject the plain key and
+		// return ErrNotADirectory in that case so both engines agree on the wire
+		// class and the audited truth for the same edge; only a genuinely absent
+		// key returns fs.ErrNotExist.
+		key, err := e.objectKey(scope, p)
+		if err != nil {
+			return nil, err
+		}
+		exists, err := e.keyExists(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			return nil, fmt.Errorf("objectstore: s3 list %q: %w", p, ErrNotADirectory)
+		}
 		return nil, fmt.Errorf("objectstore: s3 list %q: %w", p, fs.ErrNotExist)
 	}
 	return infos, nil
@@ -1308,7 +1326,7 @@ func (e *s3Engine) ReadRange(ctx context.Context, scope ScopeID, p string, offse
 		return err
 	}
 	if offset < 0 || length < 0 {
-		return fmt.Errorf("objectstore: s3 readrange: negative offset or length")
+		return fmt.Errorf("%w: negative offset or length", ErrInvalidRange)
 	}
 	if length == 0 {
 		// Zero-length window: no GET, but existence still asserted — the

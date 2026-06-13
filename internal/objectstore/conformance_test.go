@@ -409,6 +409,36 @@ func runConformance(t *testing.T, f confFactory) {
 		}
 	})
 
+	// ReadRange negative window: a negative offset OR negative length is a
+	// malformed window and BOTH engines refuse it identically with
+	// ErrInvalidRange, writing no bytes — the same hostile {offset,length}
+	// must never succeed on one engine and error on the other.
+	t.Run("ReadRange_NegativeRefused", func(t *testing.T) {
+		tg := f(t)
+		e, sc := tg.eng, tg.scope
+		confWrite(t, e, sc, "r.bin", "abcdefghij", false)
+
+		for _, tc := range []struct {
+			name           string
+			offset, length int64
+		}{
+			{"negative offset", -1, 5},
+			{"negative length", 0, -1},
+			{"both negative", -3, -4},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var buf bytes.Buffer
+				err := e.ReadRange(ctx, sc, "r.bin", tc.offset, tc.length, &buf)
+				if !errors.Is(err, ErrInvalidRange) {
+					t.Fatalf("ReadRange(%d, %d) = %v, want ErrInvalidRange", tc.offset, tc.length, err)
+				}
+				if buf.Len() != 0 {
+					t.Fatalf("ReadRange(%d, %d) wrote %d bytes on refusal, want 0", tc.offset, tc.length, buf.Len())
+				}
+			})
+		}
+	})
+
 	// Listing is ONE level only — nested entries are invisible — and the
 	// literal path "." lists the scope root.
 	t.Run("List_OneLevel", func(t *testing.T) {
@@ -442,6 +472,24 @@ func runConformance(t *testing.T, f confFactory) {
 		}
 		if len(root) != 1 || root[0].Name != "top" || !root[0].IsDir {
 			t.Fatalf("List(.) = %+v, want exactly [top (dir)]", root)
+		}
+	})
+
+	// Listing a path that names a FILE (not a directory) refuses with
+	// ErrNotADirectory on BOTH engines — never not-found — so a guest that
+	// lists a file gets the same class and audited truth regardless of backend.
+	// A genuinely absent path stays fs.ErrNotExist (covered by MissingSource).
+	t.Run("List_FilePath_NotADirectory", func(t *testing.T) {
+		tg := f(t)
+		e, sc := tg.eng, tg.scope
+		confWrite(t, e, sc, "leaf.txt", "bytes", false)
+
+		_, err := e.List(ctx, sc, "leaf.txt")
+		if !errors.Is(err, ErrNotADirectory) {
+			t.Fatalf("List(file) = %v, want ErrNotADirectory", err)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("List(file) = %v, must NOT degrade to not-found", err)
 		}
 	})
 

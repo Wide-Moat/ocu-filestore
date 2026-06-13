@@ -64,6 +64,12 @@ var ErrAlreadyExists = errors.New("objectstore: object already exists")
 // errors.Is.
 var ErrNotADirectory = errors.New("objectstore: path is not a directory")
 
+// ErrInvalidRange is the ReadRange-argument sentinel: a negative offset or
+// negative length is a malformed window. Both engines refuse it identically
+// (the same hostile {offset,length} must not succeed on one engine and error
+// on the other). Match it with errors.Is.
+var ErrInvalidRange = errors.New("objectstore: invalid read range")
+
 // ErrTransient is the retryable backend-failure sentinel: the backend leg
 // failed in a way that may succeed on a later attempt (backend 5xx, request
 // timeout, transport-level connection failure) after the engine's own
@@ -120,11 +126,17 @@ func isPathEscape(err error) bool {
 // scope the caller does not hold is scope_mismatch territory upstream
 // (NFR-SEC-43), so every verb here takes exactly one scope.
 //
-// Context contract: EVERY verb honors ctx — cancellation or deadline expiry
-// aborts the operation promptly (including mid-stream in WriteStream,
-// CopyFile, and ReadRange) and the verb surfaces ctx.Err() through its
-// returned error (errors.Is-matchable). An aborted write never leaves a
-// partial object visible at the destination path.
+// Context contract: EVERY verb honors ctx and surfaces ctx.Err() through its
+// returned error (errors.Is-matchable). A verb checks ctx at entry, so a
+// caller that cancels before the verb starts gets an immediate abort, never a
+// stray side effect. Long-running verbs abort PROMPTLY mid-operation: the
+// streaming verbs (WriteStream, CopyFile, ReadRange) check between byte copies,
+// and the recursive erase/remove verbs (ProvisionScope, TeardownScope,
+// RemoveDir) check between directory entries so a teardown of a huge scope can
+// be interrupted rather than blocking until the whole tree is walked. The
+// remaining verbs are bounded single syscalls whose entry check is their only
+// cancellation point. An aborted write never leaves a partial object visible at
+// the destination path.
 //
 // Idempotency contract (per verb, for retry after an AMBIGUOUS failure —
 // the caller saw an error but cannot know whether the backend applied the
