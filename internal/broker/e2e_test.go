@@ -368,6 +368,109 @@ func (d *daemon) uploadStreamParamsOnly(t *testing.T, params map[string]any) []b
 	return trailer
 }
 
+// downloadFrames is the parsed outcome of a fileDownload server-stream: the
+// concatenated data-frame bytes and the decoded end-stream trailer.
+type downloadFrames struct {
+	data    []byte
+	trailer struct {
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+}
+
+// listUUID lists a directory over the real socket and returns the uuid the
+// listing minted for the given guest path. A fileDownload is uuid-addressed, so
+// the guest must list (or readFile) first to obtain it.
+func (d *daemon) listUUID(t *testing.T, dir, guestPath string) string {
+	t.Helper()
+	resp := d.postUnary(t, "listDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   dir,
+		"authorization_metadata": authMeta("read"),
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("listDirectory status = %d, want 200; body %s", resp.StatusCode, b)
+	}
+	var ld struct {
+		Entries []struct {
+			File *struct {
+				Path string `json:"path"`
+				UUID string `json:"uuid"`
+			} `json:"file"`
+		} `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ld); err != nil {
+		t.Fatalf("decode listDirectory: %v", err)
+	}
+	for _, e := range ld.Entries {
+		if e.File != nil && e.File.Path == guestPath {
+			return e.File.UUID
+		}
+	}
+	t.Fatalf("listDirectory of %q did not emit a uuid for %q", dir, guestPath)
+	return ""
+}
+
+// downloadStream sends a fileDownload server-stream: a single params frame
+// (uuid-addressed, optional range) and reads the data frames + trailer back.
+// A nil rng requests the whole object.
+func (d *daemon) downloadStream(t *testing.T, uuid string, rng *[2]int64) downloadFrames {
+	t.Helper()
+	params := map[string]any{
+		"filesystem_id":          goldenScope,
+		"uuid":                   uuid,
+		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
+	}
+	if rng != nil {
+		params["range"] = map[string]any{"offset": rng[0], "length": rng[1]}
+	}
+	var body bytes.Buffer
+	pj, _ := json.Marshal(params)
+	writeFrame(&body, dataFlag, pj)
+
+	req, err := http.NewRequest(http.MethodPost, "http://unix"+servicePrefix+"fileDownload", bytes.NewReader(body.Bytes()))
+	if err != nil {
+		t.Fatalf("new download request: %v", err)
+	}
+	req.Header.Set("Content-Type", contentTypeConnectJSON)
+	req.Header.Set(connectVersionHeader, connectVersion)
+	resp, err := d.client().Do(req)
+	if err != nil {
+		t.Fatalf("download do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("download status = %d, want 200 (streaming); body %s", resp.StatusCode, b)
+	}
+	br := bufio.NewReader(resp.Body)
+	var out downloadFrames
+	for {
+		flag, payload, err := readFrame(br)
+		if err != nil {
+			break
+		}
+		switch flag {
+		case endStreamFlag:
+			if jerr := json.Unmarshal(payload, &out.trailer); jerr != nil {
+				t.Fatalf("download trailer not JSON: %v (%s)", jerr, payload)
+			}
+		case dataFlag:
+			var df struct {
+				Data []byte `json:"data"`
+			}
+			if jerr := json.Unmarshal(payload, &df); jerr != nil {
+				t.Fatalf("download data frame not JSON: %v (%s)", jerr, payload)
+			}
+			out.data = append(out.data, df.Data...)
+		}
+	}
+	return out
+}
+
 // --- E2E cases ------------------------------------------------------------
 
 // TestE2EAllowPath drives the allow path over a real socket: provision (flags)
@@ -612,6 +715,147 @@ func TestE2ESignalTeardown(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestE2EDownloadRange drives the fileDownload server-stream over the real
+// socket: upload a known blob, list to mint its uuid, then download (a) the
+// whole object and (b) a half-open ranged window, asserting the streamed bytes
+// match in both cases. This exercises the streaming download branch
+// (serveStreaming -> handleFileDownload, the range path) and the data-frame
+// codec end to end against the live daemon. The /pub prefix is downloadable so
+// the resolved grant permits the read (SEC-73).
+func TestE2EDownloadRange(t *testing.T) {
+	skipUnlessPeerCredSupported(t)
+	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub", maxFileSize: 1 << 20})
+
+	mkResp := d.postUnary(t, "makeDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub",
+		"authorization_metadata": authMeta("write"),
+	})
+	mkResp.Body.Close()
+	if mkResp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory /pub status = %d, want 200", mkResp.StatusCode)
+	}
+
+	const content = "0123456789ABCDEF"
+	trailer := d.uploadStream(t, map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/range.bin",
+		"declared_size_bytes":    len(content),
+		"authorization_metadata": authMeta("write"),
+	}, [][]byte{[]byte(content)})
+	if got := strings.TrimSpace(string(trailer)); got != "{}" {
+		t.Fatalf("upload trailer = %q, want success {}", got)
+	}
+
+	uuid := d.listUUID(t, "/pub", "/pub/range.bin")
+
+	t.Run("whole_object", func(t *testing.T) {
+		out := d.downloadStream(t, uuid, nil)
+		if out.trailer.Error != nil {
+			t.Fatalf("whole-object download trailer = %+v, want success", out.trailer.Error)
+		}
+		if string(out.data) != content {
+			t.Fatalf("whole-object download = %q, want %q", out.data, content)
+		}
+	})
+
+	t.Run("ranged_window", func(t *testing.T) {
+		// Half-open window [6, 6+5) = "6789A".
+		out := d.downloadStream(t, uuid, &[2]int64{6, 5})
+		if out.trailer.Error != nil {
+			t.Fatalf("ranged download trailer = %+v, want success", out.trailer.Error)
+		}
+		if want := content[6 : 6+5]; string(out.data) != want {
+			t.Fatalf("ranged download = %q, want %q", out.data, want)
+		}
+	})
+}
+
+// TestE2EUploadMidStreamCancel pins the streaming-abort path over the real
+// socket: a fileUpload that declares a size, sends one chunk, then drops the
+// connection BEFORE the end-stream half-close (the request context cancels
+// mid-stream). The daemon must abort the in-flight WriteStream without staging a
+// torn object — the temp+rename atomicity guarantees nothing becomes namespace-
+// visible — and without leaking the pipe goroutine (the test would hang on a
+// leak). After the cancel a readFile of the target must NOT find a committed
+// object.
+func TestE2EUploadMidStreamCancel(t *testing.T) {
+	skipUnlessPeerCredSupported(t)
+	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub", maxFileSize: 1 << 20})
+
+	mkResp := d.postUnary(t, "makeDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub",
+		"authorization_metadata": authMeta("write"),
+	})
+	mkResp.Body.Close()
+	if mkResp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory /pub status = %d, want 200", mkResp.StatusCode)
+	}
+
+	// Build a params frame declaring more bytes than we will send, then one
+	// chunk, and deliberately OMIT the end-stream frame. We cancel the request
+	// context after the chunk lands so the server's frame read blocks then
+	// aborts.
+	var body bytes.Buffer
+	pj, _ := json.Marshal(map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/torn.bin",
+		"declared_size_bytes":    64,
+		"authorization_metadata": authMeta("write"),
+	})
+	writeFrame(&body, dataFlag, pj)
+	writeFrame(&body, dataFlag, mustChunk(t, []byte("partial-bytes")))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix"+servicePrefix+"fileUpload", bytes.NewReader(body.Bytes()))
+	if err != nil {
+		t.Fatalf("new upload request: %v", err)
+	}
+	req.Header.Set("Content-Type", contentTypeConnectJSON)
+	req.Header.Set(connectVersionHeader, connectVersion)
+
+	// Issue the request in a goroutine; cancel shortly after so the body is
+	// half-delivered (params + chunk, no end-stream) and the connection drops.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, derr := d.client().Do(req)
+		if derr == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("mid-stream cancel did not unwind (possible pipe-goroutine leak)")
+	}
+
+	// The torn upload never committed: a readFile of the target finds nothing.
+	resp := d.postUnary(t, "readFile", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub/torn.bin",
+		"authorization_metadata": authMeta("read"),
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("torn.bin is readable after a mid-stream cancel; want no committed object (temp+rename atomicity)")
+	}
+}
+
+// mustChunk marshals an upload chunk frame body or fails the test.
+func mustChunk(t *testing.T, b []byte) []byte {
+	t.Helper()
+	cj, err := json.Marshal(map[string]any{"chunk": b})
+	if err != nil {
+		t.Fatalf("marshal chunk: %v", err)
+	}
+	return cj
 }
 
 // assertNothingStaged fails if any regular file exists anywhere under root.
