@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+
+# gitleaks allowlist for the ocu-filestore repository.
+#
+# Each entry below is a documented false positive: a well-known example
+# value from public AWS documentation that appears in our own docs to
+# show the credential-file format accepted by the broker.  No real
+# credentials are committed; entries here are scoped as tightly as
+# possible (regex on the exact example value, confined to doc files).
+
+[allowlist]
+  description = "Documented false positives: AWS example credentials in docs"
+
+  # "wJalrXUtnFEMI/K7MDENG" is the canonical AWS-documentation example
+  # secret access key that has appeared in Amazon's official SDK and IAM
+  # guides for over a decade.  It appears in docs/engines.md and
+  # docs/operations.md to illustrate the two-line credential file format
+  # required by the broker's -s3-credential-file flag.  This value is
+  # publicly known, widely published, and carries no authentication
+  # capability against any real AWS account.
+  regexes = [
+    "wJalrXUtnFEMI/K7MDENG",
+  ]
+
+  # Confine the allowlist to documentation files only: a real credential
+  # accidentally placed outside docs/ would NOT be suppressed.
+  paths = [
+    "docs/",
+  ]
