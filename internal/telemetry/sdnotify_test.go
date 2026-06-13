@@ -12,6 +12,19 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
 
+// shortNotifySocket returns a path <= 104 bytes (macOS sun_path limit) for a
+// temporary unixgram socket. t.TempDir() paths can exceed the limit, so we
+// use os.MkdirTemp under /tmp directly (which is short enough).
+func shortNotifySocket(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "sdnt")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
+}
+
 // TestSdNotifyReadyNoopWhenUnset pins the no-op contract: SdNotifyReady returns
 // nil when NOTIFY_SOCKET is unset, without panicking or dialling anything.
 func TestSdNotifyReadyNoopWhenUnset(t *testing.T) {
@@ -33,8 +46,7 @@ func TestSdNotifyStoppingNoopWhenUnset(t *testing.T) {
 // is set to a bound unixgram socket, SdNotifyReady dials and writes exactly
 // "READY=1".
 func TestSdNotifyReadyWritesDatagram(t *testing.T) {
-	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "notify.sock")
+	sockPath := shortNotifySocket(t, "n.sock")
 
 	ln, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
@@ -60,8 +72,7 @@ func TestSdNotifyReadyWritesDatagram(t *testing.T) {
 // TestSdNotifyStoppingWritesDatagram pins the STOPPING=1 datagram: when
 // NOTIFY_SOCKET is set, SdNotifyStopping writes exactly "STOPPING=1".
 func TestSdNotifyStoppingWritesDatagram(t *testing.T) {
-	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "notify.sock")
+	sockPath := shortNotifySocket(t, "n.sock")
 
 	ln, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
@@ -94,8 +105,7 @@ func TestSdNotifySocketEnvVarRespected(t *testing.T) {
 	}
 
 	// Second: valid socket — must write.
-	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "n2.sock")
+	sockPath := shortNotifySocket(t, "n2.sock")
 	ln, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
 	if err != nil {
 		t.Fatalf("ListenUnixgram: %v", err)
