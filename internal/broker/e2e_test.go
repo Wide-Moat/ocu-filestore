@@ -378,6 +378,19 @@ func TestE2EAllowPath(t *testing.T) {
 	skipUnlessPeerCredSupported(t)
 	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub", maxFileSize: 1 << 20})
 
+	// Both engines require the parent directory to exist before writing a file
+	// into a sub-path (POSIX mkdir semantics: a missing parent refuses). The
+	// scope root is ready after provision; /pub must be created explicitly.
+	mkResp := d.postUnary(t, "makeDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub",
+		"authorization_metadata": authMeta("write"),
+	})
+	mkResp.Body.Close()
+	if mkResp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory /pub status = %d, want 200", mkResp.StatusCode)
+	}
+
 	// fileUpload /pub/golden.bin = raw "ABCDEFGH".
 	raw := []byte("ABCDEFGH")
 	trailer := d.uploadStream(t, map[string]any{
@@ -632,6 +645,20 @@ func TestE2ES3CredentialRedaction(t *testing.T) {
 	}
 
 	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub"})
+
+	// Both engines require the parent directory to exist before a file write
+	// into a sub-path (POSIX mkdir semantics). The S3 engine's parentExists
+	// check refuses without a /pub directory marker, exactly as the local
+	// engine refuses without the directory.
+	mkResp := d.postUnary(t, "makeDirectory", map[string]any{
+		"filesystem_id":          goldenScope,
+		"path":                   "/pub",
+		"authorization_metadata": authMeta("write"),
+	})
+	mkResp.Body.Close()
+	if mkResp.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory /pub status = %d, want 200", mkResp.StatusCode)
+	}
 
 	// One allow (upload writes through to the backend, audited) and one
 	// deny (missing object, audited) so both verdict paths emit events.
