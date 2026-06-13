@@ -34,11 +34,22 @@ spec:
         app.kubernetes.io/name: ocu-filestored
         app.kubernetes.io/component: storage-broker
     spec:
-      # 35 seconds — 10 s above the daemon's bounded 25-second drain so a
-      # SIGTERM always lets graceful drain + erase-before-reuse (NFR-SEC-54)
-      # finish before the pod is force-killed. Matches the systemd unit's
+      # Graceful stop is TWO phases, not one:
+      #   phase 1 — bounded connection drain (25 s): in-flight south-face
+      #             operations finish or fail-closed.
+      #   phase 2 — TeardownScope erase-before-reuse (NFR-SEC-54), bounded by
+      #             the daemon's teardownTimeout (10 min = 600 s): the whole
+      #             scope under the engine-root is securely erased so no
+      #             customer bytes are left on the persistent PVC.
+      # The grace period must cover BOTH phases, or the kubelet sends SIGKILL
+      # mid-erase and orphans customer bytes on the PVC. 625 s = 25 s drain +
+      # 600 s teardown, with no extra slack so the value tracks the two
+      # constants exactly. On the local-volume shelf the erase is a single
+      # directory subtree; if your engine-root is small and you want a shorter
+      # grace period, lower the daemon's teardownTimeout accordingly and keep
+      # this value at drain + that bound. Must match the systemd unit's
       # TimeoutStopSec (see contrib/systemd/ocu-filestored.service).
-      terminationGracePeriodSeconds: 35
+      terminationGracePeriodSeconds: 625
 
       securityContext:
         runAsNonRoot: true
