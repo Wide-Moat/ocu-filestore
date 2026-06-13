@@ -322,6 +322,12 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	pr, pw := io.Pipe()
 	writeErrCh := make(chan error, 1)
 	go func() {
+		// Panic containment (T2-4, RES-02): on a panic in WriteStream,
+		// recoverWriteStream closes pr with errInternalPanic (unblocking any
+		// producer pw.Write immediately) and sends on writeErrCh so the
+		// upload handler can drain and write the deny trailer. The engine's
+		// temp+rename atomicity guarantees no torn object is visible.
+		defer recoverWriteStream(pr, writeErrCh)
 		err := d.engine.WriteStream(sc.ctx, sc.ps.FilesystemID, enginePath(params.Path), pr, params.OverwriteExisting)
 		// Close the read end with the engine's error so a producer pw.Write
 		// blocked on a reader that returned early (e.g. WriteStream refused
@@ -593,6 +599,11 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	pr, pw := io.Pipe()
 	readErrCh := make(chan error, 1)
 	go func() {
+		// Panic containment (T2-4, RES-02): on a panic in ReadRange,
+		// recoverReadStream closes pw with errInternalPanic (unblocking the
+		// consumer io.ReadFull loop immediately) and sends on readErrCh so
+		// the download handler can terminate with an error trailer.
+		defer recoverReadStream(pw, readErrCh)
 		err := d.engine.ReadRange(sc.ctx, sc.ps.FilesystemID, rel, offset, length, pw)
 		pw.CloseWithError(err)
 		readErrCh <- err

@@ -240,6 +240,12 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Derive a request-scoped logger so every log line for this request
 	// carries request_id without requiring each call site to pass it.
 	reqLog := d.logger.With(slog.String(observ.KeyRequestID, reqID))
+	// Panic containment (T2-4, RES-02): a recover() wrapper sitting OUTSIDE
+	// the LOCKED STAGE 0->4 pipeline. On any panic it makes a best-effort
+	// audit Mandate for an internal deny (NFR-SEC-79) then writes a structured
+	// wire deny — never a naked connection drop. The STAGE 0->4 order is not
+	// modified; this is a pure additive safety net.
+	defer d.recoverDispatch(w, &reqLog)()
 
 	// STAGE 0: route. A non-POST to a valid-shaped route is a 405; an
 	// unknown route or version/content-type fault is invalid_argument. No
