@@ -52,7 +52,13 @@ jobs:
         with:
           go-version-file: go.mod
       - name: install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@2026.1
+        # Pin to the exact commit the 2026.1 tag points to, not the bare
+        # calendar tag: govulncheck/cosign pin exact versions, and the bare
+        # 2026.1 tag would float onto later 2026.1.x patches so a rule change
+        # could flip this lint gate red/green between two runs of the same
+        # commit. The 2026.1 release ships no separate patch tag yet, so the
+        # immutable commit SHA is the tightest pin available.
+        run: go install honnef.co/go/tools/cmd/staticcheck@5a501ea53df483ea698b8a046cd3a8e8b6ae7620 # 2026.1
       - name: staticcheck
         run: staticcheck ./...
 

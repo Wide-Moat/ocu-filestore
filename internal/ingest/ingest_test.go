@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"strings"
@@ -241,6 +242,77 @@ func TestSymlinkInsideUnsupported(t *testing.T) {
 	}
 	if !sink.aborted || sink.committed {
 		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
+}
+
+// buildRawExternalAttrsZip writes a single entry with external attributes
+// and creator host set verbatim — bypassing SetMode — so a test can smuggle
+// raw Unix file-type bits without the standard-library SetMode also stamping
+// a Unix creator host (which would surface the type in FileInfo().Mode()).
+func buildRawExternalAttrsZip(t *testing.T, name string, body []byte, creatorVersion uint16, externalAttrs uint32) []byte {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	w := zip.NewWriter(buf)
+	fh := &zip.FileHeader{
+		Name:               name,
+		CreatorVersion:     creatorVersion,
+		ExternalAttrs:      externalAttrs,
+		Method:             zip.Store,
+		CRC32:              crc32.ChecksumIEEE(body),
+		CompressedSize64:   uint64(len(body)),
+		UncompressedSize64: uint64(len(body)),
+	}
+	fw, err := w.CreateRaw(fh)
+	if err != nil {
+		t.Fatalf("create raw header %q: %v", name, err)
+	}
+	if _, err := fw.Write(body); err != nil {
+		t.Fatalf("write raw entry %q: %v", name, err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestNonUnixCreatorSymlinkRejected pins ingest-03: a symlink smuggled in a
+// non-Unix creator archive — the S_IFLNK file-type bits live in the external
+// attributes but the symlink bit never surfaces in FileInfo().Mode() because
+// the creator host is not Unix — is rejected as unclassifiable rather than
+// staged as inert file content carrying the target text.
+func TestNonUnixCreatorSymlinkRejected(t *testing.T) {
+	const sIFLNK = 0o120000
+	// Creator host 0 (FAT/MS-DOS), with S_IFLNK packed into the high bits of
+	// the external attributes — the smuggle the decoded mode would miss.
+	data := buildRawExternalAttrsZip(t, "link", []byte("inside.txt"), 0, uint32(sIFLNK|0o777)<<16)
+
+	sink := &recordingSink{}
+	err := ValidateZip(context.Background(), data, testConfig(), sink)
+	if !errors.Is(err, ErrUnclassifiableEntry) {
+		t.Fatalf("ValidateZip: got %v, want ErrUnclassifiableEntry", err)
+	}
+	if len(sink.staged) != 0 || len(sink.symlinks) != 0 {
+		t.Fatalf("sink saw the smuggled entry: staged=%v symlinks=%v", sink.staged, sink.symlinks)
+	}
+	if !sink.aborted || sink.committed {
+		t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+	}
+}
+
+// TestRegularFileWithUnixAttrsStaged guards against a false positive from the
+// raw-attr check: an ordinary regular file whose external attributes carry
+// S_IFREG (a normal Unix-creator regular entry) stages cleanly.
+func TestRegularFileWithUnixAttrsStaged(t *testing.T) {
+	data := buildZip(t, zipEntry{name: "ok.txt", body: []byte("regular content"), mode: 0o644})
+	sink := &recordingSink{}
+	if err := ValidateZip(context.Background(), data, testConfig(), sink); err != nil {
+		t.Fatalf("ValidateZip(regular file with mode): got %v, want nil", err)
+	}
+	if len(sink.staged) != 1 || sink.staged[0] != "ok.txt" {
+		t.Fatalf("regular file not staged: staged=%v", sink.staged)
+	}
+	if !sink.committed {
+		t.Fatal("regular-file archive did not commit")
 	}
 }
 
