@@ -695,3 +695,27 @@ func TestLexicalStagePinnedPerVerb(t *testing.T) {
 		})
 	}
 }
+
+// TestLocalEngineRootReadinessProbe pins the engine root readiness probe used
+// by /readyz (T2-3): List(ctx, scope, ".") returns nil for a provisioned scope
+// root (the special-case path; ValidatePath rejects "." for data verbs but
+// List has a deliberate scope-root carve-out) and an error for a missing
+// root. The Engine interface needs no new verb — List reuses the existing seam.
+func TestLocalEngineRootReadinessProbe(t *testing.T) {
+	ctx := context.Background()
+	eng, base, scope := newLocalEngine(t)
+
+	// Provisioned scope root is present — probe returns nil.
+	if _, err := eng.List(ctx, scope, "."); err != nil {
+		t.Fatalf("List(scope, '.') on present root: got %v, want nil", err)
+	}
+
+	// Remove the scope root: probe must now error (readyz would return not-ready).
+	scopeDir := filepath.Join(base, string(scope))
+	if err := os.RemoveAll(scopeDir); err != nil {
+		t.Fatalf("RemoveAll scope dir: %v", err)
+	}
+	if _, err := eng.List(ctx, scope, "."); err == nil {
+		t.Fatal("List(scope, '.') on missing root: got nil, want error (readyz must report not-ready)")
+	}
+}

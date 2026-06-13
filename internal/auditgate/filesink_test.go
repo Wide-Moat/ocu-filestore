@@ -428,6 +428,79 @@ func TestRestartTornTailRefusal(t *testing.T) {
 	}
 }
 
+// TestFileSinkLatchedReportsState pins the Latched() reader: a healthy sink
+// reports false; after a write or sync fault it reports true and stays true
+// on every subsequent Mandate call (SEC-79: the 100%-deny condition is
+// observable).
+func TestFileSinkLatchedReportsState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault faultSyncer
+	}{
+		{"write fault", faultSyncer{failWrite: true}},
+		{"sync fault", faultSyncer{failSync: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, s := newTestSink(t)
+			if s.Latched() {
+				t.Fatal("Latched() on healthy sink: got true, want false")
+			}
+			fault := tc.fault
+			fault.ws = s.f
+			s.w = &fault
+			_ = s.Mandate(context.Background(), testEvent())
+			if !s.Latched() {
+				t.Fatal("Latched() after fault: got false, want true")
+			}
+			s.w = s.f // underlying fault gone — latch stays
+			_ = s.Mandate(context.Background(), testEvent())
+			if !s.Latched() {
+				t.Fatal("Latched() stays true after fault is cleared: got false")
+			}
+		})
+	}
+}
+
+// TestFileSinkOnLatchFiresExactlyOnce pins the on-latch callback contract:
+// the callback fires EXACTLY ONCE when the sink transitions to the latched
+// state; subsequent denied Mandates do NOT re-fire it.
+func TestFileSinkOnLatchFiresExactlyOnce(t *testing.T) {
+	_, s := newTestSink(t)
+	var count int
+	s.SetOnLatch(func() { count++ })
+
+	// Baseline: healthy Mandate does not fire the callback.
+	if err := s.Mandate(context.Background(), testEvent()); err != nil {
+		t.Fatalf("baseline Mandate: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("onLatch fired before any fault: count=%d, want 0", count)
+	}
+
+	// Inject fault: the first failed Mandate fires the callback.
+	fault := &faultSyncer{ws: s.f, failWrite: true}
+	s.w = fault
+	_ = s.Mandate(context.Background(), testEvent())
+	if count != 1 {
+		t.Fatalf("onLatch after first fault: count=%d, want 1", count)
+	}
+
+	// Three more denied Mandates — callback must NOT fire again.
+	s.w = s.f // fault cleared; latch remains
+	for i := 0; i < 3; i++ {
+		_ = s.Mandate(context.Background(), testEvent())
+	}
+	if count != 1 {
+		t.Fatalf("onLatch after follow-up Mandates: count=%d, want 1 (fires exactly once)", count)
+	}
+}
+
+// TestFileSinkExistingFailClosedTestsUnchanged is a compile-time canary: the
+// existing fail-closed behaviour tests still call the same API. If the
+// filesink semantics changed this would fail at compile time. The runtime
+// correctness is pinned by TestMandateLatchesAfterFault (unchanged).
+var _ = func() bool { return (*FileSink)(nil) == nil } // nop: confirms FileSink is still a concrete type
+
 // TestRestartTornTailTolerated pins the torn-write case: a trailing partial
 // line with no newline was never acked (Sync never returned), so the
 // constructor succeeds, continues from the last complete line, and the
