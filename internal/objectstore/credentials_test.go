@@ -367,7 +367,7 @@ func stsTestConfig(t *testing.T) STSConfig {
 // documented exception is ListBucketMultipartUploads (the SEC-54 orphan
 // sweep lists bucket-wide and filters client-side).
 func TestSTSPolicyDocument(t *testing.T) {
-	raw, err := scopePrefixPolicy("ocu-bucket", "fs-sts-01")
+	raw, err := scopePrefixPolicy("ocu-bucket", "fs-sts-01", "us-east-1")
 	if err != nil {
 		t.Fatalf("scopePrefixPolicy: %v", err)
 	}
@@ -400,6 +400,7 @@ func TestSTSPolicyDocument(t *testing.T) {
 		t.Fatal("ScopeObjects statement missing")
 	}
 	if obj.Resource != "arn:aws:s3:::ocu-bucket/fs-sts-01/*" {
+		// us-east-1 maps to partition "aws" — the existing assertion is correct.
 		t.Fatalf("ScopeObjects resource = %q, want the scope-prefix cell", obj.Resource)
 	}
 	for _, want := range []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject",
@@ -420,6 +421,7 @@ func TestSTSPolicyDocument(t *testing.T) {
 		t.Fatal("ScopeList statement missing")
 	}
 	if list.Resource != "arn:aws:s3:::ocu-bucket" {
+		// us-east-1 → partition "aws".
 		t.Fatalf("ScopeList resource = %q, want the bucket ARN", list.Resource)
 	}
 	cond, ok := list.Condition["StringLike"]
@@ -448,7 +450,7 @@ func TestSTSHostileScopeNeverBuildsPolicy(t *testing.T) {
 		if _, err := NewSTSCredentialSource(cfg); !errors.Is(err, ErrInvalidScopeID) {
 			t.Fatalf("NewSTSCredentialSource(scope=%q) = %v, want ErrInvalidScopeID", hostile, err)
 		}
-		if raw, err := scopePrefixPolicy("ocu-bucket", hostile); !errors.Is(err, ErrInvalidScopeID) {
+		if raw, err := scopePrefixPolicy("ocu-bucket", hostile, "us-east-1"); !errors.Is(err, ErrInvalidScopeID) {
 			t.Fatalf("scopePrefixPolicy(scope=%q) = %q, %v, want ErrInvalidScopeID", hostile, raw, err)
 		}
 	}
@@ -543,5 +545,125 @@ shape is covered un-gated by the policy-document and constructor tests.`)
 	}
 	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" || creds.SessionToken == "" {
 		t.Fatal("AssumeRole returned an incomplete session credential")
+	}
+}
+
+// TestARNPartition table-tests the region-to-partition mapping. Every ARN
+// embedded in the inline session policy must carry the correct partition so
+// that STS does not silently reject or widen the policy.
+func TestARNPartition(t *testing.T) {
+	for _, tc := range []struct {
+		region    string
+		partition string
+	}{
+		{"us-east-1", "aws"},
+		{"us-west-2", "aws"},
+		{"eu-west-1", "aws"},
+		{"ap-southeast-1", "aws"},
+		{"us-gov-west-1", "aws-us-gov"},
+		{"us-gov-east-1", "aws-us-gov"},
+		{"cn-north-1", "aws-cn"},
+		{"cn-northwest-1", "aws-cn"},
+	} {
+		t.Run(tc.region, func(t *testing.T) {
+			got := arnPartition(tc.region)
+			if got != tc.partition {
+				t.Fatalf("arnPartition(%q) = %q, want %q", tc.region, got, tc.partition)
+			}
+		})
+	}
+}
+
+// TestScopePrefixPolicy_GovCloudPartition asserts that a GovCloud region
+// produces Resource ARNs carrying the "aws-us-gov" partition. A wrong
+// partition would cause STS to reject the policy or grant nothing, silently
+// defeating per-session confinement (crutch-03 / NFR-SEC-25).
+func TestScopePrefixPolicy_GovCloudPartition(t *testing.T) {
+	raw, err := scopePrefixPolicy("ocu-bucket", "fs-sts-01", "us-gov-west-1")
+	if err != nil {
+		t.Fatalf("scopePrefixPolicy(us-gov-west-1): %v", err)
+	}
+	var doc stsPolicyDocument
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("policy is not valid JSON: %v", err)
+	}
+	for _, st := range doc.Statement {
+		if !strings.HasPrefix(st.Resource, "arn:aws-us-gov:s3:::") {
+			t.Fatalf("statement %q Resource = %q, want prefix arn:aws-us-gov:s3:::", st.Sid, st.Resource)
+		}
+	}
+}
+
+// TestValidateBucketName asserts that validateBucketName accepts valid S3
+// bucket names and refuses names containing IAM-Resource-glob-meaningful
+// characters or violating S3 naming rules. The validator guards
+// NewSTSCredentialSource so a hostile bucket never reaches scopePrefixPolicy.
+func TestValidateBucketName(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bucket string
+		wantOK bool
+	}{
+		// valid names
+		{"simple lowercase", "ocu-bucket", true},
+		{"digits and hyphens", "bucket-123-abc", true},
+		{"dots allowed", "my.bucket.name", true},
+		{"minimum length 3", "abc", true},
+		{"maximum length 63", strings.Repeat("a", 63), true},
+
+		// IAM-glob-meaningful characters — must be refused
+		{"wildcard star", "my*bucket", false},
+		{"forward slash", "a/b", false},
+		{"leading slash", "/bucket", false},
+		{"trailing slash", "bucket/", false},
+
+		// S3 charset violations
+		{"uppercase letter", "UPPER", false},
+		{"uppercase mixed", "MyBucket", false},
+		{"space in name", "my bucket", false},
+		{"at-sign", "my@bucket", false},
+		{"colon", "my:bucket", false},
+		{"underscore", "my_bucket", false},
+
+		// length constraints
+		{"empty string", "", false},
+		{"too short 1 char", "a", false},
+		{"too short 2 chars", "ab", false},
+		{"too long 64 chars", strings.Repeat("a", 64), false},
+
+		// leading/trailing hyphen and dot
+		{"leading hyphen", "-bucket", false},
+		{"trailing hyphen", "bucket-", false},
+		{"leading dot", ".bucket", false},
+		{"trailing dot", "bucket.", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBucketName(tc.bucket)
+			if tc.wantOK && err != nil {
+				t.Fatalf("validateBucketName(%q) = %v, want nil", tc.bucket, err)
+			}
+			if !tc.wantOK {
+				if err == nil {
+					t.Fatalf("validateBucketName(%q) = nil, want error", tc.bucket)
+				}
+				if !errors.Is(err, errSTSConfig) {
+					t.Fatalf("validateBucketName(%q) = %v, want errSTSConfig sentinel", tc.bucket, err)
+				}
+			}
+		})
+	}
+}
+
+// TestNewSTSCredentialSource_InvalidBucket asserts that NewSTSCredentialSource
+// refuses hostile or malformed bucket names before any policy text is built.
+func TestNewSTSCredentialSource_InvalidBucket(t *testing.T) {
+	for _, hostile := range []string{"my*bucket", "a/b", "UPPER", "", "ab", strings.Repeat("x", 64)} {
+		t.Run(hostile, func(t *testing.T) {
+			cfg := stsTestConfig(t)
+			cfg.Bucket = hostile
+			if _, err := NewSTSCredentialSource(cfg); !errors.Is(err, errSTSConfig) {
+				t.Fatalf("NewSTSCredentialSource(bucket=%q) = %v, want errSTSConfig", hostile, err)
+			}
+		})
 	}
 }
