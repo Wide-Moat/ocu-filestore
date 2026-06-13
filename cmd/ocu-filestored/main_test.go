@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -432,6 +433,47 @@ func TestSelectCredentialSourceKindFlows(t *testing.T) {
 	cfg.filesystemID = "../escape"
 	if _, err := selectCredentialSource(cfg, "ocu-bucket", "us-east-1"); !errors.Is(err, objectstore.ErrInvalidScopeID) {
 		t.Fatalf("selectCredentialSource(hostile scope) = %v, want ErrInvalidScopeID", err)
+	}
+}
+
+// TestRunVersionFlagPrintsAndExitsClean pins T1-13: `-version` prints the
+// build identity to stdout and returns nil (exit 0 through main), without
+// requiring any of the serving flags.
+func TestRunVersionFlagPrintsAndExitsClean(t *testing.T) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	runErr := run([]string{"-version"})
+	_ = w.Close()
+	os.Stdout = old
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+	if runErr != nil {
+		t.Fatalf("run(-version): got %v, want nil (exit 0)", runErr)
+	}
+	got := string(out)
+	if !strings.Contains(got, "ocu-filestored") || !strings.Contains(got, version) {
+		t.Fatalf("run(-version) printed %q, want the daemon name and version %q", got, version)
+	}
+}
+
+// TestVersionString pins the build-identity shape: the stamped version var
+// (the ldflags -X main.version target — its existence is what makes the
+// release stamping a real assignment, not a no-op) and the Go toolchain
+// version from the embedded build info.
+func TestVersionString(t *testing.T) {
+	got := versionString()
+	if !strings.HasPrefix(got, "ocu-filestored "+version) {
+		t.Fatalf("versionString() = %q, want prefix %q", got, "ocu-filestored "+version)
+	}
+	// The test binary always embeds build info with a Go toolchain version.
+	if !strings.Contains(got, "go1") {
+		t.Fatalf("versionString() = %q, want the Go toolchain version", got)
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -40,6 +41,49 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
+
+// version is the build tag stamped by the release pipeline via
+// `-ldflags "-X main.version=<tag>"`. A non-release build reports "dev".
+var version = "dev"
+
+// versionString reports the daemon build identity on one line: the stamped
+// version, the VCS revision and commit time when the build carries them
+// (runtime/debug build info; a dirty working tree is marked), and the Go
+// toolchain version.
+func versionString() string {
+	var b strings.Builder
+	b.WriteString("ocu-filestored " + version)
+	if info, ok := debug.ReadBuildInfo(); ok {
+		var rev, vcsTime, modified string
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.time":
+				vcsTime = s.Value
+			case "vcs.modified":
+				modified = s.Value
+			}
+		}
+		if rev != "" {
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			if modified == "true" {
+				rev += "-dirty"
+			}
+			b.WriteString(" (" + rev)
+			if vcsTime != "" {
+				b.WriteString(" " + vcsTime)
+			}
+			b.WriteString(")")
+		}
+		if info.GoVersion != "" {
+			b.WriteString(" " + info.GoVersion)
+		}
+	}
+	return b.String()
+}
 
 // errBadProfile rejects an admission profile outside the legal set. Match it
 // with errors.Is.
@@ -156,11 +200,14 @@ type brokerConfig struct {
 
 // run parses and validates the frozen flag surface, then composes and serves
 // the daemon. A parse error other than -h/-help propagates; -h/-help returns
-// nil. A non-admitted profile/tenancy/credential triple, or a missing/invalid
+// nil; -version prints the build identity and returns nil (exit 0). A
+// non-admitted profile/tenancy/credential triple, or a missing/invalid
 // required flag, returns a typed error BEFORE any socket is bound.
 func run(args []string) error {
 	fs := flag.NewFlagSet("ocu-filestored", flag.ContinueOnError)
 
+	showVersion := fs.Bool("version", false,
+		"print the version, VCS revision, and Go toolchain, then exit 0")
 	fs.String("north-listen", "127.0.0.1:7080",
 		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
 	engine := fs.String("engine", "local-volume",
@@ -215,6 +262,14 @@ func run(args []string) error {
 			return nil
 		}
 		return err
+	}
+
+	// -version prints the build identity and exits 0 before any validation:
+	// an operator (and the release smoke) must be able to interrogate a
+	// binary without supplying the required serving flags.
+	if *showVersion {
+		fmt.Println(versionString())
+		return nil
 	}
 
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,

@@ -137,6 +137,18 @@ jobs:
           done
           (cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt)
 
+      - name: smoke the stamped version (-version must report the tag)
+        # The ldflags stamp is only real if `main.version` exists and the
+        # binary reports it: run the just-built amd64 binary (the runner's
+        # own arch) and require the tag in its -version output.
+        run: |
+          set -euo pipefail
+          chmod +x dist/ocu-filestored_linux_amd64
+          out=$(dist/ocu-filestored_linux_amd64 -version)
+          echo "$out"
+          echo "$out" | grep -F "${GITHUB_REF_NAME}" >/dev/null \
+            || { echo "::error::-version output does not carry the tag ${GITHUB_REF_NAME}"; exit 1; }
+
       - name: generate the changelog since the previous tag
         id: changelog
         run: |
