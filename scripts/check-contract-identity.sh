@@ -24,6 +24,7 @@ readonly CANON_DIR="${OCU_CANON_DIR:-../open-computer-use}"
 # so the set cannot silently fall out of sync with what is actually vendored.
 readonly -a CONTRACTS=(
   'file-ops.schema.json'
+  'file-artifact-api.schema.json'
 )
 
 # Resolve the canon side once: probe the first declared contract to decide
