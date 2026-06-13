@@ -27,8 +27,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -285,8 +287,38 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer srv.Close()
-	return srv.Serve()
+	return serveUntilSignal(srv)
+}
+
+// serveUntilSignal serves srv until either Serve returns on its own (a
+// listener fault) or SIGTERM/SIGINT arrives. On a signal the session begins
+// its bounded drain (southface force-closes stragglers past the bound) and
+// teardown ALWAYS runs — TeardownScope erase-before-reuse plus socket
+// removal (NFR-SEC-54): a clean stop signal must never skip the erase. Every
+// exit path combines the serve and close results with errors.Join, so a
+// teardown error is never silently dropped behind a serve error (or vice
+// versa).
+func serveUntilSignal(srv southface.Server) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+
+	select {
+	case err := <-serveErr:
+		// Serve ended without a signal (listener fault): teardown still runs.
+		return errors.Join(err, srv.Close())
+	case <-ctx.Done():
+		// Signal received. Stop intercepting FIRST so a second
+		// SIGTERM/SIGINT during a wedged drain kills the process hard
+		// (default disposition) instead of being swallowed.
+		stop()
+		closeErr := srv.Close()
+		// Close shut the listener down, so Serve returns promptly (a clean
+		// shutdown collapses to nil); drain the goroutine and surface both.
+		return errors.Join(<-serveErr, closeErr)
+	}
 }
 
 // validate parses and checks the flag surface, returning a brokerConfig or a
@@ -631,16 +663,15 @@ type teardownServer struct {
 }
 
 // Close shuts the session down, erases the scope (erase-before-reuse), and
-// releases the per-session ceilings. The session Close error takes precedence;
-// the teardown error is reported only if the session closed cleanly.
+// releases the per-session ceilings. TeardownScope runs UNCONDITIONALLY —
+// a session-close failure never skips the erase — and both errors surface
+// via errors.Join: a teardown error is never silently dropped behind a
+// session-close error (NFR-SEC-54).
 func (t *teardownServer) Close() error {
 	closeErr := t.Server.Close()
 	teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
 	defer cancelTeardown()
 	teardownErr := t.engine.TeardownScope(teardownCtx, t.scope)
 	t.ceiling.Release(ceilings.SessionKey(t.fsid))
-	if closeErr != nil {
-		return closeErr
-	}
-	return teardownErr
+	return errors.Join(closeErr, teardownErr)
 }

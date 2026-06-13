@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -613,6 +614,124 @@ func TestTenancyHyphenToUnderscoreMap(t *testing.T) {
 		t.Fatal("admission constant is hyphenated; the map would be a no-op (it must not be)")
 	}
 }
+
+// fakeLifecycleServer is a controllable southface.Server for the signal and
+// teardown-ordering tests: Serve optionally blocks until Close is called
+// (the real session's shape), and both verbs return injected errors.
+type fakeLifecycleServer struct {
+	serveStarted chan struct{}
+	closeCalled  chan struct{}
+	blockServe   bool
+	serveErr     error
+	closeErr     error
+}
+
+func (s *fakeLifecycleServer) Serve() error {
+	close(s.serveStarted)
+	if s.blockServe {
+		<-s.closeCalled
+	}
+	return s.serveErr
+}
+
+func (s *fakeLifecycleServer) Close() error {
+	close(s.closeCalled)
+	return s.closeErr
+}
+
+// TestServeUntilSignalSigtermRunsTeardown pins T1-9/SEC-54 stop path: a real
+// SIGTERM delivered to the process makes serveUntilSignal close the server
+// (teardown runs) and SURFACES the close error — a teardown failure on a
+// clean signal stop is never silently dropped.
+func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
+	teardownErr := errors.New("teardown failed loudly")
+	srv := &fakeLifecycleServer{
+		serveStarted: make(chan struct{}),
+		closeCalled:  make(chan struct{}),
+		blockServe:   true,
+		closeErr:     teardownErr,
+	}
+	result := make(chan error, 1)
+	go func() { result <- serveUntilSignal(srv) }()
+
+	// Serve has started, therefore signal.NotifyContext is already armed
+	// (it is registered before the Serve goroutine launches).
+	<-srv.serveStarted
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("self-SIGTERM: %v", err)
+	}
+
+	select {
+	case err := <-result:
+		select {
+		case <-srv.closeCalled:
+		default:
+			t.Fatal("serveUntilSignal returned without calling Close — teardown was skipped on SIGTERM")
+		}
+		if !errors.Is(err, teardownErr) {
+			t.Fatalf("serveUntilSignal after SIGTERM = %v, want the surfaced teardown error", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveUntilSignal did not return within 10s of SIGTERM")
+	}
+}
+
+// TestServeUntilSignalServeFaultStillTearsDown pins that a Serve that fails
+// on its own (listener fault, no signal) still runs teardown, and BOTH the
+// serve error and the close error surface via errors.Join.
+func TestServeUntilSignalServeFaultStillTearsDown(t *testing.T) {
+	serveFault := errors.New("listener fault")
+	teardownErr := errors.New("teardown also failed")
+	srv := &fakeLifecycleServer{
+		serveStarted: make(chan struct{}),
+		closeCalled:  make(chan struct{}),
+		serveErr:     serveFault,
+		closeErr:     teardownErr,
+	}
+	err := serveUntilSignal(srv)
+	select {
+	case <-srv.closeCalled:
+	default:
+		t.Fatal("Close was not called after a serve fault — teardown skipped")
+	}
+	if !errors.Is(err, serveFault) || !errors.Is(err, teardownErr) {
+		t.Fatalf("serveUntilSignal = %v, want BOTH the serve fault and the teardown error joined", err)
+	}
+}
+
+// TestTeardownServerCloseJoinsBothErrors pins that teardownServer.Close runs
+// the scope erase even when the session close fails, and reports both.
+func TestTeardownServerCloseJoinsBothErrors(t *testing.T) {
+	closeFault := errors.New("session close fault")
+	eng := &deadlineRecordingEngine{}
+	reg := ceilings.NewRegistry(ceilings.Config{
+		OpsPerSecond:         defaultOpsPerSecond,
+		OpsBurst:             defaultOpsBurst,
+		InFlightBytesCeiling: defaultInFlightBytes,
+		FDCeiling:            defaultFDCeiling,
+		Clock:                time.Now,
+	})
+	srv := &teardownServer{
+		Server:  failingCloseServer{err: closeFault},
+		engine:  eng,
+		ceiling: reg,
+		scope:   objectstore.ScopeID("fs1"),
+		fsid:    "fs1",
+	}
+	err := srv.Close()
+	if !eng.hadDeadline {
+		t.Fatal("TeardownScope did not run after a failing session close — the erase was skipped")
+	}
+	if !errors.Is(err, closeFault) {
+		t.Fatalf("Close = %v, want the session close fault surfaced", err)
+	}
+}
+
+// failingCloseServer is a southface.Server whose Close always fails.
+type failingCloseServer struct{ err error }
+
+func (failingCloseServer) Serve() error   { return nil }
+func (f failingCloseServer) Close() error { return f.err }
 
 // nopServer is a no-op southface.Server for exercising teardownServer.Close
 // in isolation.

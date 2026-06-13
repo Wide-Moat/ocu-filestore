@@ -255,18 +255,35 @@ func (s *session) Serve() error {
 	return err
 }
 
-// Close shuts the server down, releases the scope binding, and unlinks the
-// socket. In-flight operations finish or fail fail-closed, never
-// half-acknowledged. The unix listener's default SetUnlinkOnClose removes the
-// socket on listener close; Close also removes it explicitly to cover the
-// shutdown-before-serve path.
+// shutdownDrainTimeout bounds the graceful drain in Close: in-flight
+// operations get this long to finish before stragglers are force-closed. A
+// wedged peer must never hold the session open indefinitely — the caller's
+// teardown (erase-before-reuse, NFR-SEC-54) runs AFTER Close returns, so an
+// unbounded drain would be an unbounded teardown delay. The bound is
+// deliberately under typical service-manager stop grace periods (30s) so the
+// drain, the force-close, AND the scope erase all fit before a SIGKILL.
+const shutdownDrainTimeout = 25 * time.Second
+
+// Close shuts the server down with a BOUNDED drain, releases the scope
+// binding, and unlinks the socket. In-flight operations get up to
+// shutdownDrainTimeout to finish or fail fail-closed, never
+// half-acknowledged; stragglers past the bound are force-closed so teardown
+// can always proceed. Every failure on the way down surfaces via errors.Join
+// — a drain expiry never hides a force-close or unlink error. The unix
+// listener's default SetUnlinkOnClose removes the socket on listener close;
+// Close also removes it explicitly to cover the shutdown-before-serve path.
 func (s *session) Close() error {
-	shutdownErr := s.srv.Shutdown(context.Background())
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancelDrain()
+	shutdownErr := s.srv.Shutdown(drainCtx)
+	if shutdownErr != nil {
+		// The bounded drain expired (or shutdown itself failed): force-close
+		// the straggling connections. Both errors surface.
+		shutdownErr = errors.Join(shutdownErr, s.srv.Close())
+	}
 	s.reg.Release(s.socketPath)
 	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		if shutdownErr == nil {
-			shutdownErr = err
-		}
+		shutdownErr = errors.Join(shutdownErr, err)
 	}
 	return shutdownErr
 }

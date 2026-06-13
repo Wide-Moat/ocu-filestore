@@ -21,8 +21,10 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +32,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -538,6 +541,64 @@ func TestE2EPeerDrop(t *testing.T) {
 		t.Fatalf("host-uid dial should pass the gate: %v", err)
 	}
 	_ = conn.Close()
+}
+
+// TestE2ESignalTeardown pins the T1-9/SEC-54 stop path on the REAL binary:
+// a SIGTERM (and a SIGINT) to a running daemon exits 0, removes the session
+// socket, and erases the scope directory — the signal stop NEVER skips the
+// erase-before-reuse teardown. The case plants a file directly in the
+// provisioned scope on the host filesystem (no socket dial), so it is
+// platform-neutral: it runs on darwin too, where the peer-cred-gated dial
+// cases loud-skip. The s3 leg skips (no host scope dir to plant into; the
+// s3 teardown sweep is covered by the engine and conformance suites).
+func TestE2ESignalTeardown(t *testing.T) {
+	if e2eEngineS3() {
+		t.Skip("signal-teardown scope assertion drives the local-volume leg; the s3 sweep is engine-suite-covered")
+	}
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(sig.String(), func(t *testing.T) {
+			d := startDaemon(t, daemonOptions{})
+			scopeDir := filepath.Join(d.engineRoot, goldenScope)
+
+			// Plant session bytes directly in the provisioned scope: the
+			// teardown must erase them regardless of how they arrived.
+			if err := os.WriteFile(filepath.Join(scopeDir, "leftover.bin"), []byte("SESSIONBYTES"), 0o600); err != nil {
+				t.Fatalf("plant leftover: %v", err)
+			}
+
+			if err := d.cmd.Process.Signal(sig); err != nil {
+				t.Fatalf("send %v: %v", sig, err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- d.cmd.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("daemon exit after %v = %v, want exit 0; stderr:\n%s", sig, err, d.stderr.String())
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("daemon did not exit within 30s of %v (drain bound + teardown must fit); stderr:\n%s", sig, d.stderr.String())
+			}
+
+			// The socket file is gone.
+			if _, err := os.Stat(d.socketPath); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("socket %q after %v: stat err = %v, want removed", d.socketPath, sig, err)
+			}
+			// The scope directory was erased: it exists (recreated empty by
+			// the teardown) and holds nothing.
+			entries, err := os.ReadDir(scopeDir)
+			if err != nil {
+				t.Fatalf("read scope dir after %v: %v", sig, err)
+			}
+			if len(entries) != 0 {
+				names := make([]string, 0, len(entries))
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				t.Fatalf("scope dir not empty after %v teardown: %v (SEC-54)", sig, names)
+			}
+		})
+	}
 }
 
 // assertNothingStaged fails if any regular file exists anywhere under root.
