@@ -159,17 +159,15 @@ func mapDeny(class string) DenyVerdict {
 
 // mapDenyDegraded builds the verdict for the audited-truth vs wire-reason
 // split: the audit record carries auditReason (the broker-resolved TRUTH);
-// the wire carries wireClass's code, status, and header gating. When the
-// two differ, a correlation id links the audited record to the wire
-// response. The degrade itself (e.g. cross-scope uuid presented as
-// not_found) is handler-phase behaviour; the spine carries the split now so
-// the API is fixed.
+// the wire carries wireClass's code, status, and header gating. The
+// CorrelationID is NOT auto-minted here; callers set it to the per-request
+// id (T2-18) so the audit record, the x-request-id response header, and
+// the log line all share ONE id rather than two. A caller that does not set
+// CorrelationID explicitly gets an empty string — acceptable for code paths
+// that do not have a request context (e.g., direct unit tests).
 func mapDenyDegraded(auditReason, wireClass string) DenyVerdict {
 	v := mapDeny(wireClass)
 	v.AuditReason = auditReason
-	if auditReason != wireClass {
-		v.CorrelationID = newCorrelationID()
-	}
 	return v
 }
 

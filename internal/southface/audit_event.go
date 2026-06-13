@@ -55,5 +55,6 @@ func mapAuditEvent(e auditEvent) auditgate.FileActivityEvent {
 		Downloadable: e.Downloadable,
 		Outcome:      outcome,
 		// PrevHash chained by Mandate — leave empty.
+		CorrelationUID: e.RequestID,
 	}
 }

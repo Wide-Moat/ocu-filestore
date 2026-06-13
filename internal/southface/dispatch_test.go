@@ -424,8 +424,10 @@ func TestDispatchSizeAndHeaderGates(t *testing.T) {
 
 // TestD8Split pins the audited-truth vs wire-reason split: when the wire
 // reason degrades away from the audited truth, the verdict carries the truth
-// as AuditReason, the degraded code as WireCode, and a 32-char hex correlation
-// id; when they agree, the id is empty.
+// as AuditReason and the degraded code as WireCode. CorrelationID is NOT
+// auto-minted by mapDenyDegraded (T2-18 unifies it into the per-request id);
+// callers set CorrelationID to reqID after calling mapDenyDegraded so the
+// wire response, the log line, and the audit record share ONE id end-to-end.
 func TestD8Split(t *testing.T) {
 	v := mapDenyDegraded(denyScopeMismatch, denyNotFound)
 	if v.AuditReason != denyScopeMismatch {
@@ -434,13 +436,9 @@ func TestD8Split(t *testing.T) {
 	if v.WireCode != wireCodeNotFound {
 		t.Fatalf("WireCode = %q, want %q", v.WireCode, wireCodeNotFound)
 	}
-	if len(v.CorrelationID) != 32 {
-		t.Fatalf("CorrelationID len = %d, want 32", len(v.CorrelationID))
-	}
-	for _, c := range v.CorrelationID {
-		if !strings.ContainsRune("0123456789abcdef", c) {
-			t.Fatalf("CorrelationID %q not lowercase hex", v.CorrelationID)
-		}
+	// CorrelationID is empty — callers supply the per-request id (T2-18).
+	if v.CorrelationID != "" {
+		t.Fatalf("CorrelationID = %q, want empty (caller sets it to the request id)", v.CorrelationID)
 	}
 	same := mapDenyDegraded(denyScopeMismatch, denyScopeMismatch)
 	if same.CorrelationID != "" {

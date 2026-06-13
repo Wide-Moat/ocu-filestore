@@ -70,8 +70,9 @@ func TestDenyMapperUnknownClassFailsClosed(t *testing.T) {
 // TestDenyMapperAuditTruthSplit pins the audited-truth vs wire-reason split:
 // when the wire reason degrades away from the broker-resolved truth (e.g.
 // audited scope_mismatch presented as not_found for anti-enumeration), the
-// verdict carries the truth in AuditReason, the degraded code on the wire,
-// and a correlation id linking the two.
+// verdict carries the truth in AuditReason and the degraded code on the
+// wire. CorrelationID is NOT auto-minted by mapDenyDegraded (T2-18:
+// callers supply the per-request id so there is ONE id end-to-end, not two).
 func TestDenyMapperAuditTruthSplit(t *testing.T) {
 	v := mapDenyDegraded(denyScopeMismatch, denyNotFound)
 	if v.AuditReason != denyScopeMismatch {
@@ -83,11 +84,13 @@ func TestDenyMapperAuditTruthSplit(t *testing.T) {
 	if v.WireHeader {
 		t.Fatalf("WireHeader = true, want false (not_found carries no x-deny-reason)")
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(v.CorrelationID) {
-		t.Fatalf("CorrelationID = %q, want 32-char lowercase hex", v.CorrelationID)
+	// CorrelationID is left empty by mapDenyDegraded — the caller (ServeHTTP
+	// mandateDeny) sets it to the per-request id (T2-18).
+	if v.CorrelationID != "" {
+		t.Fatalf("CorrelationID = %q, want empty (caller sets it to the request id)", v.CorrelationID)
 	}
 
-	// When truth and wire agree the correlation id may be (and is) empty.
+	// When truth and wire agree the correlation id is also empty.
 	same := mapDenyDegraded(denyScopeMismatch, denyScopeMismatch)
 	if same.CorrelationID != "" {
 		t.Fatalf("CorrelationID = %q, want empty when truth == wire", same.CorrelationID)

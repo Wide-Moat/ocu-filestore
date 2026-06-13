@@ -20,6 +20,11 @@ import (
 // fatal only to a stalled one.
 const defaultFrameReadTimeout = 30 * time.Second
 
+// requestIDHeader is the response header name for the per-request correlation
+// id (T2-18). It is present on EVERY response — allow AND deny, unary AND
+// streaming — and must never be used as a metric label (T2-2 cardinality rule).
+const requestIDHeader = "x-request-id"
+
 // OCSF File System Activity ids (class 1001). There is no rename/move id, so a
 // move/copy is recorded as a Create on the produced (destination) handle
 // (Q7). The set is the slice the namespace ops need; the auditgate branch owns
@@ -60,8 +65,22 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 // 0->4 order is unchanged — the log and metric recording are strictly additive
 // observation. op is the southface Op string ("" if unknown at deny time,
 // recorded as "internal" sentinel).
+//
+// denyWith uses the dispatcher's base logger (no request_id); call denyWithLog
+// from request-scoped paths where a request_id-bearing logger is available.
 func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
 	d.logger.Warn("broker deny",
+		slog.String(observ.KeyDenyClass, v.AuditReason),
+		slog.String(observ.KeyReason, message),
+	)
+	writeConnectError(w, v, message)
+}
+
+// denyWithLog is the request-scoped variant of denyWith: it uses the supplied
+// logger (which carries the request_id via observ.KeyRequestID from a prior
+// logger.With call) so deny WARN lines are correlated end-to-end.
+func (d *dispatcher) denyWithLog(w http.ResponseWriter, l *slog.Logger, v DenyVerdict, message string) {
+	l.Warn("broker deny",
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
@@ -198,9 +217,11 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 // ServeHTTP runs the LOCKED pipeline. The order is load-bearing and must not
 // be reordered:
 //
-//	STAGE 0 header gate (NO body byte read): route -> version -> Content-Type
-//	  -> PeerScope from context -> declared-size pre-buffer on Content-Length
-//	  -> ops/s throttle keyed on the CHANNEL scope (never the body)
+//	STAGE 0 header gate (NO body byte read): mint request id -> set
+//	  x-request-id header -> derive request-scoped logger -> route ->
+//	  version -> Content-Type -> PeerScope from context ->
+//	  declared-size pre-buffer on Content-Length -> ops/s throttle keyed
+//	  on the CHANNEL scope (never the body)
 //	STAGE 1 strict envelope decode (through the MaxBytesReader backstop)
 //	STAGE 1b channel-scope cross-check on the DECODED body (D2)
 //	STAGE 2 authz (Resolver.Resolve with caller evidence from the channel)
@@ -209,6 +230,17 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 //
 // Every refusal flows through the deny.go mapper — one source of truth.
 func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// STAGE 0: mint the per-request correlation id and stamp it on the
+	// response header immediately (before any WriteHeader path). The id is
+	// a 32-char lowercase hex token from crypto/rand — high-cardinality but
+	// NOT a metric label (T2-2 cardinality rule). It links the log lines,
+	// the audit record, and the wire response for this single request.
+	reqID := newCorrelationID()
+	w.Header().Set(requestIDHeader, reqID)
+	// Derive a request-scoped logger so every log line for this request
+	// carries request_id without requiring each call site to pass it.
+	reqLog := d.logger.With(slog.String(observ.KeyRequestID, reqID))
+
 	// STAGE 0: route. A non-POST to a valid-shaped route is a 405; an
 	// unknown route or version/content-type fault is invalid_argument. No
 	// body byte is read in this stage (SEC-76/78).
@@ -216,10 +248,10 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if err == errBadMethod {
 			w.Header().Set("Allow", http.MethodPost)
-			d.denyWith(w, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
+			d.denyWithLog(w, reqLog, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
 			return
 		}
-		d.denyWith(w, mapDeny(denyClassForDecodeErr(err)), "unknown route")
+		d.denyWithLog(w, reqLog, mapDeny(denyClassForDecodeErr(err)), "unknown route")
 		return
 	}
 
@@ -229,7 +261,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// method) do not have an op and use plain denyWith (no ops_total entry).
 	opStr := string(op)
 	denyOp := func(v DenyVerdict, message string) {
-		d.denyWith(w, v, message)
+		d.denyWithLog(w, reqLog, v, message)
 		if d.brokerMetrics != nil {
 			func() {
 				defer func() { recover() }() //nolint:errcheck
@@ -246,7 +278,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// unary Content-Length pre-buffer reject would kill a chunked connect+json
 	// upload (Pitfalls 1, 2). The unary path below is unchanged.
 	if isStreamingOp(op) {
-		d.serveStreaming(w, r, op)
+		d.serveStreaming(w, r, op, reqID, reqLog)
 		return
 	}
 
@@ -372,6 +404,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
 	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
+	allowEvent.RequestID = reqID
 	mandateStart := time.Now()
 	mandateErr := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent))
 	d.observeStage("audit_mandate", time.Since(mandateStart).Seconds())
@@ -379,6 +412,14 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		denyOp(mapDeny(denyClassForErr(mandateErr)), "audit gate unavailable")
 		return
 	}
+
+	// STAGE 3 cleared: emit a DEBUG-level allow line so the request_id (T2-18)
+	// appears in the log for successfully mandated requests. The deny path
+	// already logs via denyWithLog; this ensures the id is visible on the
+	// allow path too without adding an info-level line for every request.
+	reqLog.Debug("broker allow",
+		slog.String(observ.KeyOp, opStr),
+	)
 
 	// STAGE 4: the per-op handler. The seven phase-9 ops have real handlers;
 	// the other eleven stay unimplemented. A route op absent from the registry
@@ -403,11 +444,15 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// STAGE-3 allow-Mandate failure path above.
 	mandateDeny := func(auditReason, wireClass, message string) {
 		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
+		denyEvent.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
 			denyOp(mapDeny(denyAuditDown), "audit gate unavailable")
 			return
 		}
-		denyOp(mapDenyDegraded(auditReason, wireClass), message)
+		// Set CorrelationID to the request id (T2-18: one id, not two).
+		v := mapDenyDegraded(auditReason, wireClass)
+		v.CorrelationID = reqID
+		denyOp(v, message)
 	}
 
 	// STAGE 4: time the engine handler call. The timer wraps h(...) as an
@@ -531,6 +576,11 @@ type auditEvent struct {
 	// DenyReason is set only on a handler-stage deny event; empty on an
 	// allow event.
 	DenyReason string
+	// RequestID is the T2-18 correlation id minted at dispatch STAGE 0;
+	// it links this audit record to the x-request-id response header and
+	// the structured log line for the same request. Empty when the event
+	// is synthesised outside a request context.
+	RequestID string
 }
 
 // withStatus returns a copy of the verdict with an overridden HTTP status,

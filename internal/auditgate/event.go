@@ -78,7 +78,8 @@ type Metadata struct {
 // SHA-256 of the previous written line (AUD-02).
 //
 // Field declaration order is the JSON marshal order and therefore part of
-// the hash-chain input — do not reorder fields.
+// the hash-chain input — do not reorder fields. Append new fields only;
+// never reorder existing ones.
 type FileActivityEvent struct {
 	ClassUID    int        `json:"class_uid"`    // const 1001
 	CategoryUID int        `json:"category_uid"` // const 1
@@ -96,4 +97,11 @@ type FileActivityEvent struct {
 	Downloadable bool         `json:"downloadable"` // resolved at read, never stamped at write (NFR-SEC-73)
 	Outcome      Outcome      `json:"outcome"`
 	PrevHash     string       `json:"prev_hash"`
+	// CorrelationUID is an append-only OCU extension (T2-18): the
+	// request-scoped correlation id minted at dispatch STAGE 0 and carried
+	// end-to-end through the log record, the x-request-id response header,
+	// and this audit record so the three telemetry surfaces can be joined.
+	// It is omitempty so a zero value (no request context, e.g. a
+	// synthesised event in a test) does not alter the hash-chain input.
+	CorrelationUID string `json:"correlation_uid,omitempty"`
 }

@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 )
 
 // downloadChunkSize is the maximum number of raw bytes written into a single
@@ -79,18 +82,25 @@ func checkStreamContentType(r *http.Request) bool {
 // sees the verdict (WIRE-LESSONS #2). A pre-PeerScope wiring fault (no channel
 // scope) is the one case with no session context to frame against — it fails
 // closed with a unary internal error.
-func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op Op) {
+//
+// reqID is the per-request correlation id minted by ServeHTTP at STAGE 0; it
+// is already set on the response header by the caller. reqLog is a logger
+// pre-decorated with request_id so streaming WARN lines carry the same id.
+func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op Op, reqID string, reqLog *slog.Logger) {
 	// PeerScope first: without the channel binding there is no scope to key
 	// audit/ceilings on — a wiring fault that fails closed. This is the only
 	// pre-frame fault written as a unary error (no session to frame against).
 	ps, ok := peerScopeFromContext(r.Context())
 	if !ok {
+		// x-request-id is already set on w.Header() by ServeHTTP before this
+		// call, so it will appear on this unary error response too.
 		writeConnectError(w, mapDeny(denyInternal), "no channel scope on connection")
 		return
 	}
 
 	// From here every refusal is a framed HTTP-200 trailer. Commit the 200
-	// header before the first frame.
+	// header (x-request-id is already queued on w.Header()) before the first
+	// frame.
 	w.Header().Set("Content-Type", connContentTypeStream)
 	w.WriteHeader(http.StatusOK)
 
@@ -113,19 +123,23 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 	switch op {
 	case OpFileUpload:
 		d.handleFileUpload(streamCtx{
-			w:    w,
-			body: r.Body,
-			ctx:  r.Context(),
-			ps:   ps,
-			sess: sess,
+			w:      w,
+			body:   r.Body,
+			ctx:    r.Context(),
+			ps:     ps,
+			sess:   sess,
+			reqID:  reqID,
+			reqLog: reqLog,
 		})
 	case OpFileDownload:
 		d.handleFileDownload(streamCtx{
-			w:    w,
-			body: r.Body,
-			ctx:  r.Context(),
-			ps:   ps,
-			sess: sess,
+			w:      w,
+			body:   r.Body,
+			ctx:    r.Context(),
+			ps:     ps,
+			sess:   sess,
+			reqID:  reqID,
+			reqLog: reqLog,
 		})
 	default:
 		_ = writeEndStream(w, &connectError{Code: wireCodeUnimplemented, Message: "operation not implemented in this build"})
@@ -138,20 +152,27 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 // channel-bound PeerScope, and the per-session ceilings handle. The audit
 // hooks are built by the handler from the dispatcher's guard once the params
 // (and the resolved grant) are known.
+//
+// reqID and reqLog carry the T2-18 correlation id (minted by ServeHTTP at
+// STAGE 0) and the request-scoped logger so streaming audit events and log
+// lines carry the same id as the x-request-id response header.
 type streamCtx struct {
-	w    http.ResponseWriter
-	body io.Reader
-	ctx  context.Context
-	ps   PeerScope
-	sess CeilingsSession
+	w      http.ResponseWriter
+	body   io.Reader
+	ctx    context.Context
+	ps     PeerScope
+	sess   CeilingsSession
+	reqID  string
+	reqLog *slog.Logger
 }
 
 // streamAuditEvent builds a fileUpload audit event from the resolved params +
 // grant. ActivityID is a Create (an upload produces a new object);
 // Downloadable carries the resolved grant; ByteCount carries the declared
 // size (the upload's intended byte count). The durable encoding is the audit
-// gate's; the spine passes the value through Guard.Mandate.
-func (d *dispatcher) streamAuditEvent(ps PeerScope, req ResolveRequest, grant Grant, declared int64) auditEvent {
+// gate's; the spine passes the value through Guard.Mandate. reqID is the
+// T2-18 per-request correlation id threaded end-to-end.
+func (d *dispatcher) streamAuditEvent(ps PeerScope, req ResolveRequest, grant Grant, declared int64, reqID string) auditEvent {
 	return auditEvent{
 		Op:           OpFileUpload,
 		Scope:        ps.FilesystemID,
@@ -163,6 +184,7 @@ func (d *dispatcher) streamAuditEvent(ps PeerScope, req ResolveRequest, grant Gr
 		ObjectHandle: ps.FilesystemID + ":" + req.Path,
 		ByteCount:    declared,
 		Downloadable: grant.Downloadable,
+		RequestID:    reqID,
 	}
 }
 
@@ -206,7 +228,12 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	// upload — so the verdict the guest sees must be audit-down, never the
 	// original refusal. This mirrors the allow-Mandate failure path below.
 	denyTrailer := func(auditReason, wireCode, message string) {
+		sc.reqLog.Warn("broker deny",
+			slog.String(observ.KeyDenyClass, auditReason),
+			slog.String(observ.KeyReason, message),
+		)
 		ev := d.denyAuditEvent(OpFileUpload, sc.ps, req, grant, nil, auditReason)
+		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
@@ -274,7 +301,7 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 	}
 
 	// --- audit ALLOW before any chunk (audit-before-ack) ---
-	allow := d.streamAuditEvent(sc.ps, req, grant, declared)
+	allow := d.streamAuditEvent(sc.ps, req, grant, declared, sc.reqID)
 	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
 		// The allow Mandate itself failed (audit down). Deny before any chunk;
 		// do NOT re-Mandate a deny (the gate is unavailable) — just frame it.
@@ -400,8 +427,9 @@ func (d *dispatcher) handleFileUpload(sc streamCtx) {
 // params + grant. ActivityID is a Read; Downloadable carries the resolved
 // grant; ByteCount is zero (byte count is unknown ahead of the range read;
 // the audit records the intent, not the transferred size). ObjectHandle is
-// the scope:path derived from the objectIDStore resolution.
-func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, grant Grant) auditEvent {
+// the scope:path derived from the objectIDStore resolution. reqID is the
+// T2-18 per-request correlation id threaded end-to-end.
+func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, grant Grant, reqID string) auditEvent {
 	return auditEvent{
 		Op:           OpFileDownload,
 		Scope:        ps.FilesystemID,
@@ -413,6 +441,7 @@ func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, 
 		ObjectHandle: ps.FilesystemID + ":" + req.Path,
 		ByteCount:    0,
 		Downloadable: grant.Downloadable,
+		RequestID:    reqID,
 	}
 }
 
@@ -448,7 +477,12 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	// degrades to unavailable — an unrecorded truth never surfaces on the wire
 	// (NFR-SEC-79, invariant 8, mirrors denyTrailer in handleFileUpload).
 	denyDownloadTrailer := func(auditReason, wireCode, message string) {
+		sc.reqLog.Warn("broker deny",
+			slog.String(observ.KeyDenyClass, auditReason),
+			slog.String(observ.KeyReason, message),
+		)
 		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, auditReason)
+		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
@@ -508,6 +542,7 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	if rec.scope != sc.ps.FilesystemID {
 		// Cross-scope: audit scope_mismatch truth, wire not_found (D8).
 		ev := d.denyAuditEvent(OpFileDownload, sc.ps, req, grant, nil, denyScopeMismatch)
+		ev.RequestID = sc.reqID
 		if err := d.guard.Mandate(sc.ctx, mapAuditEvent(ev)); err != nil {
 			_ = writeEndStream(sc.w, &connectError{Code: wireCodeUnavailable, Message: "audit gate unavailable"})
 			return
@@ -537,7 +572,7 @@ func (d *dispatcher) handleFileDownload(sc streamCtx) {
 	}
 
 	// --- audit ALLOW before any data frame (audit-before-ack, SEC-79) ---
-	allow := d.streamDownloadAuditEvent(sc.ps, req, grant)
+	allow := d.streamDownloadAuditEvent(sc.ps, req, grant, sc.reqID)
 	if err := d.guard.Mandate(sc.ctx, mapAuditEvent(allow)); err != nil {
 		// The allow Mandate failed (audit down). Deny before any byte is sent;
 		// do NOT re-Mandate a deny (the gate is unavailable).
