@@ -18,6 +18,11 @@
 # leak a .fail file into a commit.
 testdata/rapid/
 **/testdata/rapid/
+
+# Coverage profiles — build artifacts produced by `go test -coverprofile`,
+# never source (CI uploads them as run artifacts).
+cover.out
+*.coverprofile
 __pycache__/
 *.pyc
 .venv/
