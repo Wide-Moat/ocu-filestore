@@ -135,7 +135,17 @@ jobs:
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
-        run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
+        run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/... -timeout 600s -count=1
+      # A healthy run is ~20s; if the suite needs anywhere near 600s the
+      # backend rig is degraded and the right outcome is a fast, named FAIL —
+      # not a quarter-hour false-green. Dump rig health on EVERY outcome so a
+      # degraded backend identifies itself in the log.
+      - name: rig diagnostics (always, names a degraded backend)
+        if: always()
+        run: |
+          docker compose -f deploy/docker-compose.test.yml logs --tail 200 minio || true
+          docker stats --no-stream || true
+          df -h || true
       - name: tear the rig down
         if: always()
         run: docker compose -f deploy/docker-compose.test.yml down -v
