@@ -96,6 +96,35 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 	}
 }
 
+// TestComposeCrashRestartErasesScope pins the T1-10/SEC-54 crash path at the
+// composition level: a daemon that crashed mid-session (no Close, so no
+// TeardownScope) leaves a dirty scope; the NEXT composition's ProvisionScope
+// erases it, so the restarted daemon never re-serves prior-session bytes.
+func TestComposeCrashRestartErasesScope(t *testing.T) {
+	cfg := validBrokerConfig(t)
+	srv1, err := compose(cfg)
+	if err != nil {
+		t.Fatalf("compose (session one): %v", err)
+	}
+	_ = srv1 // crashed: deliberately NO Close — teardown never runs.
+
+	// Prior-session bytes, written straight into the provisioned scope.
+	scopeDir := filepath.Join(cfg.engineRoot, cfg.filesystemID)
+	prior := filepath.Join(scopeDir, "prior.bin")
+	if err := os.WriteFile(prior, []byte("PRIORSESSION"), 0o600); err != nil {
+		t.Fatalf("plant prior-session file: %v", err)
+	}
+
+	srv2, err := compose(cfg)
+	if err != nil {
+		t.Fatalf("compose (restart): %v", err)
+	}
+	defer srv2.Close()
+	if _, err := os.Stat(prior); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prior-session file after restart provision: stat err = %v, want erased (SEC-54)", err)
+	}
+}
+
 // TestComposeRefusedTripleBindsNoSocket pins SEC-60: a non-admitted
 // profile/tenancy/credential triple returns the admission refusal and binds NO
 // socket under -south-socket-dir.

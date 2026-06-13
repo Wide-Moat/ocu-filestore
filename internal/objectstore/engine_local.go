@@ -13,14 +13,42 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
+
+// stagingDirName is the broker-internal staging area at the scope root:
+// every write streams into a temp name under it before committing into
+// place. It is GUEST-INVISIBLE — never surfaced in a listing of the scope
+// root, and unaddressable through any data verb (a reserved name) — and it
+// is removed wholesale by the Provision/Teardown sweeps, so a partial write
+// left by a crashed daemon never survives into a later session (SEC-54
+// crash path).
+const stagingDirName = ".ocu-staging"
+
+// guestPath validates a caller-supplied data path (ValidatePath, lexical
+// stage) and then refuses any path whose FIRST component names the
+// broker-internal staging area: the guest must be unable to read, list,
+// write, move, or remove anything under it. Deeper components with the same
+// name are not reserved — the staging area lives only at the scope root.
+func guestPath(p string) (string, error) {
+	clean, err := ValidatePath(p)
+	if err != nil {
+		return "", err
+	}
+	first, _, _ := strings.Cut(clean, string(filepath.Separator))
+	if first == stagingDirName {
+		return "", fmt.Errorf("%w: %q is a broker-internal reserved name", ErrInvalidPath, stagingDirName)
+	}
+	return clean, nil
+}
 
 // localVolumeEngine is the ADR-0010 local-volume Engine: a host filesystem
 // permission, no network leg. Every verb runs the caller's path through
-// ValidatePath (lexical stage) and then an os.Root method under the scope's
-// ScopeRoot (containment stage) — no verb ever joins baseDir with caller
-// input; the only trusted derivation is baseDir+ScopeID for the scope dir
-// itself in ProvisionScope/TeardownScope.
+// guestPath (ValidatePath lexical stage + the staging-area reservation) and
+// then an os.Root method under the scope's ScopeRoot (containment stage) —
+// no verb ever joins baseDir with caller input; the only trusted derivation
+// is baseDir+ScopeID for the scope dir itself in
+// ProvisionScope/TeardownScope.
 //
 // The engine opens a ScopeRoot per call and closes it on return. Per-call
 // open is deliberate: it is leak-free without fd lifecycle tracking, and fd
@@ -80,15 +108,42 @@ func toFileInfo(fi os.FileInfo) FileInfo {
 	}
 }
 
-// ProvisionScope creates baseDir/<scope> at session grant. OpenScopeRoot
-// refuses an absent directory, so this must run before any data verb on a
-// fresh scope. Provisioning an existing scope is a no-op.
+// ProvisionScope prepares baseDir/<scope> at session grant — ERASE-AT-
+// PROVISION (SEC-54 crash path, mirroring the s3 engine): a scope directory
+// left behind by a daemon that crashed mid-session (its TeardownScope never
+// ran) is erased before serving, so a restart never re-serves prior-session
+// bytes. The same sweep removes any orphaned partial write in the staging
+// area, which is then recreated empty. A symlinked or non-directory scope
+// entry refuses BEFORE any removal, exactly as in TeardownScope (T-03-05).
+// OpenScopeRoot refuses an absent directory, so this must run before any
+// data verb on a fresh scope.
 func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) error {
 	if err := validateScopeID(scope); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(e.scopePath(scope), 0o700); err != nil {
+	scopePath := e.scopePath(scope)
+
+	info, err := os.Lstat(scopePath)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: scope dir %q is a symbolic link, refusing provision", ErrInvalidPath, scope)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%w: scope %q", ErrNotADirectory, scope)
+		}
+		if err := os.RemoveAll(scopePath); err != nil {
+			return fmt.Errorf("objectstore: erase scope %q at provision: %w", scope, err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("objectstore: lstat scope %q: %w", scope, err)
+	}
+
+	if err := os.MkdirAll(scopePath, 0o700); err != nil {
 		return fmt.Errorf("objectstore: provision scope %q: %w", scope, err)
+	}
+	if err := os.Mkdir(filepath.Join(scopePath, stagingDirName), 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("objectstore: provision staging area for %q: %w", scope, err)
 	}
 	return nil
 }
@@ -107,6 +162,11 @@ func (e *localVolumeEngine) ProvisionScope(_ context.Context, scope ScopeID) err
 // may live outside baseDir (T-03-05). The erase runs from the parent via
 // os.RemoveAll(scopePath) — os.Root.RemoveAll(".") is platform-unreliable
 // for removing a root's own contents and is deliberately not used.
+//
+// The staging area goes down with the scope (it lives inside it) and is NOT
+// recreated here: after teardown the scope directory is fully empty. The
+// next ProvisionScope — or, defensively, the next write's on-demand
+// creation — restores it.
 func (e *localVolumeEngine) TeardownScope(_ context.Context, scope ScopeID) error {
 	if err := validateScopeID(scope); err != nil {
 		return err
@@ -162,7 +222,7 @@ func (e *localVolumeEngine) List(_ context.Context, scope ScopeID, path string) 
 
 	cleanPath := "."
 	if path != "." {
-		cleanPath, err = ValidatePath(path)
+		cleanPath, err = guestPath(path)
 		if err != nil {
 			return nil, err
 		}
@@ -174,6 +234,11 @@ func (e *localVolumeEngine) List(_ context.Context, scope ScopeID, path string) 
 	}
 	out := make([]FileInfo, 0, len(entries))
 	for _, entry := range entries {
+		if cleanPath == "." && entry.Name() == stagingDirName {
+			// The broker-internal staging area is guest-invisible: it never
+			// appears in a listing of the scope root (SEC-54).
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return nil, fmt.Errorf("objectstore: list entry %q: %w", entry.Name(), err)
@@ -191,7 +256,7 @@ func (e *localVolumeEngine) Stat(_ context.Context, scope ScopeID, path string) 
 	}
 	defer sr.Close()
 
-	cleanPath, err := ValidatePath(path)
+	cleanPath, err := guestPath(path)
 	if err != nil {
 		return FileInfo{}, err
 	}
@@ -211,7 +276,7 @@ func (e *localVolumeEngine) MakeDir(_ context.Context, scope ScopeID, path strin
 	}
 	defer sr.Close()
 
-	cleanPath, err := ValidatePath(path)
+	cleanPath, err := guestPath(path)
 	if err != nil {
 		return err
 	}
@@ -256,11 +321,11 @@ func (e *localVolumeEngine) renameWithin(scope ScopeID, src, dst string, overwri
 	}
 	defer sr.Close()
 
-	cleanSrc, err := ValidatePath(src)
+	cleanSrc, err := guestPath(src)
 	if err != nil {
 		return err
 	}
-	cleanDst, err := ValidatePath(dst)
+	cleanDst, err := guestPath(dst)
 	if err != nil {
 		return err
 	}
@@ -318,7 +383,7 @@ func (e *localVolumeEngine) RemoveDir(_ context.Context, scope ScopeID, path str
 	}
 	defer sr.Close()
 
-	cleanPath, err := ValidatePath(path)
+	cleanPath, err := guestPath(path)
 	if err != nil {
 		return err
 	}
@@ -336,7 +401,7 @@ func (e *localVolumeEngine) RemoveFile(_ context.Context, scope ScopeID, path st
 	}
 	defer sr.Close()
 
-	cleanPath, err := ValidatePath(path)
+	cleanPath, err := guestPath(path)
 	if err != nil {
 		return err
 	}
@@ -360,7 +425,7 @@ func (e *localVolumeEngine) CopyFile(ctx context.Context, scope ScopeID, src, ds
 	}
 	defer sr.Close()
 
-	cleanDst, err := ValidatePath(dst)
+	cleanDst, err := guestPath(dst)
 	if err != nil {
 		return err
 	}
@@ -372,7 +437,11 @@ func (e *localVolumeEngine) CopyFile(ctx context.Context, scope ScopeID, src, ds
 		}
 	}
 
-	srcF, err := sr.Open(src) // ValidatePath + contained open
+	cleanSrc, err := guestPath(src)
+	if err != nil {
+		return err
+	}
+	srcF, err := sr.root.Open(cleanSrc) // contained open
 	if err != nil {
 		return err
 	}
@@ -392,7 +461,11 @@ func (e *localVolumeEngine) ReadRange(ctx context.Context, scope ScopeID, path s
 	}
 	defer sr.Close()
 
-	f, err := sr.Open(path) // ValidatePath + contained open
+	cleanPath, err := guestPath(path)
+	if err != nil {
+		return err
+	}
+	f, err := sr.root.Open(cleanPath) // contained open
 	if err != nil {
 		return err
 	}
@@ -425,7 +498,7 @@ func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path
 	}
 	defer sr.Close()
 
-	cleanPath, err := ValidatePath(path)
+	cleanPath, err := guestPath(path)
 	if err != nil {
 		return err
 	}
@@ -442,12 +515,16 @@ func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path
 }
 
 // writeTempAndCommit is the shared atomic-write tail for WriteStream and
-// CopyFile: stream into cleanDst+".tmp."+<process-unique suffix> in the
-// destination's own directory (same-dir commit is atomic), fsync, then
-// commit into place. The suffix prevents temp-name collision under
-// concurrent writes to the same destination (T-03-06). On ANY error the
-// temp is removed; on success no temp remains. cleanDst has already passed
-// ValidatePath — containment of the temp name itself is still enforced by
+// CopyFile: stream into a process-unique temp name inside the broker-
+// internal staging area at the scope root (guest-invisible: never listed,
+// unaddressable, and swept by Provision/Teardown so a crashed partial write
+// never survives into a later session — SEC-54), fsync, then commit into
+// place. The staging area and the destination live in the same scope
+// directory tree on one filesystem, so the rename/link commit is atomic.
+// The random suffix prevents temp-name collision under concurrent writes to
+// the same destination (T-03-06). On ANY error the temp is removed; on
+// success no temp remains. cleanDst has already passed the guest-path
+// validation — containment of the temp name itself is still enforced by
 // the root on open.
 //
 // The commit is replace-aware: with replace true the temp RENAMES into
@@ -457,7 +534,13 @@ func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path
 // (no stat-then-rename TOCTOU) — and the temp name is then removed by the
 // deferred cleanup.
 func writeTempAndCommit(sr *ScopeRoot, cleanDst string, r io.Reader, replace bool) error {
-	tmpName := cleanDst + ".tmp." + strconv.FormatUint(rand.Uint64(), 36)
+	// On-demand staging creation: a teardown leaves the scope fully empty,
+	// and the next write restores the area without requiring a re-provision.
+	if err := sr.root.Mkdir(stagingDirName, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("objectstore: create staging area: %w", err)
+	}
+	tmpName := filepath.Join(stagingDirName,
+		filepath.Base(cleanDst)+".tmp."+strconv.FormatUint(rand.Uint64(), 36))
 
 	f, err := sr.root.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {

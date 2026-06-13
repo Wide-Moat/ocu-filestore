@@ -112,16 +112,34 @@ func TestLocalEngine_WriteStreamCleanup(t *testing.T) {
 		t.Fatal("WriteStream with failing reader: got nil error")
 	}
 
-	entries, err := os.ReadDir(filepath.Join(base, string(scope)))
+	assertScopeGuestEmpty(t, base, scope)
+}
+
+// assertScopeGuestEmpty fails unless the scope directory holds NOTHING
+// beyond the broker-internal staging area, and that area holds no leftover
+// temp either.
+func assertScopeGuestEmpty(t *testing.T, base string, scope ScopeID) {
+	t.Helper()
+	scopeDir := filepath.Join(base, string(scope))
+	entries, err := os.ReadDir(scopeDir)
 	if err != nil {
 		t.Fatalf("read scope dir: %v", err)
 	}
-	if len(entries) != 0 {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
+	for _, e := range entries {
+		if e.Name() != stagingDirName {
+			t.Fatalf("scope dir holds unexpected entry %q; want only the staging area", e.Name())
+		}
+	}
+	staged, err := os.ReadDir(filepath.Join(scopeDir, stagingDirName))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read staging area: %v", err)
+	}
+	if len(staged) != 0 {
+		names := make([]string, 0, len(staged))
+		for _, e := range staged {
 			names = append(names, e.Name())
 		}
-		t.Fatalf("scope dir not empty after failed write: %v", names)
+		t.Fatalf("staging area not empty: %v", names)
 	}
 }
 
@@ -159,17 +177,7 @@ func TestLocalEngine_WriteStreamCancelCtx(t *testing.T) {
 		t.Fatalf("WriteStream under mid-stream cancel: got %v, want errors.Is(context.Canceled)", err)
 	}
 
-	entries, err := os.ReadDir(filepath.Join(base, string(scope)))
-	if err != nil {
-		t.Fatalf("read scope dir: %v", err)
-	}
-	if len(entries) != 0 {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("scope dir not empty after cancelled write: %v", names)
-	}
+	assertScopeGuestEmpty(t, base, scope)
 }
 
 // TestLocalEngine_ReadRange pins the half-open [offset, offset+length)
