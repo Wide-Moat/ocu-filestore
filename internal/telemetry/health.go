@@ -18,6 +18,16 @@ type ReadyProbe struct {
 	Check func() error
 }
 
+// RegisterOpsListenerHealthHandlers registers /healthz (liveness) and /readyz
+// (readiness) on an *OpsListener using its Handle registration seam. It is the
+// composition layer's entry point: the composition builds the probes, then
+// calls this function before starting the ops listener. For unit tests that
+// operate directly on an *http.ServeMux, use RegisterHealthHandlers instead.
+func RegisterOpsListenerHealthHandlers(ol *OpsListener, probes []ReadyProbe) {
+	ol.Handle("/healthz", healthzHandler())
+	ol.Handle("/readyz", readyzHandler(probes))
+}
+
 // RegisterHealthHandlers registers /healthz (liveness) and /readyz (readiness)
 // on mux. The handlers are served over the loopback ops listener (plan 02's
 // registration seam) and need no second listener.
@@ -34,7 +44,14 @@ type ReadyProbe struct {
 //
 // Only GET and HEAD are accepted on both routes; any other method returns 405.
 func RegisterHealthHandlers(mux *http.ServeMux, probes []ReadyProbe) {
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/healthz", healthzHandler())
+	mux.Handle("/readyz", readyzHandler(probes))
+}
+
+// healthzHandler returns the /healthz liveness handler: 200 always, 405 on
+// non-GET/HEAD.
+func healthzHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -43,8 +60,13 @@ func RegisterHealthHandlers(mux *http.ServeMux, probes []ReadyProbe) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
+}
 
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+// readyzHandler returns the /readyz readiness handler: 200 iff all probes
+// pass, else 503 with failing probe names (T-14-09: names only, no error text,
+// no path, no payload).
+func readyzHandler(probes []ReadyProbe) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return

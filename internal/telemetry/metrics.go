@@ -76,14 +76,15 @@ func KnownOps() []string {
 // BrokerMetrics is the concrete metric set for the ocu-filestore broker daemon.
 // Obtain it via NewBrokerMetrics; do not construct directly.
 type BrokerMetrics struct {
-	reg           *Registry
-	opsTotal      *Counter
-	stageLatency  *Histogram
-	peerAccepted  *Counter
-	peerDropped   *Counter
-	inFlightBytes *Gauge
-	fdInUse       *Gauge
-	opsTokens     *Gauge
+	reg              *Registry
+	opsTotal         *Counter
+	stageLatency     *Histogram
+	peerAccepted     *Counter
+	peerDropped      *Counter
+	inFlightBytes    *Gauge
+	fdInUse          *Gauge
+	opsTokens        *Gauge
+	auditSinkLatched *Gauge
 }
 
 // NewBrokerMetrics creates and registers the full broker metric set.
@@ -134,17 +135,26 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		LabelSet{},
 	)
 
+	// audit_sink_latched is a binary gauge: 0 when the FileSink is healthy,
+	// 1 after the fail-closed audit latch trips (SEC-79 made observable via
+	// scraping; T-14-10). The composition layer flips it via SetAuditSinkLatched.
+	auditSinkLatched := reg.NewGauge("audit_sink_latched",
+		"1 when the fail-closed audit sink has permanently latched (broker serving 100% denies); 0 when healthy.",
+		LabelSet{},
+	)
+
 	reg.NewBuildInfo(version)
 
 	return &BrokerMetrics{
-		reg:           reg,
-		opsTotal:      opsTotal,
-		stageLatency:  stageLatency,
-		peerAccepted:  peerAccepted,
-		peerDropped:   peerDropped,
-		inFlightBytes: inFlightBytes,
-		fdInUse:       fdInUse,
-		opsTokens:     opsTokens,
+		reg:              reg,
+		opsTotal:         opsTotal,
+		stageLatency:     stageLatency,
+		peerAccepted:     peerAccepted,
+		peerDropped:      peerDropped,
+		inFlightBytes:    inFlightBytes,
+		fdInUse:          fdInUse,
+		opsTokens:        opsTokens,
+		auditSinkLatched: auditSinkLatched,
 	}
 }
 
@@ -184,4 +194,11 @@ func (m *BrokerMetrics) SetCeilings(inFlightBytes float64, fdInUse float64, opsT
 	m.inFlightBytes.Set(Labels{}, inFlightBytes)
 	m.fdInUse.Set(Labels{}, fdInUse)
 	m.opsTokens.Set(Labels{}, opsTokens)
+}
+
+// SetAuditSinkLatched sets the audit_sink_latched gauge. The composition layer
+// calls this with 1 when the FileSink on-latch callback fires (SEC-79 made
+// observable; T-14-10). A value of 0 indicates a healthy sink.
+func (m *BrokerMetrics) SetAuditSinkLatched(v float64) {
+	m.auditSinkLatched.Set(Labels{}, v)
 }

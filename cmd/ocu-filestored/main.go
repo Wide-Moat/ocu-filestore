@@ -90,6 +90,32 @@ func versionString() string {
 	return b.String()
 }
 
+// errHealthCheckFailed is returned by runHealthCheck when /healthz does not
+// answer 200 (the daemon is unreachable or not serving). Match it with
+// errors.Is.
+var errHealthCheckFailed = errors.New("ocu-filestored: health-check probe failed")
+
+// runHealthCheck is the -health-check self-probe mode: it dials -ops-listen
+// /healthz and returns nil (exit 0) if the response is 200, otherwise a typed
+// error (non-zero). This is the container-healthcheck probe: the distroless
+// image has no shell/curl, so the HEALTHCHECK exec's the daemon binary itself
+// with -health-check instead of a curl one-liner.
+func runHealthCheck(opsListenAddr string) error {
+	if opsListenAddr == "" {
+		return fmt.Errorf("%w: -ops-listen is empty; no ops listener to probe", errHealthCheckFailed)
+	}
+	url := "http://" + opsListenAddr + "/healthz"
+	resp, err := http.Get(url) //nolint:noctx // short-lived self-probe, no context needed
+	if err != nil {
+		return fmt.Errorf("%w: %v", errHealthCheckFailed, err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%w: /healthz returned %d", errHealthCheckFailed, resp.StatusCode)
+	}
+	return nil
+}
+
 // errBadProfile rejects an admission profile outside the legal set. Match it
 // with errors.Is.
 var errBadProfile = errors.New("ocu-filestored: unknown admission profile")
@@ -219,6 +245,8 @@ func run(args []string) error {
 
 	showVersion := fs.Bool("version", false,
 		"print the version, VCS revision, and Go toolchain, then exit 0")
+	healthCheck := fs.Bool("health-check", false,
+		"self-probe mode: dial -ops-listen /healthz and exit 0 (alive) or non-zero (unreachable); requires no serving flags")
 	logLevel := fs.String("log-level", "info",
 		"structured log level: debug | info | warn | error (default info)")
 	opsListen := fs.String("ops-listen", "127.0.0.1:9464",
@@ -287,6 +315,15 @@ func run(args []string) error {
 		return nil
 	}
 
+	// -health-check self-probe mode: dial the daemon's own /healthz on
+	// -ops-listen and exit 0 on a 200 response, non-zero otherwise. This
+	// short-circuits before validate so a container healthcheck only needs
+	// the two flags, not the full serving set. The NOTIFY_SOCKET env var
+	// is not consulted in this mode.
+	if *healthCheck {
+		return runHealthCheck(*opsListen)
+	}
+
 	cfg, err := validate(*engine, *engineRoot, *auditSink, *socketDir, *filesystemID,
 		*profile, *tenancy, *grantedIntents, *downloadablePrefixes, *maxFileSize, *maxRequestBytes,
 		*opsPerSecond, *opsBurst, *s3CredentialFile, *s3STSRoleARN, *s3STSEndpoint,
@@ -341,7 +378,7 @@ func run(args []string) error {
 		slog.String("s3_credential_file", cfg.s3CredentialFile),
 	)
 
-	srv, err := compose(cfg, l, m)
+	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {
 		if opsListener != nil {
 			_ = opsListener.Close()
@@ -378,6 +415,13 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 
+	// Notify systemd that the daemon is ready. If NOTIFY_SOCKET is unset this
+	// is a no-op; any error is logged but does not stop the daemon (the ops
+	// listener's fail-soft posture applies to optional integrations).
+	if err := telemetry.SdNotifyReady(); err != nil {
+		l.Warn("sd_notify READY failed", slog.String("err", err.Error()))
+	}
+
 	shutdownOpsListener := func() error {
 		if opsListener == nil {
 			return nil
@@ -399,6 +443,11 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 		// (default disposition) instead of being swallowed.
 		l.Info("signal received; starting bounded drain")
 		stop()
+		// Notify systemd that the daemon is stopping. Errors are logged,
+		// not surfaced — the shutdown path must always complete.
+		if err := telemetry.SdNotifyStopping(); err != nil {
+			l.Warn("sd_notify STOPPING failed", slog.String("err", err.Error()))
+		}
 		closeErr := srv.Close()
 		opsErr := shutdownOpsListener()
 		// Close shut the listener down, so Serve returns promptly (a clean
@@ -651,7 +700,17 @@ func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstor
 // ops_total and stage-latency instrumentation, and into the accept gate for
 // peer counters. Peer counter callbacks are wired via Config.OnPeerAccepted
 // and Config.OnPeerDropped.
-func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics) (southface.Server, error) {
+//
+// ol is the loopback ops listener; when non-nil compose registers /healthz and
+// /readyz with the audit-latch and engine-root readiness probes. A nil
+// opsListener skips probe registration (unit tests that don't start a listener).
+func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ...*telemetry.OpsListener) (southface.Server, error) {
+	// Unpack the optional ops listener (variadic for backward compat in tests
+	// that pass none).
+	var opsListener *telemetry.OpsListener
+	if len(ol) > 0 {
+		opsListener = ol[0]
+	}
 	// Engine-kind construction inputs FIRST — both ADR-0010 kinds are real.
 	// For s3: the dial path is the storage-lane transport (or the loud
 	// dev-direct rig client), the credential arrives through the
@@ -722,6 +781,18 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics) (sout
 		// An unwritable sink refuses to serve — fail-closed (NFR-SEC-79).
 		return nil, err
 	}
+
+	// Wire the on-latch callback: emits an ERROR slog line and flips the
+	// audit_sink_latched gauge to 1 the moment the fail-closed audit latch
+	// trips. The latch turning the broker into a 100%-deny machine is now
+	// observable (SEC-79 made observable; T-14-10).
+	// The callback captures l and m by pointer (both are already pointers), safe.
+	sink.SetOnLatch(func() {
+		l.Error("audit sink latched; broker serving 100% denies until restart",
+			slog.String(observ.KeyReason, "audit_latch"))
+		m.SetAuditSinkLatched(1)
+	})
+
 	reg := ceilings.NewRegistry(ceilings.Config{
 		OpsPerSecond:         cfg.opsPerSecond,
 		OpsBurst:             cfg.opsBurst,
@@ -760,6 +831,34 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics) (sout
 	if err != nil {
 		return nil, err
 	}
+
+	// Register /healthz and /readyz on the ops listener if one was provided.
+	// The audit-latch probe reads FileSink.Latched(); the engine-root probe runs
+	// a bounded List(scope, ".") — no Engine interface widening (plan decision).
+	if opsListener != nil {
+		probes := []telemetry.ReadyProbe{
+			{
+				Name: "audit_latch",
+				Check: func() error {
+					if sink.Latched() {
+						return errors.New("audit sink latched")
+					}
+					return nil
+				},
+			},
+			{
+				Name: "engine_root",
+				Check: func() error {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_, err := eng.List(ctx, scope, ".")
+					return err
+				},
+			},
+		}
+		telemetry.RegisterOpsListenerHealthHandlers(opsListener, probes)
+	}
+
 	// Wrap the server so Close also tears down the scope (erase-before-reuse)
 	// and releases the per-session ceilings (NFR-SEC-54).
 	return &teardownServer{

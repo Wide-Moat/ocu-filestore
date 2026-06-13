@@ -65,4 +65,12 @@ VOLUME ["/var/lib/ocu-filestore/engine-root", "/var/log/ocu-filestore", "/run/oc
 
 USER nonroot:nonroot
 
+# HEALTHCHECK uses the daemon's own -health-check self-probe mode: it dials
+# the loopback ops listener /healthz and exits 0 (alive) or non-zero
+# (unreachable). The distroless image has no shell or curl, so the daemon
+# binary serves as its own liveness probe. The ops listener default address
+# must match the -ops-listen flag default (127.0.0.1:9464).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/ocu-filestored", "-health-check"]
+
 ENTRYPOINT ["/usr/local/bin/ocu-filestored"]

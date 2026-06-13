@@ -1043,12 +1043,15 @@ func TestComposeLatchCallbackWired(t *testing.T) {
 	// and is covered in TestLatchCallbackIntegration below.
 	out := logBuf.String()
 	_ = out // no ERROR emitted yet — just confirm compose succeeded
-	// audit_sink_latched starts at 0 (not latched).
+	// audit_sink_latched starts at 0 (not latched). Check for the value line
+	// (not the HELP line which also contains "audit_sink_latched 1 when...").
 	var metricsOut strings.Builder
 	m.Registry().WriteTo(&metricsOut)
 	metrics := metricsOut.String()
-	if strings.Contains(metrics, "audit_sink_latched 1") {
-		t.Fatalf("audit_sink_latched gauge is 1 on healthy compose; want 0")
+	// A latched gauge would render as "audit_sink_latched 1\n".
+	// A healthy gauge renders no value line at all (zero value is omitted).
+	if strings.Contains(metrics, "\naudit_sink_latched 1\n") {
+		t.Fatalf("audit_sink_latched gauge is 1 on healthy compose; want 0 or absent")
 	}
 }
 
@@ -1089,8 +1092,8 @@ func TestDockerfileAndComposeHealthcheckRewired(t *testing.T) {
 		name string
 		path string
 	}{
-		{"Dockerfile", "../../../Dockerfile"},
-		{"docker-compose.yml", "../../../deploy/docker-compose.yml"},
+		{"Dockerfile", "../../Dockerfile"},
+		{"docker-compose.yml", "../../deploy/docker-compose.yml"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data, err := os.ReadFile(tc.path)
@@ -1111,7 +1114,7 @@ func TestDockerfileAndComposeHealthcheckRewired(t *testing.T) {
 // TestSystemdUnitIsTypeNotify pins the systemd unit has Type=notify and the
 // required hardening directives.
 func TestSystemdUnitIsTypeNotify(t *testing.T) {
-	path := "../../../contrib/systemd/ocu-filestored.service"
+	path := "../../contrib/systemd/ocu-filestored.service"
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(systemd unit): %v", err)

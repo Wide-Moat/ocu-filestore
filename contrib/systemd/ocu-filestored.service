@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# systemd service unit for the ocu-filestored storage-broker daemon
+# (component-04). Requires systemd >= 207 for Type=notify.
+#
+# DEPLOYMENT NOTES:
+#   - Copy to /etc/systemd/system/ocu-filestored.service (or drop-in dir).
+#   - Adjust the ExecStart flags (filesystem-id, engine-root, audit-sink,
+#     granted-intents) to match the deployment's values.
+#   - The three WritablePaths directives cover the only mutable surfaces:
+#     engine root (customer workspace bytes), audit sink directory
+#     (fail-closed OCSF records), and the per-session socket directory.
+#   - After editing: systemctl daemon-reload && systemctl enable ocu-filestored
+
+[Unit]
+Description=Open Computer Use storage broker daemon (component-04)
+Documentation=https://github.com/Wide-Moat/ocu-filestore
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+User=ocufilestore
+Group=ocufilestore
+
+ExecStart=/usr/local/bin/ocu-filestored \
+    -engine local-volume \
+    -engine-root /var/lib/ocu-filestore/engine-root \
+    -audit-sink /var/log/ocu-filestore/audit.ocsf.jsonl \
+    -south-socket-dir /run/ocu-filestore/sessions \
+    -filesystem-id solo-session \
+    -broker-max-file-size 1073741824 \
+    -granted-intents read,write \
+    -profile trusted_operator \
+    -tenancy single-tenant \
+    -ops-listen 127.0.0.1:9464
+
+# Graceful stop: send SIGTERM, wait up to TimeoutStopSec for the bounded drain
+# (southface forces-closes in-flight operations at 25s), then SIGKILL. The
+# bound is 35s — 10s above the daemon's 25s drain — so a clean stop always
+# lets erase-before-reuse teardown finish before SIGKILL (NFR-SEC-54).
+TimeoutStopSec=35s
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=5s
+
+# --- Security hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The three mutable surfaces the daemon writes (everything else is read-only
+# per ProtectSystem=strict):
+#   1. Engine root: customer workspace bytes.
+#   2. Audit sink directory: fail-closed OCSF audit records.
+#   3. Per-session socket directory: unix sockets for sandbox peers.
+ReadWritePaths=/var/lib/ocu-filestore/engine-root
+ReadWritePaths=/var/log/ocu-filestore
+ReadWritePaths=/run/ocu-filestore/sessions
+
+RuntimeDirectory=ocu-filestore
+RuntimeDirectoryMode=0755
+LogsDirectory=ocu-filestore
+StateDirectory=ocu-filestore
+
+[Install]
+WantedBy=multi-user.target

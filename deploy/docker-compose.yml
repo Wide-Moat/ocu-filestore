@@ -25,9 +25,9 @@
 #   drain, so `docker compose stop` always lets the graceful path (drain,
 #   erase-before-reuse teardown, socket removal — NFR-SEC-54) finish before
 #   the SIGKILL fallback.
-# - The healthcheck execs `-version` (exit 0) as a liveness proxy: it
-#   proves the binary and the container runtime are sound. A real health
-#   probe endpoint arrives with T2-3.
+# - The healthcheck execs `-health-check` (T2-3): the daemon dials its own
+#   loopback ops listener /healthz and exits 0 (alive) or non-zero
+#   (unreachable). This replaces the -version liveness proxy.
 
 services:
   broker:
@@ -70,7 +70,7 @@ services:
       - audit:/var/log/ocu-filestore
       - sessions:/run/ocu-filestore/sessions
     healthcheck:
-      test: ["CMD", "/usr/local/bin/ocu-filestored", "-version"]
+      test: ["CMD", "/usr/local/bin/ocu-filestored", "-health-check"]
       interval: 30s
       timeout: 5s
       retries: 3
