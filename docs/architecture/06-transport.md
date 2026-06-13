@@ -501,10 +501,10 @@ metric records the same truth the audit record does.
 
 | Condition | Audit truth (deny class) | Wire code | Transport surface |
 | --- | --- | --- | --- |
-| Bad/missing `Connect-Protocol-Version` | `malformed` | `invalid_argument` | unary body / 0x02 trailer |
-| Wrong content-type | `malformed` | `invalid_argument` | unary body / 0x02 trailer |
+| Bad/missing `Connect-Protocol-Version` | `malformed_envelope` | `invalid_argument` | unary body / 0x02 trailer |
+| Wrong content-type | `malformed_envelope` | `invalid_argument` | unary body / 0x02 trailer |
 | Body scope ≠ channel scope | `scope_mismatch` | `permission_denied` | unary body / 0x02 trailer |
-| Wire intent ≠ route op intent | `malformed` | `invalid_argument` | unary body |
+| Wire intent ≠ route op intent | `malformed_envelope` | `invalid_argument` | unary body |
 | Declared size > whole-object ceiling | `size_exceeded` | `invalid_argument` | 0x02 trailer (upload) |
 | Frame length > 4 MiB transport cap | `throttle` | `resource_exhausted` | 0x02 trailer |
 | Per-session rate / fd / byte ceiling | `throttle` | `resource_exhausted` | unary body / 0x02 trailer |
