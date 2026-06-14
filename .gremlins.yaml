@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# go-gremlins mutation-testing configuration. Auto-discovered at the module
+# root by `gremlins unleash` (and by `make mutation` and the mutation CI job),
+# so the scope lives here in one place instead of being duplicated across the
+# command lines.
+#
+# Scope: the pure-logic leaf packages where mutation testing has the highest
+# signal and the suite is fast — the authorization resolver, the deny-class
+# vocabulary, and the per-session ceilings. The S3 / socket / streaming
+# packages are deliberately excluded: they need the live MinIO rig and the
+# peer-credential socket, which would make a mutation run enormous for little
+# added signal over their own conformance and e2e suites.
+#
+# coverpkg restricts coverage collection to those packages; the path argument
+# passed on the command line restricts which source files are mutated. Keep
+# the two in agreement.
+#
+# Schema reference: https://github.com/go-gremlins/gremlins
+unleash:
+  coverpkg: ./internal/authz/...,./internal/denyclass/...,./internal/ceilings/...
+  # Thresholds are 0 (advisory) until a stable baseline is measured on the CI
+  # toolchain. The ratchet plan: once gremlins reports a real efficacy figure
+  # on the pinned Go toolchain, set threshold.efficacy / threshold.mutant-coverage
+  # to floor(baseline) and drop continue-on-error in the workflow so a drop in
+  # assertion strength fails the gate.
+  threshold:
+    efficacy: 0
+    mutant-coverage: 0

@@ -112,6 +112,7 @@ Individual targets:
 | `make vet` | `go vet ./...` | `go / vet` |
 | `make staticcheck` | `staticcheck ./...` @ `2026.1` | `go / staticcheck` |
 | `make lint` | `golangci-lint run` (`.golangci.yml`) | `go / golangci` |
+| `make mutation` | go-gremlins mutation test (advisory) on the pure-logic packages | `mutation / gremlins` |
 | `make test` | `go test ./...` | `go / test` |
 | `make test-race` | `go test -race ./... -timeout 600s` | `go / race` |
 | `make cover` | Coverage over `./internal/...`, floor enforced | `go / coverage` |
@@ -242,6 +243,16 @@ Every PR must clear all of the following CI jobs before merge:
 
 Additionally, `govulncheck` (`go / govulncheck`) runs on every PR and fails
 on known-exploitable vulnerabilities reachable from this module.
+
+The `mutation / gremlins` job (go-gremlins) runs on every PR and on a weekly
+cron, scoped to the pure-logic leaf packages (`internal/authz`,
+`internal/denyclass`, `internal/ceilings`). It measures assertion strength —
+it rewrites covered source and re-runs the suite, so a surviving mutant marks a
+line the tests execute but do not assert on, a gap line coverage cannot see. It
+is **advisory** (`continue-on-error`): it surfaces the efficacy summary in the
+job log but does not block merge yet. The scope lives in `.gremlins.yaml`. Run
+`make mutation` locally to reproduce it. The ratchet plan (a threshold floor,
+then dropping the advisory flag) is recorded in `.github/workflows/mutation.yml`.
 
 Security workflow jobs also run on a weekly cron schedule against `main`.
 

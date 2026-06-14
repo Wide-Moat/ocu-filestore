@@ -30,6 +30,9 @@ DEADCODE_VERSION := v0.30.0
 # golangci-lint version pinned in CI (go.yml golangci job + go install fallback).
 GOLANGCI_LINT_VERSION := v2.12.2
 
+# go-gremlins mutation tester version pinned in CI (mutation.yml install step).
+GREMLINS_VERSION := v0.6.0
+
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
@@ -63,7 +66,7 @@ E2E_MODCACHE_WARM := $(if $(filter runsc,$(RUNTIME)),echo "--- (runsc) warming o
 E2E_MODCACHE_CLEAN := $(if $(filter runsc,$(RUNTIME)),; status=$$?; docker volume rm $(E2E_MODCACHE_VOL) >/dev/null 2>&1 || true; exit $$status)
 
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
-        staticcheck lint deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
+        staticcheck lint mutation deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -78,6 +81,7 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' vet         "go vet ./..."
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
 	@printf '  %-20s  %s\n' lint        "golangci-lint run (structural meta-linter, .golangci.yml)"
+	@printf '  %-20s  %s\n' mutation    "go-gremlins mutation test (advisory) on the pure-logic packages"
 	@printf '  %-20s  %s\n' deadcode    "whole-program deadcode -test ./... (advisory; exits 1 on any finding)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
@@ -183,6 +187,30 @@ deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0
 	@out=$$(go run golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION) -test ./...); \
 	echo "$$out"; \
 	test -z "$$out" || exit 1
+
+# ── mutation (advisory — NOT part of `make check`) ────────────────────────────
+#
+# Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
+# (authz, denyclass, ceilings). Mutation testing measures assertion strength —
+# it rewrites covered source and re-runs the suite; a mutant the tests still
+# pass on is a line executed but not asserted on, which line coverage cannot
+# see. The coverpkg scope is read from .gremlins.yaml at the repo root.
+#
+# gremlins unleash takes a single path argument, so the packages are run in a
+# loop. Advisory and deliberately excluded from `make check`: gremlins is slow
+# (and its coverage-to-mutant matching is not yet reliable on this Go
+# toolchain), so it is a standalone target, not a pre-push gate.
+
+mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings — pinned to $(GREMLINS_VERSION)
+	@if ! command -v gremlins >/dev/null 2>&1; then \
+	  echo "gremlins not found — install with:"; \
+	  echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
+	  exit 1; \
+	fi
+	@for pkg in ./internal/authz/ ./internal/denyclass/ ./internal/ceilings/; do \
+	  echo "--- gremlins unleash $$pkg ---"; \
+	  gremlins unleash "$$pkg" || echo "gremlins reported a non-zero exit for $$pkg (advisory)"; \
+	done
 
 # ── checks ───────────────────────────────────────────────────────────────────
 
