@@ -101,7 +101,7 @@ assistance. If it was not, omit it.
 
 ```sh
 make check
-# runs: fmt + vet + staticcheck + spdx + contract + identity + test
+# runs: fmt + vet + staticcheck + lint + spdx + contract + identity + test
 ```
 
 Individual targets:
@@ -111,6 +111,7 @@ Individual targets:
 | `make fmt` | `gofmt -l .` (fails if unformatted) | `go / gofmt` |
 | `make vet` | `go vet ./...` | `go / vet` |
 | `make staticcheck` | `staticcheck ./...` @ `2026.1` | `go / staticcheck` |
+| `make lint` | `golangci-lint run` (`.golangci.yml`) | `go / golangci` |
 | `make test` | `go test ./...` | `go / test` |
 | `make test-race` | `go test -race ./... -timeout 600s` | `go / race` |
 | `make cover` | Coverage over `./internal/...`, floor enforced | `go / coverage` |
@@ -120,14 +121,21 @@ Individual targets:
 | `make e2e-linux` | Linux-only e2e in a container (darwin escape hatch) | `e2e / e2e` |
 | `make s3-rig-up` | Start MinIO test rig | needed for live-S3 legs |
 
-Prerequisites: Go >= 1.25 (match `go.mod`), GNU make, Docker (for
+Prerequisites: Go >= 1.26 (match `go.mod`), GNU make, Docker (for
 `e2e-linux` and the MinIO rig).
 
-Install `staticcheck` once:
+Install the two pinned linters once:
 
 ```sh
 go install honnef.co/go/tools/cmd/staticcheck@2026.1
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 ```
+
+`golangci-lint` (`.golangci.yml`) is the structural meta-linter: beyond the
+single-purpose `go / vet` and `go / staticcheck` gates it runs the security and
+correctness set this daemon needs — `gosec`, `errorlint`, `bodyclose`, and
+peers. Its config-level exclusions are scoped and commented; do not add bare
+`//nolint` to source.
 
 ### Gated legs that loud-skip without extra setup
 
@@ -216,6 +224,7 @@ Every PR must clear all of the following CI jobs before merge:
 | Format | `go / gofmt` | Any unformatted Go file |
 | Vet | `go / vet` | `go vet` findings |
 | Static analysis | `go / staticcheck` | `staticcheck` findings |
+| Meta-linter | `go / golangci` | `golangci-lint` findings (`.golangci.yml`) |
 | Unit tests | `go / test` | Any test failure |
 | Race detector | `go / race` | Data race detected |
 | Coverage floor | `go / coverage` | Coverage below 86.0% over `./internal/...` |

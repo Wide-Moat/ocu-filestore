@@ -27,6 +27,9 @@ STATICCHECK_VERSION := 2026.1
 # this round — surfaced, not blocking (a blocking flip is a later ratchet).
 DEADCODE_VERSION := v0.30.0
 
+# golangci-lint version pinned in CI (go.yml golangci job + go install fallback).
+GOLANGCI_LINT_VERSION := v2.12.2
+
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
@@ -60,7 +63,7 @@ E2E_MODCACHE_WARM := $(if $(filter runsc,$(RUNTIME)),echo "--- (runsc) warming o
 E2E_MODCACHE_CLEAN := $(if $(filter runsc,$(RUNTIME)),; status=$$?; docker volume rm $(E2E_MODCACHE_VOL) >/dev/null 2>&1 || true; exit $$status)
 
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
-        staticcheck deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
+        staticcheck lint deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -74,11 +77,12 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' fmt         "gofmt -l . (fails if any file is unformatted)"
 	@printf '  %-20s  %s\n' vet         "go vet ./..."
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
+	@printf '  %-20s  %s\n' lint        "golangci-lint run (structural meta-linter, .golangci.yml)"
 	@printf '  %-20s  %s\n' deadcode    "whole-program deadcode -test ./... (advisory; exits 1 on any finding)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
 	@printf '  %-20s  %s\n' identity    "scripts/check-doc-identity.sh"
-	@printf '  %-20s  %s\n' check       "Full local gate: fmt+vet+staticcheck+spdx+contract+identity+test"
+	@printf '  %-20s  %s\n' check       "Full local gate: fmt+vet+staticcheck+lint+spdx+contract+identity+test"
 	@printf '  %-20s  %s\n' e2e-linux   "REST/TLS live e2e in a Linux container (RUNTIME=runc|runsc)"
 	@printf '  %-20s  %s\n' s3-rig-up   "Bring up the MinIO test rig (docker-compose.test.yml)"
 	@printf '  %-20s  %s\n' s3-rig-down "Tear down the MinIO test rig"
@@ -158,6 +162,14 @@ staticcheck: ## staticcheck ./... — pinned to $(STATICCHECK_VERSION), matching
 	fi
 	staticcheck ./...
 
+lint: ## golangci-lint run — structural meta-linter (.golangci.yml), pinned to $(GOLANGCI_LINT_VERSION)
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+	  echo "golangci-lint not found — install with:"; \
+	  echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)"; \
+	  exit 1; \
+	fi
+	golangci-lint run --timeout=5m ./...
+
 # deadcode is whole-program reachability: it flags an unreachable EXPORTED
 # function that package-scoped unused-analysis (golangci `unused`/staticcheck
 # U1000) structurally cannot see.  CRITICAL: the tool EXITS 0 even when it
@@ -193,7 +205,7 @@ identity: ## Assert no retired maintainer address in tracked files
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: goversion-guard fmt vet staticcheck spdx contract identity test ## Full local gate (pre-push)
+check: goversion-guard fmt vet staticcheck lint spdx contract identity test ## Full local gate (pre-push)
 
 # ── go version drift guard ───────────────────────────────────────────────────
 #
