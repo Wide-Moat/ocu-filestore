@@ -235,6 +235,7 @@ Every PR must clear all of the following CI jobs before merge:
 | Secrets scan | `security / secrets-gitleaks` | Any secret detected by gitleaks |
 | Secrets scan | `security / secrets-trufflehog` | Any secret detected by trufflehog |
 | SAST | `security / sast-semgrep` | CRITICAL semgrep finding |
+| Dataflow analysis | `codeql / analyze` | CodeQL `security-and-quality` finding on Go |
 | SCA | `security / sca-trivy-fs` | CRITICAL trivy finding |
 | Conventional commits | `security / conventional-commits` | PR title not in Conventional Commits format |
 | Real-binary e2e | `e2e / e2e` | Daemon smoke or Integration/E2E failure |
