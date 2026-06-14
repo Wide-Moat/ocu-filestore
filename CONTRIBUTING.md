@@ -80,6 +80,10 @@ assistance. If it was not, omit it.
 
 - **English only** — all code, comments, commit messages, PR titles and
   descriptions, and documentation. No exceptions.
+- **Documentation standard** — prose docs (package READMEs, architecture
+  pages, wire references) follow [docs/documentation-standard.md](docs/documentation-standard.md):
+  name code by identifier rather than line coordinate, let structure earn its
+  shape, and state each fact once.
 - **Project's own words** — state facts as this project knows them. Do not
   name any third-party system or upstream project as the origin of a
   behaviour, design choice, or implementation detail. Cite public open-source
