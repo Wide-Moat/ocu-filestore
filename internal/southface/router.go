@@ -31,14 +31,17 @@ const multipartContentType = "multipart/form-data"
 // the dispatcher owns the LOCKED STAGE 0->4 spine and re-parses the route to
 // drive the per-op handler.
 type restRouter struct {
-	// dispatcher is the wrapped LOCKED-spine handler. A well-formed unary or
-	// streaming request is delegated to it verbatim.
-	dispatcher http.Handler
+	// dispatcher is the wrapped LOCKED-spine handler. A well-formed unary
+	// request (and, this wave, the still-on-Connect fileDownload) is delegated
+	// to it verbatim. The multipart fileUpload op is routed to the dispatcher's
+	// dedicated multipart entry (serveUploadMultipart) so the REST upload handler
+	// runs instead of the retired Connect streaming branch.
+	dispatcher *dispatcher
 }
 
 // newRESTRouter wraps a dispatcher in the REST route boundary. The returned
 // handler is the south-face http.Handler the TLS server binds.
-func newRESTRouter(dispatcher http.Handler) *restRouter {
+func newRESTRouter(dispatcher *dispatcher) *restRouter {
 	return &restRouter{dispatcher: dispatcher}
 }
 
@@ -74,19 +77,23 @@ func (rt *restRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRESTDeny(w, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
 		return
 	}
-	// Content negotiation: fileUpload is multipart/form-data and rides the
-	// dispatcher's streaming branch; every other op is application/json. The
-	// classification is observational at this boundary — the dispatcher's STAGE-0
-	// Content-Type gate (unary) and the streaming Content-Type gate (fileUpload /
-	// fileDownload) enforce the EXACT media type and own every media-type refusal,
-	// so the route boundary stays a thin classifier with one deny owner. The
-	// negotiated request class is computed here so the boundary has a single,
-	// tested view of how each op's body is framed.
+	// Content negotiation: fileUpload is multipart/form-data and is routed to the
+	// dispatcher's dedicated multipart upload entry; every other op is
+	// application/json (and, this wave, the still-on-Connect fileDownload rides
+	// the dispatcher's streaming branch). The dispatcher's STAGE-0 Content-Type
+	// gate (unary) and the streaming Content-Type gate (fileDownload) enforce the
+	// EXACT media type and own every media-type refusal for those paths; the
+	// multipart upload entry owns its own multipart parse, so the route boundary
+	// stays a thin classifier.
 	//
-	// PENDING-PHASE-7(A1-route): when the data-plane ops pivot off the Connect
-	// streaming path, the multipart fileUpload route gains its own dispatch here;
-	// this wave it still rides the dispatcher's streaming branch unchanged.
-	_ = negotiatedRequestClass(op, r)
+	// PENDING-PHASE-7(A2-multipart): the multipart fileUpload op now dispatches to
+	// serveUploadMultipart (the REST upload handler), not the retired Connect
+	// streaming branch. fileDownload stays on the old Connect path until its own
+	// wave.
+	if negotiatedRequestClass(op, r) == multipartContentType {
+		rt.dispatcher.serveUploadMultipart(w, r)
+		return
+	}
 	rt.dispatcher.ServeHTTP(w, r)
 }
 
