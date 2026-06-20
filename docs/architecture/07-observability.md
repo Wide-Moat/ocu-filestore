@@ -190,8 +190,6 @@ every render.
 |--------|------|--------|---------|
 | `ops_total` | counter | `op`, `outcome`, `deny_class` | Every file operation dispatched, by op, allow/deny, and deny class |
 | `stage_latency_seconds` | histogram | `stage` | Latency of the three locked dispatch stages |
-| `peer_accepted_total` | counter | — | Connections admitted at the peer-cred accept gate |
-| `peer_dropped_total` | counter | — | Connections rejected at the peer-cred accept gate |
 | `ceilings_in_flight_bytes` | gauge | — | Current in-flight bytes for the active session |
 | `ceilings_fd_in_use` | gauge | — | Current open file-descriptor count for the active session |
 | `ceilings_ops_tokens` | gauge | — | Current ops/s token-bucket level for the active session |

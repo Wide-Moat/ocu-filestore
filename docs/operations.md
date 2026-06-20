@@ -303,8 +303,6 @@ Returns the metric set in Prometheus text format (content-type
 |--------|------|-------------|
 | `ops_total{op,outcome,deny_class}` | Counter | File operations dispatched, by operation name, outcome (`allow`/`deny`), and deny class |
 | `stage_latency_seconds{stage}` | Histogram | Latency of the three dispatch stages: `audit_mandate`, `engine`, `authz` |
-| `peer_accepted_total` | Counter | Connections admitted through the peer-cred accept gate |
-| `peer_dropped_total` | Counter | Connections rejected at the peer-cred accept gate |
 | `ceilings_in_flight_bytes` | Gauge | Current in-flight bytes for the active session |
 | `ceilings_fd_in_use` | Gauge | Current open file descriptor count for the active session |
 | `ceilings_ops_tokens` | Gauge | Current ops token-bucket level |
