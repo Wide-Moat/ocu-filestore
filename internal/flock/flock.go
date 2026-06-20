@@ -11,9 +11,11 @@
 //     pointed at the same sink would interleave appends and corrupt the
 //     chain's hash linkage, so they must collide on this lock regardless of
 //     any other flag — the sink is the resource, so the lock is keyed on it.
-//   - The session socket directory: a lock keyed on that directory. Two
-//     daemons minting sockets into the same directory would clash on bind, so
-//     the default double-start (same socket directory) collides here.
+//   - The south-face bind address: a lock keyed on that resource. Two daemons
+//     binding the same TCP listen address would clash on bind, so the default
+//     double-start (same bind address) collides here. (Under REST/TLS the south
+//     face binds a TCP port, not a unix socket; this lock is keyed on the bind
+//     resource, whatever its concrete form.)
 //
 // Because each lock names its own resource, a collision on either resource is
 // sufficient to refuse a second start, and neither guarantee depends on the

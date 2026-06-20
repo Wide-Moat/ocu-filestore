@@ -97,7 +97,7 @@ A daemon serves exactly one tenant filesystem scope. The credential-bound scope
 is the host-attested binding a request is authorized against; it is the
 transport-neutral analogue of the retired per-socket provision
 (`credscope.go:CredentialScope`). The
-[`CredentialScopeExtractor`](#3-the-edge-injected-credential-scope) derives that
+[`CredentialScopeExtractor`](#3-the-edge-injected-credential-scope-component-04-spec-l55-l62) derives that
 binding from the edge-injected bearer on each request: the `FilesystemID` the
 credential authority bound the credential to, and the exhaustive
 `GrantedIntents` set the credential carries.
@@ -356,7 +356,7 @@ engine's temp+rename atomicity guarantees no torn object becomes visible.
 > end-stream trailer, and a `Connect-Protocol-Version` header. That framing, that
 > trailer-authoritative verdict, and that per-session Unix-socket transport are
 > **retired** — replaced by the multipart-upload / octet-stream-download REST
-> shapes above (ADR-0014 L40; [pending-phase7](../pending-phase7.md)).
+> shapes above (ADR-0014 L34; [pending-phase7](../pending-phase7.md)).
 
 ```mermaid
 sequenceDiagram

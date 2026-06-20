@@ -197,10 +197,11 @@ Construction is fail-loud and happens before the first byte serves:
 3. Pin `MinVersion` TLS 1.2 and advertise `h2` then `http/1.1` via ALPN, so the
    server negotiates HTTP/2 where the peer supports it and still serves a peer
    that only speaks HTTP/1.1.
-4. Wrap the REST router (the locked dispatch spine behind
-   `POST <service_url>/v1/filestore/fs/<operation>`) as the server handler. The
-   listener is not opened until `Serve` calls `net.Listen("tcp", -south-bind)`
-   followed by `ServeTLS`.
+4. Wrap the REST router (the dispatch spine — STAGE-ordering locked — behind
+   `POST <service_url>/v1/filestore/fs/<operation>`, a route frozen pending the
+   #292 canon merge, not yet canon-pinned: `envelope.go:restBase`,
+   `PENDING-PHASE-7(A1-route)`) as the server handler. The listener is not opened
+   until `Serve` calls `net.Listen("tcp", -south-bind)` followed by `ServeTLS`.
 
 ### 2.1 The credential-scope source
 
@@ -347,14 +348,17 @@ problem across crashes; `run` also defers `afl.Release()` for the clean path.
 
 The legitimate deployment topology is *N* daemons, one per `filesystem_id`
 (per-tenant instantiation, NFR-SEC-76), each a distinct scope. The lock must not
-over-restrict that topology: keying the guard on a resource the daemons share —
-as a retired design that keyed on a shared bind directory once did — would
-refuse the second through *N*th daemons even though they corrupt no common audit
-chain. The per-scope audit-sink lock fully preserves the no-interleaved-chain
-guarantee **without** imposing that restriction: distinct scopes have distinct
-sinks, take distinct locks, and coexist. (The `flock` package still carries a
-comment describing that retired shared-directory lock as an optional second
-resource; the daemon takes only the audit-sink lock — the topology fix.)
+over-restrict that topology: keying the *audit-chain* guard on a resource the
+daemons share — as a retired design that keyed it on a shared bind directory once
+did — would refuse the second through *N*th daemons even though they corrupt no
+common audit chain. The per-scope audit-sink lock fully preserves the
+no-interleaved-chain guarantee **without** imposing that restriction: distinct
+scopes have distinct sinks, take distinct locks, and coexist. (The `flock`
+package documents two resources it can lock — the audit sink and the south-face
+bind address — and the bind-address lock remains current as a distinct guard
+against a same-address double-start; under REST/TLS that bind resource is a TCP
+listen address rather than a unix socket. The retired thing is *keying the audit
+guard on the bind resource*, not the bind-address lock itself.)
 
 ---
 
