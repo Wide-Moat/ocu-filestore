@@ -4,9 +4,7 @@
 package southface
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -14,124 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 )
-
-// errmap-01: negative range offset/length ─────────────────────────────────
-
-// TestNegativeRangeDownloadDeniesMalformed pins errmap-01: a fileDownload with
-// a negative range offset or length must be rejected BEFORE the ALLOW audit is
-// emitted, producing a framed deny trailer (wireCodeInvalidArgument) and NO
-// data frames — and no spurious ALLOW Mandate in the audit chain.
-func TestNegativeRangeDownloadDeniesMalformed(t *testing.T) {
-	const engPath = "neg.bin"
-	content := []byte("NEGATIVE_RANGE_TEST_BYTES")
-
-	eng := newFakeEngine()
-	eng.putBytes(streamScope, engPath, content)
-
-	g := &fakeGuard{}
-	sess := &recordingCeilingsSession{}
-	resolver := &fakeResolver{grant: Grant{Downloadable: true}}
-	d := newStreamDispatcher(eng, g, sess, 1<<20)
-	d.resolver = resolver
-
-	// Mint a uuid by listing.
-	w := serveOp(d, OpListDirectory,
-		listBody(streamScope, "/", 0, "", false),
-		streamScope, okIntents())
-	resp := decodeList(t, w)
-	var uuid string
-	for _, e := range resp.Entries {
-		if e.File != nil && e.File.Path == "/"+engPath {
-			uuid = e.File.UUID
-		}
-	}
-	if uuid == "" {
-		t.Fatalf("listDirectory did not mint a uuid for %s", engPath)
-	}
-
-	cases := []struct {
-		name   string
-		offset int64
-		length int64
-	}{
-		{"negative_offset", -1, 8},
-		{"negative_length", 4, -1},
-		{"both_negative", -5, -3},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Reset guard events between sub-tests.
-			g.mu.Lock()
-			g.events = nil
-			g.mu.Unlock()
-
-			body := downloadParamsFrame(t, streamScope, uuid, &fileRange{Offset: tc.offset, Length: tc.length})
-			rec := serveStream(d, OpFileDownload, bytes.NewReader(body), streamScope, okIntents())
-
-			// The streaming path always returns HTTP 200; the verdict is in
-			// the framed end-stream trailer.
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200 (streaming path)", rec.Code)
-			}
-
-			// Parse frames: there must be NO data frames and exactly one
-			// end-stream trailer with the invalid_argument wire code.
-			rb := bytes.NewReader(rec.Body.Bytes())
-			dataFrames := 0
-			var trailer endStreamResponse
-			for {
-				f, payload, err := readFrame(rb)
-				if err != nil {
-					break
-				}
-				if f == endStreamFlag {
-					if jerr := json.Unmarshal(payload, &trailer); jerr != nil {
-						t.Fatalf("trailer not JSON: %v", jerr)
-					}
-					break
-				}
-				if f == dataFlag {
-					dataFrames++
-				}
-			}
-
-			if dataFrames != 0 {
-				t.Fatalf("negative range: %d data frames emitted before deny, want 0", dataFrames)
-			}
-			if trailer.Error == nil {
-				t.Fatal("negative range: trailer has no error, want invalid_argument deny")
-			}
-			if trailer.Error.Code != wireCodeInvalidArgument {
-				t.Fatalf("negative range: trailer wire code = %q, want %q", trailer.Error.Code, wireCodeInvalidArgument)
-			}
-
-			// The essential invariant: the audit chain must record exactly ONE
-			// DENY event with no prior ALLOW. denyDownloadTrailer mandates the
-			// deny audit record before writing the trailer (SEC-79); the ALLOW
-			// Mandate (which fires after the range check in the normal path)
-			// must never have been emitted. Assert exactly one event and that
-			// it carries DispositionDeny.
-			g.mu.Lock()
-			events := make([]any, len(g.events))
-			copy(events, g.events)
-			g.mu.Unlock()
-			if len(events) != 1 {
-				t.Fatalf("negative range: %d audit events recorded, want exactly 1 (the deny)", len(events))
-			}
-			ev, ok := events[0].(auditgate.FileActivityEvent)
-			if !ok {
-				t.Fatalf("negative range: audit event is not FileActivityEvent: %T", events[0])
-			}
-			if ev.Outcome.DispositionID != auditgate.DispositionDeny {
-				t.Fatalf("negative range: audit event disposition = %q, want %q (deny)", ev.Outcome.DispositionID, auditgate.DispositionDeny)
-			}
-		})
-	}
-}
 
 // TestErrInvalidRangeClassifiesMalformed pins the sentinel-remap path for
 // errmap-01: the southface mirror errInvalidRange must classify as denyMalformed

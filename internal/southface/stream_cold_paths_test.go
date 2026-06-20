@@ -4,114 +4,10 @@
 package southface
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"testing"
 )
-
-// drainErrEngine is a fault-injection Engine that fully drains the WriteStream
-// reader (as the real local engine's io.Copy does) and records the TERMINAL
-// error the reader returned. It lets a unit test observe whether the upload
-// handler closed the engine pipe with a clean io.EOF (which io.Copy would treat
-// as a successful commit) or with a real abort error. Only WriteStream is
-// meaningful; the other verbs are unused here.
-type drainErrEngine struct {
-	termErr error // the error the reader returned after the last byte
-	n       int64 // bytes drained
-}
-
-func (e *drainErrEngine) WriteStream(ctx context.Context, _, _ string, r io.Reader, _ bool) error {
-	buf := make([]byte, 512)
-	for {
-		nn, err := r.Read(buf)
-		e.n += int64(nn)
-		if err != nil {
-			e.termErr = err
-			// Mirror io.Copy semantics: io.EOF is a clean end (nil), any other
-			// error propagates as the WriteStream error.
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func (e *drainErrEngine) List(context.Context, string, string) ([]FileInfo, error) {
-	return nil, errors.New("unused")
-}
-func (e *drainErrEngine) Stat(context.Context, string, string) (FileInfo, error) {
-	return FileInfo{}, errors.New("unused")
-}
-func (e *drainErrEngine) MakeDir(context.Context, string, string) error { return errors.New("unused") }
-func (e *drainErrEngine) MoveDir(context.Context, string, string, string, bool) error {
-	return errors.New("unused")
-}
-func (e *drainErrEngine) RemoveDir(context.Context, string, string) error {
-	return errors.New("unused")
-}
-func (e *drainErrEngine) CopyFile(context.Context, string, string, string, bool) error {
-	return errors.New("unused")
-}
-func (e *drainErrEngine) MoveFile(context.Context, string, string, string, bool) error {
-	return errors.New("unused")
-}
-func (e *drainErrEngine) RemoveFile(context.Context, string, string) error {
-	return errors.New("unused")
-}
-func (e *drainErrEngine) ReadRange(context.Context, string, string, int64, int64, io.Writer) error {
-	return errors.New("unused")
-}
-
-var _ Engine = (*drainErrEngine)(nil)
-
-// TestUploadTruncatedStreamClosesPipeWithAbortError pins the torn-commit fix at
-// the handler layer with no mock of the real engine's atomicity: a fileUpload
-// that sends params + one chunk and then TRUNCATES (the body returns io.EOF
-// before the explicit end-stream half-close, exactly the mid-stream connection
-// drop) must close the engine pipe with a NON-EOF abort error. A clean io.EOF
-// would make the engine's io.Copy treat the partial bytes as a complete stream
-// and commit a torn object (temp+rename). The drainErrEngine records the
-// terminal error its reader saw; the test asserts it is NOT io.EOF, so the real
-// engine would discard the temp.
-func TestUploadTruncatedStreamClosesPipeWithAbortError(t *testing.T) {
-	eng := &drainErrEngine{}
-	sess := &recordingCeilingsSession{}
-	d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
-
-	// params declaring 64 bytes + one 13-byte chunk, then NO end-stream frame:
-	// the body simply ends, so the handler's next readFrame returns io.EOF.
-	body := concat(
-		paramsFrame(t, streamScope, "/torn.bin", 64),
-		chunkFrame(t, []byte("partial-bytes")),
-	)
-	w := serveStream(d, OpFileUpload, bytes.NewReader(body), streamScope, okIntents())
-
-	// The verdict is an abort error trailer (never success).
-	assertErrorTrailer(t, w, wireCodeAborted)
-
-	// The engine's reader saw a NON-EOF terminal error — the load-bearing
-	// assertion: a clean io.EOF here is the torn-commit bug.
-	if eng.termErr == nil {
-		t.Fatal("engine WriteStream reader saw no terminal error; the pipe was clean-closed (torn-commit bug)")
-	}
-	if errors.Is(eng.termErr, io.EOF) {
-		t.Fatalf("engine WriteStream reader terminal error = io.EOF; a truncated upload MUST close the pipe with a non-EOF abort error so the engine discards the temp (got %v)", eng.termErr)
-	}
-	if !errors.Is(eng.termErr, errStreamAborted) {
-		t.Fatalf("engine WriteStream reader terminal error = %v, want errStreamAborted", eng.termErr)
-	}
-	// The 13 partial bytes were drained but the stream aborted before commit.
-	if eng.n != 13 {
-		t.Fatalf("engine drained %d bytes, want the 13 partial bytes", eng.n)
-	}
-	// Ceilings balance on the abort path.
-	if !sess.balanced() {
-		t.Fatalf("ceilings unbalanced after truncated-upload abort: acq=%d rel=%d", sess.acquired, sess.released)
-	}
-}
 
 // TestDenyClassForDecodeErrArms pins the two decode-class arms the route/
 // envelope happy paths do not reach: the declared-size sentinel maps to
@@ -157,7 +53,8 @@ func TestCtxOrBackground(t *testing.T) {
 // arms: a present object returns its size; a missing object surfaces the
 // engine's not_found error (classified to denyNotFound by the caller); and a
 // panicking engine is RECOVERED into errInternalPanic so a Stat fault on the
-// main handler goroutine never escapes the streaming contract.
+// main handler goroutine never escapes into a half-written octet-stream
+// response.
 func TestStatSizeContained(t *testing.T) {
 	const scope = "fs-stat-contained"
 

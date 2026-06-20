@@ -5,9 +5,18 @@ package southface
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -51,26 +60,92 @@ func (serveFakeEngine) WriteStream(context.Context, string, string, io.Reader, b
 	return nil
 }
 
-// serveAllowAllChecker is a peerChecker that admits every connection as the
-// host uid, so the lifecycle tests can dial without a Linux peer-cred path.
-func serveAllowAllChecker(uid uint32) peerChecker {
-	return func(net.Conn) (uint32, int32, error) { return uid, 0, nil }
+// serveFakeExtractor binds every presented bearer to a fixed scope. The
+// lifecycle tests only need a non-nil credential-scope source so the wiring
+// guard passes; they do not drive a real request through it.
+func serveFakeExtractor() CredentialScopeExtractor {
+	return NewCredentialScopeExtractor(func(bearer string) (CredentialScope, error) {
+		if bearer == "" {
+			return CredentialScope{}, nil
+		}
+		return CredentialScope{FilesystemID: "fs-serve-01", GrantedIntents: []Intent{IntentRead, IntentWrite}}, nil
+	})
 }
 
-func serveValidConfig(t *testing.T, dir string) Config {
+// serveTestCert writes a fresh self-signed loopback certificate + key to two
+// PEM files under the test temp dir and returns their paths plus a cert pool
+// trusting the certificate.
+func serveTestCert(t *testing.T) (certFile, keyFile string, pool *x509.CertPool) {
 	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ocu-filestore-serve-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey: %v", err)
+	}
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	pool = x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("AppendCertsFromPEM: no certificate parsed")
+	}
+	return certFile, keyFile, pool
+}
+
+// freeLoopbackAddr returns a currently-free loopback host:port. There is a
+// small race between the probe close and the server rebind, acceptable in a
+// single-process test.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func serveValidConfig(t *testing.T) Config {
+	t.Helper()
+	certFile, keyFile, _ := serveTestCert(t)
 	return Config{
 		Resolver:          serveFakeResolver{},
 		Guard:             serveFakeGuard{},
 		Ceilings:          ceilingsRegistryStub(),
 		Engine:            serveFakeEngine{},
-		Registry:          NewSessionRegistry(),
-		Entry:             SessionEntry{FilesystemID: "fs-serve-01", GrantedIntents: []Intent{IntentRead, IntentWrite}},
-		Dir:               dir,
+		CredExtractor:     serveFakeExtractor(),
+		BindAddr:          freeLoopbackAddr(t),
+		CertFile:          certFile,
+		KeyFile:           keyFile,
 		SizeCeiling:       4 << 20,
 		BrokerMaxFileSize: 1 << 30,
-		CheckPeer:         serveAllowAllChecker(7),
-		HostUID:           7,
 	}
 }
 
@@ -96,9 +171,8 @@ func (serveFakeSession) ReleaseFD()               {}
 // BrokerMaxFileSize is a wiring fault that returns a typed error, never a
 // silent default.
 func TestServeRejectsUnsetBrokerMaxFileSize(t *testing.T) {
-	dir := shortSocketDir(t)
 	for _, bad := range []int64{0, -1} {
-		cfg := serveValidConfig(t, dir)
+		cfg := serveValidConfig(t)
 		cfg.BrokerMaxFileSize = bad
 		if _, err := Serve(cfg); !errors.Is(err, ErrBrokerMaxFileSizeUnset) {
 			t.Fatalf("Serve(BrokerMaxFileSize=%d): got %v, want ErrBrokerMaxFileSizeUnset", bad, err)
@@ -107,10 +181,9 @@ func TestServeRejectsUnsetBrokerMaxFileSize(t *testing.T) {
 }
 
 // TestServeRejectsNilSeams pins the fail-loud wiring guard: a nil
-// Resolver/Guard/Engine returns ErrSeamMissing, never a latent nil-deref on
-// the serve path.
+// Resolver/Guard/Engine/Ceilings/CredExtractor returns ErrSeamMissing, never a
+// latent nil-deref on the serve path.
 func TestServeRejectsNilSeams(t *testing.T) {
-	dir := shortSocketDir(t)
 	for _, tc := range []struct {
 		name   string
 		mutate func(*Config)
@@ -119,14 +192,36 @@ func TestServeRejectsNilSeams(t *testing.T) {
 		{"nil_guard", func(c *Config) { c.Guard = nil }},
 		{"nil_engine", func(c *Config) { c.Engine = nil }},
 		{"nil_ceilings", func(c *Config) { c.Ceilings = nil }},
-		{"nil_registry", func(c *Config) { c.Registry = nil }},
-		{"nil_checkpeer", func(c *Config) { c.CheckPeer = nil }},
+		{"nil_credextractor", func(c *Config) { c.CredExtractor = nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := serveValidConfig(t, dir)
+			cfg := serveValidConfig(t)
 			tc.mutate(&cfg)
 			if _, err := Serve(cfg); !errors.Is(err, ErrSeamMissing) {
 				t.Fatalf("Serve(%s): got %v, want ErrSeamMissing", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestServeRejectsMissingTLSMaterial pins that a missing bind address or an
+// unreadable cert/key refuses startup with a typed TLS-config error rather than
+// binding a half-configured listener.
+func TestServeRejectsMissingTLSMaterial(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"empty_bind", func(c *Config) { c.BindAddr = "" }},
+		{"empty_cert", func(c *Config) { c.CertFile = "" }},
+		{"empty_key", func(c *Config) { c.KeyFile = "" }},
+		{"missing_cert_file", func(c *Config) { c.CertFile = filepath.Join(t.TempDir(), "nope.pem") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := serveValidConfig(t)
+			tc.mutate(&cfg)
+			if _, err := Serve(cfg); !errors.Is(err, errTLSConfig) {
+				t.Fatalf("Serve(%s): got %v, want errTLSConfig", tc.name, err)
 			}
 		})
 	}
@@ -136,8 +231,7 @@ func TestServeRejectsNilSeams(t *testing.T) {
 // dispatcher carries maxFileSize == cfg.BrokerMaxFileSize, NOT sizeCeiling.
 // This is the only place the unexported field is set from a flag value.
 func TestServeSetsMaxFileSizeFromConfig(t *testing.T) {
-	dir := shortSocketDir(t)
-	cfg := serveValidConfig(t, dir)
+	cfg := serveValidConfig(t)
 	cfg.SizeCeiling = 4 << 20
 	cfg.BrokerMaxFileSize = 123_456_789
 	srv, err := Serve(cfg)
@@ -145,71 +239,78 @@ func TestServeSetsMaxFileSizeFromConfig(t *testing.T) {
 		t.Fatalf("Serve: unexpected error %v", err)
 	}
 	defer srv.Close()
-	sess, ok := srv.(*session)
+	ts, ok := srv.(*tlsServer)
 	if !ok {
-		t.Fatalf("Serve returned %T, want *session", srv)
+		t.Fatalf("Serve returned %T, want *tlsServer", srv)
 	}
-	d, ok := sess.srv.Handler.(*dispatcher)
+	router, ok := ts.srv.Handler.(*restRouter)
 	if !ok {
-		t.Fatalf("session handler is %T, want *dispatcher", sess.srv.Handler)
+		t.Fatalf("server handler is %T, want *restRouter", ts.srv.Handler)
 	}
+	d := router.dispatcher
 	if d.maxFileSize != cfg.BrokerMaxFileSize {
 		t.Fatalf("maxFileSize = %d, want %d (BrokerMaxFileSize, not sizeCeiling)", d.maxFileSize, cfg.BrokerMaxFileSize)
 	}
 	if d.maxFileSize == d.sizeCeiling {
 		t.Fatalf("maxFileSize must be distinct from sizeCeiling; both are %d", d.maxFileSize)
 	}
+	if d.credExtractor == nil {
+		t.Fatal("Serve did not wire the credential-scope extractor onto the dispatcher")
+	}
 }
 
-// TestServeServesAndCloses pins the lifecycle: the returned Server serves on a
-// real unix socket and Close releases the scope binding and unlinks the
-// socket.
+// TestServeServesAndCloses pins the lifecycle: the returned Server serves over
+// TLS HTTP/2 and answers a request, and Close shuts it down cleanly.
 func TestServeServesAndCloses(t *testing.T) {
-	dir := shortSocketDir(t)
-	cfg := serveValidConfig(t, dir)
+	certFile, keyFile, pool := serveTestCert(t)
+	addr := freeLoopbackAddr(t)
+	cfg := Config{
+		Resolver:          serveFakeResolver{},
+		Guard:             serveFakeGuard{},
+		Ceilings:          ceilingsRegistryStub(),
+		Engine:            serveFakeEngine{},
+		CredExtractor:     serveFakeExtractor(),
+		BindAddr:          addr,
+		CertFile:          certFile,
+		KeyFile:           keyFile,
+		SizeCeiling:       4 << 20,
+		BrokerMaxFileSize: 1 << 30,
+	}
 	srv, err := Serve(cfg)
 	if err != nil {
 		t.Fatalf("Serve: unexpected error %v", err)
 	}
-	sess := srv.(*session)
-	socketPath := sess.socketPath
-	if filepath.Dir(socketPath) != dir {
-		t.Fatalf("socket %q not under dir %q", socketPath, dir)
-	}
-	if _, ok := cfg.Registry.Lookup(socketPath); !ok {
-		t.Fatalf("Serve did not provision the scope binding for %q", socketPath)
-	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
-	// Give Serve a moment to enter the accept loop, then dial once to prove
-	// the socket is live.
-	time.Sleep(20 * time.Millisecond)
-	conn, dialErr := net.Dial("unix", socketPath)
-	if dialErr != nil {
-		t.Fatalf("dial %q: %v", socketPath, dialErr)
+
+	client := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+		Timeout:   3 * time.Second,
 	}
-	_ = conn.Close()
+	// The server rebinds the just-freed port in its goroutine; retry the dial
+	// briefly so the test does not race the bind.
+	probe := "https://" + addr + "/v1/filestore/fs/readFile"
+	deadline := time.Now().Add(3 * time.Second)
+	var reached bool
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodGet, probe, nil)
+		resp, derr := client.Do(req)
+		if derr == nil {
+			resp.Body.Close()
+			reached = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !reached {
+		t.Fatal("TLS south-face server did not become reachable")
+	}
 
 	if err := srv.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	if err := <-serveErr; err != nil {
 		t.Fatalf("Serve returned %v, want nil on clean shutdown", err)
-	}
-	if _, ok := cfg.Registry.Lookup(socketPath); ok {
-		t.Fatalf("Close did not release the scope binding for %q", socketPath)
-	}
-	if _, statErr := os.Stat(socketPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("Close did not unlink the socket %q (stat err %v)", socketPath, statErr)
-	}
-}
-
-// TestHostPeerCheckerIsTheRealGate pins that HostPeerChecker returns the
-// package's real extractPeerCred wiring (the SEC-76 gate), not a
-// reimplementation.
-func TestHostPeerCheckerIsTheRealGate(t *testing.T) {
-	if HostPeerChecker() == nil {
-		t.Fatal("HostPeerChecker returned nil; the SEC-76 gate must be wired")
 	}
 }

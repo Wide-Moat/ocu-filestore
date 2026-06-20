@@ -20,11 +20,12 @@ import (
 // SIZE_EXCEEDED / NOT_FOUND) is preferred for log consistency but any
 // pattern-valid token is legal. Sibling-proven, frozen pending #292.
 //
-// This file is the unary REST deny writer: it REPLACES writeConnectError on the
-// unary path (the streaming fileUpload/fileDownload ops still ride the Connect
-// framed-trailer path this wave and keep writeConnectError). The status comes
-// from the SURVIVING deny.go DenyVerdict.WireStatus (derived via
-// statusForWireCode) — this writer never reimplements the status table.
+// This file is the REST deny writer for EVERY op: the 16 unary-JSON ops and the
+// two data-plane ops (multipart fileUpload / octet-stream fileDownload) all
+// write their pre-byte refusal through it. It is the sole replacement for the
+// retired Connect error writer. The status comes from the SURVIVING deny.go
+// DenyVerdict.WireStatus (derived via statusForWireCode) — this writer never
+// reimplements the status table.
 
 // boundedReason is the diagnostic deny body: a pattern-validated open
 // reason_code and a bounded human-readable message. The HTTP status is
@@ -81,8 +82,8 @@ func clampMessage(message string) string {
 // statusForWireCode table), the application/json BoundedReason {reason_code,
 // message} diagnostic body, and — only when the verdict gates it
 // (permission_denied / unauthenticated) — the x-deny-reason header carrying the
-// broker-resolved audit truth. It is the single unary refusal path, replacing
-// writeConnectError for the 16 unary REST-JSON ops.
+// broker-resolved audit truth. It is the single pre-byte refusal path for every
+// op: the 16 unary-JSON ops and the two data-plane ops.
 //
 // x-request-id is NOT set here: ServeHTTP stamps it on the response header at
 // STAGE 0 before any deny path runs, so it is already queued on w.Header() and

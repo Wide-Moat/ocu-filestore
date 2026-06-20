@@ -4,9 +4,7 @@
 package southface
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -130,54 +128,6 @@ func TestReadFileTraversalBypassDenied(t *testing.T) {
 	}
 }
 
-// TestFileDownloadTraversalBypassDenied pins the bypass-01 download leg: even
-// if a uuid is minted against a downloadable-prefixed path, a uuid whose stored
-// path canonicalizes outside the prefix is denied at DOWNLOADABLE@READ, and the
-// engine ReadRange is NEVER called for the secret object. The store is now
-// keyed off canonical paths, so a readFile that minted the uuid would itself
-// have been denied (above) — but this drives the download handler's own
-// canonicalize-and-resolve path directly through a planted record to prove the
-// download leg is independently fail-closed.
-func TestFileDownloadTraversalBypassDenied(t *testing.T) {
-	eng := newFakeEngine()
-	eng.putBytes(streamScope, "secret/key.bin", []byte("TOPSECRETKEYMATERIAL"))
-
-	resolver := &prefixResolver{prefix: "/pub"}
-	sess := &recordingCeilingsSession{}
-	d := newStreamDispatcher(eng, &fakeGuard{}, sess, 1<<20)
-	d.resolver = resolver
-
-	// Plant a uuid record holding a traversal path that cleans outside /pub.
-	uuid := d.ids.idFor(streamScope, "/pub/../secret/key.bin")
-
-	body := downloadParamsFrame(t, streamScope, uuid, nil)
-	rec := serveStream(d, OpFileDownload, bytes.NewReader(body), streamScope, okIntents())
-
-	// Stream is always HTTP 200; the verdict is in the trailer.
-	if rec.Code != 200 {
-		t.Fatalf("download status = %d, want 200 (streaming path)", rec.Code)
-	}
-	trailer := lastTrailer(t, rec.Body.Bytes())
-	if trailer.Error == nil {
-		t.Fatalf("traversal download trailer = success, want a deny trailer (object leaked)")
-	}
-
-	// The resolver saw the canonical path (outside the prefix), so downloadable
-	// resolved false.
-	if got := resolver.lastReq.Path; got != "/secret/key.bin" {
-		t.Fatalf("resolver saw path %q, want canonical /secret/key.bin", got)
-	}
-
-	// The engine ReadRange must NEVER have streamed the secret object.
-	if calls := eng.readRangeCalls(); len(calls) != 0 {
-		t.Fatalf("engine ReadRange called %v on a denied traversal download; the bytes leaked", calls)
-	}
-	if !sess.balanced() {
-		t.Fatalf("ceilings gauge unbalanced after a denied download: bytes %d/%d fd %d/%d",
-			sess.acquired, sess.released, sess.fdAcquired, sess.fdReleased)
-	}
-}
-
 // TestAuthzPathEqualsEnginePath pins the invariant (bypass-03): for a request
 // the spine accepts, the path the resolver sees equals the path the engine
 // resolves. It drives a successful readFile through a path with redundant
@@ -226,24 +176,4 @@ func TestAuthzPathEqualsEnginePath(t *testing.T) {
 	if resp.File.Path != "/pub/docs/a.txt" {
 		t.Fatalf("readFile emitted path %q, want canonical /pub/docs/a.txt", resp.File.Path)
 	}
-}
-
-// lastTrailer reads frames and returns the end-stream trailer.
-func lastTrailer(t *testing.T, body []byte) endStreamResponse {
-	t.Helper()
-	rb := bytes.NewReader(body)
-	var trailer endStreamResponse
-	for {
-		f, payload, err := readFrame(rb)
-		if err != nil {
-			break
-		}
-		if f == endStreamFlag {
-			if jerr := json.Unmarshal(payload, &trailer); jerr != nil {
-				t.Fatalf("trailer not JSON: %v", jerr)
-			}
-			break
-		}
-	}
-	return trailer
 }

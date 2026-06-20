@@ -134,10 +134,11 @@ func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {
 // would route it to a nil handler.
 //
 // fileUpload (OPS-05) and fileDownload (OPS-06) are dispatched OUT-OF-BAND:
-// the ServeHTTP streaming branch routes them to serveStreaming before the
-// registry is consulted, so their registry entries stay unimplemented and are
-// never reached on the streaming path. getFileMetadata/listFiles stay
-// unimplemented (deferred).
+// the REST router routes them to their dedicated entrypoints
+// (serveUploadMultipart / serveDownloadOctetStream) before this registry is
+// consulted, so their registry entries stay unimplemented and are never reached
+// on the data-plane path. getFileMetadata/listFiles stay unimplemented
+// (deferred).
 func newHandlerRegistry() map[Op]opHandler {
 	reg := make(map[Op]opHandler, len(knownOps))
 	for op := range knownOps {

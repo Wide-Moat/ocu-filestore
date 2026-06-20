@@ -51,20 +51,28 @@ func bodyFor(scope string, intent Intent) string {
 	return fmt.Sprintf(`{"filesystem_id":%q,"path":"/p","authorization_metadata":{"intent":%q,"downloadable":false}}`, scope, intent)
 }
 
+// wireErr is the {Code, Message} shape the unary deny tests assert against. The
+// REST deny body is a BoundedReason {reason_code, message}; decodeErrBody maps
+// it into this shape (lowercasing the reason_code to the closed wire-code token)
+// so the existing assertions stay portable across the transport pivot.
+type wireErr struct {
+	Code    string
+	Message string
+}
+
 // decodeErrBody parses a REST deny body (BoundedReason {reason_code, message})
-// into a connectError-shaped value the unary tests assert against: the
-// reason_code is the uppercased wire code, so lowercasing it recovers the
-// closed Connect wire-code token (permission_denied / not_found / ...) the
-// existing assertions compare to. The HTTP status remains the authoritative
-// verdict; this helper exists only to keep the diagnostic-body assertions
-// portable across the transport pivot.
-func decodeErrBody(t *testing.T, w *httptest.ResponseRecorder) connectError {
+// into a wireErr the unary tests assert against: the reason_code is the
+// uppercased wire code, so lowercasing it recovers the closed wire-code token
+// (permission_denied / not_found / ...) the existing assertions compare to. The
+// HTTP status remains the authoritative verdict; this helper exists only to keep
+// the diagnostic-body assertions portable across the transport pivot.
+func decodeErrBody(t *testing.T, w *httptest.ResponseRecorder) wireErr {
 	t.Helper()
 	var br boundedReason
 	if err := json.Unmarshal(w.Body.Bytes(), &br); err != nil {
 		t.Fatalf("error body not JSON: %v (%q)", err, w.Body.String())
 	}
-	return connectError{Code: strings.ToLower(br.ReasonCode), Message: br.Message}
+	return wireErr{Code: strings.ToLower(br.ReasonCode), Message: br.Message}
 }
 
 // TestMandateBeforeAck pins NFR-SEC-79: the recording fake Guard proves
@@ -268,11 +276,12 @@ func TestPropChannelScope(t *testing.T) {
 // x-deny-reason. readFile (OPS-04) is implemented over an engine, so against
 // this nil-engine test dispatcher its registry entry stays unimplemented and
 // it is included here (the engine-backed readFile success/deny paths are
-// pinned in handlers_test.go). The two STREAMING ops (fileUpload, fileDownload)
-// no longer ride the unary registry — ServeHTTP routes them to serveStreaming
-// before the unary content-type/registry gate (phase 10), so they are
-// validated on the streaming path (fileDownload's unimplemented trailer and
-// the fileUpload routing are pinned in stream_handler_test.go), not here.
+// pinned in handlers_test.go). The two DATA-PLANE ops (fileUpload, fileDownload)
+// no longer ride the unary registry — the REST router routes them to their
+// dedicated entrypoints (serveUploadMultipart / serveDownloadOctetStream)
+// before the unary content-type/registry gate, so they are validated on the
+// data-plane path (upload_multipart_test.go / download_octetstream_test.go),
+// not here.
 func TestRegistryUnimplemented(t *testing.T) {
 	unaryUnimplemented := []Op{
 		OpListDirectory, OpMakeDirectory, OpMoveDirectory, OpRemoveDirectory,

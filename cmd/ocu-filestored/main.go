@@ -22,10 +22,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -147,18 +149,6 @@ const auditLockSuffix = ".lock"
 // names the resource so the operator knows which lock to inspect.
 var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the audit-sink lock)")
 
-// errStorageLaneRequired refuses `-engine s3` without a storage lane: the
-// s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
-// a direct backend dial is refused (NFR-SEC-16, NFR-SEC-85). Dev rigs must
-// say -storage-lane-dev-direct EXPLICITLY to dial direct. Match it with
-// errors.Is.
-var errStorageLaneRequired = errors.New("ocu-filestored: -engine s3 requires -storage-lane (ADR-0011: the s3 backend leg transits the storage egress lane; a direct backend dial is refused, NFR-SEC-16) — dev rigs may set -storage-lane-dev-direct explicitly")
-
-// errStorageLaneAmbiguous refuses -storage-lane together with
-// -storage-lane-dev-direct: the operator must pick exactly one dial
-// posture. Match it with errors.Is.
-var errStorageLaneAmbiguous = errors.New("ocu-filestored: -storage-lane and -storage-lane-dev-direct are mutually exclusive")
-
 // tenancyAdmission maps the Phase-8-frozen hyphenated -tenancy flag values to
 // the admission package's underscored constants. The flag value set is frozen
 // (single-tenant | multi-tenant) and is NOT byte-identical to admission's
@@ -231,8 +221,15 @@ type brokerConfig struct {
 	s3PathStyle      bool
 	auditSink        string
 	socketDir        string
-	filesystemID     string
-	maxFileSize      int64
+	// bindAddr/certFile/keyFile carry the TLS HTTP/2 south-face transport
+	// (the service_url the guest dials outbound through the Egress edge, and
+	// the service's own server certificate). PENDING-PHASE-7: the dedicated
+	// flag surface lands in the flag-pivot wave; compose reads these fields.
+	bindAddr     string
+	certFile     string
+	keyFile      string
+	filesystemID string
+	maxFileSize  int64
 	maxRequestByte   int64
 	opsPerSecond     float64
 	opsBurst         float64
@@ -266,6 +263,16 @@ func run(args []string) error {
 		"loopback-only bind address for the ops listener (/metrics); empty disables; non-loopback refused pre-bind")
 	fs.String("north-listen", "127.0.0.1:7080",
 		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
+	// South-face TLS transport: the service_url the guest dials outbound through
+	// the Egress edge (guest -> edge -> service direct HTTPS), and the service's
+	// own server certificate. PENDING-PHASE-7: the canon route/credential shapes
+	// are sibling-proven but not yet frozen in component-04.
+	southBind := fs.String("south-bind", "127.0.0.1:7443",
+		"south-face TLS HTTP/2 bind address (the service_url the guest dials through the Egress edge)")
+	tlsCert := fs.String("tls-cert", "",
+		"REQUIRED south-face TLS server certificate PEM path")
+	tlsKey := fs.String("tls-key", "",
+		"REQUIRED south-face TLS server private-key PEM path")
 	engine := fs.String("engine", "local-volume",
 		"backend object-store engine: local-volume | s3 (ADR-0010)")
 	maxRequestBytes := fs.Int64("max-request-bytes", 52428800,
@@ -351,6 +358,9 @@ func run(args []string) error {
 		engineRoot:           *engineRoot,
 		auditSink:            *auditSink,
 		socketDir:            *socketDir,
+		southBind:            *southBind,
+		tlsCert:              *tlsCert,
+		tlsKey:               *tlsKey,
 		filesystemID:         *filesystemID,
 		profile:              *profile,
 		tenancy:              *tenancy,
@@ -592,6 +602,9 @@ type rawFlags struct {
 	engineRoot           string
 	auditSink            string
 	socketDir            string
+	southBind            string
+	tlsCert              string
+	tlsKey               string
 	filesystemID         string
 	profile              string
 	tenancy              string
@@ -632,6 +645,9 @@ func validate(r rawFlags) (brokerConfig, error) {
 	engineRoot := r.engineRoot
 	auditSink := r.auditSink
 	socketDir := r.socketDir
+	southBind := r.southBind
+	tlsCert := r.tlsCert
+	tlsKey := r.tlsKey
 	filesystemID := r.filesystemID
 	profile := r.profile
 	tenancy := r.tenancy
@@ -680,36 +696,13 @@ func validate(r rawFlags) (brokerConfig, error) {
 	if s3CredentialFile != "" && kind != objectstore.S3 {
 		return cfg, fmt.Errorf("%w: -s3-credential-file is only valid with -engine s3", errMissingRequiredFlag)
 	}
-	if s3STSRoleARN != "" && kind != objectstore.S3 {
-		return cfg, fmt.Errorf("%w: -s3-sts-role-arn is only valid with -engine s3", errMissingRequiredFlag)
-	}
-	if s3STSEndpoint != "" && kind != objectstore.S3 {
-		return cfg, fmt.Errorf("%w: -s3-sts-endpoint is only valid with -engine s3", errMissingRequiredFlag)
-	}
-	if s3STSEndpoint != "" && s3STSRoleARN == "" {
-		return cfg, fmt.Errorf("%w: -s3-sts-endpoint requires -s3-sts-role-arn", errMissingRequiredFlag)
-	}
 
-	// Storage-lane refusal matrix (ADR-0011, NFR-SEC-16/85). The lane is a
-	// network-engine concept: on local-volume a lane flag would be a silent
-	// no-op, and a silent no-op lies.
-	if kind != objectstore.S3 {
-		if storageLane != "" {
-			return cfg, fmt.Errorf("%w: -storage-lane is only valid with -engine s3", errMissingRequiredFlag)
-		}
-		if laneDevDirect {
-			return cfg, fmt.Errorf("%w: -storage-lane-dev-direct is only valid with -engine s3", errMissingRequiredFlag)
-		}
-		if caBundle != "" {
-			return cfg, fmt.Errorf("%w: -ca-bundle is only valid with -engine s3", errMissingRequiredFlag)
-		}
-	}
-	if storageLane != "" && laneDevDirect {
-		return cfg, errStorageLaneAmbiguous
-	}
-	if caBundle != "" && storageLane == "" {
-		return cfg, fmt.Errorf("%w: -ca-bundle requires -storage-lane", errMissingRequiredFlag)
-	}
+	// PENDING-PHASE-7(engine-leg-egress): the guest-path storage lane is retired
+	// (the guest path is now guest -> edge -> service direct HTTPS), and the
+	// broker mints/signs nothing (invariant 3), so the STS / AssumeRole and the
+	// storage-lane refusal matrix are gone. The legacy -storage-lane / -ca-bundle
+	// / -s3-sts-* flags still parse for one transition wave but are inert; the
+	// flag-pivot wave removes them from the surface.
 
 	prof, ok := profileAdmission[profile]
 	if !ok {
@@ -754,6 +747,18 @@ func validate(r rawFlags) (brokerConfig, error) {
 	if auditSink == "" {
 		return cfg, fmt.Errorf("%w: -audit-sink is required", errMissingRequiredFlag)
 	}
+	// South-face TLS transport (the service the guest dials through the edge):
+	// the bind address and the server cert+key are required — the service speaks
+	// REST over HTTPS, so a missing cert/key is a wiring fault, not a default.
+	if southBind == "" {
+		return cfg, fmt.Errorf("%w: -south-bind is required", errMissingRequiredFlag)
+	}
+	if tlsCert == "" {
+		return cfg, fmt.Errorf("%w: -tls-cert is required (the south-face TLS server certificate)", errMissingRequiredFlag)
+	}
+	if tlsKey == "" {
+		return cfg, fmt.Errorf("%w: -tls-key is required (the south-face TLS server private key)", errMissingRequiredFlag)
+	}
 	if filesystemID == "" {
 		return cfg, fmt.Errorf("%w: -filesystem-id is required", errMissingRequiredFlag)
 	}
@@ -772,13 +777,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 		return cfg, err
 	}
 
-	// The lane requirement is the LAST gate: every other flag defect
-	// reports first, so this refusal provably means "flags valid, lane
-	// posture missing" (the e2e smoke pins exactly that shape).
-	if kind == objectstore.S3 && storageLane == "" && !laneDevDirect {
-		return cfg, errStorageLaneRequired
-	}
-
 	cfg = brokerConfig{
 		engineKind:       kind,
 		engineRoot:       engineRoot,
@@ -794,6 +792,9 @@ func validate(r rawFlags) (brokerConfig, error) {
 		s3PathStyle:      s3PathStyle,
 		auditSink:        auditSink,
 		socketDir:        socketDir,
+		bindAddr:         southBind,
+		certFile:         tlsCert,
+		keyFile:          tlsKey,
 		filesystemID:     filesystemID,
 		maxFileSize:      maxFileSize,
 		maxRequestByte:   maxRequestBytes,
@@ -955,31 +956,93 @@ func applyEnvFallbacks(fs *flag.FlagSet) error {
 	return nil
 }
 
-// selectCredentialSource picks the s3 backend credential source from the
-// flag surface: with -s3-sts-role-arn set, the static intake becomes the
-// PARENT credential and STS-per-session mints the scope-prefix-confined
-// session credential; otherwise the static host-local source serves
-// directly. The admitted credential KIND flows from the returned source's
-// Kind() — never hard-wired for the s3 engine (the local-volume path keeps
-// the hard-wired host-local kind: it exercises a filesystem permission, not
-// a backend credential). bucket and region arrive from the s3 engine
-// configuration at composition time.
-func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstore.CredentialSource, error) {
-	static, err := objectstore.NewStaticCredentialSource(cfg.s3CredentialFile)
-	if err != nil {
-		return nil, err
-	}
-	if cfg.s3STSRoleARN == "" {
-		return static, nil
-	}
-	return objectstore.NewSTSCredentialSource(objectstore.STSConfig{
-		RoleARN:  cfg.s3STSRoleARN,
-		Endpoint: cfg.s3STSEndpoint,
-		Region:   region,
-		Bucket:   bucket,
-		Scope:    objectstore.ScopeID(cfg.filesystemID),
-		Parent:   static,
+// selectCredentialSource picks the s3 backend credential source from the flag
+// surface: the static host-local intake (the engine's OWN backend credential,
+// NFR-SEC-25). The admitted credential KIND flows from the returned source's
+// Kind() — never hard-wired for the s3 engine (the local-volume path keeps the
+// hard-wired host-local kind: it exercises a filesystem permission, not a
+// backend credential). The bucket/region parameters are retained on the
+// signature for the composition call site but no longer drive a per-session
+// policy (the broker mints nothing).
+//
+// The broker mints/signs nothing (invariant 3): the broker-signs / AssumeRole
+// per-session credential-minting path is retired. The engine's OWN backend
+// credential is the static host-local source; the edge performs the RFC-8693
+// credential exchange for the guest, not the service.
+func selectCredentialSource(cfg brokerConfig, _, _ string) (objectstore.CredentialSource, error) {
+	return objectstore.NewStaticCredentialSource(cfg.s3CredentialFile)
+}
+
+// backendDialTimeout / backendTLSHandshakeTimeout / backendIdleConnTimeout /
+// backendExpectContinue bound the engine's backend dial so a wedged backend can
+// never hang a dial or handshake indefinitely. Verb-level deadlines stay with
+// the caller's ctx.
+const (
+	backendDialTimeout         = 10 * time.Second
+	backendTLSHandshakeTimeout = 10 * time.Second
+	backendIdleConnTimeout     = 90 * time.Second
+	backendExpectContinue      = 1 * time.Second
+)
+
+// newCredentialScopeExtractor wires the daemon's credential-scope source: it
+// derives the credential-bound filesystem scope from the edge-injected
+// Authorization: Bearer the service receives on every admitted request.
+//
+// PENDING-PHASE-7(A5-credscope): the credential authority's contract for HOW
+// the bound filesystem_id and intent grant are carried on the injected
+// credential is unpinned. In the interim single-tenant trusted_operator cell,
+// the edge has already validated+stripped the guest's weak session JWT and
+// injected the real backend credential; the daemon binds every PRESENT bearer
+// to the configured single-tenant scope (filesystem-id + granted-intents). The
+// per-request filesystem_id cross-check (the surviving channel-scope check)
+// still rejects a body that disagrees with this bound scope (403). An ABSENT
+// bearer is rejected upstream (errMissingBearer -> 401). The bind does NOT
+// JWKS-verify the bearer — the edge owns weak-JWT validation; the service
+// mints/signs nothing (invariant 3).
+func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtractor {
+	fsid := cfg.filesystemID
+	intents := cfg.grantedIntents
+	return southface.NewCredentialScopeExtractor(func(bearer string) (southface.CredentialScope, error) {
+		// A present-but-empty token is rejected before this bind by
+		// bearerFromRequest; an empty bound FilesystemID is treated as a
+		// rejection by the extractor. The interim bind binds a present bearer to
+		// the single-tenant configured scope.
+		if bearer == "" {
+			return southface.CredentialScope{}, nil
+		}
+		return southface.CredentialScope{
+			FilesystemID:   fsid,
+			GrantedIntents: intents,
+		}, nil
 	})
+}
+
+// newBackendTLSClient builds the s3 engine's backend HTTP client: a strict
+// fail-closed TLS transport (MinVersion TLS 1.2, no InsecureSkipVerify path),
+// HTTP/2 attempted, bounded timeouts, and — critically — http.Transport.Proxy
+// left NIL: an HTTPS_PROXY/HTTP_PROXY/NO_PROXY environment variable can neither
+// redirect nor bypass the backend leg (NFR-SEC-16, NFR-SEC-85). It is the
+// engine's OWN backend dial (NFR-SEC-25), distinct from the guest's
+// edge-injected credential path.
+//
+// PENDING-PHASE-7(engine-leg-egress): whether this backend leg retains an
+// egress proxy is an unfrozen ADR-0011-vs-new-model reconciliation; this client
+// is a plain direct strict-TLS dial in the interim (docs/pending-phase7.md).
+func newBackendTLSClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: (&net.Dialer{
+				Timeout:   backendDialTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			TLSHandshakeTimeout:   backendTLSHandshakeTimeout,
+			IdleConnTimeout:       backendIdleConnTimeout,
+			ExpectContinueTimeout: backendExpectContinue,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 }
 
 // compose runs the startup admission gate and, on admit, constructs the seams,
@@ -1025,14 +1088,13 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		// Constructed after admission below.
 	case objectstore.S3:
 		var err error
-		if cfg.laneDevDirect {
-			s3Client, err = objectstore.NewDevDirectTransport(cfg.caBundle)
-		} else {
-			s3Client, err = objectstore.NewLaneTransport(cfg.storageLane, cfg.caBundle)
-		}
-		if err != nil {
-			return nil, err
-		}
+		// PENDING-PHASE-7(engine-leg-egress): the engine's OWN backend leg
+		// dials with a plain strict-TLS client (MinVersion 1.2, ForceAttemptHTTP2,
+		// never http.ProxyFromEnvironment). The retired storage-lane fixed-proxy
+		// transport carried the GUEST data path, which is now guest->edge->service
+		// direct HTTPS; whether the engine's backend dial retains an egress proxy
+		// is an unfrozen ADR-0011-vs-new-model reconciliation (docs/pending-phase7.md).
+		s3Client = newBackendTLSClient()
 		source, err := selectCredentialSource(cfg, cfg.s3Bucket, cfg.s3Region)
 		if err != nil {
 			return nil, err
@@ -1113,17 +1175,14 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		Guard:             broker.NewGuard(sink),
 		Ceilings:          broker.NewCeilings(reg),
 		Engine:            broker.NewEngine(eng),
-		Registry:          southface.NewSessionRegistry(),
-		Entry:             southface.SessionEntry{FilesystemID: cfg.filesystemID, GrantedIntents: cfg.grantedIntents},
-		Dir:               cfg.socketDir,
+		CredExtractor:     newCredentialScopeExtractor(cfg),
+		BindAddr:          cfg.bindAddr,
+		CertFile:          cfg.certFile,
+		KeyFile:           cfg.keyFile,
 		SizeCeiling:       cfg.maxRequestByte,
 		BrokerMaxFileSize: cfg.maxFileSize,
-		CheckPeer:         southface.HostPeerChecker(),
-		HostUID:           uint32(os.Getuid()),
 		Logger:            l,
 		BrokerMetrics:     m,
-		OnPeerAccepted:    m.PeerAccepted,
-		OnPeerDropped:     m.PeerDropped,
 	})
 	if err != nil {
 		return nil, err

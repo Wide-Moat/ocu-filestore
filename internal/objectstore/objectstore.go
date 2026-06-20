@@ -8,8 +8,15 @@
 // a host filesystem permission, no network leg) and an S3 engine, both
 // present from day one.
 //
-// A network engine's backend leg transits the storage-dedicated egress lane
-// (ADR-0011); a direct backend dial bypassing it is refused (NFR-SEC-16).
+// PENDING-PHASE-7(engine-leg-egress): a network engine's backend leg is a
+// single governed egress hop dialed with this package's own host-local backend
+// credential. The guest-path storage lane (the fixed-proxy transport that
+// formerly carried the guest data path under ADR-0011) is retired: the guest
+// path is now guest -> edge -> service direct HTTPS, and the service is the only
+// thing that speaks the backend protocol. Whether the engine's OWN backend dial
+// retains an egress proxy is an ADR-0011-vs-new-model reconciliation not yet
+// frozen in component-04 canon (see docs/pending-phase7.md); a direct backend
+// dial that bypasses the engine's single client is still refused (NFR-SEC-16).
 // Path resolution happens here, inside the host-attested filesystem_id
 // prefix: traversal, symlink, absolute-path, and URL-shaped handles are
 // rejected before any backend call (NFR-SEC-25). The credential never
@@ -31,10 +38,13 @@ type EngineKind string
 
 const (
 	// LocalVolume exercises a host filesystem permission, not a network
-	// credential; it opens no network leg, so the egress-transit rule does
-	// not apply to it.
+	// credential; it opens no network leg, so the egress-hop rule does not
+	// apply to it.
 	LocalVolume EngineKind = "local-volume"
-	// S3 is the network engine; its leg transits the storage lane.
+	// S3 is the network engine; its backend leg is a single governed egress
+	// hop dialed with this package's own host-local credential.
+	// PENDING-PHASE-7(engine-leg-egress): whether that hop retains an egress
+	// proxy is an unfrozen ADR-0011-vs-new-model reconciliation.
 	S3 EngineKind = "s3"
 )
 

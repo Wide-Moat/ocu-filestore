@@ -728,13 +728,16 @@ func TestE2ESignalTeardown(t *testing.T) {
 	}
 }
 
-// TestE2EDownloadRange drives the fileDownload server-stream over the real
-// socket: upload a known blob, list to mint its uuid, then download (a) the
-// whole object and (b) a half-open ranged window, asserting the streamed bytes
-// match in both cases. This exercises the streaming download branch
-// (serveStreaming -> handleFileDownload, the range path) and the data-frame
-// codec end to end against the live daemon. The /pub prefix is downloadable so
-// the resolved grant permits the read (SEC-73).
+// TestE2EDownloadRange drives the fileDownload leg over the real daemon: upload
+// a known blob, list to mint its uuid, then download (a) the whole object and
+// (b) a half-open ranged window, asserting the streamed bytes match in both
+// cases. The /pub prefix is downloadable so the resolved grant permits the read
+// (SEC-73).
+//
+// PENDING-PHASE-7: this live harness still drives the retired unix-socket /
+// framed transport and is gated behind OCU_BROKER_BIN (it loud-skips under a
+// standard `go test ./...`); the flag-pivot / full-parity wave migrates it onto
+// the TLS REST transport (multipart upload, octet-stream download).
 func TestE2EDownloadRange(t *testing.T) {
 	skipUnlessPeerCredSupported(t)
 	d := startDaemon(t, daemonOptions{downloadablePrefix: "/pub", maxFileSize: 1 << 20})

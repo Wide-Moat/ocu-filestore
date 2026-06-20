@@ -147,6 +147,21 @@ func newBearerScopeExtractor(bind func(bearer string) (CredentialScope, error)) 
 	return bearerScopeExtractor{bind: bind}
 }
 
+// NewCredentialScopeExtractor is the exported constructor the composition layer
+// wires into Config.CredExtractor. It returns the default bearer-scope
+// extractor over bind: bind maps a verbatim edge-injected bearer to its
+// credential-bound scope (FilesystemID + GrantedIntents + actor uid/pid). A nil
+// bind, a bind error, or a bound scope with an empty FilesystemID is a
+// rejection — an unwired credential source fails CLOSED on every request.
+//
+// PENDING-PHASE-7(A5-credscope): the production bind binds to the credential
+// authority's contract for how the bound filesystem_id and intent grant are
+// carried on the injected credential; that contract is unpinned. The extractor
+// does NOT JWKS-verify the bearer (the edge owns weak-JWT validation).
+func NewCredentialScopeExtractor(bind func(bearer string) (CredentialScope, error)) CredentialScopeExtractor {
+	return newBearerScopeExtractor(bind)
+}
+
 // bearerFromRequest extracts the verbatim credential from the request's
 // Authorization header, stripping the "Bearer " scheme. It returns
 // errMissingBearer when the header is absent, carries a different scheme, or

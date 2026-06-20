@@ -4,10 +4,9 @@
 package southface
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -105,216 +104,48 @@ func TestPanicContainmentUnaryPath(t *testing.T) {
 	}
 }
 
-// TestPanicContainmentStreamUploadPath drives a panicking-fake-engine on the
-// STREAMING UPLOAD path (fileUpload → WriteStream). Asserts:
-//
-//   - The stream response is HTTP 200 (always, per the streaming contract).
-//   - The trailer carries a deny error code (not a success — the upload did
-//     not commit).
-//   - No goroutine leak: the test completes without hanging (if the pipe
-//     goroutine leaked the test would deadlock waiting on writeErrCh).
-//   - A deny audit was attempted (guard.Mandate called).
-func TestPanicContainmentStreamUploadPath(t *testing.T) {
+// TestPanicContainmentMultipartUploadPath drives a panicking-fake-engine on the
+// REST multipart fileUpload path (WriteStream panics inside the pipe
+// goroutine). recoverWriteStream must contain the panic: the reassembly loop's
+// blocked pw.Write unblocks (the read end is closed with errInternalPanic), the
+// upload aborts cleanly, no goroutine leaks (the test would deadlock on
+// writeErrCh otherwise), and the engine's temp+rename atomicity guarantees no
+// torn object. The pre-byte allow audit was already Mandated, so the guard was
+// called (NFR-SEC-79).
+func TestPanicContainmentMultipartUploadPath(t *testing.T) {
 	g := &fakeGuard{}
-	d := newDispatcherWithEngine(
-		&fakeResolver{grant: Grant{Downloadable: true}},
-		g,
-		okCeilings(),
-		1<<20,
-		panicEngine{},
-	)
-	// Inject a generous maxFileSize so the pre-buffer size reject does not
-	// fire before the engine is reached.
-	d.maxFileSize = 1 << 30
+	sess := &recordingCeilingsSession{}
+	d := newStreamDispatcher(panicEngine{}, g, sess, 1<<20)
+	// The resolver must grant write so the upload reaches the engine WriteStream.
+	d.resolver = &fakeResolver{grant: Grant{Downloadable: true}}
 
-	const (
-		scope   = "fs-panic-stream"
-		path    = "/upload-panic.bin"
-		content = "hello panic"
-	)
-	declared := int64(len(content))
+	content := []byte("PANIC-DURING-WRITESTREAM")
+	w := serveUpload(t, d, uploadBodyOpts{
+		scope: "fs-panic-upload", path: "/boom.bin", declared: int64(len(content)), fileBytes: content,
+	}, "fs-panic-upload", okIntents())
 
-	// Build a valid upload stream: params + one chunk + end-stream.
-	var buf bytes.Buffer
-	if err := writeFrame(&buf, dataFlag, []byte(
-		`{"filesystem_id":"`+scope+`","path":"`+path+`","declared_size_bytes":`+
-			itoa(declared)+`,"authorization_metadata":{"intent":"write","downloadable":false}}`,
-	)); err != nil {
-		t.Fatalf("params frame: %v", err)
+	// The panic was contained: the handler returned a structured response, not a
+	// crash (a leaked pipe goroutine would have hung this test on writeErrCh).
+	if w.Code == 0 {
+		t.Fatal("response code is 0 — the WriteStream panic was not contained (goroutine crash)")
 	}
-	chunk, _ := json.Marshal(uploadChunkFrame{Chunk: []byte(content)})
-	if err := writeFrame(&buf, dataFlag, chunk); err != nil {
-		t.Fatalf("chunk frame: %v", err)
+	if w.Code == http.StatusOK {
+		t.Fatalf("status = %d, want a deny (the upload must not commit on a WriteStream panic)", w.Code)
 	}
-	if err := writeFrame(&buf, endStreamFlag, []byte("{}")); err != nil {
-		t.Fatalf("end-stream frame: %v", err)
-	}
-
-	w := httptest.NewRecorder()
-	serveStreamingShim(d, w, streamRequest(OpFileUpload, &buf, scope, okIntents()))
-
-	// Always HTTP 200 on the streaming path.
-	if w.Code != 200 {
-		t.Fatalf("streaming response status = %d, want 200", w.Code)
-	}
-
-	// The trailer must be an error (the engine panicked, the upload did not
-	// commit). The exact code may be internal or unavailable depending on
-	// whether the Mandate call also failed.
-	_, resp := streamTrailer(t, w)
-	if resp.Error == nil {
-		t.Fatal("trailer = success, want an error (engine panicked)")
-	}
-
-	// Guard was called at least once (the allow Mandate at STAGE 3 fired).
+	// The deny audit was attempted (the allow Mandate fired before the engine
+	// goroutine ran).
 	g.mu.Lock()
 	evCount := len(g.events)
 	g.mu.Unlock()
 	if evCount == 0 {
-		t.Fatal("guard.Mandate was never called — deny audit was not attempted (NFR-SEC-79)")
+		t.Fatal("guard.Mandate was never called — audit was not attempted (NFR-SEC-79)")
 	}
-}
-
-// TestPanicContainmentStreamDownloadPath drives a panicking-fake-engine on the
-// STREAMING DOWNLOAD path (fileDownload → ReadRange). To reach ReadRange we
-// need a valid UUID in the objectIDStore, which requires a prior listing or
-// readFile to mint one. We seed the store directly (the store is package-
-// accessible) and build a valid download request.
-func TestPanicContainmentStreamDownloadPath(t *testing.T) {
-	g := &fakeGuard{}
-	d := newDispatcherWithEngine(
-		&fakeResolver{grant: Grant{Downloadable: true}},
-		g,
-		okCeilings(),
-		1<<20,
-		panicEngine{},
-	)
-
-	const (
-		scope    = "fs-panic-download"
-		filePath = "panic-file.bin"
-	)
-
-	// Obtain a UUID from the objectIDStore (engine-relative path, no leading
-	// slash — the store is keyed on the guest-convention path emitted by the
-	// listing handler, which is the engine path with "/" prepended).
-	uuid := d.ids.idFor(scope, "/"+filePath)
-
-	// Build a valid download request: params frame carrying the uuid. A RANGE
-	// is supplied so the handler skips the whole-object Stat size probe and
-	// drives straight to ReadRange — the verb whose pipe-goroutine panic
-	// containment (recoverReadStream) this test exercises.
-	paramsJSON := `{"filesystem_id":"` + scope + `","uuid":"` + uuid + `","range":{"offset":0,"length":16},"authorization_metadata":{"intent":"read","downloadable":true}}`
-	var buf bytes.Buffer
-	if err := writeFrame(&buf, dataFlag, []byte(paramsJSON)); err != nil {
-		t.Fatalf("params frame: %v", err)
+	// The ceilings gauge balances even on the panic-abort path (every acquire
+	// released).
+	if !sess.balanced() {
+		t.Fatalf("ceilings gauge unbalanced after a contained WriteStream panic: bytes %d/%d fd %d/%d",
+			sess.acquired, sess.released, sess.fdAcquired, sess.fdReleased)
 	}
-
-	w := httptest.NewRecorder()
-	serveStreamingShim(d, w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
-
-	// Always HTTP 200 on the streaming path.
-	if w.Code != 200 {
-		t.Fatalf("streaming response status = %d, want 200", w.Code)
-	}
-
-	// Trailer must carry an error.
-	_, resp := streamTrailer(t, w)
-	if resp.Error == nil {
-		t.Fatal("trailer = success, want error (engine ReadRange panicked)")
-	}
-
-	// Guard was called (allow Mandate fired before the engine goroutine).
-	g.mu.Lock()
-	evCount := len(g.events)
-	g.mu.Unlock()
-	if evCount == 0 {
-		t.Fatal("guard.Mandate was never called — deny audit was not attempted (NFR-SEC-79)")
-	}
-}
-
-// TestPanicContainmentStreamDownloadStatPath drives a panicking-fake-engine on
-// the WHOLE-OBJECT download path, where the handler runs engine.Stat on the
-// MAIN goroutine to resolve the read length (a nil Range = whole object). A
-// Stat panic must be contained INTO a framed end-stream error trailer — never
-// escape to recoverDispatch and surface as a unary error after the HTTP-200
-// stream header is already committed (the streaming always-framed-trailer
-// contract). The deny audit must still be attempted (NFR-SEC-79).
-func TestPanicContainmentStreamDownloadStatPath(t *testing.T) {
-	g := &fakeGuard{}
-	d := newDispatcherWithEngine(
-		&fakeResolver{grant: Grant{Downloadable: true}},
-		g,
-		okCeilings(),
-		1<<20,
-		panicEngine{},
-	)
-
-	const (
-		scope    = "fs-panic-stat"
-		filePath = "panic-stat.bin"
-	)
-	uuid := d.ids.idFor(scope, "/"+filePath)
-
-	// NO range field → whole-object read → the handler calls engine.Stat, which
-	// panics on panicEngine.
-	paramsJSON := `{"filesystem_id":"` + scope + `","uuid":"` + uuid + `","authorization_metadata":{"intent":"read","downloadable":true}}`
-	var buf bytes.Buffer
-	if err := writeFrame(&buf, dataFlag, []byte(paramsJSON)); err != nil {
-		t.Fatalf("params frame: %v", err)
-	}
-
-	w := httptest.NewRecorder()
-	serveStreamingShim(d, w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
-
-	if w.Code != 200 {
-		t.Fatalf("streaming response status = %d, want 200", w.Code)
-	}
-
-	// The verdict must be a framed END-STREAM (0x02) error trailer, proving the
-	// Stat panic was contained inside the stream rather than escaping to the
-	// unary recoverDispatch net.
-	flag, resp := streamTrailer(t, w)
-	if flag != endStreamFlag {
-		t.Fatalf("last frame flag = %#x, want end-stream %#x (Stat panic escaped the stream)", flag, endStreamFlag)
-	}
-	if resp.Error == nil {
-		t.Fatal("trailer = success, want error (engine Stat panicked)")
-	}
-
-	// Deny audit was attempted (the contained panic flows through
-	// denyDownloadTrailer → guard.Mandate before the trailer).
-	g.mu.Lock()
-	evCount := len(g.events)
-	g.mu.Unlock()
-	if evCount == 0 {
-		t.Fatal("guard.Mandate was never called — deny audit was not attempted (NFR-SEC-79)")
-	}
-}
-
-// itoa is a minimal int64-to-string helper used in the test body literal so
-// the test has no import on strconv (it stays in the southface test package
-// without pulling in extra packages).
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }
 
 // TestDispatcherRecoveryDoesNotReorderPipeline verifies that adding the panic

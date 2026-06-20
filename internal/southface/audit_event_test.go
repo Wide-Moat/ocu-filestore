@@ -158,7 +158,7 @@ func TestMapAuditEventDenyRead(t *testing.T) {
 // type-asserts. A *FileSink given the mapped event accepts it (durable write),
 // where the raw auditEvent would be refused as ErrAuditUnavailable.
 func TestMapAuditEventDeliveredToRealFileSink(t *testing.T) {
-	dir := shortSocketDir(t)
+	dir := t.TempDir()
 	sink, err := auditgate.NewFileSink(dir + "/audit.jsonl")
 	if err != nil {
 		t.Fatalf("NewFileSink: %v", err)

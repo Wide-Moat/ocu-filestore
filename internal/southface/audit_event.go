@@ -58,3 +58,47 @@ func mapAuditEvent(e auditEvent) auditgate.FileActivityEvent {
 		CorrelationUID: e.RequestID,
 	}
 }
+
+// streamAuditEvent builds a fileUpload audit event from the resolved params +
+// grant. ActivityID is a Create (an upload produces a new object);
+// Downloadable carries the resolved grant; ByteCount carries the declared
+// size (the upload's intended byte count). The durable encoding is the audit
+// gate's; the REST multipart handler passes the value through Guard.Mandate.
+// reqID is the T2-18 per-request correlation id threaded end-to-end.
+func (d *dispatcher) streamAuditEvent(ps PeerScope, req ResolveRequest, grant Grant, declared int64, reqID string) auditEvent {
+	return auditEvent{
+		Op:           OpFileUpload,
+		Scope:        ps.FilesystemID,
+		Path:         req.Path,
+		Intent:       req.Intent,
+		PeerUID:      ps.UID,
+		PeerPID:      ps.PID,
+		ActivityID:   activityCreate,
+		ObjectHandle: ps.FilesystemID + ":" + req.Path,
+		ByteCount:    declared,
+		Downloadable: grant.Downloadable,
+		RequestID:    reqID,
+	}
+}
+
+// streamDownloadAuditEvent builds a fileDownload ALLOW audit event from the
+// resolved (scope, path) + grant. ActivityID is a Read; ByteCount is left zero
+// (the audit records the access, not the streamed byte total); Downloadable
+// carries the broker-resolved grant (NFR-SEC-73, resolved at read). The REST
+// octet-stream handler passes the value through Guard.Mandate before the first
+// byte (audit-before-ack, SEC-79).
+func (d *dispatcher) streamDownloadAuditEvent(ps PeerScope, req ResolveRequest, grant Grant, reqID string) auditEvent {
+	return auditEvent{
+		Op:           OpFileDownload,
+		Scope:        ps.FilesystemID,
+		Path:         req.Path,
+		Intent:       req.Intent,
+		PeerUID:      ps.UID,
+		PeerPID:      ps.PID,
+		ActivityID:   activityRead,
+		ObjectHandle: ps.FilesystemID + ":" + req.Path,
+		ByteCount:    0,
+		Downloadable: grant.Downloadable,
+		RequestID:    reqID,
+	}
+}

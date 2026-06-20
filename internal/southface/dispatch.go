@@ -45,29 +45,7 @@ const (
 	activityDelete = 4 // delete / remove
 )
 
-// connectError is the Connect unary error body: a Connect code and a human
-// message. details are omitted in this build (the contract leaves them
-// optional).
-type connectError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-// writeConnectError writes a Connect error response from a DenyVerdict: the
-// derived HTTP status, the application/json body, and — only when the verdict
-// gates it (permission_denied / unauthenticated, n3) — the x-deny-reason
-// header carrying the audited truth. It is the single response path for every
-// refusal the spine produces.
-func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
-	if v.WireHeader {
-		w.Header().Set("x-deny-reason", v.AuditReason)
-	}
-	w.Header().Set("Content-Type", contentTypeJSON)
-	w.WriteHeader(v.WireStatus)
-	_ = json.NewEncoder(w).Encode(connectError{Code: v.WireCode, Message: message})
-}
-
-// denyWith writes the Connect error response, emits a WARN log carrying the
+// denyWith writes the REST deny response, emits a WARN log carrying the
 // broker-resolved AuditReason truth (never the degraded wire reason), and
 // records the deny in ops_total. The log carries deny_class (the truth) so
 // operators see the real reason even when the WIRE degrades it for
@@ -79,11 +57,10 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 // denyWith uses the dispatcher's base logger (no request_id); call denyWithLog
 // from request-scoped paths where a request_id-bearing logger is available.
 //
-// PENDING-PHASE-7(A3-deny): the unary refusal is written as a REST response —
-// the authoritative HTTP status plus a BoundedReason {reason_code, message}
-// diagnostic body (writeRESTDeny). The streaming fileUpload/fileDownload ops
-// still ride the Connect framed-trailer path this wave and keep
-// writeConnectError; only the unary choke points move here.
+// PENDING-PHASE-7(A3-deny): the refusal is written as a REST response — the
+// authoritative HTTP status plus a BoundedReason {reason_code, message}
+// diagnostic body (writeRESTDeny). Every op (the 16 unary-JSON ops and the two
+// data-plane ops) now writes its pre-byte refusal this way.
 func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
 	d.logger.Warn("broker deny",
 		slog.String(observ.KeyDenyClass, v.AuditReason),
@@ -244,9 +221,8 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		reg[OpMoveFile] = handleMoveFile
 		reg[OpRemoveFile] = handleRemoveFile
 		// readFile (OPS-04) rides the unary dispatch unchanged. fileUpload
-		// (OPS-05) is dispatched OUT-OF-BAND via serveStreaming and never read
-		// from this registry, so its entry stays unimplemented (see
-		// handler_stub.go).
+		// (OPS-05) is REST-routed to serveUploadMultipart and never read from
+		// this registry, so its entry stays unimplemented (see handler_stub.go).
 		reg[OpReadFile] = handleReadFile
 	}
 	return &dispatcher{
