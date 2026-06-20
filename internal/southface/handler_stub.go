@@ -47,8 +47,20 @@ type handlerCtx struct {
 	// decision can never disagree with the bytes touched. It is in the guest
 	// leading-slash convention; enginePath trims it for the engine call.
 	canonPath string
-	ps        PeerScope
-	grant     Grant
+	// canonSource and canonDest are the spine-canonicalized SECOND-LEG paths for
+	// the two-path namespace ops (moveDirectory, copyFile, moveFile). The spine
+	// cleans req.Source/req.Destination through the SAME canonicalizePath it
+	// applies to the primary path at the STAGE 1b->2 boundary (crutch-04), BEFORE
+	// authz and audit, so the authorized/audited leg is the exact leg the engine
+	// touches — never a raw, un-canonicalized wire path. A canonicalize error on
+	// either leg is denied denyMalformed at the spine and the handler is never
+	// reached, symmetric with the primary path. Both are in the guest
+	// leading-slash convention; the handler trims them through enginePath for the
+	// engine call. They are empty for single-path ops, which never read them.
+	canonSource string
+	canonDest   string
+	ps          PeerScope
+	grant       Grant
 
 	mandateDeny func(auditReason, wireClass, message string)
 }

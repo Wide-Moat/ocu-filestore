@@ -444,6 +444,25 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	env.Path = canonPath
 
+	// STAGE 1b -> 2 BOUNDARY (crutch-04): canonicalize the SECOND-LEG paths of the
+	// two-path namespace ops (moveDirectory, copyFile, moveFile) through the SAME
+	// canonicalizePath the primary path went through above, BEFORE STAGE 2 authz
+	// and STAGE 3 audit. The two-path handlers used to feed req.Source/
+	// req.Destination RAW into the engine (slash-strip only), so authz/audit
+	// decided on the primary path while the engine validated a different,
+	// un-canonicalized leg — the canonicalize-once-before-authz invariant
+	// (bypass-01/03) held for the primary path but was broken for move/copy. The
+	// engine-side ValidatePath/os.Root is still defense-in-depth (no escape), but
+	// the authorized/audited leg must be the exact leg the engine touches. A
+	// canonicalize error on either leg is denyMalformed HERE — symmetric with the
+	// primary path — and the handler is never reached. canonSrc/canonDst are
+	// empty for single-path ops, which never read them.
+	canonSrc, canonDst, perr := canonicalizeMoveCopyLegs(op, bodyBytes)
+	if perr != nil {
+		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
+		return
+	}
+
 	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
 	// The route op is AUTHORITATIVE for what the request does; the wire
 	// authorization_metadata.intent is an untrusted hint. The authz intent
@@ -487,7 +506,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// audit-down verdict (n3). This pre-handler allow-Mandate stays HERE,
 	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
-	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
+	allowEvent := d.auditEvent(op, ps, req, grant, canonDst)
 	allowEvent.RequestID = reqID
 	mandateStart := time.Now()
 	mandateErr := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent))
@@ -527,7 +546,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (the truth header only ever accompanies a recorded truth), mirroring the
 	// STAGE-3 allow-Mandate failure path above.
 	mandateDeny := func(auditReason, wireClass, message string) {
-		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
+		denyEvent := d.denyAuditEvent(op, ps, req, grant, canonDst, auditReason)
 		denyEvent.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
 			denyOp(mapDeny(denyAuditDown), "audit gate unavailable")
@@ -548,6 +567,8 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		op:          op,
 		body:        bodyBytes,
 		canonPath:   env.Path, // the spine-canonicalized primary path (bypass-01/03)
+		canonSource: canonSrc, // the spine-canonicalized move/copy source leg (crutch-04)
+		canonDest:   canonDst, // the spine-canonicalized move/copy destination leg (crutch-04)
 		ps:          ps,
 		grant:       grant,
 		mandateDeny: mandateDeny,
@@ -593,47 +614,80 @@ func activityForOp(op Op) int {
 	}
 }
 
-// objectHandleForOp derives the audited object handle for an op. For
-// move/copy the handle is the DESTINATION (the produced object); for the
-// others it is the envelope path. The destination is read from the buffered
-// body so the audit record names the produced handle even though the spine
-// envelope carries no destination field.
+// canonicalizeMoveCopyLegs canonicalizes the SECOND-LEG paths (source and
+// destination) of the two-path namespace ops (moveDirectory, copyFile,
+// moveFile) through the SAME canonicalizePath the spine applies to the primary
+// path at the STAGE 1b->2 boundary (crutch-04). It runs on the buffered body
+// AFTER the channel-scope cross-check has cleared (nothing trusts the body
+// before STAGE 1b) and BEFORE STAGE 2 authz / STAGE 3 audit, so the
+// authorized/audited leg is the exact leg the engine touches.
 //
-// The destination path is canonicalized through canonicalizePath — the same
-// canonicalizer the dispatch boundary applies to the primary path at STAGE
-// 1b/2 (bypass-01/03) — so the durable audit record names the
-// broker-resolved truth and never a raw wire path that could encode traversal
-// segments ("/pub/../priv/stolen") while the engine wrote a different object
-// ("/priv/stolen"). If the body cannot be decoded or the destination is
-// lexically invalid, the handle falls back to the canonicalized primary path
-// (req.Path), which the spine already cleaned at STAGE 1b (NFR-SEC-79).
-func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) string {
-	path := req.Path
-	var rawDst string
-	var gotDst bool
+// A body that cannot be decoded is treated as a missing leg ("" returned,
+// no error): the op handler's strict decodeOp re-decodes the same bytes and
+// owns the malformed-body refusal — this helper never pre-empts that with its
+// own malformed verdict. A leg that decodes but is lexically invalid or escapes
+// the scope (canonicalizePath error) returns the error so the spine denies
+// denyMalformed before the engine — symmetric with the primary path.
+//
+// Both returned legs are in the guest leading-slash convention; the handler
+// trims them through enginePath for the engine call. For a single-path op the
+// returned legs are empty and the handler never reads them.
+func canonicalizeMoveCopyLegs(op Op, body []byte) (src string, dst string, err error) {
+	var rawSrc, rawDst string
 	switch op {
 	case OpMoveDirectory:
 		var b moveDirectoryRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
 	case OpCopyFile:
 		var b copyFileRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
 	case OpMoveFile:
 		var b moveFileRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
+	default:
+		return "", "", nil
 	}
-	if gotDst {
-		if clean, err := canonicalizePath(rawDst); err == nil {
-			path = clean
+	src, err = canonicalizePath(rawSrc)
+	if err != nil {
+		return "", "", err
+	}
+	dst, err = canonicalizePath(rawDst)
+	if err != nil {
+		return "", "", err
+	}
+	return src, dst, nil
+}
+
+// objectHandleForOp derives the audited object handle for an op. For
+// move/copy the handle is the DESTINATION (the produced object); for the
+// others it is the envelope path. The destination passed in is the
+// spine-canonicalized destination leg (canonDst) — cleaned through the SAME
+// canonicalizer the dispatch boundary applies to the primary path at STAGE
+// 1b/2 (bypass-01/03, crutch-04) — so the durable audit record names the
+// broker-resolved truth and never a raw wire path that could encode traversal
+// segments ("/pub/../priv/stolen") while the engine wrote a different object
+// ("/priv/stolen"). The audited destination is now the EXACT leg the engine
+// receives, because the spine canonicalizes it once and both the audit record
+// and the engine call derive from that single cleaned form. A single-path op
+// (or a two-path op whose body failed to decode, leaving canonDst empty) names
+// the canonicalized primary path (req.Path), which the spine already cleaned at
+// STAGE 1b (NFR-SEC-79).
+func objectHandleForOp(op Op, scope string, req ResolveRequest, canonDst string) string {
+	path := req.Path
+	switch op {
+	case OpMoveDirectory, OpCopyFile, OpMoveFile:
+		if canonDst != "" {
+			path = canonDst
 		}
-		// If canonicalizePath rejects the destination (lexically invalid), path
-		// stays as req.Path — the already-canonical primary path.
 	}
 	return scope + ":" + path
 }
@@ -643,8 +697,9 @@ func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) str
 // passes an opaque value through Guard.Mandate exactly as the real gate
 // consumes it. The op-aware fields (ActivityID, ObjectHandle, Intent,
 // Downloadable) are populated per Q7; the committed envelope fields keep their
-// meaning.
-func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte) auditEvent {
+// meaning. canonDst is the spine-canonicalized destination leg for a two-path
+// op (crutch-04), empty for a single-path op.
+func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, canonDst string) auditEvent {
 	return auditEvent{
 		Op:           op,
 		Scope:        ps.FilesystemID,
@@ -654,7 +709,7 @@ func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant G
 		PeerPID:      ps.PID,
 		AccessTime:   nil,
 		ActivityID:   activityForOp(op),
-		ObjectHandle: objectHandleForOp(op, ps.FilesystemID, req, body),
+		ObjectHandle: objectHandleForOp(op, ps.FilesystemID, req, canonDst),
 		ByteCount:    0,
 		Downloadable: grant.Downloadable,
 	}
@@ -664,9 +719,10 @@ func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant G
 // refusal: the same op-aware shape as the allow event, carrying the
 // broker-resolved truth as the DenyReason. It is emitted through the spine's
 // guard (via the mandateDeny hook) BEFORE the wire deny so the durable record
-// captures that the op did not take effect (T-09-04 / NFR-SEC-79).
-func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte, auditReason string) auditEvent {
-	e := d.auditEvent(op, ps, req, grant, body)
+// captures that the op did not take effect (T-09-04 / NFR-SEC-79). canonDst is
+// the spine-canonicalized destination leg for a two-path op (crutch-04).
+func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, canonDst string, auditReason string) auditEvent {
+	e := d.auditEvent(op, ps, req, grant, canonDst)
 	e.DenyReason = auditReason
 	return e
 }

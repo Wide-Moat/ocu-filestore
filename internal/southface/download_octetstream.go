@@ -157,7 +157,7 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 			slog.String(observ.KeyDenyClass, auditReason),
 			slog.String(observ.KeyReason, message),
 		)
-		ev := d.denyAuditEvent(OpFileDownload, ps, req, grant, nil, auditReason)
+		ev := d.denyAuditEvent(OpFileDownload, ps, req, grant, "", auditReason)
 		ev.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(ev)); err != nil {
 			d.recordOp(string(OpFileDownload), "deny", denyAuditDown)
@@ -223,7 +223,7 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 		// names the handle that was actually probed — an empty handle would blind
 		// the anti-enumeration trail this deny exists to capture.
 		probed := ResolveRequest{Filesystem: rec.scope, Path: rec.path, Intent: IntentRead}
-		ev := d.denyAuditEvent(OpFileDownload, ps, probed, grant, nil, denyScopeMismatch)
+		ev := d.denyAuditEvent(OpFileDownload, ps, probed, grant, "", denyScopeMismatch)
 		ev.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(ev)); err != nil {
 			d.recordOp(string(OpFileDownload), "deny", denyAuditDown)

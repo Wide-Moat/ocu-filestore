@@ -165,7 +165,7 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 			slog.String(observ.KeyDenyClass, auditReason),
 			slog.String(observ.KeyReason, message),
 		)
-		ev := d.denyAuditEvent(OpFileUpload, ps, req, grant, nil, auditReason)
+		ev := d.denyAuditEvent(OpFileUpload, ps, req, grant, "", auditReason)
 		ev.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(ev)); err != nil {
 			// Deny-Mandate failure degrades the verdict to audit_down; book the
