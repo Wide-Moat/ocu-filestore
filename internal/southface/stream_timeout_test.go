@@ -53,7 +53,7 @@ func TestStalledUploadStreamAborts(t *testing.T) {
 	d.maxFileSize = 1 << 20
 	d.frameReadTimeout = 200 * time.Millisecond // shrink the budget for the test
 
-	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger(), nil, nil)
+	s, err := provisionSession(dir, entry, reg, streamingShimHandler{d}, allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestStalledDownloadStreamAborts(t *testing.T) {
 	// dispatcher) so the download resolves without a prior listing round-trip.
 	uuid := d.ids.idFor(scope, "/big.bin")
 
-	s, err := provisionSession(dir, entry, reg, d, allowAllPeer, 4242, discardLogger(), nil, nil)
+	s, err := provisionSession(dir, entry, reg, streamingShimHandler{d}, allowAllPeer, 4242, discardLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("provisionSession: %v", err)
 	}

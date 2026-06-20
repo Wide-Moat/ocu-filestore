@@ -332,17 +332,15 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// STREAMING BRANCH (per-op flag, NOT content-type sniffing): a streaming
-	// op (fileUpload, fileDownload) has its own STAGE-0 gate
-	// (application/connect+json, no Content-Length pre-buffer reject) and
-	// emits a framed HTTP-200 trailer for every verdict. It MUST branch HERE,
-	// before the unary checkContentType (hard-equals application/json) and the
-	// unary Content-Length pre-buffer reject would kill a chunked connect+json
-	// upload (Pitfalls 1, 2). The unary path below is unchanged.
-	if isStreamingOp(op) {
-		d.serveStreaming(w, r, op, reqID, reqLog)
-		return
-	}
+	// DATA-PLANE OPS are NOT dispatched here. Both fileUpload (multipart) and
+	// fileDownload (octet-stream) are REST-routed by the router to their dedicated
+	// entrypoints (serveUploadMultipart / serveDownloadOctetStream) BEFORE the
+	// request reaches this unary spine, so this ServeHTTP path now serves ONLY the
+	// 16 unary-JSON ops. The retired Connect serveStreaming branch is gone — no op
+	// rides it. A data-plane op reaching this spine directly (a caller that bypassed
+	// the router) would fall through the unary Content-Type/Content-Length gate
+	// below and be refused, which is the correct fail-closed behaviour for an
+	// out-of-band call.
 
 	// STAGE 0: Content-Type. The unary REST ops are application/json; the
 	// Connect version header is gone (the REST transport pins no protocol-version

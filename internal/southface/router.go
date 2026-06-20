@@ -77,21 +77,25 @@ func (rt *restRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRESTDeny(w, mapDeny(denyMalformed).withStatus(http.StatusMethodNotAllowed), "method not allowed")
 		return
 	}
-	// Content negotiation: fileUpload is multipart/form-data and is routed to the
-	// dispatcher's dedicated multipart upload entry; every other op is
-	// application/json (and, this wave, the still-on-Connect fileDownload rides
-	// the dispatcher's streaming branch). The dispatcher's STAGE-0 Content-Type
-	// gate (unary) and the streaming Content-Type gate (fileDownload) enforce the
-	// EXACT media type and own every media-type refusal for those paths; the
-	// multipart upload entry owns its own multipart parse, so the route boundary
-	// stays a thin classifier.
+	// Content negotiation by op transport class. The two data-plane ops own
+	// dedicated entrypoints; every other op (the 16 unary-JSON ops) rides the
+	// dispatcher's LOCKED STAGE 0->4 spine. The dispatcher's STAGE-0 Content-Type
+	// gate (unary) enforces the EXACT application/json media type and owns every
+	// unary media-type refusal; each data-plane entry owns its own request parse,
+	// so the route boundary stays a thin classifier.
 	//
-	// PENDING-PHASE-7(A2-multipart): the multipart fileUpload op now dispatches to
-	// serveUploadMultipart (the REST upload handler), not the retired Connect
-	// streaming branch. fileDownload stays on the old Connect path until its own
-	// wave.
+	//   - PENDING-PHASE-7(A2-multipart): fileUpload (multipart/form-data)
+	//     dispatches to serveUploadMultipart.
+	//   - PENDING-PHASE-7(A2-octet): fileDownload (application/json request,
+	//     application/octet-stream response) dispatches to
+	//     serveDownloadOctetStream. With this, BOTH data-plane ops are REST-routed
+	//     and NO op rides the retired Connect streaming branch.
 	if negotiatedRequestClass(op, r) == multipartContentType {
 		rt.dispatcher.serveUploadMultipart(w, r)
+		return
+	}
+	if op == OpFileDownload {
+		rt.dispatcher.serveDownloadOctetStream(w, r)
 		return
 	}
 	rt.dispatcher.ServeHTTP(w, r)

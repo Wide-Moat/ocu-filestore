@@ -114,10 +114,15 @@ func streamRequest(op Op, body io.Reader, scope string, intents []Intent) *http.
 	return r.WithContext(contextWithPeerScope(r.Context(), ps))
 }
 
-// serveStream drives a streaming op end-to-end and returns the recorder.
+// serveStream drives a streaming op end-to-end and returns the recorder. Wave 4
+// removed the dual-dispatch streaming branch from ServeHTTP (the data-plane ops
+// pivoted to the REST transports), so these legacy Connect streaming tests route
+// through serveStreamingShim, which runs the retired ServeHTTP streaming-branch
+// prologue and calls the surviving serveStreaming method directly. The shim and
+// serveStreaming both die in Wave 5 with the rest of the dead Connect transport.
 func serveStream(d *dispatcher, op Op, body io.Reader, scope string, intents []Intent) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(op, body, scope, intents))
+	serveStreamingShim(d, w, streamRequest(op, body, scope, intents))
 	return w
 }
 

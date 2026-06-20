@@ -104,7 +104,7 @@ func TestRequestIDPresentOnStreamingDeny(t *testing.T) {
 	// cross-check inside the streaming STAGE 0.
 	pf := paramsFrame(t, "wrong-scope", "/file.txt", 5)
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
+	serveStreamingShim(d, w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200 (streaming always 200)", w.Code)
@@ -140,7 +140,7 @@ func TestRequestIDPresentOnStreamingAllow(t *testing.T) {
 	streamBody := bytes.NewReader(concat(pf, cf, ef))
 
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, streamBody, streamScope, []Intent{IntentWrite}))
+	serveStreamingShim(d, w, streamRequest(OpFileUpload, streamBody, streamScope, []Intent{IntentWrite}))
 
 	assertSuccessTrailer(t, w)
 
@@ -240,7 +240,7 @@ func TestRequestIDUnifiedDenyAudit(t *testing.T) {
 	// Upload params with a mismatched filesystem_id → scope_mismatch deny.
 	pf := paramsFrame(t, "wrong-scope", "/file.txt", 5)
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
+	serveStreamingShim(d, w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
 
 	reqID := w.Header().Get(requestIDHeader)
 	if !reqIDRe.MatchString(reqID) {

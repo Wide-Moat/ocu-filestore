@@ -151,7 +151,7 @@ func TestPanicContainmentStreamUploadPath(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, &buf, scope, okIntents()))
+	serveStreamingShim(d, w, streamRequest(OpFileUpload, &buf, scope, okIntents()))
 
 	// Always HTTP 200 on the streaming path.
 	if w.Code != 200 {
@@ -211,7 +211,7 @@ func TestPanicContainmentStreamDownloadPath(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
+	serveStreamingShim(d, w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
 
 	// Always HTTP 200 on the streaming path.
 	if w.Code != 200 {
@@ -265,7 +265,7 @@ func TestPanicContainmentStreamDownloadStatPath(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
+	serveStreamingShim(d, w, streamRequest(OpFileDownload, &buf, scope, []Intent{IntentRead, IntentWrite}))
 
 	if w.Code != 200 {
 		t.Fatalf("streaming response status = %d, want 200", w.Code)
