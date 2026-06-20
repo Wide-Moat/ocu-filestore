@@ -201,6 +201,43 @@ func TestComposeCrashRestartErasesScope(t *testing.T) {
 	}
 }
 
+// TestComposeServeConstructionFailureTearsDownScope pins FILESTORED-11: when
+// compose provisions a scope (eng.ProvisionScope) and a LATER step fails
+// before ownership passes to teardownServer — here southface.Serve's TLS
+// construction rejecting a malformed certificate — compose must roll back the
+// just-provisioned scope (engine.TeardownScope), never leak a dirty scope onto
+// the error path. The LocalVolume erase signature is observable: a freshly
+// provisioned scope holds a .ocu-staging subdir; the rollback teardown
+// re-creates the scope dir EMPTY, so the staging subdir is gone.
+func TestComposeServeConstructionFailureTearsDownScope(t *testing.T) {
+	cfg := validBrokerConfig(t)
+	// Corrupt the certificate AFTER admission/provision but on the path Serve
+	// loads: tls.LoadX509KeyPair on this garbage fails, and Serve returns the
+	// error — the post-provision failure window FILESTORED-11 guards.
+	if err := os.WriteFile(cfg.certFile, []byte("-----BEGIN CERTIFICATE-----\nnot a real cert\n-----END CERTIFICATE-----\n"), 0o600); err != nil {
+		t.Fatalf("plant malformed cert: %v", err)
+	}
+
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
+	if err == nil {
+		_ = srv.Close()
+		t.Fatal("compose with a malformed TLS cert returned nil error; want a Serve-construction failure")
+	}
+	if srv != nil {
+		t.Fatalf("compose returned a non-nil Server on the failure path; want nil")
+	}
+
+	// The scope was provisioned then must have been torn down: the LocalVolume
+	// erase re-creates the scope dir empty, so the .ocu-staging subdir left by
+	// ProvisionScope is gone. Its survival would prove the leak FILESTORED-11
+	// fixes (provisioned-but-never-torn-down).
+	scopeDir := filepath.Join(cfg.engineRoot, cfg.filesystemID)
+	staging := filepath.Join(scopeDir, ".ocu-staging")
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging dir after a failed compose: stat err = %v, want erased — the provisioned scope was NOT torn down (FILESTORED-11)", err)
+	}
+}
+
 // TestComposeRefusedTripleBindsNoListener pins SEC-60: a non-admitted
 // profile/tenancy/credential triple returns the admission refusal and binds NO
 // south-face TLS listener — compose refuses with a nil Server before

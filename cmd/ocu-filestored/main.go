@@ -1120,6 +1120,28 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		return nil, err
 	}
 
+	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
+	// post-provision step fails before ownership passes to teardownServer
+	// (whose Close runs TeardownScope), compose returns nil,err WITHOUT a
+	// closer for that scope — the erase-before-reuse contract would be left
+	// to the next ProvisionScope, but the dirty scope persists meanwhile.
+	// This deferred rollback erases the just-provisioned scope on every
+	// post-provision error path, bounded by teardownTimeout, and is disarmed
+	// (committed = true) only once the teardownServer takes ownership.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
+		defer cancelTeardown()
+		if err := eng.TeardownScope(teardownCtx, scope); err != nil {
+			l.Error("rolling back a provisioned scope after a failed compose",
+				slog.String(observ.KeyReason, "compose_rollback"),
+				slog.String("error", err.Error()))
+		}
+	}()
+
 	srv, err := southface.Serve(southface.Config{
 		Resolver:          broker.NewResolver(resolver),
 		Guard:             broker.NewGuard(sink),
@@ -1164,6 +1186,11 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		}
 		telemetry.RegisterOpsListenerHealthHandlers(opsListener, probes)
 	}
+
+	// Ownership of the provisioned scope now passes to teardownServer, whose
+	// Close runs TeardownScope. Disarm the rollback latch (FILESTORED-11) so
+	// the deferred erase above does not double-tear-down a live scope.
+	committed = true
 
 	// Wrap the server so Close also tears down the scope (erase-before-reuse)
 	// and releases the per-session ceilings (NFR-SEC-54).
