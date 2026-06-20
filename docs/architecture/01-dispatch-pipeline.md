@@ -680,9 +680,9 @@ truth), never the degraded wire reason (`denyWith` / `denyWithLog`).
   known set fails closed to `internal`.
 - `envelope.go:denyClassForDecodeErr` maps envelope/route decode sentinels:
   `size_exceeded` for the size sentinel; `malformed_envelope` for the
-  malformed-envelope / unknown-route / bad-version / bad-content-type /
-  route-op-mismatch sentinels; `internal` otherwise. (`errBadMethod` is handled
-  out of band as the 405.)
+  malformed-envelope / unknown-route / bad-content-type / route-op-mismatch
+  sentinels; `internal` otherwise. (`errBadMethod` is handled out of band as
+  the 405.)
 - `handlers.go:auditTruthForEngineErr` names the audited truth for engine
   errors (the path-escape → `scope_mismatch` truth that degrades to the
   `not_found` wire class is the D8 case).
