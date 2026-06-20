@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+      # Drift guard: the Makefile derives GO_VERSION from go.mod (single source
+      # of truth). This fails the job if that derivation ever diverges from the
+      # go.mod `go` directive — e.g. someone re-hardcodes a literal version.
+      - name: GO_VERSION drift guard (Makefile vs go.mod)
+        run: make goversion-guard
       - name: gofmt -l (fail on any unformatted file)
         run: |
           set -euo pipefail

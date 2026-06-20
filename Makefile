@@ -6,13 +6,17 @@
 # Every target runs the same commands that .github/workflows/go.yml and e2e.yml
 # run; `make check` is the one-command pre-push gate.  Where CI uses
 # actions/setup-go the equivalent is the host Go toolchain, so the Go version
-# must match go.mod (currently 1.25.0).
+# must match go.mod — which is why GO_VERSION below is READ FROM go.mod rather
+# than hardcoded (no number to drift out of sync).
 #
-# Prerequisites: Go >= 1.25, GNU make (or compatible POSIX make), Docker
+# Prerequisites: Go >= 1.26, GNU make (or compatible POSIX make), Docker
 # (required only for make e2e-linux and make s3-rig-up).
 
-# Go version recorded in go.mod (keep in sync when go.mod changes).
-GO_VERSION := 1.25.0
+# Go version — derived from the `go` directive in go.mod so it can never drift
+# from the single source of truth. `:=` evaluates the shell once at parse time.
+# The `goversion-guard` target (wired into `check`) re-asserts this equality as
+# a backstop in case someone re-hardcodes a literal here later.
+GO_VERSION := $(shell awk '/^go /{print $$2; exit}' go.mod)
 
 # Staticcheck version pinned in CI (go.yml install step).
 STATICCHECK_VERSION := 2026.1
@@ -25,7 +29,7 @@ COVERAGE_FLOOR := 86.0
 RUNTIME ?= runc
 
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
-        staticcheck check e2e-linux s3-rig-up s3-rig-down
+        staticcheck goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -142,7 +146,24 @@ identity: ## Assert no retired maintainer address in tracked files
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: fmt vet staticcheck spdx contract identity test ## Full local gate (pre-push)
+check: goversion-guard fmt vet staticcheck spdx contract identity test ## Full local gate (pre-push)
+
+# ── go version drift guard ───────────────────────────────────────────────────
+#
+# Backstop for the single-source-of-truth derivation above: assert the resolved
+# GO_VERSION equals the `go` directive in go.mod and fail loudly if they differ.
+# This is non-vacuous — it re-reads go.mod independently here, so if someone
+# re-hardcodes GO_VERSION (or go.mod is bumped to e.g. 9.9.9 without the derived
+# value following), the target exits 1. Wired into `check` and into CI's gofmt
+# job (.github/workflows/go.yml) so the drift cannot reach a merge.
+goversion-guard: ## Assert Makefile GO_VERSION matches the go.mod `go` directive
+	@gomod=$$(awk '/^go /{print $$2; exit}' go.mod); \
+	if [ "$(GO_VERSION)" != "$$gomod" ]; then \
+	  echo "::error::GO_VERSION drift: Makefile resolved '$(GO_VERSION)' but go.mod requires '$$gomod'"; \
+	  echo "GO_VERSION must derive from go.mod (single source of truth) — do not hardcode it."; \
+	  exit 1; \
+	fi; \
+	echo "GO_VERSION guard ok: $(GO_VERSION) matches go.mod"
 
 # ── containerised REST/TLS e2e ───────────────────────────────────────────────
 #
