@@ -42,8 +42,13 @@ var ErrScopeMismatch = errors.New("authz: filesystem scope mismatch")
 // NFR-SEC-49). Match it with errors.Is.
 var ErrIntentDenied = errors.New("authz: intent denied for caller")
 
-// ErrNotDownloadable — the object is readable in-session but yields no
-// egress-eligible artifact; the byte path out is refused (NFR-SEC-73).
+// ErrNotDownloadable — the read could not be authorized because the stored
+// downloadable disposition could not be resolved (the tag lookup failed); the
+// read is refused fail-closed (NFR-SEC-73). This is NOT the resolved
+// "not downloadable" verdict: a successful lookup reporting downloadable=false
+// allows the read and returns Grant{Downloadable: false} (invariant 5 —
+// readable in-session, no egress-eligible artifact); the egress-artifact deny
+// is the consuming op's decision on Grant.Downloadable, not a resolver error.
 // Match it with errors.Is.
 var ErrNotDownloadable = errors.New("authz: object not downloadable")
 

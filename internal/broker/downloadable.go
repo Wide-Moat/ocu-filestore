@@ -25,8 +25,12 @@ import (
 //
 // It is fail-closed: it never reports downloadable=true for a path it cannot
 // confidently match, so an unmatched path is readable-in-session-but-denied-
-// egress (the resolver maps false -> ErrNotDownloadable on intent=read). The
-// resolver enforces the preview rule independently — intent=preview is
+// egress. On intent=read the resolver maps a false tag to
+// Grant{Downloadable: false}, nil (invariant 5: the read is allowed, the
+// egress-eligible artifact withheld) — the egress-artifact deny is the
+// consuming op's decision on Grant.Downloadable, NOT a resolver error. Only a
+// non-nil error from this func denies the read fail-closed (ErrNotDownloadable).
+// The resolver enforces the preview rule independently — intent=preview is
 // structurally non-downloadable and never consults this func.
 //
 // The returned func is never nil (authz.New panics on nil — Pitfall 4).

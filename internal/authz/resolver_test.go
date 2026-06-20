@@ -149,15 +149,43 @@ func TestUnknownIntentDenied(t *testing.T) {
 	}
 }
 
-// TestNotDownloadable pins AUTHZ-02/03 / NFR-SEC-73: read with a false
-// stored tag denies ErrNotDownloadable, and a tag lookup error denies the
-// same way — fail-closed.
+// TestNotDownloadable pins AUTHZ-02/03 / NFR-SEC-73, invariant 5. The two
+// cases are deliberately DISTINCT and this distinction IS the invariant:
+//
+//   - A successful tag lookup reporting downloadable=false is NOT a deny. Per
+//     invariant 5 the object is "readable in-session but yields no
+//     egress-eligible artifact": the resolver ALLOWS the read and returns
+//     Grant{Downloadable: false}, nil. The egress-artifact deny is the
+//     consuming op's decision on the bit, not a resolver error. (This case was
+//     previously pinned to ErrNotDownloadable — an over-deny that denied the
+//     whole read; it is flipped here to match canon invariant 5, not to make a
+//     test green: the southface read/download handlers already gate egress on
+//     Grant.Downloadable and never relied on the resolver erroring.)
+//   - A tag lookup ERROR stays fail-closed: the disposition could not be
+//     resolved, so the read itself is denied ErrNotDownloadable.
 func TestNotDownloadable(t *testing.T) {
+	// Successful lookup, downloadable=false: read ALLOWED, artifact withheld.
+	t.Run("stored tag false allows read with Downloadable=false", func(t *testing.T) {
+		r := New(tagReturning(false, nil))
+		ev := CallerEvidence{Scope: "fs1", GrantedIntents: []Intent{IntentRead}}
+		g, err := r.Resolve(context.Background(), ev, Request{
+			Filesystem: "fs1",
+			Path:       "a.txt",
+			Intent:     IntentRead,
+		})
+		if err != nil {
+			t.Fatalf("Resolve: got %v, want nil (read allowed in-session, invariant 5)", err)
+		}
+		if g.Downloadable {
+			t.Fatal("read with a false stored tag yielded Downloadable=true; the egress artifact must be withheld")
+		}
+	})
+
+	// Tag lookup error: fail-closed read deny (the disposition is unresolved).
 	for _, tc := range []struct {
 		name string
 		tag  StoredTagFunc
 	}{
-		{"stored tag false", tagReturning(false, nil)},
 		{"tag lookup error", tagReturning(true, errors.New("lookup failed"))},
 		{"tag lookup error with false tag", tagReturning(false, errors.New("lookup failed"))},
 	} {
@@ -170,7 +198,7 @@ func TestNotDownloadable(t *testing.T) {
 				Intent:     IntentRead,
 			})
 			if !errors.Is(err, ErrNotDownloadable) {
-				t.Fatalf("Resolve: got %v, want ErrNotDownloadable", err)
+				t.Fatalf("Resolve: got %v, want ErrNotDownloadable (fail-closed on unresolved disposition)", err)
 			}
 			if g.Downloadable {
 				t.Fatal("deny returned Downloadable=true")
