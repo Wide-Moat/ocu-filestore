@@ -150,20 +150,31 @@ check: goversion-guard fmt vet staticcheck spdx contract identity test ## Full l
 
 # ── go version drift guard ───────────────────────────────────────────────────
 #
-# Backstop for the single-source-of-truth derivation above: assert the resolved
-# GO_VERSION equals the `go` directive in go.mod and fail loudly if they differ.
-# This is non-vacuous — it re-reads go.mod independently here, so if someone
-# re-hardcodes GO_VERSION (or go.mod is bumped to e.g. 9.9.9 without the derived
-# value following), the target exits 1. Wired into `check` and into CI's gofmt
-# job (.github/workflows/go.yml) so the drift cannot reach a merge.
-goversion-guard: ## Assert Makefile GO_VERSION matches the go.mod `go` directive
+# Cross-check the TWO independent copies of the Go toolchain version that live
+# in the tree: the `go` directive in go.mod (canonical for the host/CI build)
+# and the `golang:<tag>` builder image pinned in the Dockerfile (the container
+# build). go.mod's value is also what GO_VERSION derives from, so comparing
+# GO_VERSION against go.mod would be vacuous (both sides are the same read).
+# This target instead reads each file independently and fails loudly if the two
+# disagree — so bumping go.mod without bumping the Dockerfile base (or vice
+# versa) exits 1. Wired into `check` and into CI (.github/workflows/go.yml) so
+# the drift cannot reach a merge.
+goversion-guard: ## Cross-check the go.mod `go` directive against the Dockerfile golang tag
 	@gomod=$$(awk '/^go /{print $$2; exit}' go.mod); \
-	if [ "$(GO_VERSION)" != "$$gomod" ]; then \
-	  echo "::error::GO_VERSION drift: Makefile resolved '$(GO_VERSION)' but go.mod requires '$$gomod'"; \
-	  echo "GO_VERSION must derive from go.mod (single source of truth) — do not hardcode it."; \
+	docker=$$(sed -nE 's/.*golang:([0-9]+\.[0-9]+(\.[0-9]+)?)@sha256:.*/\1/p' Dockerfile | head -n1); \
+	if [ -z "$$gomod" ]; then \
+	  echo "::error::goversion-guard: could not read the 'go' directive from go.mod"; \
 	  exit 1; \
 	fi; \
-	echo "GO_VERSION guard ok: $(GO_VERSION) matches go.mod"
+	if [ -z "$$docker" ]; then \
+	  echo "::error::goversion-guard: could not read the golang:<tag> base image from Dockerfile"; \
+	  exit 1; \
+	fi; \
+	if [ "$$gomod" != "$$docker" ]; then \
+	  echo "::error::Go version drift: go.mod has $$gomod but Dockerfile pins golang:$$docker"; \
+	  exit 1; \
+	fi; \
+	echo "goversion-guard ok: go.mod and Dockerfile both pin Go $$gomod"
 
 # ── containerised REST/TLS e2e ───────────────────────────────────────────────
 #
