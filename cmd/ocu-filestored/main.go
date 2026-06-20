@@ -4,20 +4,24 @@
 // Command ocu-filestored is the storage-broker daemon (component-04): one
 // process, two faces (guest-mount south, data-plane-client north), one backend
 // credential. This build composes the south face into a real, dialable daemon:
-// it parses the frozen flag surface, runs the startup admission gate BEFORE
-// binding any socket (NFR-SEC-60), constructs the local-volume engine, the
-// three-axis resolver, the fail-closed audit sink, and the per-session
-// ceilings registry, wraps them in the broker adapters, provisions a session
-// scope, and serves the per-session unix-socket listener.
+// it parses the flag surface, runs the startup admission gate BEFORE binding
+// any listener (NFR-SEC-60), constructs the local-volume engine, the three-axis
+// resolver, the fail-closed audit sink, and the per-session ceilings registry,
+// wraps them in the broker adapters, provisions a session scope, and serves the
+// south-face TLS HTTPS listener. The guest reaches that listener outbound
+// through the Egress edge (guest -> edge -> service direct HTTPS); there is no
+// unix socket.
 //
-// The south-face flag surface is API and frozen: -south-socket-dir (the
-// host-owned 0700 directory per-session sockets are minted into),
-// -tenancy/-profile (the admission axes), -audit-sink, -engine/-engine-root,
-// -broker-max-file-size (>0, the whole-object ceiling), -filesystem-id,
-// -granted-intents, -downloadable-prefixes, -max-request-bytes (the
-// per-RPC-message ceiling), and the optional per-session ops token-bucket
-// tuning pair -ops-per-second (>0) / -ops-burst (>=1). -north-listen parses
-// but binds nothing this phase (the north face is deferred).
+// The south-face transport flags are -south-bind (the service_url the guest
+// dials through the edge) and the REQUIRED -tls-cert / -tls-key (the service's
+// own server certificate and private key). The rest of the surface: -tenancy /
+// -profile (the admission axes), -audit-sink, -engine / -engine-root, the s3
+// backing-store flags (-s3-bucket / -s3-endpoint / -s3-region / -s3-path-style /
+// -s3-credential-file), -broker-max-file-size (>0, the whole-object ceiling),
+// -filesystem-id, -granted-intents, -downloadable-prefixes, -max-request-bytes
+// (the per-RPC-message ceiling), and the optional per-session ops token-bucket
+// tuning pair -ops-per-second (>0) / -ops-burst (>=1). -north-listen parses but
+// binds nothing this phase (the north face is deferred).
 package main
 
 import (
@@ -141,7 +145,7 @@ var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 // auditLockSuffix names the exclusive flock file that guards the audit hash
 // chain. It is the audit-sink path plus this suffix, so the lock is keyed on
 // the very resource it protects: two daemons pointed at the same -audit-sink
-// collide on this lock regardless of their -south-socket-dir, and a daemon
+// collide on this lock regardless of their -south-bind address, and a daemon
 // pointed at a different sink takes a distinct lock (T2-7, LIFE-07).
 const auditLockSuffix = ".lock"
 
@@ -210,21 +214,14 @@ type brokerConfig struct {
 	engineKind       objectstore.EngineKind
 	engineRoot       string
 	s3CredentialFile string
-	s3STSRoleARN     string
-	s3STSEndpoint    string
-	storageLane      string
-	caBundle         string
-	laneDevDirect    bool
 	s3Bucket         string
 	s3Endpoint       string
 	s3Region         string
 	s3PathStyle      bool
 	auditSink        string
-	socketDir        string
-	// bindAddr/certFile/keyFile carry the TLS HTTP/2 south-face transport
-	// (the service_url the guest dials outbound through the Egress edge, and
-	// the service's own server certificate). PENDING-PHASE-7: the dedicated
-	// flag surface lands in the flag-pivot wave; compose reads these fields.
+	// bindAddr/certFile/keyFile carry the TLS HTTPS south-face transport: the
+	// service_url the guest dials outbound through the Egress edge, and the
+	// service's own server certificate and private key.
 	bindAddr     string
 	certFile     string
 	keyFile      string
@@ -268,7 +265,7 @@ func run(args []string) error {
 	// own server certificate. PENDING-PHASE-7: the canon route/credential shapes
 	// are sibling-proven but not yet frozen in component-04.
 	southBind := fs.String("south-bind", "127.0.0.1:7443",
-		"south-face TLS HTTP/2 bind address (the service_url the guest dials through the Egress edge)")
+		"south-face TLS HTTPS bind address (the service_url the guest dials outbound through the Egress edge)")
 	tlsCert := fs.String("tls-cert", "",
 		"REQUIRED south-face TLS server certificate PEM path")
 	tlsKey := fs.String("tls-key", "",
@@ -277,8 +274,6 @@ func run(args []string) error {
 		"backend object-store engine: local-volume | s3 (ADR-0010)")
 	maxRequestBytes := fs.Int64("max-request-bytes", 52428800,
 		"per-RPC-message inbound body ceiling, rejected pre-buffer (NFR-SEC-78); default 50 MiB")
-	socketDir := fs.String("south-socket-dir", "/run/ocu-filestore/sessions",
-		"host-owned 0700 directory the south face provisions per-session unix sockets into")
 	auditSink := fs.String("audit-sink", "",
 		"REQUIRED audit gate file-sink path; an audit-write failure denies the operation (NFR-SEC-79)")
 	profile := fs.String("profile", "trusted_operator",
@@ -289,16 +284,6 @@ func run(args []string) error {
 		"REQUIRED local-volume engine root: the customer workspace volume directory")
 	s3CredentialFile := fs.String("s3-credential-file", "",
 		"s3 engine only: PATH to a 0600 daemon-owned file holding access_key_id=/secret_access_key= lines; the secret itself NEVER arrives as a flag value (T1-7). Env fallback: "+objectstore.EnvS3AccessKeyID+"/"+objectstore.EnvS3SecretAccessKey)
-	s3STSRoleARN := fs.String("s3-sts-role-arn", "",
-		"s3 engine only: assume this role per session via STS with a scope-prefix inline policy (sts_per_session credential kind); an ARN is not a secret. Empty = the static host-local credential")
-	s3STSEndpoint := fs.String("s3-sts-endpoint", "",
-		"s3 engine only: STS endpoint override for S3-compatible rigs; requires -s3-sts-role-arn")
-	storageLane := fs.String("storage-lane", "",
-		"s3 engine only: storage egress lane proxy URL — the FIXED proxy every backend request transits (ADR-0011); proxy env vars are never consulted")
-	laneDevDirect := fs.Bool("storage-lane-dev-direct", false,
-		"DEV RIGS ONLY: dial the s3 backend directly without the storage lane. This violates the ADR-0011 deployment posture; never set it in production")
-	caBundle := fs.String("ca-bundle", "",
-		"optional PEM bundle APPENDED to a cloned system cert pool for an inspecting storage-lane proxy's CA; requires -storage-lane; a missing or garbled bundle refuses startup")
 	s3Bucket := fs.String("s3-bucket", "",
 		"REQUIRED for -engine s3: the single backend bucket all scopes live under")
 	s3Endpoint := fs.String("s3-endpoint", "",
@@ -310,7 +295,7 @@ func run(args []string) error {
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
-		"REQUIRED host-attested filesystem scope bound to the session socket")
+		"REQUIRED host-attested filesystem scope bound to the session")
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
@@ -357,7 +342,6 @@ func run(args []string) error {
 		engine:               *engine,
 		engineRoot:           *engineRoot,
 		auditSink:            *auditSink,
-		socketDir:            *socketDir,
 		southBind:            *southBind,
 		tlsCert:              *tlsCert,
 		tlsKey:               *tlsKey,
@@ -371,11 +355,6 @@ func run(args []string) error {
 		opsPerSecond:         *opsPerSecond,
 		opsBurst:             *opsBurst,
 		s3CredentialFile:     *s3CredentialFile,
-		s3STSRoleARN:         *s3STSRoleARN,
-		s3STSEndpoint:        *s3STSEndpoint,
-		storageLane:          *storageLane,
-		caBundle:             *caBundle,
-		laneDevDirect:        *laneDevDirect,
 		s3Bucket:             *s3Bucket,
 		s3Endpoint:           *s3Endpoint,
 		s3Region:             *s3Region,
@@ -419,7 +398,7 @@ func run(args []string) error {
 	l.Info("ocu-filestored starting",
 		slog.String("version", version),
 		slog.String("engine", string(cfg.engineKind)),
-		slog.String("socket_dir", cfg.socketDir),
+		slog.String("south_bind", cfg.bindAddr),
 		slog.String("audit_sink", cfg.auditSink),
 		slog.String(observ.KeyScope, cfg.filesystemID),
 		slog.String("profile", string(cfg.profile)),
@@ -594,14 +573,13 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 // daemon's command-line flags one field per flag, BEFORE any parsing or
 // admission. Passing this struct (instead of a long positional argument list)
 // names every value at the call site, so a reorder of two same-typed fields
-// (e.g. the s3Bucket/s3Endpoint/s3Region strings, or the laneDevDirect/
-// s3PathStyle bools) can no longer compile silently into a swapped meaning.
+// (e.g. the s3Bucket/s3Endpoint/s3Region strings, or the southBind/tlsCert/
+// tlsKey strings) can no longer compile silently into a swapped meaning.
 // validate consumes a rawFlags and returns the validated brokerConfig.
 type rawFlags struct {
 	engine               string
 	engineRoot           string
 	auditSink            string
-	socketDir            string
 	southBind            string
 	tlsCert              string
 	tlsKey               string
@@ -615,11 +593,6 @@ type rawFlags struct {
 	opsPerSecond         float64
 	opsBurst             float64
 	s3CredentialFile     string
-	s3STSRoleARN         string
-	s3STSEndpoint        string
-	storageLane          string
-	caBundle             string
-	laneDevDirect        bool
 	s3Bucket             string
 	s3Endpoint           string
 	s3Region             string
@@ -644,7 +617,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 	engine := r.engine
 	engineRoot := r.engineRoot
 	auditSink := r.auditSink
-	socketDir := r.socketDir
 	southBind := r.southBind
 	tlsCert := r.tlsCert
 	tlsKey := r.tlsKey
@@ -658,11 +630,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 	opsPerSecond := r.opsPerSecond
 	opsBurst := r.opsBurst
 	s3CredentialFile := r.s3CredentialFile
-	s3STSRoleARN := r.s3STSRoleARN
-	s3STSEndpoint := r.s3STSEndpoint
-	storageLane := r.storageLane
-	caBundle := r.caBundle
-	laneDevDirect := r.laneDevDirect
 	s3Bucket := r.s3Bucket
 	s3Endpoint := r.s3Endpoint
 	s3Region := r.s3Region
@@ -696,13 +663,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 	if s3CredentialFile != "" && kind != objectstore.S3 {
 		return cfg, fmt.Errorf("%w: -s3-credential-file is only valid with -engine s3", errMissingRequiredFlag)
 	}
-
-	// PENDING-PHASE-7(engine-leg-egress): the guest-path storage lane is retired
-	// (the guest path is now guest -> edge -> service direct HTTPS), and the
-	// broker mints/signs nothing (invariant 3), so the STS / AssumeRole and the
-	// storage-lane refusal matrix are gone. The legacy -storage-lane / -ca-bundle
-	// / -s3-sts-* flags still parse for one transition wave but are inert; the
-	// flag-pivot wave removes them from the surface.
 
 	prof, ok := profileAdmission[profile]
 	if !ok {
@@ -781,17 +741,11 @@ func validate(r rawFlags) (brokerConfig, error) {
 		engineKind:       kind,
 		engineRoot:       engineRoot,
 		s3CredentialFile: s3CredentialFile,
-		s3STSRoleARN:     s3STSRoleARN,
-		s3STSEndpoint:    s3STSEndpoint,
-		storageLane:      storageLane,
-		caBundle:         caBundle,
-		laneDevDirect:    laneDevDirect,
 		s3Bucket:         s3Bucket,
 		s3Endpoint:       s3Endpoint,
 		s3Region:         s3Region,
 		s3PathStyle:      s3PathStyle,
 		auditSink:        auditSink,
-		socketDir:        socketDir,
 		bindAddr:         southBind,
 		certFile:         tlsCert,
 		keyFile:          tlsKey,
@@ -887,16 +841,13 @@ var envFallbackMap = func() map[string]string {
 		"north-listen",
 		"engine",
 		"max-request-bytes",
-		"south-socket-dir",
+		"south-bind",
+		"tls-cert",
+		"tls-key",
 		"audit-sink",
 		"profile",
 		"tenancy",
 		"engine-root",
-		"s3-sts-role-arn",
-		"s3-sts-endpoint",
-		"storage-lane",
-		"storage-lane-dev-direct",
-		"ca-bundle",
 		"s3-bucket",
 		"s3-endpoint",
 		"s3-region",
