@@ -23,8 +23,6 @@ func TestMetricsBrokerSetRegistersAll(t *testing.T) {
 	requiredFamilies := []string{
 		"ops_total",
 		"stage_latency_seconds",
-		"peer_accepted_total",
-		"peer_dropped_total",
 		"build_info",
 		"ceilings_in_flight_bytes",
 		"ceilings_fd_in_use",
@@ -85,32 +83,6 @@ func TestMetricsStageHistograms(t *testing.T) {
 		if !strings.Contains(out, `stage="`+stage+`"`) {
 			t.Errorf("stage %q not found in output:\n%s", stage, out)
 		}
-	}
-}
-
-// TestMetricsPeerCounters verifies that peer accepted/dropped counters exist.
-func TestMetricsPeerCounters(t *testing.T) {
-	m := telemetry.NewBrokerMetrics("v0.0.0-test")
-
-	m.PeerAccepted()
-	m.PeerAccepted()
-	m.PeerDropped()
-
-	var buf bytes.Buffer
-	m.Registry().WriteTo(&buf)
-	out := buf.String()
-
-	if !strings.Contains(out, "peer_accepted_total") {
-		t.Fatalf("peer_accepted_total missing:\n%s", out)
-	}
-	if !strings.Contains(out, "peer_dropped_total") {
-		t.Fatalf("peer_dropped_total missing:\n%s", out)
-	}
-	if !strings.Contains(out, "peer_accepted_total 2") {
-		t.Fatalf("peer_accepted_total not 2:\n%s", out)
-	}
-	if !strings.Contains(out, "peer_dropped_total 1") {
-		t.Fatalf("peer_dropped_total not 1:\n%s", out)
 	}
 }
 

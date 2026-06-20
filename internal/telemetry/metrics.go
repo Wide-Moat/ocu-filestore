@@ -74,8 +74,6 @@ type BrokerMetrics struct {
 	reg              *Registry
 	opsTotal         *Counter
 	stageLatency     *Histogram
-	peerAccepted     *Counter
-	peerDropped      *Counter
 	inFlightBytes    *Gauge
 	fdInUse          *Gauge
 	opsTokens        *Gauge
@@ -101,16 +99,6 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		"Latency of the three locked dispatch stages.",
 		stageLatencyBuckets,
 		LabelSet{"stage": knownStages},
-	)
-
-	peerAccepted := reg.NewCounter("peer_accepted_total",
-		"Connections admitted through the SEC-76 peer-cred accept gate.",
-		LabelSet{},
-	)
-
-	peerDropped := reg.NewCounter("peer_dropped_total",
-		"Connections rejected at the SEC-76 peer-cred accept gate.",
-		LabelSet{},
 	)
 
 	// Ceilings gauges are unlabeled: this single-tenant trusted_operator shelf
@@ -144,8 +132,6 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		reg:              reg,
 		opsTotal:         opsTotal,
 		stageLatency:     stageLatency,
-		peerAccepted:     peerAccepted,
-		peerDropped:      peerDropped,
 		inFlightBytes:    inFlightBytes,
 		fdInUse:          fdInUse,
 		opsTokens:        opsTokens,
@@ -170,16 +156,6 @@ func (m *BrokerMetrics) RecordOp(op, outcome, denyClass string) {
 // stage must be one of "audit_mandate", "engine", "authz".
 func (m *BrokerMetrics) ObserveStage(stage string, seconds float64) {
 	m.stageLatency.Observe(Labels{"stage": stage}, seconds)
-}
-
-// PeerAccepted increments the peer_accepted_total counter.
-func (m *BrokerMetrics) PeerAccepted() {
-	m.peerAccepted.Inc(Labels{})
-}
-
-// PeerDropped increments the peer_dropped_total counter.
-func (m *BrokerMetrics) PeerDropped() {
-	m.peerDropped.Inc(Labels{})
 }
 
 // SetCeilings updates the ceilings gauges from a snapshot of the active
