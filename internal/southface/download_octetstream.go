@@ -6,6 +6,7 @@ package southface
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -337,7 +338,28 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 	// the client as it arrives (chunked transfer), keeping outbound memory bounded
 	// regardless of object size. A ResponseWriter that does not support flushing
 	// (some test recorders) degrades to a plain copy — the bytes still arrive.
-	fw := &flushingResponseWriter{w: w, flusher: asFlusher(w)}
+	//
+	// armWriteDeadline (NFR-SEC-46, crutch-01) re-arms a frameWriteTimeout-from-now
+	// write deadline before EACH flush so a legitimately-long large download (slow
+	// but progressing) keeps pushing the deadline out, while a STALLED reader
+	// (kernel send buffer full, no progress for frameWriteTimeout) makes the next
+	// flush's write return a deadline error. That error propagates out of
+	// flushingResponseWriter.Write into engine.ReadRange, which stops producing and
+	// returns the error — terminating the stream and releasing the fd (the 200
+	// header is already committed, so the status cannot change). A ResponseWriter
+	// without write-deadline support (http.ErrNotSupported, e.g. an in-memory test
+	// recorder) leaves the per-flush arming a no-op and relies on the
+	// http.Server-level backstop.
+	rc := http.NewResponseController(w)
+	armWriteDeadline := func() {
+		if err := rc.SetWriteDeadline(time.Now().Add(d.frameWriteTimeout)); err != nil &&
+			!errors.Is(err, http.ErrNotSupported) {
+			reqLog.Warn("download write-deadline arming failed",
+				slog.String(observ.KeyReason, err.Error()),
+			)
+		}
+	}
+	fw := &flushingResponseWriter{w: w, flusher: asFlusher(w), arm: armWriteDeadline}
 	rerr := d.engine.ReadRange(r.Context(), ps.FilesystemID, enginePath(req.Path), offset, length, fw)
 	d.observeStage("engine", time.Since(engineStart).Seconds())
 	if rerr != nil {
@@ -371,12 +393,21 @@ const contentTypeOctetStream = "application/octet-stream"
 type flushingResponseWriter struct {
 	w       io.Writer
 	flusher http.Flusher
+	// arm re-arms the per-flush outbound write deadline (NFR-SEC-46, crutch-01)
+	// before each write so a stalled reader trips the deadline on the next write.
+	// A nil arm is a no-op (a non-deadline caller).
+	arm func()
 }
 
-// Write copies the engine bytes to the underlying ResponseWriter and flushes the
-// chunk toward the client. A write error (the client disconnected mid-stream)
-// propagates back into engine.ReadRange, which stops producing.
+// Write re-arms the per-flush write deadline, copies the engine bytes to the
+// underlying ResponseWriter, and flushes the chunk toward the client. A write
+// error (the client disconnected mid-stream, OR a stalled reader that tripped the
+// re-armed write deadline) propagates back into engine.ReadRange, which stops
+// producing.
 func (f *flushingResponseWriter) Write(p []byte) (int, error) {
+	if f.arm != nil {
+		f.arm()
+	}
 	n, err := f.w.Write(p)
 	if f.flusher != nil {
 		f.flusher.Flush()

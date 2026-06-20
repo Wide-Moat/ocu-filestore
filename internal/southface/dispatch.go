@@ -164,22 +164,26 @@ type dispatcher struct {
 	// CLOSED and loudly rather than silently inheriting a placeholder ceiling.
 	// Tests set a small value directly (the package is in-package).
 	maxFileSize int64
-	// frameReadTimeout bounds the wait for EACH inbound stream frame
-	// (NFR-SEC-46): a peer that opens an upload and stalls would otherwise
-	// pin the goroutine, an fd-ceiling slot, and any acquired in-flight
-	// bytes for the session's lifetime. The streaming handler extends a
-	// per-connection read deadline by this much before every frame read; an
-	// expired deadline surfaces as a readFrame error and aborts through the
-	// existing hard-abort path. Defaulted in newDispatcherWithEngine; tests
-	// shrink it.
+	// frameReadTimeout bounds the wait for EACH inbound read off the streamed
+	// upload body (NFR-SEC-46): a peer that opens an upload and stalls would
+	// otherwise pin the goroutine, an fd-ceiling slot, and any acquired
+	// in-flight bytes for the session's lifetime. serveUploadMultipart RE-ARMS
+	// a frameReadTimeout-from-now read deadline (via http.NewResponseController)
+	// before every filePart.Read, so a slow-but-progressing transfer keeps
+	// pushing the deadline out while a STALL trips it: the deadline-exceeded
+	// read surfaces as a non-EOF read error and aborts through the existing
+	// hard-abort path (release fd/bytes, no torn object). LIVE: read by the
+	// upload handler. Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameReadTimeout time.Duration
-	// frameWriteTimeout bounds the wait for EACH outbound data frame on the
-	// download stream (NFR-SEC-46, crutch-01): the symmetric mirror of
-	// frameReadTimeout for the egress leg. The download handler arms a
-	// per-connection write deadline by this much before every writeFrame; a
-	// stalled reader makes the next writeFrame error and aborts through the
-	// existing drain path that closes the ReadRange pipe and releases the fd
-	// slot. Defaulted in newDispatcherWithEngine; tests shrink it.
+	// frameWriteTimeout bounds the wait for EACH outbound flush on the download
+	// stream (NFR-SEC-46, crutch-01): the symmetric mirror of frameReadTimeout
+	// for the egress leg. serveDownloadOctetStream RE-ARMS a
+	// frameWriteTimeout-from-now write deadline (via http.NewResponseController)
+	// before every flush; a stalled reader makes the next write error, which
+	// propagates out of the flushing writer into engine.ReadRange, terminating
+	// the stream and releasing the fd slot (the 200 header is already committed,
+	// so the status cannot change). LIVE: read by the download handler.
+	// Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameWriteTimeout time.Duration
 
 	// credExtractor is the A5 credential-scope source for the UNARY REST path:

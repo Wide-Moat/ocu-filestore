@@ -1009,8 +1009,7 @@ func newBackendTLSClient() *http.Client {
 //
 // m is the broker metric set; it is wired into the southface dispatcher for
 // ops_total and stage-latency instrumentation, and into the accept gate for
-// peer counters. Peer counter callbacks are wired via Config.OnPeerAccepted
-// and Config.OnPeerDropped.
+// peer counters.
 //
 // ol is the loopback ops listener; when non-nil compose registers /healthz and
 // /readyz with the audit-latch and engine-root readiness probes. A nil

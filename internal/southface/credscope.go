@@ -10,15 +10,20 @@ import (
 )
 
 // PENDING-PHASE-7(A5-credscope): the service receives ONLY the edge-injected
-// real credential on Authorization: Bearer (never the guest weak JWT). It
-// forwards that bearer to the engine unmodified; the engine enforces the
-// filesystem_id scope on it — 403 on a foreign filesystem_id, 401 on a
-// missing/expired credential — per the credential authority's contract. The
-// scope check sits at the SERVICE/ROUTE layer feeding a thin engine (OQ-2
-// option c). It does NOT JWKS-verify the bearer: the edge owns weak-JWT
-// validation and has already validated+stripped the guest session JWT before
-// injecting the real credential. Component-04 mints/signs nothing (invariant 3).
-// Sibling-proven, frozen pending #292 — flips to "frozen @ canon-rev <sha>".
+// real credential on Authorization: Bearer (never the guest weak JWT). The
+// canon's literal A5 clause — "the engine enforces filesystem_id scope on the
+// credential" — is realised as the open-question's option (c): the scope check
+// sits at the SERVICE/ROUTE layer (deriveCredScope below), and the engine seam
+// is keyed on the scope STRING and takes no bearer — it uses its OWN host-local
+// backend credential. So 403 on a foreign filesystem_id and 401 on a
+// missing/expired credential are decided HERE, at the route, not inside a
+// bearer-bearing engine; the literal "engine enforces" reads as this
+// service-layer check, which breaks no security property (NFR-SEC-25: one
+// backend credential, one client). It does NOT JWKS-verify the bearer: the edge
+// owns weak-JWT validation and has already validated+stripped the guest session
+// JWT before injecting the real credential. Component-04 mints/signs nothing
+// (invariant 3). Sibling-proven, frozen pending #292 — flips to "frozen @
+// canon-rev <sha>". See docs/pending-phase7.md "Notes on the credential model".
 //
 // This file is the credential-scope source: it replaces the unix-socket
 // peer-cred PeerScope as the per-request host-attested-scope origin. It

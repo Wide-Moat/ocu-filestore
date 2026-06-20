@@ -30,9 +30,14 @@ var errTLSConfig = errors.New("southface: TLS server misconfigured")
 //     connection.
 //   - tlsIdleTimeout reaps idle keep-alive connections.
 //
-// ReadTimeout stays UNSET on purpose: it would cap a whole legitimate streamed
-// upload/download; the data-plane handlers bound a stalled body with their own
-// per-request deadlines instead.
+// ReadTimeout / WriteTimeout stay UNSET on purpose: a connection-wide cap would
+// kill a legitimately-long streamed upload/download. The data-plane handlers
+// bound a STALL instead with per-iteration deadlines re-armed via
+// http.NewResponseController — the upload handler re-arms a read deadline before
+// every body read, the download handler re-arms a write deadline before every
+// flush — so a slow-but-progressing transfer keeps extending its deadline while a
+// stall (no byte for the frame timeout) trips it and aborts the operation
+// fail-closed (NFR-SEC-46).
 const (
 	tlsReadHeaderTimeout = 10 * time.Second
 	tlsIdleTimeout       = 2 * time.Minute

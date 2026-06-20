@@ -65,6 +65,23 @@ func (s *recordingCeilingsSession) balanced() bool {
 	return s.acquired == s.released && s.fdAcquired == s.fdReleased
 }
 
+// fdBalance returns the (acquired, released) fd-slot counts under the lock so a
+// test polling for an asynchronous server-side ReleaseFD reads them race-free
+// (the server goroutine mutates them under this same mutex).
+func (s *recordingCeilingsSession) fdBalance() (acquired, released int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fdAcquired, s.fdReleased
+}
+
+// gauges returns a race-safe snapshot of every acquire/release counter for a
+// diagnostic failure message (the server goroutine mutates them under this mutex).
+func (s *recordingCeilingsSession) gauges() (bytesAcq, bytesRel int64, fdAcq, fdRel int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acquired, s.released, s.fdAcquired, s.fdReleased
+}
+
 // recordingRegistry returns a fixed recording session for every key and records
 // the keys requested (the channel-scope-keying witness).
 type recordingRegistry struct {

@@ -253,6 +253,28 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	}
 	defer sess.ReleaseFD()
 
+	// --- stall bound (NFR-SEC-46): re-armed per-read inbound deadline ---
+	// rc is the per-connection ResponseController; armReadDeadline re-arms a
+	// frameReadTimeout-from-now read deadline before EACH read off the file part
+	// so a slow-but-progressing transfer is fine while a STALL (no byte for
+	// frameReadTimeout) makes the next filePart.Read return a deadline error and
+	// trips the existing hard-abort path. A ResponseController that does not
+	// support read deadlines (e.g. an in-memory test recorder) returns
+	// http.ErrNotSupported, in which case the per-read arming is a no-op and the
+	// http.Server-level header/idle timeouts are the only backstop.
+	rc := http.NewResponseController(w)
+	armReadDeadline := func() {
+		if err := rc.SetReadDeadline(time.Now().Add(d.frameReadTimeout)); err != nil &&
+			!errors.Is(err, http.ErrNotSupported) {
+			// A non-"unsupported" deadline-arming error is unexpected; surface it
+			// in the diagnostic log but do NOT crash — the transfer continues under
+			// the http.Server-level timeouts.
+			reqLog.Warn("upload read-deadline arming failed",
+				slog.String(observ.KeyReason, err.Error()),
+			)
+		}
+	}
+
 	// --- reassembly: single io.Pipe -> WriteStream(overwrite=OverwriteExisting) ---
 	// overwrite_existing defaults to false when the field is absent (JSON zero
 	// value), preserving create-new behaviour for any sender that omits it.
@@ -281,6 +303,11 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	var acc int64
 	buf := make([]byte, uploadReadChunk)
 	for {
+		// Re-arm the inbound read deadline before EACH read: a transfer that keeps
+		// making progress keeps pushing the deadline out, while a STALL trips it on
+		// the next read (surfacing as a deadline-exceeded read error handled by the
+		// hard-abort path below).
+		armReadDeadline()
 		n, rerr := filePart.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
@@ -315,7 +342,8 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 				break // closing multipart boundary = authoritative end of the part
 			}
 			// A non-EOF read error from the part (truncated body / client
-			// disconnect / a malformed trailing part boundary): HARD ABORT. Close
+			// disconnect / a malformed trailing part boundary / a STALL that tripped
+			// the re-armed read deadline, NFR-SEC-46): HARD ABORT. Close
 			// the engine pipe with a NON-EOF abort sentinel, never the raw rerr: a
 			// truncated body surfaces as io.ErrUnexpectedEOF, and io.Copy inside
 			// WriteStream treats a pipe read returning io.EOF as a CLEAN end —
