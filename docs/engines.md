@@ -17,10 +17,9 @@ Questions or issues: developer@widemoat.ai
 | | `-engine local-volume` | `-engine s3` |
 |---|---|---|
 | **Backend** | Host filesystem directory | S3-compatible object store |
-| **Network leg** | None — reads and writes go to a local directory | Yes — every verb transits the storage egress lane |
+| **Network leg** | None — reads and writes go to a local directory | Yes — the engine dials the backing store directly over strict TLS |
 | **Single-host only?** | Yes — the directory must be on the local volume | No — the bucket is remote |
-| **Credential** | Host filesystem permission (daemon's uid) | Access key + optional STS per-session |
-| **Storage lane required** | No | **Yes** in production; dev override available |
+| **Backend credential** | Host filesystem permission (daemon's uid) | Static host-local access key (the engine's own backend credential, NFR-SEC-25) |
 | **Versioned bucket** | n/a | Versioned buckets are supported; unversioned are the simpler path |
 | **Erase-before-reuse (NFR-SEC-54)** | Recursive directory removal | Object deletion (+ version sweep if bucket is versioned) |
 | **Typical use** | Solo deployment, development, single-host container | Multi-host, managed object storage, cloud |
@@ -72,7 +71,6 @@ of the scope.
 | `-s3-bucket` | `OCU_FILESTORE_S3_BUCKET` | The single bucket all scopes live under |
 | `-s3-endpoint` | `OCU_FILESTORE_S3_ENDPOINT` | Backend endpoint URL; required even for AWS (use the regional endpoint) |
 | `-s3-region` | `OCU_FILESTORE_S3_REGION` | Signing region; default `us-east-1` if unset but always required |
-| `-storage-lane` | `OCU_FILESTORE_STORAGE_LANE` | Storage egress lane proxy URL (ADR-0011); required unless `-storage-lane-dev-direct` is set |
 
 ### Path-style addressing — MinIO and Ceph RGW
 
@@ -127,28 +125,23 @@ This is fail-closed behaviour (NFR-SEC-54): the engine never reports a
 successful erase when it cannot verify that bytes are gone. Fix the IAM policy
 to include `s3:ListBucketVersions` on the bucket, then restart.
 
-### Storage egress lane (ADR-0011)
+### Backend dial (NFR-SEC-25)
 
-The S3 engine's backend leg **must** transit a dedicated storage egress lane.
-A direct backend dial that bypasses the lane is refused (NFR-SEC-16, NFR-SEC-85):
+The S3 engine is the single component that speaks the object-store protocol
+(NFR-SEC-25). It dials the backing store directly with a plain strict-TLS HTTP
+client: `MinVersion` TLS 1.2, HTTP/2 attempted, and it never consults
+`HTTP_PROXY`, `HTTPS_PROXY`, or `NO_PROXY` from the process environment.
 
-```
-ocu-filestored: -engine s3 requires -storage-lane (ADR-0011 …)
-```
+**TLS is strict fail-closed:** there is no `InsecureSkipVerify` path. The
+backend endpoint must present a certificate the system trust store can verify.
 
-The lane is a fixed HTTP/HTTPS proxy supplied via `-storage-lane`. The engine
-builds the HTTP transport with `http.ProxyURL(laneURL)` and never consults
-`HTTP_PROXY`, `HTTPS_PROXY`, or `NO_PROXY` from the process environment — those
-environment variables cannot redirect or bypass the lane.
-
-**TLS is strict fail-closed:** there is no `InsecureSkipVerify` path. If the
-storage lane proxy performs TLS inspection, provide the proxy's CA certificate
-via `-ca-bundle` (a PEM file appended to the system cert pool). A missing or
-unparseable CA bundle refuses startup; it does not silently fall back.
-
-**Dev rigs:** set `-storage-lane-dev-direct` to skip the lane requirement and
-dial the backend directly. This flag is mutually exclusive with `-storage-lane`.
-Never set it in production.
+> The guest data path no longer transits a storage egress lane. The guest
+> reaches the south-face TLS REST listener outbound through the Egress edge
+> (guest → edge → service direct HTTPS); the retired ADR-0011 fixed-proxy lane
+> carried that guest path and is gone. Whether the engine's own backend leg
+> later reintroduces an egress proxy is an open ADR-0011-vs-new-model
+> reconciliation tracked in [docs/pending-phase7.md](pending-phase7.md)
+> (`engine-leg-egress`), not a current flag.
 
 ### Credential intake
 
@@ -172,43 +165,21 @@ Backend credentials never arrive as flag values — flag values are visible in
 
 These env vars are **not** part of the generic `OCU_FILESTORE_*` fallback map.
 
-### STS-per-session credential (optional)
-
-Set `-s3-sts-role-arn` to enable STS-per-session credentials. The daemon calls
-`AssumeRole` using the static credential above as the parent, producing a
-short-lived session credential. The session credential is confined by an
-**inline IAM session policy** scoped to the tenant's key prefix:
-
-```json
-{
-  "Statement": [
-    {
-      "Sid": "ScopeObjects",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "…"],
-      "Resource": "arn:aws:s3:::BUCKET/SCOPE/*"
-    },
-    {
-      "Sid": "ScopeList",
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
-      "Resource": "arn:aws:s3:::BUCKET",
-      "Condition": {"StringLike": {"s3:prefix": "SCOPE/*"}}
-    }
-  ]
-}
-```
-
-Even if the session credential leaks, it can touch only the tenant's own prefix
-cell. The static parent credential never leaves the daemon.
-
-Optionally override the STS endpoint (for self-hosted S3-compatible stacks) via
-`-s3-sts-endpoint`; requires `-s3-sts-role-arn`.
+The static credential is the **engine's own backend credential** (NFR-SEC-25):
+the key the single object-store client uses to reach the backing store. It is
+distinct from the **guest's filestore credential**, which the service never
+holds. The Egress trust-edge validates and strips the guest's weak session JWT,
+exchanges it (RFC 8693) for the real filestore credential, and injects that on
+the request's `Authorization: Bearer` header. The service forwards the injected
+credential to the engine unmodified and **mints/signs nothing** (invariant 3);
+the engine enforces `filesystem_id` scope on it — a foreign scope is `403`, a
+missing or expired credential is `401`. The per-session `AssumeRole`
+credential-minting the service once performed is retired along with the
+broker-signs model.
 
 ### IAM policy requirements for the static credential
 
-Whether using the static credential directly or as the STS parent, the
-credential's IAM policy must allow:
+The engine's static backend credential's IAM policy must allow:
 
 **Object operations on the scope prefix:**
 - `s3:GetObject`, `s3:GetObjectVersion`, `s3:GetObjectTagging`
@@ -224,8 +195,8 @@ credential's IAM policy must allow:
   client-side (a prefix condition on this API is not honored by every backend)
 - `s3:GetBucketVersioning`
 
-**Scope the policy to the minimum prefix.** The STS session policy narrows it
-further per session, but the static credential's base policy is the outer bound.
+**Scope the policy to the minimum prefix.** The static credential's base policy
+is the outer bound on what the engine can ever touch in the backing store.
 
 ### Multipart uploads and memory bounds
 
