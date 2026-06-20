@@ -97,15 +97,26 @@ build, matching the CI runner exactly, using the containerised helper:
 make e2e-linux
 ```
 
-This runs `docker run golang:1.25.0` with the source tree bind-mounted.
-Inside the container the build system:
+This runs `docker run golang:1.25.0` with the source tree bind-mounted.  The
+live slice drives the real daemon over its TLS HTTPS/HTTP-2 REST listener; the
+test mints its own throwaway loopback certificate in-process, so the target
+supplies no certs.  Inside the container the build system:
 
 1. Copies the source tree to a writable workspace (the bind-mount is
    read-only so module cache writes succeed).
 2. Builds the static daemon binary (`CGO_ENABLED=0 go build -trimpath`) for
    Linux/amd64 inside the container.
 3. Sets `OCU_BROKER_BIN` to the freshly-built binary path.
-4. Runs `go test -run 'Integration|E2E' ./... -v -timeout 600s`.
+4. Runs `go test -run E2E ./internal/broker/ -v -timeout 600s`.
+
+The container runtime is selected by `RUNTIME` (default `runc`).  Run the
+gVisor leg with `make e2e-linux RUNTIME=runsc`.  The target honors the ambient
+docker context, so on a Linux substrate run it through `limactl shell`:
+
+```sh
+limactl shell ocu-linux -- make e2e-linux                # runc
+limactl shell ocu-linux -- make e2e-linux RUNTIME=runsc  # gVisor (runsc)
+```
 
 The container uses `--network host` so a MinIO rig started with
 `make s3-rig-up` is visible inside the container (the S3 env vars are
@@ -121,11 +132,10 @@ export OCU_S3_TEST_SECRET_KEY=ocu-test-secret-key
 make e2e-linux
 ```
 
-`--network host` is Linux-native behaviour.  On Docker Desktop for Mac the
-host network mode is emulated and `127.0.0.1` inside the container resolves
-to the VM loopback, not the Mac's loopback.  If the S3 rig is reachable only
-on the Mac's loopback, start it with the host-gateway address exposed, or use
-`docker.for.mac.localhost` as the S3 endpoint hostname.
+`--network host` is Linux-native behaviour and is the intended substrate: run
+the target on a Linux host (directly or through `limactl shell`) where the
+container and the MinIO rig share the host network, so `127.0.0.1` inside the
+container reaches the rig.
 
 ---
 

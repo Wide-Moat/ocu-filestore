@@ -20,6 +20,10 @@ STATICCHECK_VERSION := 2026.1
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
+# Container runtime for make e2e-linux.  Default runc; set RUNTIME=runsc to run
+# the same slice on the gVisor sandbox runtime (the second real-substrate leg).
+RUNTIME ?= runc
+
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
         staticcheck check e2e-linux s3-rig-up s3-rig-down
 
@@ -39,7 +43,7 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
 	@printf '  %-20s  %s\n' identity    "scripts/check-doc-identity.sh"
 	@printf '  %-20s  %s\n' check       "Full local gate: fmt+vet+staticcheck+spdx+contract+identity+test"
-	@printf '  %-20s  %s\n' e2e-linux   "Containerised e2e (Linux SO_PEERCRED + live socket) — darwin escape hatch"
+	@printf '  %-20s  %s\n' e2e-linux   "REST/TLS live e2e in a Linux container (RUNTIME=runc|runsc)"
 	@printf '  %-20s  %s\n' s3-rig-up   "Bring up the MinIO test rig (docker-compose.test.yml)"
 	@printf '  %-20s  %s\n' s3-rig-down "Tear down the MinIO test rig"
 	@echo
@@ -140,30 +144,38 @@ identity: ## Assert no retired maintainer address in tracked files
 
 check: fmt vet staticcheck spdx contract identity test ## Full local gate (pre-push)
 
-# ── containerised e2e (darwin escape hatch) ──────────────────────────────────
+# ── containerised REST/TLS e2e ───────────────────────────────────────────────
 #
-# The Integration|E2E test slice exercises SO_PEERCRED peer-credential
-# enforcement on the Unix socket.  SO_PEERCRED is a Linux-only syscall; the
-# tests loud-skip natively on darwin.  `make e2e-linux` runs the full slice
-# inside an official golang container (Linux kernel), eliminating the skip.
+# The broker E2E live slice drives the REAL ocu-filestored daemon over its
+# production TLS HTTPS/HTTP-2 REST listener (no unix socket, no peer-credential
+# syscall).  The test self-provisions a throwaway loopback TLS certificate
+# in-process and hands it to the daemon via -tls-cert/-tls-key, so this target
+# only builds the binary and points OCU_BROKER_BIN at it — it provides no certs.
 #
-# The container receives a copy of the source tree (bind-mounted read-only),
-# builds the static daemon binary inside the container so the ELF matches the
-# Linux runtime, then runs the Integration|E2E slice.  The S3 env vars are
-# forwarded when present so the S3 e2e leg also runs if the MinIO rig is up
-# (rig must be reachable from the container; use docker network = host or set
-# OCU_S3_TEST_ENDPOINT to the host-gateway address).
+# Running it inside a Linux container builds a matching ELF and exercises the
+# daemon under a real container runtime.  The container copies the source tree
+# (bind-mounted read-only), builds the static daemon binary, sets OCU_BROKER_BIN,
+# then runs `go test -run E2E ./internal/broker/`.  The S3 env vars are forwarded
+# when present so the S3 conformance leg also runs if the MinIO rig is up
+# (rig reachable over --network host on a Linux substrate).
 #
-# The socket directory is created inside the container using TMPDIR, so no
-# host filesystem permissions are involved.
+# RUNTIME selects the container runtime: runc (default) or runsc (gVisor).  The
+# target passes --runtime=$(RUNTIME) and honors the ambient docker context, so
+# it works through `limactl shell` or a Lima docker-context without a hardcoded
+# path.  The two real-substrate legs are:
 #
-# Usage (on darwin or any host):
+#   limactl shell ocu-linux -- make e2e-linux                # runc
+#   limactl shell ocu-linux -- make e2e-linux RUNTIME=runsc  # gVisor (runsc)
+#
+# Usage:
 #   make e2e-linux
+#   make e2e-linux RUNTIME=runsc
 #   make s3-rig-up && make e2e-linux   # includes the live S3 leg
 
-e2e-linux: ## Run Linux-only e2e (SO_PEERCRED) inside a golang container — darwin escape hatch
+e2e-linux: ## Run the REST/TLS live e2e in a Linux container (RUNTIME=runc|runsc)
 	@echo "--- building the broker binary inside the Linux container ---"
 	docker run --rm \
+	  --runtime=$(RUNTIME) \
 	  --network host \
 	  --volume "$(CURDIR):/src:ro" \
 	  --workdir /workspace \
@@ -179,7 +191,7 @@ e2e-linux: ## Run Linux-only e2e (SO_PEERCRED) inside a golang container — dar
 	    cd /workspace/repo && \
 	    CGO_ENABLED=0 go build -trimpath -o /workspace/ocu-filestored ./cmd/ocu-filestored && \
 	    OCU_BROKER_BIN=/workspace/ocu-filestored \
-	      go test -run "Integration|E2E" ./... -v -timeout 600s \
+	      go test -run E2E ./internal/broker/ -v -timeout 600s \
 	  '
 
 # ── MinIO rig helpers ─────────────────────────────────────────────────────────
