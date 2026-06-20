@@ -11,19 +11,17 @@ import (
 	"strings"
 )
 
-// servicePrefix is the Connect route prefix for the south-face service. A
-// unary or streaming request targets servicePrefix + <op>; any other path is
-// not a member of this service.
-const servicePrefix = "/ocu.filestore.v1alpha.FilesystemService/"
+// PENDING-PHASE-7(A1-route): restBase is the REST route prefix every
+// south-face operation hangs off — a request targets POST restBase + <op>;
+// the operation is the trailing path segment and the method is always POST.
+// Any path outside this prefix, or one naming an op outside the frozen enum, is
+// not a member of this service. Sibling-proven, frozen pending #292.
+const restBase = "/v1/filestore/fs/"
 
-// connectProtocolVersionHeader and its required value pin the Connect unary
-// contract: the header is REQUIRED on every request and its only legal value
-// is "1"; absent or wrong is invalid_argument before the body is parsed (D1).
-const (
-	connectProtocolVersionHeader = "Connect-Protocol-Version"
-	connectProtocolVersion       = "1"
-	contentTypeJSON              = "application/json"
-)
+// contentTypeJSON is the request/response media type for the 16 unary REST-JSON
+// ops (and the fileDownload request body). The streaming fileUpload carries
+// multipart/form-data instead; the router does content negotiation.
+const contentTypeJSON = "application/json"
 
 // Envelope decode sentinels. Each maps to a deny class in deny.go; the
 // dispatcher classifies them with errors.Is. Match with errors.Is.
@@ -39,12 +37,11 @@ var (
 	errDeclaredSizeExceeded = errors.New("southface: declared body size exceeds ceiling")
 
 	// errUnknownRoute — the request path is not a member of the south-face
-	// service. Maps to invalid_argument.
+	// service (a path outside restBase, or one naming an op outside the frozen
+	// enum). On the router boundary it is a 404 (anti-enumeration: an unknown op
+	// is indistinguishable from a missing object); on the in-handler decode path
+	// it maps to invalid_argument.
 	errUnknownRoute = errors.New("southface: unknown route")
-
-	// errBadVersion — the Connect-Protocol-Version header is absent or not
-	// "1". Maps to invalid_argument.
-	errBadVersion = errors.New("southface: missing or wrong Connect-Protocol-Version")
 
 	// errBadContentType — the request Content-Type is not application/json.
 	// Maps to invalid_argument.
@@ -125,30 +122,24 @@ func requiredIntentForOp(op Op) (Intent, bool) {
 	return intent, ok
 }
 
-// parseRoute matches a request's method and path against the south-face
-// service, returning the routed Op. A non-POST method to any path is
-// errBadMethod; a path outside the service prefix or naming an unknown op is
-// errUnknownRoute.
+// PENDING-PHASE-7(A1-route): parseRoute matches a request's method and path
+// against the south-face REST surface, returning the routed Op. The op is the
+// trailing path segment of restBase; the method is always POST. A non-POST
+// method to a restBase route is errBadMethod (405 with Allow: POST); a path
+// outside restBase or one naming an op outside the frozen enum is
+// errUnknownRoute (404 at the router). Sibling-proven, frozen pending #292.
 func parseRoute(method, path string) (Op, error) {
+	if !strings.HasPrefix(path, restBase) {
+		return "", errUnknownRoute
+	}
 	if method != http.MethodPost {
 		return "", errBadMethod
 	}
-	if !strings.HasPrefix(path, servicePrefix) {
-		return "", errUnknownRoute
-	}
-	op := Op(strings.TrimPrefix(path, servicePrefix))
+	op := Op(strings.TrimPrefix(path, restBase))
 	if _, ok := knownOps[op]; !ok {
 		return "", errUnknownRoute
 	}
 	return op, nil
-}
-
-// checkVersion enforces the REQUIRED Connect-Protocol-Version header (D1).
-func checkVersion(r *http.Request) error {
-	if r.Header.Get(connectProtocolVersionHeader) != connectProtocolVersion {
-		return errBadVersion
-	}
-	return nil
 }
 
 // checkContentType enforces application/json for unary requests; a charset or
@@ -271,7 +262,6 @@ func denyClassForDecodeErr(err error) string {
 		return denySizeExceeded
 	case errors.Is(err, errMalformedEnvelope),
 		errors.Is(err, errUnknownRoute),
-		errors.Is(err, errBadVersion),
 		errors.Is(err, errBadContentType),
 		errors.Is(err, errRouteOpMismatch):
 		return denyMalformed

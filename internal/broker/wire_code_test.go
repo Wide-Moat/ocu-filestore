@@ -136,16 +136,17 @@ func serveSouthface(t *testing.T, guard auditgate.Guard, reg *ceilings.Registry)
 	}
 }
 
-// postReadFile sends a unary readFile through the live session socket.
+// postReadFile sends a unary readFile through the live session socket. The
+// route is the REST surface (POST /v1/filestore/fs/<op>, application/json, no
+// protocol-version header) the unary transport now speaks end-to-end.
 func postReadFile(t *testing.T, client *http.Client) *http.Response {
 	t.Helper()
 	body := `{"filesystem_id":"fs-wire","path":"/x","authorization_metadata":{"intent":"read","downloadable":false}}`
 	req, err := http.NewRequest(http.MethodPost,
-		"http://session/ocu.filestore.v1alpha.FilesystemService/readFile", strings.NewReader(body))
+		"http://session/v1/filestore/fs/readFile", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {

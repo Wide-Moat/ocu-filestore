@@ -87,11 +87,8 @@ func TestPanicContainmentUnaryPath(t *testing.T) {
 		t.Fatal("response code is 0 — panic was not recovered (server crashed)")
 	}
 
-	// The wire deny is structured Connect JSON.
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("response body is not Connect JSON: %v (%q)", err, w.Body.String())
-	}
+	// The wire deny is the structured REST BoundedReason body.
+	ce := decodeErrBody(t, w)
 	if ce.Code != wireCodeInternal {
 		t.Fatalf("wire code = %q, want %q (internal)", ce.Code, wireCodeInternal)
 	}

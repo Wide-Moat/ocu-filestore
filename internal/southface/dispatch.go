@@ -78,12 +78,18 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 //
 // denyWith uses the dispatcher's base logger (no request_id); call denyWithLog
 // from request-scoped paths where a request_id-bearing logger is available.
+//
+// PENDING-PHASE-7(A3-deny): the unary refusal is written as a REST response —
+// the authoritative HTTP status plus a BoundedReason {reason_code, message}
+// diagnostic body (writeRESTDeny). The streaming fileUpload/fileDownload ops
+// still ride the Connect framed-trailer path this wave and keep
+// writeConnectError; only the unary choke points move here.
 func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
 	d.logger.Warn("broker deny",
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
-	writeConnectError(w, v, message)
+	writeRESTDeny(w, v, message)
 }
 
 // denyWithLog is the request-scoped variant of denyWith: it uses the supplied
@@ -94,7 +100,7 @@ func (d *dispatcher) denyWithLog(w http.ResponseWriter, l *slog.Logger, v DenyVe
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
-	writeConnectError(w, v, message)
+	writeRESTDeny(w, v, message)
 }
 
 // recordAllow records ops_total{op, outcome=allow, deny_class=none} after a
@@ -198,6 +204,19 @@ type dispatcher struct {
 	// existing drain path that closes the ReadRange pipe and releases the fd
 	// slot. Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameWriteTimeout time.Duration
+
+	// credExtractor is the A5 credential-scope source for the UNARY REST path:
+	// when non-nil, STAGE-0 derives the request's host-attested PeerScope from
+	// the edge-injected Authorization: Bearer (deriveCredScope) rather than from
+	// the unix peer-cred stashed in the connection context. When nil the unary
+	// path falls back to peerScopeFromContext, the unix-transport source — so the
+	// streaming branch (still on the Connect path this wave) and any caller that
+	// injects PeerScope via contextWithPeerScope continue to work unchanged.
+	//
+	// PENDING-PHASE-7(A5-credscope): the production wiring binds a
+	// CredentialScopeExtractor here; the streaming branch keeps the unix peer
+	// scope until the data-plane ops pivot in a later wave.
+	credExtractor CredentialScopeExtractor
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -253,9 +272,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 //
 //	STAGE 0 header gate (NO body byte read): mint request id -> set
 //	  x-request-id header -> derive request-scoped logger -> route ->
-//	  version -> Content-Type -> PeerScope from context ->
-//	  declared-size pre-buffer on Content-Length -> ops/s throttle keyed
-//	  on the CHANNEL scope (never the body)
+//	  Content-Type -> PeerScope (credential-scope on the unary REST path, or
+//	  the unix peer scope from context for the streaming branch / injected
+//	  callers) -> declared-size pre-buffer on Content-Length -> ops/s
+//	  throttle keyed on the CHANNEL scope (never the body)
 //	STAGE 1 strict envelope decode (through the MaxBytesReader backstop)
 //	STAGE 1b channel-scope cross-check on the DECODED body (D2)
 //	STAGE 2 authz (Resolver.Resolve with caller evidence from the channel)
@@ -324,24 +344,38 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// STAGE 0: version header (D1).
-	if err := checkVersion(r); err != nil {
-		denyOp(mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
-		return
-	}
-
-	// STAGE 0: Content-Type.
+	// STAGE 0: Content-Type. The unary REST ops are application/json; the
+	// Connect version header is gone (the REST transport pins no protocol-version
+	// header).
 	if err := checkContentType(r); err != nil {
 		denyOp(mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
 		return
 	}
 
-	// STAGE 0: PeerScope from the connection context — the host-attested
-	// channel identity. Its absence is a wiring fault: fail closed.
-	ps, ok := peerScopeFromContext(r.Context())
-	if !ok {
-		denyOp(mapDeny(denyInternal), "no channel scope on connection")
-		return
+	// STAGE 0: PeerScope — the host-attested channel identity. The SOURCE is
+	// gated (A5): when a credential extractor is wired, the unary REST path
+	// derives the scope from the edge-injected Authorization: Bearer
+	// (peerScopeFromCredential); otherwise it reads the unix peer scope stashed
+	// in the connection context (the streaming branch's source this wave, and the
+	// source any test that injects PeerScope via contextWithPeerScope relies on).
+	// A missing/rejected credential is unauthenticated (401); an absent context
+	// scope on the fallback path is a wiring fault and fails closed.
+	var ps PeerScope
+	if d.credExtractor != nil {
+		var v DenyVerdict
+		var ok bool
+		ps, v, ok = peerScopeFromCredential(r, d.credExtractor)
+		if !ok {
+			denyOp(v, "credential rejected")
+			return
+		}
+	} else {
+		var ok bool
+		ps, ok = peerScopeFromContext(r.Context())
+		if !ok {
+			denyOp(mapDeny(denyInternal), "no channel scope on connection")
+			return
+		}
 	}
 
 	// STAGE 0: declared-size pre-buffer on the Content-Length (SEC-78). A
@@ -697,8 +731,10 @@ type auditEvent struct {
 }
 
 // withStatus returns a copy of the verdict with an overridden HTTP status,
-// used only for the 405 method-not-allowed path where the Connect code stays
-// invalid_argument but the HTTP method semantics demand 405.
+// used only for the 405 method-not-allowed path where the deny class stays
+// malformed (invalid_argument) but the HTTP method semantics demand 405. The
+// BoundedReason body still carries the malformed reason_code; only the
+// authoritative status is overridden.
 func (v DenyVerdict) withStatus(status int) DenyVerdict {
 	v.WireStatus = status
 	return v

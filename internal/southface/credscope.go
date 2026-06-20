@@ -173,6 +173,39 @@ func bearerFromRequest(r *http.Request) (string, error) {
 	return token, nil
 }
 
+// peerScopeFromCredential derives the host-attested PeerScope from the
+// edge-injected Authorization: Bearer at STAGE 0 of the unary REST pipeline,
+// WITHOUT the request-fsid cross-check. It reads the bearer, derives the
+// credential-bound scope via the extractor, and returns the PeerScope the
+// dispatch spine reads (FilesystemID + GrantedIntents drive authz; UID/PID feed
+// the audit actor). The request's top-level filesystem_id is NOT available at
+// STAGE 0 (the body is not read until STAGE 1); the bound-scope-vs-request-fsid
+// comparison is the SURVIVING STAGE-1b channel-scope cross-check
+// (env.FilesystemID != ps.FilesystemID), which already names the scope_mismatch
+// truth. This split keeps STAGE 0 body-free (SEC-76/78).
+//
+// PENDING-PHASE-7(A5-credscope): a missing/malformed/expired/rejected bearer is
+// denyLeaseExpired (unauthenticated, 401) — the broker cannot attribute the
+// request to any scope. It does NOT JWKS-verify the bearer; the extractor binds
+// to the authority's contract, which is unpinned. ok=false carries the
+// DenyVerdict the route layer writes; ok=true carries the PeerScope.
+func peerScopeFromCredential(r *http.Request, extractor CredentialScopeExtractor) (PeerScope, DenyVerdict, bool) {
+	bearer, err := bearerFromRequest(r)
+	if err != nil {
+		return PeerScope{}, mapDeny(denyLeaseExpired), false
+	}
+	scope, err := extractor.Extract(bearer)
+	if err != nil {
+		return PeerScope{}, mapDeny(denyLeaseExpired), false
+	}
+	return PeerScope{
+		FilesystemID:   scope.FilesystemID,
+		GrantedIntents: scope.GrantedIntents,
+		UID:            scope.UID,
+		PID:            scope.PID,
+	}, DenyVerdict{}, true
+}
+
 // deriveCredScope is the A5 credential-scope check at the SERVICE/ROUTE layer.
 // It reads the edge-injected Authorization: Bearer, derives the
 // credential-bound filesystem scope via the extractor, and enforces that the

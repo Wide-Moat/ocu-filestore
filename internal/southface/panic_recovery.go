@@ -79,7 +79,7 @@ func (d *dispatcher) recoverDispatch(w http.ResponseWriter, reqLog **slog.Logger
 		// recovery for the same reason.
 		func() {
 			defer func() { recover() }() //nolint:errcheck
-			writeConnectError(w, mapDeny(denyInternal), "internal error")
+			writeRESTDeny(w, mapDeny(denyInternal), "internal error")
 		}()
 	}
 }

@@ -70,10 +70,10 @@ func TestStalledUploadStreamAborts(t *testing.T) {
 	// chunk, then STALL (no further chunks, no terminal chunk).
 	params := paramsFrame(t, "fs-stall", "/stalled.bin", 64)
 	var reqBuf bytes.Buffer
-	fmt.Fprintf(&reqBuf, "POST %sfileUpload HTTP/1.1\r\n", servicePrefix)
+	fmt.Fprintf(&reqBuf, "POST %sfileUpload HTTP/1.1\r\n", restBase)
 	fmt.Fprintf(&reqBuf, "Host: session\r\n")
 	fmt.Fprintf(&reqBuf, "Content-Type: %s\r\n", connContentTypeStream)
-	fmt.Fprintf(&reqBuf, "%s: %s\r\n", connectProtocolVersionHeader, connectProtocolVersion)
+	fmt.Fprintf(&reqBuf, "%s: %s\r\n", streamProtocolVersionHeader, streamProtocolVersion)
 	fmt.Fprintf(&reqBuf, "Transfer-Encoding: chunked\r\n\r\n")
 	fmt.Fprintf(&reqBuf, "%x\r\n", len(params))
 	reqBuf.Write(params)
@@ -168,10 +168,10 @@ func TestStalledDownloadStreamAborts(t *testing.T) {
 	// send buffer and blocks in writeFrame until the write deadline fires.
 	params := downloadParamsFrame(t, scope, uuid, nil)
 	var reqBuf bytes.Buffer
-	fmt.Fprintf(&reqBuf, "POST %sfileDownload HTTP/1.1\r\n", servicePrefix)
+	fmt.Fprintf(&reqBuf, "POST %sfileDownload HTTP/1.1\r\n", restBase)
 	fmt.Fprintf(&reqBuf, "Host: session\r\n")
 	fmt.Fprintf(&reqBuf, "Content-Type: %s\r\n", connContentTypeStream)
-	fmt.Fprintf(&reqBuf, "%s: %s\r\n", connectProtocolVersionHeader, connectProtocolVersion)
+	fmt.Fprintf(&reqBuf, "%s: %s\r\n", streamProtocolVersionHeader, streamProtocolVersion)
 	fmt.Fprintf(&reqBuf, "Transfer-Encoding: chunked\r\n\r\n")
 	fmt.Fprintf(&reqBuf, "%x\r\n", len(params))
 	reqBuf.Write(params)

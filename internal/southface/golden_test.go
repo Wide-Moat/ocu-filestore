@@ -21,7 +21,7 @@ const goldenUnaryBody = `{"filesystem_id":"fs-golden-01","path":"/golden-dir","a
 // decodes to the exact spine view: scope fs-golden-01, path /golden-dir,
 // intent read — with the exact route and version header the guest sends.
 func TestGoldenUnaryDecode(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", strings.NewReader(goldenUnaryBody))
+	r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", strings.NewReader(goldenUnaryBody))
 	r.ContentLength = int64(len(goldenUnaryBody))
 	op, err := parseRoute(r.Method, r.URL.Path)
 	if err != nil || op != OpListDirectory {

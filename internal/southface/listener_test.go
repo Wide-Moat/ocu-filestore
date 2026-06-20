@@ -407,11 +407,10 @@ func TestAuditActorCarriesGatePeerCreds(t *testing.T) {
 	defer s.Close()
 
 	body := `{"filesystem_id":"fs-creds-audit","path":"/x","authorization_metadata":{"intent":"write","downloadable":false}}`
-	req, err := http.NewRequest(http.MethodPost, "http://session"+servicePrefix+"makeDirectory", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, "http://session"+restBase+"makeDirectory", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	req.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
 	req.Header.Set("Content-Type", contentTypeJSON)
 	resp, err := unixHTTPClient(s.SocketPath()).Do(req)
 	if err != nil {

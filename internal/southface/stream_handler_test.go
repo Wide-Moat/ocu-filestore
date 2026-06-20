@@ -106,8 +106,8 @@ func (c *chunkCountingReader) Read(p []byte) (int, error) {
 // -1), the framed body, and a PeerScope context. The returned request drives
 // d.ServeHTTP; the framed response is read off the recorder afterwards.
 func streamRequest(op Op, body io.Reader, scope string, intents []Intent) *http.Request {
-	r := httptest.NewRequest(http.MethodPost, servicePrefix+string(op), body)
-	r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+	r := httptest.NewRequest(http.MethodPost, restBase+string(op), body)
+	r.Header.Set(streamProtocolVersionHeader, streamProtocolVersion)
 	r.Header.Set("Content-Type", connContentTypeStream)
 	r.ContentLength = -1 // chunked / unknown length
 	ps := PeerScope{FilesystemID: scope, GrantedIntents: intents, UID: 4242, PID: 7}
@@ -285,8 +285,8 @@ func TestFileUploadRouting(t *testing.T) {
 		// readFile is unary; sending connect+json must hit the unary
 		// content-type reject (the streaming branch is keyed on isStreamingOp,
 		// not the content-type).
-		r := httptest.NewRequest(http.MethodPost, servicePrefix+string(OpReadFile), bytes.NewReader([]byte(`{}`)))
-		r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+		r := httptest.NewRequest(http.MethodPost, restBase+string(OpReadFile), bytes.NewReader([]byte(`{}`)))
+		r.Header.Set(streamProtocolVersionHeader, streamProtocolVersion)
 		r.Header.Set("Content-Type", connContentTypeStream)
 		r.ContentLength = 2
 		ps := PeerScope{FilesystemID: streamScope, GrantedIntents: okIntents()}

@@ -196,10 +196,7 @@ func TestListDirectoryOfFileDeniesMalformed(t *testing.T) {
 		t.Fatalf("listDirectory of a file: status = %d, want 400 (invalid_argument)", w.Code)
 	}
 
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("response body not a connectError: %v (%s)", err, w.Body.String())
-	}
+	ce := decodeErrBody(t, w)
 	if ce.Code != wireCodeInvalidArgument {
 		t.Fatalf("wire code = %q, want %q", ce.Code, wireCodeInvalidArgument)
 	}
@@ -293,8 +290,7 @@ func TestBodyReadCancelClassifiesAborted(t *testing.T) {
 		n:      4,
 	}
 
-	r := httptest.NewRequest(http.MethodPost, servicePrefix+string(OpReadFile), body)
-	r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+	r := httptest.NewRequest(http.MethodPost, restBase+string(OpReadFile), body)
 	r.Header.Set("Content-Type", contentTypeJSON)
 	r.ContentLength = int64(len(fullBody))
 	ps := PeerScope{FilesystemID: boundScope, GrantedIntents: []Intent{IntentRead}, UID: 4242, PID: 7}
@@ -311,10 +307,7 @@ func TestBodyReadCancelClassifiesAborted(t *testing.T) {
 		t.Fatalf("context-cancelled body read: status = %d, want 409 (aborted)", w.Code)
 	}
 
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("response body not a connectError: %v (%s)", err, w.Body.String())
-	}
+	ce := decodeErrBody(t, w)
 	if ce.Code != wireCodeAborted {
 		t.Fatalf("context-cancelled body read: wire code = %q, want %q", ce.Code, wireCodeAborted)
 	}
@@ -335,8 +328,7 @@ func TestBodyReadDeadlineClassifiesAborted(t *testing.T) {
 	body := &deadlineBody{}
 	fullBody := bodyFor(boundScope, IntentRead)
 
-	r := httptest.NewRequest(http.MethodPost, servicePrefix+string(OpReadFile), body)
-	r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+	r := httptest.NewRequest(http.MethodPost, restBase+string(OpReadFile), body)
 	r.Header.Set("Content-Type", contentTypeJSON)
 	r.ContentLength = int64(len(fullBody))
 	ps := PeerScope{FilesystemID: boundScope, GrantedIntents: []Intent{IntentRead}, UID: 4242, PID: 7}
@@ -352,10 +344,7 @@ func TestBodyReadDeadlineClassifiesAborted(t *testing.T) {
 		t.Fatalf("deadline-exceeded body read: status = %d, want 409 (aborted)", w.Code)
 	}
 
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("response body not a connectError: %v (%s)", err, w.Body.String())
-	}
+	ce := decodeErrBody(t, w)
 	if ce.Code != wireCodeAborted {
 		t.Fatalf("deadline-exceeded body read: wire code = %q, want %q", ce.Code, wireCodeAborted)
 	}

@@ -336,13 +336,13 @@ func TestFileDownloadRealSocket(t *testing.T) {
 		client := unixHTTPClient(s.SocketPath())
 		body := listBody(scope, "/", 0, "", false)
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-			"http://session"+servicePrefix+"listDirectory",
+			"http://session"+restBase+"listDirectory",
 			bytes.NewReader([]byte(body)))
 		if err != nil {
 			t.Fatalf("build list request: %v", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+		req.Header.Set(streamProtocolVersionHeader, streamProtocolVersion)
 		req.ContentLength = int64(len(body))
 
 		resp, err := client.Do(req)
@@ -378,13 +378,13 @@ func TestFileDownloadRealSocket(t *testing.T) {
 		client := unixHTTPClient(s.SocketPath())
 		params := downloadParamsFrame(t, scope, uuid, nil)
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-			"http://session"+servicePrefix+"fileDownload",
+			"http://session"+restBase+"fileDownload",
 			bytes.NewReader(params))
 		if err != nil {
 			t.Fatalf("build download request: %v", err)
 		}
 		req.Header.Set("Content-Type", connContentTypeStream)
-		req.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+		req.Header.Set(streamProtocolVersionHeader, streamProtocolVersion)
 
 		resp, err := client.Do(req)
 		if err != nil {

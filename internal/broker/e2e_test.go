@@ -38,7 +38,12 @@ import (
 )
 
 const (
-	servicePrefix          = "/ocu.filestore.v1alpha.FilesystemService/"
+	// servicePrefix is the REST route base every south-face op hangs off
+	// (POST servicePrefix+<op>). The unary ops speak application/json with no
+	// protocol-version header; the streaming fileUpload/fileDownload ops still
+	// ride the framed Connect path this wave and keep the connect+json
+	// content type and the protocol-version header.
+	servicePrefix          = "/v1/filestore/fs/"
 	connectVersionHeader   = "Connect-Protocol-Version"
 	connectVersion         = "1"
 	contentTypeJSON        = "application/json"
@@ -299,7 +304,6 @@ func (d *daemon) postUnary(t *testing.T, op string, body any) *http.Response {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", contentTypeJSON)
-	req.Header.Set(connectVersionHeader, connectVersion)
 	resp, err := d.client().Do(req)
 	if err != nil {
 		t.Fatalf("%s do: %v", op, err)

@@ -60,6 +60,32 @@ func isStreamingOp(op Op) bool {
 // the streaming path; a charset or other parameter after it is tolerated.
 const connContentTypeStream = "application/connect+json"
 
+// streamProtocolVersionHeader and its required value pin the Connect streaming
+// contract for the TWO data-plane ops (fileUpload/fileDownload), which still
+// ride the framed-trailer Connect path this wave. The header is REQUIRED and
+// its only legal value is "1"; absent or wrong is invalid_argument before any
+// frame is parsed. The unary REST path no longer carries a protocol-version
+// header — this is the streaming-local survivor of the deleted unary
+// checkVersion. PENDING-PHASE-7: the data-plane ops pivot to multipart /
+// octet-stream in a later wave and this version gate retires with them.
+const (
+	streamProtocolVersionHeader = "Connect-Protocol-Version"
+	streamProtocolVersion       = "1"
+)
+
+// checkStreamVersion enforces the REQUIRED Connect-Protocol-Version header on
+// the streaming path. errBadStreamVersion maps to invalid_argument.
+func checkStreamVersion(r *http.Request) error {
+	if r.Header.Get(streamProtocolVersionHeader) != streamProtocolVersion {
+		return errBadStreamVersion
+	}
+	return nil
+}
+
+// errBadStreamVersion — the streaming request's Connect-Protocol-Version header
+// is absent or not "1". Maps to invalid_argument. Match it with errors.Is.
+var errBadStreamVersion = errors.New("southface: missing or wrong Connect-Protocol-Version")
+
 // checkStreamContentType admits application/connect+json (charset tolerated).
 // The unary checkContentType hard-equals application/json and would reject the
 // stream at the door (Pitfall 1), so the streaming path uses this instead.
@@ -109,8 +135,8 @@ func (d *dispatcher) serveStreaming(w http.ResponseWriter, r *http.Request, op O
 	// precede the op-specific handler's own deny/allow accounting, mirroring the
 	// unary denyOp choke point for the throttle/header faults.
 	opStr := string(op)
-	if err := checkVersion(r); err != nil {
-		d.recordOp(opStr, "deny", denyClassForDecodeErr(err))
+	if err := checkStreamVersion(r); err != nil {
+		d.recordOp(opStr, "deny", denyMalformed)
 		_ = writeEndStream(w, &connectError{Code: wireCodeInvalidArgument, Message: "missing or wrong Connect-Protocol-Version"})
 		return
 	}

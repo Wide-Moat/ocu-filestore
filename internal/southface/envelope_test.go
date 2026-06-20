@@ -22,12 +22,12 @@ func TestRouteParse(t *testing.T) {
 		wantOp  Op
 		wantErr error
 	}{
-		{"known unary op", http.MethodPost, servicePrefix + "listDirectory", OpListDirectory, nil},
-		{"known streaming op", http.MethodPost, servicePrefix + "fileUpload", OpFileUpload, nil},
-		{"non-POST to valid route", http.MethodGet, servicePrefix + "listDirectory", "", errBadMethod},
-		{"unknown op on prefix", http.MethodPost, servicePrefix + "noSuchOp", "", errUnknownRoute},
+		{"known unary op", http.MethodPost, restBase + "listDirectory", OpListDirectory, nil},
+		{"known streaming op", http.MethodPost, restBase + "fileUpload", OpFileUpload, nil},
+		{"non-POST to valid route", http.MethodGet, restBase + "listDirectory", "", errBadMethod},
+		{"unknown op on prefix", http.MethodPost, restBase + "noSuchOp", "", errUnknownRoute},
 		{"path outside prefix", http.MethodPost, "/other/listDirectory", "", errUnknownRoute},
-		{"bare prefix", http.MethodPost, servicePrefix, "", errUnknownRoute},
+		{"bare prefix", http.MethodPost, restBase, "", errUnknownRoute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			op, err := parseRoute(tc.method, tc.path)
@@ -47,36 +47,6 @@ func TestRouteParse(t *testing.T) {
 	}
 }
 
-// TestVersionHeader pins D1: the Connect-Protocol-Version header is REQUIRED
-// and must be "1"; absent or wrong is errBadVersion.
-func TestVersionHeader(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		value   string
-		set     bool
-		wantErr bool
-	}{
-		{"value 1", "1", true, false},
-		{"absent", "", false, true},
-		{"wrong value", "2", true, true},
-		{"empty value", "", true, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", nil)
-			r.Header.Del(connectProtocolVersionHeader)
-			if tc.set {
-				r.Header.Set(connectProtocolVersionHeader, tc.value)
-			}
-			err := checkVersion(r)
-			if tc.wantErr != (err != nil) {
-				t.Fatalf("checkVersion: got %v, wantErr=%v", err, tc.wantErr)
-			}
-			if tc.wantErr && !errors.Is(err, errBadVersion) {
-				t.Fatalf("checkVersion: got %v, want errBadVersion", err)
-			}
-		})
-	}
-}
 
 // TestContentType pins the application/json requirement, tolerating a charset
 // parameter.
@@ -93,7 +63,7 @@ func TestContentType(t *testing.T) {
 		{"connect json", "application/connect+json", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", nil)
+			r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", nil)
 			r.Header.Del("Content-Type")
 			if tc.value != "" {
 				r.Header.Set("Content-Type", tc.value)
@@ -127,7 +97,7 @@ func TestEnvelopeStrictDecode(t *testing.T) {
 		{"empty", ``, errMalformedEnvelope},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", strings.NewReader(tc.body))
+			r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", strings.NewReader(tc.body))
 			r.ContentLength = int64(len(tc.body))
 			w := httptest.NewRecorder()
 			var env unaryEnvelope
@@ -158,7 +128,7 @@ func TestEnvelopeOversize(t *testing.T) {
 	t.Run("content-length over ceiling, no body read", func(t *testing.T) {
 		body := strings.Repeat("A", 4096)
 		cr := &countingReader{r: strings.NewReader(body)}
-		r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", cr)
+		r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", cr)
 		r.ContentLength = int64(len(body))
 		w := httptest.NewRecorder()
 		var env unaryEnvelope
@@ -172,7 +142,7 @@ func TestEnvelopeOversize(t *testing.T) {
 
 	t.Run("absent content-length, backstop catches oversize", func(t *testing.T) {
 		body := `{"filesystem_id":"` + strings.Repeat("x", 4096) + `"}`
-		r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", strings.NewReader(body))
+		r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", strings.NewReader(body))
 		r.ContentLength = -1 // absent
 		w := httptest.NewRecorder()
 		var env unaryEnvelope

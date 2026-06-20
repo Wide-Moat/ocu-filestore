@@ -427,25 +427,16 @@ var denyStatusFixtures = []denyStatusFixture{
 	{http.StatusGatewayTimeout, denyClassPermanent},      // 504 → else
 }
 
-// boundedReasonFixture is the diagnostic deny body: a pattern-validated open
-// reason_code and a bounded message. It is the SAME envelope the exec/control
-// faces use. The body is diagnostic only — the HTTP status is authoritative and
-// the reason_code never drives client behaviour.
-type boundedReasonFixture struct {
-	// ReasonCode is a pattern-validated open string matching
-	// ^[A-Z][A-Z0-9_]{1,63}$ — NOT an enum. The default vocabulary below is
-	// preferred for log consistency.
-	ReasonCode string `json:"reason_code"`
-	// Message is a bounded human-readable diagnostic (maxLength 256).
-	Message string `json:"message"`
-}
+// The BoundedReason deny body type (boundedReason) and its message-length
+// ceiling (boundedReasonMessageMax) are owned by the production restdeny.go now
+// that a live unary deny writer emits them; this fixture group asserts against
+// those shared definitions rather than a test-only copy.
 
 // reasonCodePattern is the validation pattern for a BoundedReason.reason_code:
-// an uppercase-led token of 2..64 chars over [A-Z0-9_].
+// an uppercase-led token of 2..64 chars over [A-Z0-9_]. It has no production
+// constant (the reason_code is an open string the writer never closes), so the
+// fixture owns it and the writer's emitted codes are checked against it.
 const reasonCodePattern = `^[A-Z][A-Z0-9_]{1,63}$`
-
-// boundedReasonMessageMax is the BoundedReason.message length ceiling.
-const boundedReasonMessageMax = 256
 
 // defaultReasonVocabulary is the preferred (not enforced) reason_code vocabulary
 // for log consistency. The reason_code field accepts any pattern-valid string;
@@ -914,7 +905,8 @@ func testDenyStatusMap(t *testing.T) {
 // reason_code matching the open pattern, a bounded message, and the preferred
 // default vocabulary all matching the pattern.
 func testBoundedReasonShape(t *testing.T) {
-	br := boundedReasonFixture{ReasonCode: "SCOPE_MISMATCH", Message: "scope mismatch"}
+	// The production deny body serializes to exactly {reason_code, message}.
+	br := boundedReason{ReasonCode: "SCOPE_MISMATCH", Message: "scope mismatch"}
 	assertKeySet(t, decodeToMap(t, br), []string{"reason_code", "message"})
 
 	if boundedReasonMessageMax != 256 {
@@ -938,6 +930,26 @@ func testBoundedReasonShape(t *testing.T) {
 	for _, bad := range []string{"scope_mismatch", "A", "9X", "X-Y"} {
 		if re.MatchString(bad) {
 			t.Errorf("reason_code pattern wrongly accepts %q", bad)
+		}
+	}
+
+	// The production reason_code derivation (reasonCodeForVerdict) emits the
+	// preferred default vocabulary for the common verdicts and is always
+	// pattern-valid: the uppercased wire code matches the open pattern, and an
+	// empty wire code falls back to a valid token.
+	for _, class := range defaultReasonVocabulary {
+		_ = class // the vocabulary is asserted above; the verdict mapping below
+		// proves the writer derives a pattern-valid code from a real verdict.
+	}
+	for _, v := range []DenyVerdict{
+		mapDeny(denyScopeMismatch),
+		mapDeny(denyNotFound),
+		mapDeny(denyThrottle),
+		mapDeny(denyLeaseExpired),
+		{}, // empty wire code -> INTERNAL fallback
+	} {
+		if got := reasonCodeForVerdict(v); !re.MatchString(got) {
+			t.Errorf("reasonCodeForVerdict(%+v) = %q, not pattern-valid", v, got)
 		}
 	}
 }

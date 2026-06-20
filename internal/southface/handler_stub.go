@@ -112,13 +112,17 @@ func outcomeDeny(class string) opOutcome { return opOutcome{denyClass: class} }
 // for the dispatched op (southface-01).
 type opHandler func(d *handlerDeps, hc handlerCtx) opOutcome
 
-// unimplemented writes the Connect unimplemented error (501) with no
-// x-deny-reason header. Every op the seven phase-9 handlers do not replace
-// resolves to this — the registry is complete, those bodies are not. It writes
-// the wire error directly (no mandateDeny hook), so it returns the deny class
-// for the spine to record the single ops_total entry.
+// unimplemented writes the REST unimplemented deny (501) with no x-deny-reason
+// header. Every op the seven phase-9 handlers do not replace resolves to this —
+// the registry is complete, those bodies are not. It writes the wire error
+// directly (no mandateDeny hook), so it returns the deny class for the spine to
+// record the single ops_total entry.
+//
+// PENDING-PHASE-7(A3-deny): the body is the BoundedReason {reason_code,
+// message} REST shape (writeRESTDeny), not the Connect error frame; the HTTP
+// 501 status is authoritative.
 func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {
-	writeConnectError(hc.w, mapDeny(denyUnimplemented), "operation not implemented in this build")
+	writeRESTDeny(hc.w, mapDeny(denyUnimplemented), "operation not implemented in this build")
 	return outcomeDeny(denyUnimplemented)
 }
 

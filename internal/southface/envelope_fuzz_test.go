@@ -25,7 +25,7 @@ func FuzzEnvelope(f *testing.F) {
 	f.Add(strings.Repeat("A", 1<<17))
 
 	f.Fuzz(func(t *testing.T, body string) {
-		r := httptest.NewRequest(http.MethodPost, servicePrefix+"listDirectory", strings.NewReader(body))
+		r := httptest.NewRequest(http.MethodPost, restBase+"listDirectory", strings.NewReader(body))
 		r.ContentLength = int64(len(body))
 		w := httptest.NewRecorder()
 		var env unaryEnvelope
