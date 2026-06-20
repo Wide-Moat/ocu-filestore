@@ -28,6 +28,31 @@ COVERAGE_FLOOR := 86.0
 # the same slice on the gVisor sandbox runtime (the second real-substrate leg).
 RUNTIME ?= runc
 
+# Docker network for the e2e container, runtime-aware.
+#   runc  : --network host — the MinIO/S3 rig is reached over host networking on
+#           a Linux substrate, so the S3 conformance leg keeps working unchanged.
+#   runsc : empty — gVisor with --network host bypasses its own netstack, which
+#           breaks loopback (net.Listen("tcp","127.0.0.1:0") -> "bind: cannot
+#           assign requested address").  Omitting it lets the gVisor netstack own
+#           loopback so the TLS-listener e2e tests bind 127.0.0.1 successfully.
+E2E_NETWORK := $(if $(filter runsc,$(RUNTIME)),,--network host)
+
+# Offline module cache for runsc.  The gVisor sandbox netstack cannot reach
+# proxy.golang.org (DNS unreachable), so `go mod download` fails inside it.  For
+# runsc only we warm a docker-named module-cache volume under runc (which has
+# network) first, then build+test under runsc with GOPROXY=off against that
+# cache.  A docker-named volume avoids leaving a root-owned cache dir on the host
+# bind-mount.  For runc this is all empty, so runc stays a single docker run.
+E2E_MODCACHE_VOL := ocu-e2e-gomodcache-$(RUNTIME)
+E2E_MODCACHE_MOUNT := $(if $(filter runsc,$(RUNTIME)),--volume $(E2E_MODCACHE_VOL):/go/pkg/mod,)
+E2E_OFFLINE_ENV := $(if $(filter runsc,$(RUNTIME)),--env GOPROXY=off --env GOFLAGS=-mod=mod,)
+
+# runsc-only recipe fragments (empty for runc, so runc stays one docker run):
+#   _WARM  prepends a runc-side `go mod download` into the named cache volume.
+#   _CLEAN appends a guaranteed volume cleanup that preserves the test exit code.
+E2E_MODCACHE_WARM := $(if $(filter runsc,$(RUNTIME)),echo "--- (runsc) warming offline module cache under runc ---" && docker run --rm --runtime=runc --network host --volume "$(CURDIR):/src:ro" --volume $(E2E_MODCACHE_VOL):/go/pkg/mod --workdir /workspace golang:$(GO_VERSION) sh -euc 'cp -a /src /workspace/repo && cd /workspace/repo && go mod download' && )
+E2E_MODCACHE_CLEAN := $(if $(filter runsc,$(RUNTIME)),; status=$$?; docker volume rm $(E2E_MODCACHE_VOL) >/dev/null 2>&1 || true; exit $$status)
+
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
         staticcheck goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
@@ -199,6 +224,15 @@ goversion-guard: ## Cross-check the go.mod `go` directive against the Dockerfile
 #   limactl shell ocu-linux -- make e2e-linux                # runc
 #   limactl shell ocu-linux -- make e2e-linux RUNTIME=runsc  # gVisor (runsc)
 #
+# Runtime-aware behavior (see E2E_NETWORK / E2E_MODCACHE_* above):
+#   * runc  keeps --network host (S3 rig reachable) and a single docker run,
+#     byte-for-byte as before.
+#   * runsc drops --network host so the gVisor netstack owns loopback (otherwise
+#     127.0.0.1 bind fails), and — because the gVisor netstack cannot reach
+#     proxy.golang.org — first warms a docker-named module cache under runc, then
+#     builds+tests under runsc with GOPROXY=off against that cache.  The cache
+#     volume is removed afterward so no root-owned state is left on the host.
+#
 # Usage:
 #   make e2e-linux
 #   make e2e-linux RUNTIME=runsc
@@ -206,11 +240,13 @@ goversion-guard: ## Cross-check the go.mod `go` directive against the Dockerfile
 
 e2e-linux: ## Run the REST/TLS live e2e in a Linux container (RUNTIME=runc|runsc)
 	@echo "--- building the broker binary inside the Linux container ---"
-	docker run --rm \
+	$(E2E_MODCACHE_WARM)docker run --rm \
 	  --runtime=$(RUNTIME) \
-	  --network host \
+	  $(E2E_NETWORK) \
 	  --volume "$(CURDIR):/src:ro" \
+	  $(E2E_MODCACHE_MOUNT) \
 	  --workdir /workspace \
+	  $(E2E_OFFLINE_ENV) \
 	  $(if $(OCU_S3_TEST_ENDPOINT),--env OCU_S3_TEST_ENDPOINT=$(OCU_S3_TEST_ENDPOINT),) \
 	  $(if $(OCU_S3_TEST_BUCKET),--env OCU_S3_TEST_BUCKET=$(OCU_S3_TEST_BUCKET),) \
 	  $(if $(OCU_S3_TEST_VERSIONED_BUCKET),--env OCU_S3_TEST_VERSIONED_BUCKET=$(OCU_S3_TEST_VERSIONED_BUCKET),) \
@@ -224,7 +260,7 @@ e2e-linux: ## Run the REST/TLS live e2e in a Linux container (RUNTIME=runc|runsc
 	    CGO_ENABLED=0 go build -trimpath -o /workspace/ocu-filestored ./cmd/ocu-filestored && \
 	    OCU_BROKER_BIN=/workspace/ocu-filestored \
 	      go test -run E2E ./internal/broker/ -v -timeout 600s \
-	  '
+	  '$(E2E_MODCACHE_CLEAN)
 
 # ── MinIO rig helpers ─────────────────────────────────────────────────────────
 
