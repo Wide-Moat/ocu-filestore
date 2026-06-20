@@ -22,7 +22,8 @@ the NFR-SEC rows the dispatch path is responsible for: scope binding
 (NFR-SEC-43), engine-credential isolation (NFR-SEC-16/25), the three-axis
 deny-by-default authorization with `downloadable` resolved at read
 (NFR-SEC-49, NFR-SEC-73), audit-before-acknowledge fail-closed
-(NFR-SEC-79), the host-peer accept gate (NFR-SEC-76), and the per-request and
+(NFR-SEC-79), the per-tenant scope binding the engine verifies on the
+edge-injected credential (NFR-SEC-76), and the per-request and
 whole-object size ceilings (NFR-SEC-46/78).
 
 All code references below name the actual file and function in
@@ -73,8 +74,8 @@ sequenceDiagram
     participant H as Handler (STAGE 4)
     participant E as Engine
 
-    G->>S: POST /…/FilesystemService/<op> (Connect unary JSON)
-    Note over S: STAGE 0 — mint x-request-id, parse route,<br/>check version + Content-Type, read PeerScope,<br/>Content-Length pre-buffer reject, ops/s throttle
+    G->>S: POST <service_url>/v1/filestore/fs/<op> (REST-JSON over HTTPS)
+    Note over S: STAGE 0 — mint x-request-id, parse route,<br/>check version + Content-Type, read channel scope,<br/>Content-Length pre-buffer reject, ops/s throttle
     Note over S: No body byte read yet
     S->>S: STAGE 1 — buffer body once (MaxBytesReader), strict-decode envelope
     S->>S: STAGE 1b — env.filesystem_id == PeerScope.FilesystemID ?
@@ -143,11 +144,12 @@ it (NFR-SEC-76/78). The steps, in order:
 7. **Content-Type.** `checkContentType` requires `application/json` (a trailing
    `;charset=…` parameter is tolerated).
 
-8. **PeerScope from the connection context.** `peerScopeFromContext` reads the
-   host-attested channel identity (UID/PID/filesystem id/granted intents)
-   established at accept time. Its **absence is a wiring fault and fails
-   closed** to `internal`/500 — the spine never proceeds without a channel
-   binding (NFR-SEC-43/76).
+8. **Channel scope from the connection context.** `peerScopeFromContext` reads
+   the host-attested channel identity (filesystem id / granted intents) bound to
+   the request — the session scope the engine verifies on the edge-injected
+   filestore credential, never a value the body supplies. Its **absence is a
+   wiring fault and fails closed** to `internal`/500 — the spine never proceeds
+   without a channel binding (NFR-SEC-43/76).
 
 9. **Declared-size pre-buffer reject (NFR-SEC-78).** A unary request carries a
    known-size body, so an **absent Content-Length** (`r.ContentLength < 0`) is
