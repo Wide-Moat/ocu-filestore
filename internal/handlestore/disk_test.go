@@ -12,6 +12,12 @@ import (
 	"testing"
 )
 
+// newTempLog returns a fresh temp-dir log path (no store opened).
+func newTempLog(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "handles.jsonl")
+}
+
 // newTestStore opens a fresh DiskStore on a temp-dir log and returns its path.
 func newTestStore(t *testing.T) (string, *DiskStore) {
 	t.Helper()
