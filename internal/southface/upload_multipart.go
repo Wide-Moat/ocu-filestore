@@ -16,7 +16,8 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 )
 
-// PENDING-PHASE-7(A2-multipart): fileUpload over multipart/form-data. The wire
+// PHASE-7(A2-multipart): frozen @ canon-rev a030b7be914b: fileUpload over multipart/form-data. The wire
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // is a POST carrying two ordered parts: (1) a form FIELD named "params" whose
 // value is the upload params JSON (uploadParamsFrame: filesystem_id top-level,
 // path, declared_size_bytes REQUIRED, overwrite_existing omitempty, write

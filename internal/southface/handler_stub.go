@@ -130,7 +130,8 @@ type opHandler func(d *handlerDeps, hc handlerCtx) opOutcome
 // directly (no mandateDeny hook), so it returns the deny class for the spine to
 // record the single ops_total entry.
 //
-// PENDING-PHASE-7(A3-deny): the body is the BoundedReason {reason_code,
+// PHASE-7(A3-deny): frozen @ canon-rev a030b7be914b: the body is the BoundedReason {reason_code,
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // message} REST shape (writeRESTDeny), not the Connect error frame; the HTTP
 // 501 status is authoritative.
 func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {

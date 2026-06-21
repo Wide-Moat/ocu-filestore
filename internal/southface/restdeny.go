@@ -9,7 +9,8 @@ import (
 	"strings"
 )
 
-// PENDING-PHASE-7(A3-deny): the deny verdict is the HTTP status (authoritative)
+// PHASE-7(A3-deny): frozen @ canon-rev a030b7be914b: the deny verdict is the HTTP status (authoritative)
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // plus a BoundedReason {reason_code, message} diagnostic body. The HTTP status
 // is the ONLY thing a caller keys behaviour on (401|403 -> permission, 404 ->
 // not_found incl. the anti-enumeration degrade, 409 -> already_exists, 400|422

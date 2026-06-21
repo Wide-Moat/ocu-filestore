@@ -84,6 +84,34 @@ strict-TLS dial with `http.Transport.Proxy` left nil (no environment proxy can
 redirect or bypass it, NFR-SEC-16/85). Markers carry `PENDING-PHASE-7(engine-leg-egress)`
 in `internal/objectstore/objectstore.go` and `cmd/ocu-filestored/main.go`.
 
+## Partial freeze — 2026-06-22 @ canon-rev a030b7be914b (#292 merged)
+
+PR #292 merged at canon revision `a030b7be914b`. The five **wire-shape FORM**
+assumptions are now frozen: their primary markers flip in place to
+`// PHASE-7(<id>): frozen @ canon-rev a030b7be914b`, each carrying the verbatim
+architect caveat:
+
+> contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
+
+Frozen wire-shape ids: `A1-route`, `A2-multipart`, `A2-octet`, `A3-deny`,
+`A4-fsid-toplevel`. The A4 self-contradiction is resolved firsthand:
+`filesystem_id` is a top-level sibling, NOT in `authorization_metadata.required`
+(which is `{intent, downloadable}`). The freeze pins the wire FORM only; the
+governing ADRs remain `status:proposed`.
+
+Still **PENDING** (NOT frozen by this partial freeze):
+
+- `A5-credscope` — custody; ADR-0019 still `status:proposed` (GATE-2). The
+  `serve.go` marker was split: `A1-route` frozen, `A5-credscope` kept PENDING.
+- `engine-leg-egress` — custody; ADR-0021 still `status:proposed` (GATE-3).
+- Body-TBD markers (createFile / readMetadata / response field-sets and the
+  fileUpload success-body shape, `x-ocu-tbd-bodies`) — message bodies stay TBD;
+  only the route / multipart / octet / deny / fsid-placement FORM is frozen.
+
+Each frozen id retains at least one remaining PENDING marker elsewhere (router,
+envelope, dispatch, and parity-oracle sites), so every ledger row stays
+referenced and `scripts/check-pending-phase7.sh` bidirectional consistency holds.
+
 ## The parity oracle
 
 `internal/southface/restparity_fixtures_test.go` transcribes all of the above as

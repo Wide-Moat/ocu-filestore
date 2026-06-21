@@ -34,7 +34,8 @@ import (
 
 // ---------------------------------------------------------------------------
 // Group A1-route — the route table.
-// PENDING-PHASE-7(A1-route): POST <service_url>/v1/filestore/fs/<operation>;
+// PHASE-7(A1-route): frozen @ canon-rev a030b7be914b: POST <service_url>/v1/filestore/fs/<operation>;
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // the operation is the trailing path segment; method is always POST; the
 // transport is REST-JSON over HTTP/2 (unary), multipart for fileUpload, and
 // chunked octet-stream for fileDownload. Sibling-proven, frozen pending #292.
@@ -108,7 +109,8 @@ func routeFor(op Op) string { return restBaseFixture + string(op) }
 
 // ---------------------------------------------------------------------------
 // Group A4-fsid-toplevel — the common request envelope shape.
-// PENDING-PHASE-7(A4-fsid-toplevel): filesystem_id is a TOP-LEVEL field, a
+// PHASE-7(A4-fsid-toplevel): frozen @ canon-rev a030b7be914b: filesystem_id is a TOP-LEVEL field, a
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // sibling of authorization_metadata, NOT nested inside it. authorization_metadata
 // carries exactly {intent, downloadable}. downloadable is a hint the broker
 // never trusts at read. Sibling-proven, frozen pending #292.

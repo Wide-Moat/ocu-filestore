@@ -15,7 +15,8 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 )
 
-// PENDING-PHASE-7(A2-octet): fileDownload over chunked application/octet-stream.
+// PHASE-7(A2-octet): frozen @ canon-rev a030b7be914b: fileDownload over chunked application/octet-stream.
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
 // The wire is a POST carrying a JSON request body {filesystem_id top-level, uuid
 // (the object is addressed by UUID, NOT a path), optional range{offset,length}
 // as a *Range pointer with omitempty (a full download OMITS range; a ranged

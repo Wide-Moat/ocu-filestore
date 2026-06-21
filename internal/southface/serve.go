@@ -30,8 +30,10 @@ var ErrSeamMissing = errors.New("southface: a required seam is nil")
 // wires the existing locked dispatch spine behind the REST router and the TLS
 // HTTP/2 server. The field set is API: it freezes here.
 //
-// PENDING-PHASE-7(A1-route, A5-credscope): the transport is REST over the
-// edge-injected-credential HTTPS the guest dials (guest -> edge -> service). The
+// PHASE-7(A1-route): frozen @ canon-rev a030b7be914b: the transport is REST over
+// the edge-injected-credential HTTPS the guest dials (guest -> edge -> service).
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
+// PENDING-PHASE-7(A5-credscope): the
 // service receives ONLY the edge-injected real credential on Authorization:
 // Bearer; CredExtractor derives the credential-bound filesystem scope from it.
 // The retired unix-socket session fields (per-socket registry/entry/dir,
