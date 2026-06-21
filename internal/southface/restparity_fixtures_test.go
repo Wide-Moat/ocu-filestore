@@ -854,6 +854,14 @@ func testResponseShapes(t *testing.T) {
 	// readMetadata response carries both keys.
 	rm := readMetadataRespFixture{File: fileMetaFixture{Path: "/a"}, Directory: dirMetaFixture{Path: "/a"}}
 	assertKeySet(t, decodeToMap(t, rm), []string{"file", "directory"})
+
+	// createFile response carries the single non-omitempty nested file.
+	cf := createFileRespFixture{File: fileMetaFixture{Path: "/a", UUID: "u"}}
+	assertKeySet(t, decodeToMap(t, cf), []string{"file"})
+
+	// getFileMetadata response (uuid-axis) carries the single nested file.
+	gm := getFileMetadataRespFixture{File: fileMetaFixture{Path: "/a", UUID: "u"}}
+	assertKeySet(t, decodeToMap(t, gm), []string{"file"})
 }
 
 // testReadFileMetadataOnly asserts the readFile response carries the file

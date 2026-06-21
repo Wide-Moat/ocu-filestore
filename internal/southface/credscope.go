@@ -218,12 +218,10 @@ func peerScopeFromCredential(r *http.Request, extractor CredentialScopeExtractor
 	if err != nil {
 		return PeerScope{}, mapDeny(denyLeaseExpired), false
 	}
-	return PeerScope{
-		FilesystemID:   scope.FilesystemID,
-		GrantedIntents: scope.GrantedIntents,
-		UID:            scope.UID,
-		PID:            scope.PID,
-	}, DenyVerdict{}, true
+	// CredentialScope and PeerScope are field-identical (FilesystemID,
+	// GrantedIntents, UID, PID); a direct conversion is the host-attested
+	// binding crossing the credential->dispatch seam unchanged.
+	return PeerScope(scope), DenyVerdict{}, true
 }
 
 // deriveCredScope is the A5 credential-scope check at the SERVICE/ROUTE layer.
@@ -283,11 +281,8 @@ func deriveCredScope(r *http.Request, extractor CredentialScopeExtractor, reques
 
 	// The credential-bound scope is authoritative: build the PeerScope the
 	// dispatch spine reads. GrantedIntents come from the credential, never from
-	// a request field. UID/PID are credential-derived-or-zero.
-	return PeerScope{
-		FilesystemID:   scope.FilesystemID,
-		GrantedIntents: scope.GrantedIntents,
-		UID:            scope.UID,
-		PID:            scope.PID,
-	}, DenyVerdict{}, true
+	// a request field. UID/PID are credential-derived-or-zero. CredentialScope
+	// and PeerScope are field-identical, so a direct conversion carries the
+	// authoritative binding across the seam unchanged.
+	return PeerScope(scope), DenyVerdict{}, true
 }
