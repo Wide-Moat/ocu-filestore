@@ -74,6 +74,15 @@ type Record struct {
 	DownloadablePolicyRef string `json:"downloadable_policy_ref"`
 }
 
+// AuditObjectHandle returns the value that populates OCSF
+// FileActivityEvent.object_handle on the north path; the public file_id is
+// NEVER logged in the handle field (ADR-0023 honesty-fix a). The audit record
+// names the backend object reference the operation actually touched, not the
+// caller-facing handle — so the durable activity log is honest about which
+// stored object an event concerns while the public file_id stays out of the
+// handle field.
+func (r Record) AuditObjectHandle() string { return r.ObjectRef }
+
 // PutInput is the caller-supplied content of a new handle. The store mints
 // FileID and stamps CreatedAt itself, so neither appears here: a caller can
 // neither choose its handle nor backdate its record.
@@ -108,13 +117,26 @@ type ListInput struct {
 	Limit int
 }
 
-// ListPage is one scope-bound page of records plus the continuation cursor.
+// ListPage is one scope-bound page of records plus the continuation cursor and
+// the page bounds. Records is in the store's STABLE total order (CreatedAt,
+// FileID) so the bounds and cursor are stable across a daemon restart/replay.
 type ListPage struct {
-	// Records is the page of records, all bound to the requested scope.
+	// Records is the page of records, all bound to the requested scope, in the
+	// store's stable total order.
 	Records []Record
 	// NextCursor is the opaque token to pass as ListInput.Cursor for the next
 	// page, or empty when this is the final page.
 	NextCursor string
+	// HasMore is true when at least one more record sorts after this page —
+	// i.e. NextCursor is non-empty. It is the explicit "another page exists"
+	// signal so a caller need not infer it from the cursor.
+	HasMore bool
+	// FirstID is the file_id of the first record on this page (empty page → "").
+	// It names the lower bound of the page in the stable order.
+	FirstID string
+	// LastID is the file_id of the last record on this page (empty page → "").
+	// It names the upper bound and is the value NextCursor encodes.
+	LastID string
 }
 
 // Store is the durable file_id handle authority. Put records a new handle
