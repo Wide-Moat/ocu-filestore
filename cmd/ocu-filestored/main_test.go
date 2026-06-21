@@ -377,7 +377,7 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 				profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 				maxFileSize: 1024, maxRequestBytes: 4096,
 				opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-				s3Bucket:      tc.s3Bucket, s3Endpoint: tc.s3Endpoint, s3Region: tc.s3Region, s3PathStyle: tc.s3PathStyle,
+				s3Bucket: tc.s3Bucket, s3Endpoint: tc.s3Endpoint, s3Region: tc.s3Region, s3PathStyle: tc.s3PathStyle,
 				logLevelStr: "info",
 			})
 			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
@@ -399,7 +399,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3Bucket:    "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
 		logLevelStr: "info",
 	})
 	if err != nil {
@@ -435,7 +435,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
 		s3CredentialFile: "/etc/ocu/s3.cred",
-		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		s3Bucket:         "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
 		logLevelStr: "info",
 	})
 	if err != nil {

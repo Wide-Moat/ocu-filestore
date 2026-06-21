@@ -222,18 +222,18 @@ type brokerConfig struct {
 	// bindAddr/certFile/keyFile carry the TLS HTTPS south-face transport: the
 	// service_url the guest dials outbound through the Egress edge, and the
 	// service's own server certificate and private key.
-	bindAddr     string
-	certFile     string
-	keyFile      string
-	filesystemID string
-	maxFileSize  int64
-	maxRequestByte   int64
-	opsPerSecond     float64
-	opsBurst         float64
-	grantedIntents   []southface.Intent
-	dlPrefixes       []string
-	profile          admission.WorkloadTrustProfile
-	tenancy          admission.Tenancy
+	bindAddr       string
+	certFile       string
+	keyFile        string
+	filesystemID   string
+	maxFileSize    int64
+	maxRequestByte int64
+	opsPerSecond   float64
+	opsBurst       float64
+	grantedIntents []southface.Intent
+	dlPrefixes     []string
+	profile        admission.WorkloadTrustProfile
+	tenancy        admission.Tenancy
 	// logLevel is the validated slog.Level for the daemon's JSON logger.
 	logLevel slog.Level
 	// opsListen is the bind address for the loopback-only ops listener

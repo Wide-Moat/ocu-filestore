@@ -47,7 +47,6 @@ func TestRouteParse(t *testing.T) {
 	}
 }
 
-
 // TestContentType pins the application/json requirement, tolerating a charset
 // parameter.
 func TestContentType(t *testing.T) {

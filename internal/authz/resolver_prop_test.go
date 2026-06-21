@@ -37,6 +37,7 @@ func arbitraryCallerEvidence(rt *rapid.T) CallerEvidence {
 //     equals the drawn tag), keeping the new read-allowed semantics covered;
 //   - the tag-ERROR read appears on the DENY side, keeping ErrNotDownloadable
 //     a reachable, non-vacuous deny sentinel.
+//
 // This flip matches canon invariant 5, not merely a green test: it widens the
 // allow set to include the readable-but-non-downloadable case the spec names.
 func TestPropDenyByDefault(t *testing.T) {
