@@ -21,6 +21,12 @@ GO_VERSION := $(shell awk '/^go /{print $$2; exit}' go.mod)
 # Staticcheck version pinned in CI (go.yml install step).
 STATICCHECK_VERSION := 2026.1
 
+# Whole-program deadcode tool version, pinned to match go.yml. `unused`/U1000
+# (golangci-lint, staticcheck) is package-scoped and cannot see an unreachable
+# EXPORTED function; deadcode does whole-program reachability and does. ADVISORY
+# this round — surfaced, not blocking (a blocking flip is a later ratchet).
+DEADCODE_VERSION := v0.30.0
+
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
@@ -54,7 +60,7 @@ E2E_MODCACHE_WARM := $(if $(filter runsc,$(RUNTIME)),echo "--- (runsc) warming o
 E2E_MODCACHE_CLEAN := $(if $(filter runsc,$(RUNTIME)),; status=$$?; docker volume rm $(E2E_MODCACHE_VOL) >/dev/null 2>&1 || true; exit $$status)
 
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
-        staticcheck goversion-guard check e2e-linux s3-rig-up s3-rig-down
+        staticcheck deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -68,6 +74,7 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' fmt         "gofmt -l . (fails if any file is unformatted)"
 	@printf '  %-20s  %s\n' vet         "go vet ./..."
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
+	@printf '  %-20s  %s\n' deadcode    "whole-program deadcode -test ./... (advisory; exits 1 on any finding)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
 	@printf '  %-20s  %s\n' identity    "scripts/check-doc-identity.sh"
@@ -150,6 +157,20 @@ staticcheck: ## staticcheck ./... — pinned to $(STATICCHECK_VERSION), matching
 	  exit 1; \
 	fi
 	staticcheck ./...
+
+# deadcode is whole-program reachability: it flags an unreachable EXPORTED
+# function that package-scoped unused-analysis (golangci `unused`/staticcheck
+# U1000) structurally cannot see.  CRITICAL: the tool EXITS 0 even when it
+# prints findings (golang/go#64713), so a bare `deadcode -test ./...` step is a
+# permanent-green no-op.  We therefore gate on NON-EMPTY output: capture it,
+# print it, and `exit 1` if it is non-empty.  Run via `go run @$(DEADCODE_VERSION)`
+# so a fresh clone needs no global install.  ADVISORY this round — deliberately
+# NOT wired into `check` (the blocking flip is a later ratchet); CI runs the same
+# gate under continue-on-error so findings are annotated without blocking merge.
+deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0 tool wrapped)
+	@out=$$(go run golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION) -test ./...); \
+	echo "$$out"; \
+	test -z "$$out" || exit 1
 
 # ── checks ───────────────────────────────────────────────────────────────────
 

@@ -85,3 +85,26 @@ Every PR must pass: secrets scan (gitleaks + trufflehog, any hit blocks),
 naming denylist (lexicon job; the list is maintained outside the tree), SAST
 (semgrep CRITICAL blocks), SCA (trivy CRITICAL blocks), conventional-commits.
 Coverage, mutation, property, and perf gates wire in as the code lands.
+
+Run `make check` before every push (fmt+vet+staticcheck+spdx+contract+identity+
+test). Also run `make deadcode` — whole-program reachability that surfaces an
+unreachable EXPORTED function `unused`/U1000 cannot see (it is package-scoped);
+the tool exits 0 even on findings (golang/go#64713) so the target wraps it to
+exit 1 on non-empty output.
+
+Thresholds and gate status:
+- Coverage floor: 86.0% over `./internal/...` (blocking).
+- Mutation (gremlins): advisory, with a blocking ratchet planned.
+- deadcode: advisory this round (CI `continue-on-error`); a blocking flip is a
+  later ratchet. Not wired into `make check`.
+
+This is a Go repo — tool→language map. Add ONLY Go tooling. Forbidden:
+never add a JS/TS toolchain (`tsc`, `eslint`), Rust (`clippy`), or Python
+(`ruff`, `mypy`, `pylint`) linter — wrong language, they would scan an empty
+tree. Do NOT add a second coverage, mutation, SAST/semgrep, or lint gate; the
+gates above are the single source for each axis.
+
+No-bypass: never weaken or skip a gate to make it pass. Do not lower the
+coverage floor to absorb new code, do not `// nolint` or `continue-on-error` a
+blocking gate, and do not delete a finding's test to silence it. Fix the
+underlying issue or, for an advisory finding, record it for an owner decision.
