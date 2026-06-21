@@ -49,6 +49,7 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
 	"github.com/Wide-Moat/ocu-filestore/internal/flock"
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
@@ -153,6 +154,12 @@ const auditLockSuffix = ".lock"
 // names the resource so the operator knows which lock to inspect.
 var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the audit-sink lock)")
 
+// errHandleStoreAlreadyRunning is the handle-store analog of errAlreadyRunning:
+// a SEPARATE flock on <handle-store>.lock guards the durable file_id log against
+// two daemons interleaving appends, so the resource named in the refusal is the
+// handle store, not the audit sink (the two stores can live on distinct paths).
+var errHandleStoreAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the handle-store lock)")
+
 // tenancyAdmission maps the Phase-8-frozen hyphenated -tenancy flag values to
 // the admission package's underscored constants. The flag value set is frozen
 // (single-tenant | multi-tenant) and is NOT byte-identical to admission's
@@ -219,6 +226,10 @@ type brokerConfig struct {
 	s3Region         string
 	s3PathStyle      bool
 	auditSink        string
+	// handleStore is the durable file_id->handle store path (ADR-0023). Empty
+	// disables the index this phase (the north listener is inert), so it is
+	// OPTIONAL and validated only for parent-dir creatability when non-empty.
+	handleStore string
 	// bindAddr/certFile/keyFile carry the TLS HTTPS south-face transport: the
 	// service_url the guest dials outbound through the Egress edge, and the
 	// service's own server certificate and private key.
@@ -276,6 +287,8 @@ func run(args []string) error {
 		"per-RPC-message inbound body ceiling, rejected pre-buffer (NFR-SEC-78); default 50 MiB")
 	auditSink := fs.String("audit-sink", "",
 		"REQUIRED audit gate file-sink path; an audit-write failure denies the operation (NFR-SEC-79)")
+	handleStore := fs.String("handle-store", "",
+		"durable file_id->handle store path (Files-API north face, ADR-0023); empty disables the index this phase")
 	profile := fs.String("profile", "trusted_operator",
 		"admission profile: trusted_operator | internal_workforce | untrusted")
 	tenancy := fs.String("tenancy", "single-tenant",
@@ -342,6 +355,7 @@ func run(args []string) error {
 		engine:               *engine,
 		engineRoot:           *engineRoot,
 		auditSink:            *auditSink,
+		handleStore:          *handleStore,
 		southBind:            *southBind,
 		tlsCert:              *tlsCert,
 		tlsKey:               *tlsKey,
@@ -479,6 +493,56 @@ func run(args []string) error {
 	defer afl.Release()
 	l.Info("single-instance audit-sink lock acquired", slog.String("lock_file", auditLockPath))
 
+	// Handle-store single-instance guard: when --handle-store is set, acquire a
+	// SEPARATE exclusive flock on <handle-store>.lock BEFORE compose opens the
+	// durable log, mirroring the audit-sink guard. The durable file_id log is an
+	// append-only stream a second daemon must not interleave; the lock is keyed
+	// on the handle-store resource so two daemons sharing a handle store collide
+	// while distinct stores take distinct locks. An empty --handle-store skips
+	// the guard entirely (no store this phase). The parent directory is created
+	// 0700 like the audit sink's, so the durable log never sits world-traversable.
+	if cfg.handleStore != "" {
+		handleStoreAbs, hsAbsErr := filepath.Abs(cfg.handleStore)
+		if hsAbsErr != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return hsAbsErr
+		}
+		handleStoreDir := filepath.Dir(handleStoreAbs)
+		if err := os.MkdirAll(handleStoreDir, 0o700); err != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return err
+		}
+		// Chmod ignores umask, so this PINS 0700 on the leaf directory even when
+		// MkdirAll landed it at 0755 under the default umask (same rationale as
+		// the audit-sink leaf).
+		if err := os.Chmod(handleStoreDir, 0o700); err != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return err
+		}
+		handleLockPath := handleStoreAbs + auditLockSuffix
+		hfl, handleLockErr := flock.Acquire(handleLockPath)
+		if handleLockErr != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			if errors.Is(handleLockErr, flock.ErrAlreadyRunning) {
+				l.Error("single-instance guard: another daemon holds the handle-store lock; refusing to start",
+					slog.String("lock_file", handleLockPath),
+				)
+				return errHandleStoreAlreadyRunning
+			}
+			return handleLockErr
+		}
+		defer hfl.Release()
+		l.Info("single-instance handle-store lock acquired", slog.String("lock_file", handleLockPath))
+	}
+
 	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {
 		if opsListener != nil {
@@ -580,6 +644,7 @@ type rawFlags struct {
 	engine               string
 	engineRoot           string
 	auditSink            string
+	handleStore          string
 	southBind            string
 	tlsCert              string
 	tlsKey               string
@@ -746,6 +811,7 @@ func validate(r rawFlags) (brokerConfig, error) {
 		s3Region:         s3Region,
 		s3PathStyle:      s3PathStyle,
 		auditSink:        auditSink,
+		handleStore:      r.handleStore,
 		bindAddr:         southBind,
 		certFile:         tlsCert,
 		keyFile:          tlsKey,
@@ -845,6 +911,7 @@ var envFallbackMap = func() map[string]string {
 		"tls-cert",
 		"tls-key",
 		"audit-sink",
+		"handle-store",
 		"profile",
 		"tenancy",
 		"engine-root",
@@ -1102,6 +1169,25 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		m.SetAuditSinkLatched(1)
 	})
 
+	// Durable file_id handle store (ADR-0023). OPTIONAL this phase: an empty
+	// --handle-store leaves hStore nil (the north listener is inert, so the
+	// index is unused). When set, NewDiskStore opens/replays the log under the
+	// flock run() already holds, and the on-latch callback emits an ERROR line
+	// and flips the handle_store_latched gauge — making the fail-closed durable
+	// latch observable exactly like the audit sink's.
+	var hStore *handlestore.DiskStore
+	if cfg.handleStore != "" {
+		hStore, err = handlestore.NewDiskStore(cfg.handleStore)
+		if err != nil {
+			return nil, err
+		}
+		hStore.SetOnLatch(func() {
+			l.Error("handle store latched; durable file_id index refusing mutations until restart",
+				slog.String(observ.KeyReason, "handle_store_latch"))
+			m.SetHandleStoreLatched(1)
+		})
+	}
+
 	reg := ceilings.NewRegistry(ceilings.Config{
 		OpsPerSecond:         cfg.opsPerSecond,
 		OpsBurst:             cfg.opsBurst,
@@ -1132,6 +1218,12 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	defer func() {
 		if committed {
 			return
+		}
+		// Release the durable handle-store descriptor on the rollback path so a
+		// failed compose does not leak an open log fd (ownership has not yet
+		// passed to teardownServer).
+		if hStore != nil {
+			_ = hStore.Close()
 		}
 		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
 		defer cancelTeardown()
@@ -1184,6 +1276,22 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 				},
 			},
 		}
+		// handle_store_latch readiness: when the store is configured, /readyz
+		// turns unhealthy the moment its durable write/sync latch trips, so an
+		// orchestrator can stop routing to a daemon whose file_id index can no
+		// longer durably record mutations. An unconfigured store contributes no
+		// probe (the index is inert this phase).
+		if hStore != nil {
+			probes = append(probes, telemetry.ReadyProbe{
+				Name: "handle_store_latch",
+				Check: func() error {
+					if hStore.Latched() {
+						return errors.New("handle store latched")
+					}
+					return nil
+				},
+			})
+		}
 		telemetry.RegisterOpsListenerHealthHandlers(opsListener, probes)
 	}
 
@@ -1195,11 +1303,12 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// Wrap the server so Close also tears down the scope (erase-before-reuse)
 	// and releases the per-session ceilings (NFR-SEC-54).
 	return &teardownServer{
-		Server:  srv,
-		engine:  eng,
-		ceiling: reg,
-		scope:   scope,
-		fsid:    cfg.filesystemID,
+		Server:      srv,
+		engine:      eng,
+		ceiling:     reg,
+		scope:       scope,
+		fsid:        cfg.filesystemID,
+		handleStore: hStore,
 	}, nil
 }
 
@@ -1213,6 +1322,10 @@ type teardownServer struct {
 	ceiling *ceilings.Registry
 	scope   objectstore.ScopeID
 	fsid    string
+	// handleStore is the durable file_id handle store opened in compose, or nil
+	// when --handle-store was empty. Close releases its descriptor; every acked
+	// record is already fsynced, so closing loses no durable data.
+	handleStore *handlestore.DiskStore
 }
 
 // Close shuts the session down, erases the scope (erase-before-reuse), and
@@ -1226,5 +1339,12 @@ func (t *teardownServer) Close() error {
 	defer cancelTeardown()
 	teardownErr := t.engine.TeardownScope(teardownCtx, t.scope)
 	t.ceiling.Release(ceilings.SessionKey(t.fsid))
-	return errors.Join(closeErr, teardownErr)
+	// Release the durable handle-store descriptor (no-op when unconfigured).
+	// Every acked record is already fsynced, so closing loses no durable data;
+	// the error joins the others so it is never silently dropped.
+	var handleStoreErr error
+	if t.handleStore != nil {
+		handleStoreErr = t.handleStore.Close()
+	}
+	return errors.Join(closeErr, teardownErr, handleStoreErr)
 }

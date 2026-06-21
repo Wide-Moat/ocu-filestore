@@ -71,13 +71,14 @@ func KnownOps() []string {
 // BrokerMetrics is the concrete metric set for the ocu-filestore broker daemon.
 // Obtain it via NewBrokerMetrics; do not construct directly.
 type BrokerMetrics struct {
-	reg              *Registry
-	opsTotal         *Counter
-	stageLatency     *Histogram
-	inFlightBytes    *Gauge
-	fdInUse          *Gauge
-	opsTokens        *Gauge
-	auditSinkLatched *Gauge
+	reg                *Registry
+	opsTotal           *Counter
+	stageLatency       *Histogram
+	inFlightBytes      *Gauge
+	fdInUse            *Gauge
+	opsTokens          *Gauge
+	auditSinkLatched   *Gauge
+	handleStoreLatched *Gauge
 }
 
 // NewBrokerMetrics creates and registers the full broker metric set.
@@ -126,16 +127,26 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		LabelSet{},
 	)
 
+	// handle_store_latched is a binary gauge: 0 when the durable file_id handle
+	// store is healthy, 1 after its fail-closed write/sync latch trips (ADR-0023).
+	// The composition layer flips it via SetHandleStoreLatched from the store's
+	// on-latch callback.
+	handleStoreLatched := reg.NewGauge("handle_store_latched",
+		"1 when the durable file_id handle store has permanently latched on a write/sync fault; 0 when healthy.",
+		LabelSet{},
+	)
+
 	reg.NewBuildInfo(version)
 
 	return &BrokerMetrics{
-		reg:              reg,
-		opsTotal:         opsTotal,
-		stageLatency:     stageLatency,
-		inFlightBytes:    inFlightBytes,
-		fdInUse:          fdInUse,
-		opsTokens:        opsTokens,
-		auditSinkLatched: auditSinkLatched,
+		reg:                reg,
+		opsTotal:           opsTotal,
+		stageLatency:       stageLatency,
+		inFlightBytes:      inFlightBytes,
+		fdInUse:            fdInUse,
+		opsTokens:          opsTokens,
+		auditSinkLatched:   auditSinkLatched,
+		handleStoreLatched: handleStoreLatched,
 	}
 }
 
@@ -172,4 +183,11 @@ func (m *BrokerMetrics) SetCeilings(inFlightBytes float64, fdInUse float64, opsT
 // observable; T-14-10). A value of 0 indicates a healthy sink.
 func (m *BrokerMetrics) SetAuditSinkLatched(v float64) {
 	m.auditSinkLatched.Set(Labels{}, v)
+}
+
+// SetHandleStoreLatched sets the handle_store_latched gauge. The composition
+// layer calls this with 1 when the DiskStore on-latch callback fires (ADR-0023).
+// A value of 0 indicates a healthy store.
+func (m *BrokerMetrics) SetHandleStoreLatched(v float64) {
+	m.handleStoreLatched.Set(Labels{}, v)
 }
