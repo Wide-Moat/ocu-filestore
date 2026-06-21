@@ -62,25 +62,6 @@ func opsTotalFor(t *testing.T, m *telemetry.BrokerMetrics, op, outcome, denyClas
 	return 0
 }
 
-// stageObservations returns the stage_latency_seconds histogram observation
-// count for a given stage label (0 if absent).
-func stageObservations(t *testing.T, m *telemetry.BrokerMetrics, stage string) int {
-	t.Helper()
-	var buf bytes.Buffer
-	m.Registry().WriteTo(&buf)
-	want := `stage_latency_seconds_count{stage="` + stage + `"} `
-	for _, line := range strings.Split(buf.String(), "\n") {
-		if strings.HasPrefix(line, want) {
-			v, err := strconv.Atoi(strings.TrimPrefix(line, want))
-			if err != nil {
-				t.Fatalf("stage count not an int in %q: %v", line, err)
-			}
-			return v
-		}
-	}
-	return 0
-}
-
 // TestHandlerInternalDenyRecordsExactlyOneDeny pins southface-01: a STAGE-4
 // handler that refuses INTERNALLY books EXACTLY ONE ops_total entry whose
 // outcome is "deny" — never the spurious allow+deny pair the unconditional
