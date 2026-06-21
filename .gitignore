@@ -22,6 +22,7 @@ testdata/rapid/
 # Coverage profiles — build artifacts produced by `go test -coverprofile`,
 # never source (CI uploads them as run artifacts).
 cover.out
+cover.txt
 *.coverprofile
 __pycache__/
 *.pyc

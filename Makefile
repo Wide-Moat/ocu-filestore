@@ -119,14 +119,15 @@ test-race: ## go test -race ./... — mirrors go.yml race job
 
 cover: ## Collect coverage over ./internal/... and enforce the floor
 	go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/... -timeout 600s -count=1
-	@go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); t=$$3} \
+	@go tool cover -func=cover.out > cover.txt
+	@awk '/^total:/ {gsub(/%/,"",$$3); t=$$3} \
 	  END { \
 	    f=$(COVERAGE_FLOOR)+0; \
 	    if (t+0 < f) { \
 	      printf "FAIL: go internal coverage %.1f%% below floor %.1f%%\n", t, f; exit 1 \
 	    } \
 	    printf "OK:   go internal coverage %.1f%% >= floor %.1f%%\n", t, f \
-	  }'
+	  }' cover.txt
 
 # ── linters ─────────────────────────────────────────────────────────────────
 
