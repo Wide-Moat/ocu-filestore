@@ -106,6 +106,12 @@ type daemon struct {
 	engineRoot string
 	auditSink  string
 	stderr     *bytes.Buffer
+	// waitErr carries the single result of the lone cmd.Wait() reaping the
+	// process. A goroutine started right after cmd.Start() owns the wait and
+	// sends exactly once; the readiness probe reads it to detect a
+	// crash-on-startup deterministically, and stop() drains it so the process
+	// is reaped exactly once (a second Wait() is an error).
+	waitErr chan error
 }
 
 // generateLoopbackCert mints a fresh self-signed loopback certificate + key,
@@ -228,17 +234,30 @@ func startDaemon(t *testing.T) *daemon {
 		engineRoot: engineRoot,
 		auditSink:  auditSink,
 		stderr:     &stderr,
+		waitErr:    make(chan error, 1),
 	}
+	// Own the single cmd.Wait() in a goroutine started immediately after Start.
+	// This is the lone reaper for the process: it makes a crash-on-startup
+	// observable on d.waitErr (the old d.cmd.ProcessState check was dead code —
+	// ProcessState stays nil until Wait() returns, so an early exit could never
+	// be seen and the probe just spun to the deadline). stop() drains the same
+	// channel, so the process is waited on exactly once.
+	go func() { d.waitErr <- cmd.Wait() }()
 	t.Cleanup(func() { d.stop() })
 
 	// Wait for the TLS listener to answer. The daemon binds after admission +
 	// engine construction + scope provision; an unknown-op POST returns a
 	// well-formed 404 once the router is serving (any HTTP answer proves the
-	// listener is up). A daemon that exits before binding fails loudly.
+	// listener is up). A daemon that exits before binding fails loudly and
+	// deterministically the moment the reaper goroutine reports the exit.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if d.cmd.ProcessState != nil && d.cmd.ProcessState.Exited() {
-			t.Fatalf("daemon exited before serving; stderr:\n%s", stderr.String())
+		select {
+		case werr := <-d.waitErr:
+			// Re-send so stop()'s drain still has a value and never blocks.
+			d.waitErr <- werr
+			t.Fatalf("daemon exited before serving (%v); stderr:\n%s", werr, stderr.String())
+		default:
 		}
 		req, _ := http.NewRequest(http.MethodPost, d.baseURL+restBase+"noSuchProbe", strings.NewReader("{}"))
 		req.Header.Set("Content-Type", contentTypeJSON)
@@ -257,7 +276,11 @@ func startDaemon(t *testing.T) *daemon {
 func (d *daemon) stop() {
 	if d.cmd.Process != nil {
 		_ = d.cmd.Process.Kill()
-		_, _ = d.cmd.Process.Wait()
+		// Drain the lone reaper rather than calling Wait() again (a second
+		// Wait() is an error). The buffered send from the goroutine — or the
+		// re-send the probe loop performed on early exit — guarantees a value
+		// is available, so the process is reaped exactly once with no race.
+		<-d.waitErr
 	}
 }
 
