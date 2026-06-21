@@ -120,21 +120,6 @@ func ValidatePath(p string) (string, error) {
 	return clean, nil
 }
 
-// Canonicalize returns the single canonical in-scope form of a caller-supplied
-// path, or ErrInvalidPath. It is the ONE cleaner the wire boundary calls so
-// that authorization, the downloadable tag, the engine read/write, the uuid
-// store, and the audit record all see the SAME bytes for the SAME object
-// (PATH-01, NFR-SEC-73). It applies EXACTLY the rejection rules and the
-// filepath.Clean normalization of ValidatePath — it IS ValidatePath, exported
-// under a name that states the boundary obligation rather than the engine-side
-// validation it shares. A caller that has already cleaned a path through here
-// can pass the result straight to the engine: ValidatePath is idempotent on
-// its own output, so the engine's defense-in-depth re-validation accepts it
-// unchanged.
-func Canonicalize(p string) (string, error) {
-	return ValidatePath(p)
-}
-
 // ScopeRoot holds a containment root for one host-attested filesystem_id
 // scope. Every path passed to its methods is run through ValidatePath
 // first; the underlying os.Root then enforces symlink containment at open
