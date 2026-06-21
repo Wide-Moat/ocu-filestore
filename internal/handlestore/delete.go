@@ -33,6 +33,15 @@ func (s *DiskStore) Delete(ctx context.Context, fileID, attestedScope string) er
 		return ErrStoreUnavailable
 	}
 
+	// Empty attested scope authorizes nothing: reject BEFORE the map lookup so
+	// an empty scope can never tombstone a record — not even one persisted
+	// under an empty Scope (defense-in-depth, keystone-wave followup-2; do not
+	// rely only on the credscope sibling). ErrNotFound matches the
+	// absent/cross-scope case (anti-enumeration).
+	if attestedScope == "" {
+		return ErrNotFound
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failed || s.closed {

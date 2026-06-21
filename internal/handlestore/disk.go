@@ -386,6 +386,14 @@ func (s *DiskStore) Put(ctx context.Context, in PutInput) (Record, error) {
 // host-attested, credential-bound scope the dispatch spine derives per request);
 // the caller passes that value verbatim and never a request-supplied field.
 func (s *DiskStore) Get(ctx context.Context, fileID, attestedScope string) (Record, error) {
+	// Empty attested scope authorizes nothing: reject BEFORE the map lookup so
+	// an empty scope can never resolve a record — not even one persisted under
+	// an empty Scope (defense-in-depth, keystone-wave followup-2; do not rely
+	// only on the credscope sibling). The empty zero record and ErrNotFound are
+	// returned identically to the absent/cross-scope case (anti-enumeration).
+	if attestedScope == "" {
+		return Record{}, ErrNotFound
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.recs[fileID]
@@ -400,26 +408,5 @@ func (s *DiskStore) Get(ctx context.Context, fileID, attestedScope string) (Reco
 	return rec, nil
 }
 
-// List returns the records bound to in.Scope from the in-memory map. It is
-// served from the map and works on a latched store (reads are never
-// collateral-denied). The CURSOR PAGINATION surface (ListInput.Cursor /
-// ListInput.Limit, ListPage.NextCursor) is the LATER List wave (TASK 6): this
-// core implementation returns every scope-bound record in a single page with an
-// empty NextCursor, so the Store interface is satisfied and scope binding is
-// already enforced; the wave layers ordering + cursoring on top without
-// changing the scope filter.
-//
-// Like Get, List is scope-bound: only records whose Scope byte-matches
-// in.Scope are returned. A foreign scope yields an empty page — never another
-// scope's records.
-func (s *DiskStore) List(ctx context.Context, in ListInput) (ListPage, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []Record
-	for _, rec := range s.recs {
-		if rec.Scope == in.Scope {
-			out = append(out, rec)
-		}
-	}
-	return ListPage{Records: out}, nil
-}
+// List is implemented in list.go — the cursor-paged, stable-ordered,
+// scope-bound page walk (TASK 6).

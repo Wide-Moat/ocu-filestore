@@ -35,8 +35,10 @@ func TestPropGetResolvesIffScopeEqual(t *testing.T) {
 		// indistinguishability reference.
 		_, absentErr := s.Get(context.Background(), "never-minted-id", attestedScope)
 
-		if recordScope == attestedScope {
-			// Byte-equal scope -> resolves to the exact record.
+		if recordScope == attestedScope && attestedScope != "" {
+			// Byte-equal NON-EMPTY scope -> resolves to the exact record. An
+			// empty attested scope authorizes nothing and falls through to the
+			// ErrNotFound arm even when byte-equal (followup-2 defense-in-depth).
 			if getErr != nil {
 				rt.Fatalf("Get under byte-equal scope %q = %v, want the record", attestedScope, getErr)
 			}
