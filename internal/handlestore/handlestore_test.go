@@ -104,30 +104,40 @@ func TestNoExportedErrorMapsToScopeMismatch(t *testing.T) {
 func exportedErrorVarNames(t *testing.T) []string {
 	t.Helper()
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		// Skip _test.go files: the guard examines production sentinels only.
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse package dir: %v", err)
+		t.Fatalf("read package dir: %v", err)
 	}
 	var names []string
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				gd, ok := decl.(*ast.GenDecl)
-				if !ok || gd.Tok != token.VAR {
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		// Skip _test.go files: the guard examines production sentinels only.
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
 					continue
 				}
-				for _, spec := range gd.Specs {
-					vs, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for _, ident := range vs.Names {
-						if strings.HasPrefix(ident.Name, "Err") && ident.IsExported() {
-							names = append(names, ident.Name)
-						}
+				for _, ident := range vs.Names {
+					if strings.HasPrefix(ident.Name, "Err") && ident.IsExported() {
+						names = append(names, ident.Name)
 					}
 				}
 			}
