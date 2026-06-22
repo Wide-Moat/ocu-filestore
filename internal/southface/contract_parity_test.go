@@ -21,10 +21,18 @@ type fileOpsSchema struct {
 			Enum []string `json:"enum"`
 		} `json:"OperationName"`
 		DenyReason struct {
-			Properties struct {
-				XDenyReason struct {
-					Enum []string `json:"enum"`
-				} `json:"x_deny_reason"`
+			Type                 string   `json:"type"`
+			AdditionalProperties bool     `json:"additionalProperties"`
+			Required             []string `json:"required"`
+			Properties           struct {
+				ReasonCode struct {
+					Type    string `json:"type"`
+					Pattern string `json:"pattern"`
+				} `json:"reason_code"`
+				Message struct {
+					Type      string `json:"type"`
+					MaxLength int    `json:"maxLength"`
+				} `json:"message"`
 			} `json:"properties"`
 		} `json:"DenyReason"`
 		Intent struct {
@@ -59,6 +67,10 @@ func TestOpEnumMatchesContract(t *testing.T) {
 		OpListFiles, OpCopyFile, OpMoveFile, OpRemoveFile,
 		OpFileUpload, OpFileDownload, OpImportFiles, OpImportZip,
 		OpMigrateFilesystem, OpRemoveFilesystem,
+		// Frozen enum names whose bodies are x-ocu-tbd and which have no
+		// handler yet: they exist as Op constants so the set covers the WHOLE
+		// frozen OperationName enum, not only the routable subset (knownOps).
+		OpFileDelete, OpReadFileMetadata, OpReleaseQuarantinedFiles,
 	}
 
 	contractSet := make(map[string]bool, len(contract.Defs.OperationName.Enum))
@@ -86,30 +98,53 @@ func TestOpEnumMatchesContract(t *testing.T) {
 	}
 }
 
-// TestDenyVocabularyPinned asserts the deny vocabulary this package will map
-// sentinels onto matches the contract's x_deny_reason enum exactly. The
-// vocabulary is an OCU default pending NFR-SEC-51 sign-off; if it moves, it
-// moves in the architecture repo first and this test catches the drift.
+// TestDenyVocabularyPinned pins the FROZEN parts of the contract's DenyReason
+// (the storage-surface BoundedReason): the reason_code field is required, its
+// code pattern is frozen, and the {reason_code, message} envelope shape is
+// frozen. It deliberately does NOT pin a fixed N-member code list: the contract
+// marks the reason_code vocabulary as an OCU-default ADDITIVE set (an engine may
+// add a code), so what is invariant is the PATTERN and the ENVELOPE, not the
+// enumeration. If either the pattern or the envelope shape moves, it moves in
+// the architecture repo first and this test catches the drift.
 func TestDenyVocabularyPinned(t *testing.T) {
 	contract := loadContract(t)
+	dr := contract.Defs.DenyReason
 
-	want := []string{
-		"scope_mismatch",
-		"intent_denied",
-		"not_downloadable",
-		"lease_expired",
-		"size_exceeded",
-		"not_found",
-	}
-
-	got := contract.Defs.DenyReason.Properties.XDenyReason.Enum
-	if len(got) != len(want) {
-		t.Fatalf("deny vocabulary size: got %d (%v), want %d (%v)", len(got), got, len(want), want)
-	}
-	for i, reason := range want {
-		if got[i] != reason {
-			t.Errorf("deny vocabulary[%d]: got %q, want %q", i, got[i], reason)
+	// (1) reason_code is REQUIRED on the BoundedReason/DenyReason object.
+	requiredReasonCode := false
+	for _, r := range dr.Required {
+		if r == "reason_code" {
+			requiredReasonCode = true
 		}
+	}
+	if !requiredReasonCode {
+		t.Errorf("DenyReason.required = %v, want it to include %q", dr.Required, "reason_code")
+	}
+
+	// (2) the reason_code pattern is exactly the frozen code shape — an
+	// uppercase-anchored token. The vocabulary is additive; this pattern is not.
+	const frozenPattern = `^[A-Z][A-Z0-9_]{1,63}$`
+	if got := dr.Properties.ReasonCode.Pattern; got != frozenPattern {
+		t.Errorf("reason_code pattern = %q, want frozen %q", got, frozenPattern)
+	}
+	if got := dr.Properties.ReasonCode.Type; got != "string" {
+		t.Errorf("reason_code type = %q, want %q", got, "string")
+	}
+
+	// (3) the BoundedReason envelope shape is frozen: an object that admits no
+	// extra properties, carrying a string reason_code and a bounded string
+	// message (maxLength 256 — the shared exec/control BoundedReason bound).
+	if dr.Type != "object" {
+		t.Errorf("DenyReason type = %q, want %q", dr.Type, "object")
+	}
+	if dr.AdditionalProperties {
+		t.Errorf("DenyReason additionalProperties = true, want false (envelope is closed)")
+	}
+	if got := dr.Properties.Message.Type; got != "string" {
+		t.Errorf("message type = %q, want %q", got, "string")
+	}
+	if got := dr.Properties.Message.MaxLength; got != 256 {
+		t.Errorf("message maxLength = %d, want frozen 256", got)
 	}
 }
 
