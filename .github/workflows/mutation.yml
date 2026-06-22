@@ -62,10 +62,18 @@ jobs:
         run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
       - name: gremlins unleash (pure-logic packages — advisory)
         # gremlins unleash takes a single path argument (the files to mutate),
-        # so the three scoped packages are run in a loop. The coverpkg scope is
-        # read from .gremlins.yaml at the repo root. The job is advisory
+        # so the scoped packages are run in a loop. The coverpkg scope is read
+        # from .gremlins.yaml at the repo root. The job is advisory
         # (continue-on-error above), so this step emits the per-package
         # efficacy/coverage summary and never fails the run.
+        #
+        # The two highest-stakes containment guards live in rig-heavy packages,
+        # so they are mutated with --exclude-files trimming the package down to
+        # the single guard source file (the rig source — engine_s3.go, the
+        # streaming/socket handlers — is excluded; it needs the live MinIO rig).
+        # RE2 has no negative lookahead, so the exclusion is a positive
+        # enumeration of every other source file, path-anchored on the package
+        # dir so the directory name itself is not matched.
         run: |
           set -u
           for pkg in ./internal/authz/ ./internal/denyclass/ ./internal/ceilings/; do
@@ -73,3 +81,24 @@ jobs:
             gremlins unleash "$pkg" || echo "::warning::gremlins reported a non-zero exit for $pkg (advisory)"
             echo "::endgroup::"
           done
+          # pathresolver.go guard (objectstore): exclude the S3/local engine,
+          # credentials, and package-root source so only pathresolver.go is
+          # mutated. gremlins matches this package's exclude regexp against the
+          # file BASENAME, so each token is anchored with (^|/).
+          echo "::group::gremlins unleash internal/objectstore/pathresolver.go"
+          gremlins unleash \
+            --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go' \
+            ./internal/objectstore/ \
+            || echo "::warning::gremlins reported a non-zero exit for pathresolver.go (advisory)"
+          echo "::endgroup::"
+          # credscope.go guard (southface): exclude every other source file in
+          # the package (all rig / streaming / socket handlers). gremlins matches
+          # this package's exclude regexp against the package-relative PATH, so
+          # each token is prefixed with the package dir (southface/...). The
+          # southface/ prefix also disambiguates scope.go from credscope.go.
+          echo "::group::gremlins unleash internal/southface/credscope.go"
+          SF_EXC=$(ls internal/southface/*.go | grep -v _test | grep -v 'credscope.go' \
+            | sed 's#internal/##; s/\./\\./g' | paste -sd'|' -)
+          gremlins unleash --exclude-files "$SF_EXC" ./internal/southface/ \
+            || echo "::warning::gremlins reported a non-zero exit for credscope.go (advisory)"
+          echo "::endgroup::"

@@ -211,6 +211,16 @@ mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings �
 	  echo "--- gremlins unleash $$pkg ---"; \
 	  gremlins unleash "$$pkg" || echo "gremlins reported a non-zero exit for $$pkg (advisory)"; \
 	done
+	@echo "--- gremlins unleash internal/objectstore/pathresolver.go (guard) ---"
+	@gremlins unleash \
+	  --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go' \
+	  ./internal/objectstore/ \
+	  || echo "gremlins reported a non-zero exit for pathresolver.go (advisory)"
+	@echo "--- gremlins unleash internal/southface/credscope.go (guard) ---"
+	@SF_EXC=$$(ls internal/southface/*.go | grep -v _test | grep -v 'credscope.go' \
+	  | sed 's#internal/##; s/\./\\./g' | paste -sd'|' -); \
+	gremlins unleash --exclude-files "$$SF_EXC" ./internal/southface/ \
+	  || echo "gremlins reported a non-zero exit for credscope.go (advisory)"
 
 # ── checks ───────────────────────────────────────────────────────────────────
 

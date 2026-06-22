@@ -6,12 +6,17 @@
 # so the scope lives here in one place instead of being duplicated across the
 # command lines.
 #
-# Scope: the pure-logic leaf packages where mutation testing has the highest
+# Scope: the pure-logic guard sites where mutation testing has the highest
 # signal and the suite is fast — the authorization resolver, the deny-class
-# vocabulary, and the per-session ceilings. The S3 / socket / streaming
-# packages are deliberately excluded: they need the live MinIO rig and the
+# vocabulary, the per-session ceilings, AND the two highest-stakes containment
+# guards: the credential-scope derivation (credscope.go, "never a signing key")
+# and the path-containment resolver (pathresolver.go, "never a path outside the
+# attested prefix"). The S3 / socket / streaming source FILES in southface and
+# objectstore are NOT mutated (the loop in mutation.yml / the Makefile mutates
+# only the guard source paths) because they need the live MinIO rig and the
 # peer-credential socket, which would make a mutation run enormous for little
-# added signal over their own conformance and e2e suites.
+# added signal over their own conformance and e2e suites — coverpkg merely
+# widens coverage collection so the two guard files are attributed.
 #
 # coverpkg restricts coverage collection to those packages; the path argument
 # passed on the command line restricts which source files are mutated. Keep
@@ -19,12 +24,19 @@
 #
 # Schema reference: https://github.com/go-gremlins/gremlins
 unleash:
-  coverpkg: ./internal/authz/...,./internal/denyclass/...,./internal/ceilings/...
-  # Thresholds are 0 (advisory) until a stable baseline is measured on the CI
-  # toolchain. The ratchet plan: once gremlins reports a real efficacy figure
-  # on the pinned Go toolchain, set threshold.efficacy / threshold.mutant-coverage
-  # to floor(baseline) and drop continue-on-error in the workflow so a drop in
-  # assertion strength fails the gate.
+  coverpkg: ./internal/authz/...,./internal/denyclass/...,./internal/ceilings/...,./internal/southface/...,./internal/objectstore/...
+  # Thresholds STAY 0 (advisory) — NOT a green-washed ratchet. On the pinned Go
+  # 1.26 toolchain gremlins v0.6.0's coverage-to-mutant position matching is
+  # broken: a measured run reports EVERY mutant as "Not covered" (0 killed /
+  # 0 lived) across ALL in-scope packages — authz, ceilings, AND the newly
+  # scoped pathresolver — despite their mandatory property-tests. With no real
+  # efficacy figure, any non-zero threshold would be meaningless (it would pass
+  # or fail on a phantom number), so arming the gate would be a FALSE ratchet.
+  # An honest advisory beats a green-looking lie. Ratchet plan unchanged: when
+  # gremlins (a fixed release, or a different mutation tool) reports a stable,
+  # correct efficacy figure on the pinned toolchain, set threshold.efficacy /
+  # threshold.mutant-coverage to floor(baseline) and drop continue-on-error in
+  # mutation.yml. Tracked: docs/ROADMAP.md "mutation gate arm" follow-up.
   threshold:
     efficacy: 0
     mutant-coverage: 0
