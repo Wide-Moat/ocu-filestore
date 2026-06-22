@@ -32,8 +32,11 @@ through an `os.Root`/`openat` containment root, so no resolution — symlink or
 property-tests.
 
 - Invariant 1 (NFR-SEC-25)
-- Enforced: `internal/objectstore/pathresolver.go:Canonicalize` (STAGE-1b) into
-  `ScopeRoot` over `os.OpenRoot`.
+- Enforced: `internal/objectstore/pathresolver.go:ValidatePath` (STAGE-1b
+  canonicalization + `filepath.IsLocal` containment) opened through
+  `internal/objectstore/pathresolver.go:OpenScopeRoot`, whose `os.OpenRoot`
+  resolves each path component with `O_NOFOLLOW` from the scope-root fd — the
+  symlink-containment seam.
 
 ## 3. Never audit/ack without fail-closed atomicity
 
