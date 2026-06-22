@@ -123,7 +123,6 @@ func TestListCursorRoundTripsAndPages(t *testing.T) {
 			if page.NextCursor != "" {
 				t.Fatalf("HasMore=false but NextCursor=%q", page.NextCursor)
 			}
-			cursor = ""
 			break
 		}
 		if page.NextCursor == "" {

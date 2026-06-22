@@ -159,7 +159,7 @@ func NewDiskStore(path string) (*DiskStore, error) {
 		}
 	}
 
-	return &DiskStore{f: f, w: f, recs: recs, now: func() time.Time { return time.Now() }}, nil
+	return &DiskStore{f: f, w: f, recs: recs, now: time.Now}, nil
 }
 
 // syncDir fsyncs the directory at dir so a new entry inside it is durable.
