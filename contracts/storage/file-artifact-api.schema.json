@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.open-computer-use.dev/storage/file-artifact-api.schema.json",
-  "$comment": "SPDX-License-Identifier: FSL-1.1-Apache-2.0 | Copyright (c) 2025 Open Computer Use Contributors | File-artifact data plane, north face (Data-plane client -> Storage broker). HTTP+JSON REST plus the embeddable SPA, served on a dedicated file/UI ingress, NOT the MCP-tool-call listener. Distinct from the south face (file-ops.schema.json, sandbox->broker RPC). STATUS: TBD. Operation NAMES, the route shape, the three-axis authorization, the embed-token verify contract, the cookie/CSRF/CSP response envelope, and the body/archive/classification ceilings are sourced (PoC route shape) or NFR-derived (x-ocu-design / x-ocu-default); per-operation request/response BODIES are not pinned by any field-level source and are left unspecified. JSON Schema 2020-12 (json-schema.org). NFR-SEC-49, NFR-SEC-73, NFR-SEC-78, NFR-SEC-79, NFR-SEC-80, NFR-SEC-81, NFR-SEC-82, NFR-SEC-83, NFR-SEC-84.",
-  "title": "File-artifact data plane (north face, TBD)",
-  "description": "The data-plane client HTTP API and embeddable SPA fronted by the Storage broker. Operation set and the auth/response envelope are fixed; per-operation message bodies are TBD until a field-level source pins them. Do not invent bodies, opaque object ids, list pagination, resumable upload, or share-by-link capability URLs — none are sourced for this surface. Fill each operation only when sourced.",
+  "$comment": "SPDX-License-Identifier: FSL-1.1-Apache-2.0 | Copyright (c) 2025 Open Computer Use Contributors | File-artifact data plane, Web UI API (data-plane client -> Web UI service). HTTP+JSON REST plus the embeddable SPA, served on a dedicated file/UI ingress, NOT the MCP-tool-call listener. The Web UI service is its own deployable inside the Storage zone, alongside the object-store service (file-ops.schema.json) and the in-guest mount client (mount-plane). STATUS: SUPERSEDED by ADR-0023 (Files-API north contract) — the public north op-shape is now the Files-API (/v1/files); the embed-token verify, cookie/CSRF/CSP envelope, and three-axis authorization survive as the auth/transport wrapper. See docs/architecture/adr/0023-files-api-north-contract.md. Operation NAMES, the route shape, the three-axis authorization, the embed-token verify contract, the cookie/CSRF/CSP response envelope, and the body/archive/classification ceilings are sourced (PoC route shape) or NFR-derived (x-ocu-design / x-ocu-default); per-operation request/response BODIES are not pinned by any field-level source and are left unspecified. JSON Schema 2020-12 (json-schema.org). NFR-SEC-49, NFR-SEC-73, NFR-SEC-78, NFR-SEC-79, NFR-SEC-80, NFR-SEC-81, NFR-SEC-82, NFR-SEC-83, NFR-SEC-84.",
+  "title": "File-artifact data plane (Web UI API, TBD)",
+  "description": "PoC north op-shape superseded by ADR-0023; the public north contract is now the Files-API (/v1/files) with an opaque, scope-bound, server-minted file_id and opaque-id cursor pagination. The auth/transport wrapper (embed-token verify, cookie/CSRF/CSP envelope, three-axis authorization) survives. Do not extend this PoC op-shape; new work lands on the Files-API surface per ADR-0023. Resumable upload and share-by-link capability URLs remain un-sourced for either surface.",
 
   "$defs": {
     "SchemaVersion": {
@@ -14,7 +14,7 @@
     },
 
     "FilesystemId": {
-      "description": "Per-session logical scope (the isolation unit, not a crypto boundary), canonical across file-ops.schema.json and mount-config.schema.json. The PoC path parameter chat_id maps to this canonical scope id; the broker resolves access against it at accept (NFR-SEC-49).",
+      "description": "Per-session logical scope (the isolation unit, not a crypto boundary), canonical across file-ops.schema.json and mount-config.schema.json. The PoC path parameter chat_id maps to this canonical scope id; the Web UI service resolves access against it at accept (NFR-SEC-49).",
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
@@ -22,20 +22,20 @@
     },
 
     "RelativePath": {
-      "description": "Object path relative to the filesystem scope; may include subdirectories. The broker rejects a resolved destination outside the named scope (traversal; NFR-SEC-80). Sourced from the PoC upload/list/download route shape.",
+      "description": "Object path relative to the filesystem scope; may include subdirectories. The Web UI service rejects a resolved destination outside the named scope (traversal; NFR-SEC-80). Sourced from the PoC upload/list/download route shape.",
       "type": "string",
       "minLength": 1,
       "examples": ["report.pdf", "out/figure-1.png"]
     },
 
     "Intent": {
-      "description": "Storage intent axis (NFR-SEC-49). On intent=preview the broker enforces read-only and treats the object as non-downloadable regardless of stored tag.",
+      "description": "Storage intent axis (NFR-SEC-49). On intent=preview the Web UI service enforces read-only and treats the object as non-downloadable regardless of stored tag.",
       "type": "string",
       "enum": ["read", "write", "preview"]
     },
 
     "AuthorizationMetadata": {
-      "description": "Three-axis authorization resolved broker-side on every north-face operation: scope (filesystem_id) + intent + downloadable. Same axes as the south face; downloadable is resolved at READ on both faces (NFR-SEC-73). No backend credential and no upstream secret crosses to the caller or the browser (NFR-SEC-25, NFR-SEC-82).",
+      "description": "Three-axis authorization resolved by the Web UI service on every Web UI operation: scope (filesystem_id) + intent + downloadable. Same axes as the mount-plane; downloadable is resolved at READ on both planes (NFR-SEC-73). No backend credential and no upstream secret crosses to the caller or the browser (NFR-SEC-25, NFR-SEC-82).",
       "type": "object",
       "additionalProperties": false,
       "required": ["filesystem_id", "intent", "downloadable"],
@@ -43,14 +43,14 @@
         "filesystem_id": { "$ref": "#/$defs/FilesystemId" },
         "intent": { "$ref": "#/$defs/Intent" },
         "downloadable": {
-          "description": "Whether the object's bytes may leave the perimeter, resolved broker-side at read (NFR-SEC-73). A downloadable=false object is previewable in-session but no egress-eligible artifact is minted; the byte path to the browser is refused.",
+          "description": "Whether the object's bytes may leave the perimeter, resolved by the Web UI service at read (NFR-SEC-73). A downloadable=false object is previewable in-session but no egress-eligible artifact is minted; the byte path to the browser is refused.",
           "type": "boolean"
         }
       }
     },
 
     "OperationName": {
-      "description": "The north-face operation set, by name. Each maps to a PoC route shape, except `delete`, which exists by NFR (NFR-SEC-79 names upload/list/download/delete in the north-face activity set) but has no PoC route and no sourced wire body. Names/route-shapes are sourced; per-operation request/response bodies are TBD (see x-ocu-tbd-bodies).",
+      "description": "The Web UI operation set, by name. Each maps to a PoC route shape, except `delete`, which exists by NFR (NFR-SEC-79 names upload/list/download/delete in the Web UI activity set) but has no PoC route and no sourced wire body. Names/route-shapes are sourced; per-operation request/response bodies are TBD (see x-ocu-tbd-bodies).",
       "type": "string",
       "enum": [
         "upload",
@@ -64,7 +64,7 @@
     },
 
     "FileEntry": {
-      "description": "List/metadata entry. Field names are sourced from the PoC list/outputs route shape; the union of the upload-list and output-list shapes. Object handle is the {filesystem_id, path} pair (the PoC addresses by chat-scope + relative path; it carries NO opaque object id, so none is modelled — inventing one is a P4-E3 traversal risk).",
+      "description": "List/metadata entry, superseded shape. The Files-API FileObject (ADR-0023) replaces FileEntry on the north surface: it carries an opaque, scope-bound, server-minted file_id whose traversal/enumeration risk is held by the scope-binding keystone (the resolver takes scope from the host-attested channel; a foreign or unknown file_id resolves to not_found, never forbidden), not by refusing an id. FileEntry stays the superseded PoC shape; field names are sourced from the PoC list/outputs route shape (the union of the upload-list and output-list shapes), addressed by {filesystem_id, path}. New work uses the FileObject per ADR-0023.",
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "path", "size", "modified"],
@@ -89,7 +89,7 @@
           "type": "string"
         },
         "mime": {
-          "description": "Content type. SOURCED (PoC outputs classify_file / download mimetypes.guess_type). On ingest the broker-resolved type (magic-byte + declared) is authoritative (NFR-SEC-81); a declared/sniffed mismatch is recorded.",
+          "description": "Content type. SOURCED (PoC outputs classify_file / download mimetypes.guess_type). On ingest the Web-UI-resolved type (magic-byte + declared) is authoritative (NFR-SEC-81); a declared/sniffed mismatch is recorded.",
           "type": "string"
         },
         "checksum_md5": {
@@ -100,7 +100,7 @@
     },
 
     "EmbedTokenVerify": {
-      "description": "Embed-token verify contract (NFR-SEC-82). The peer backend MINTS the token; the north face VERIFIES signature + expiry before setting any session state. No OCU upstream secret enters the browser. The exp ceiling is sourced to the NFR; the JWT/OIDC claim carriers are conventional (SEC-82 does not enumerate them); the binding claim is the open replay-binding question (#217).",
+      "description": "Embed-token verify contract (NFR-SEC-82). The peer backend MINTS the token; the Web UI service VERIFIES signature + expiry before setting any session state. No OCU upstream secret enters the browser. The exp ceiling is sourced to the NFR; the JWT/OIDC claim carriers are conventional (SEC-82 does not enumerate them); the binding claim is the open replay-binding question (#217).",
       "type": "object",
       "additionalProperties": true,
       "required": ["exp"],
@@ -121,7 +121,7 @@
           "x-ocu-design": "JWT/OIDC convention; not enumerated by SEC-82."
         },
         "aud": {
-          "description": "Audience naming this north-face surface. The verifier rejects a token whose audience does not name this surface (NFR-SEC-09 audience-validation, applied here). OCU-DESIGN-conventional carrier.",
+          "description": "Audience naming this Web UI surface. The verifier rejects a token whose audience does not name this surface (NFR-SEC-09 audience-validation, applied here). OCU-DESIGN-conventional carrier.",
           "type": "string",
           "x-ocu-design": "audience-validation property is NFR-SEC-09; the aud claim name is JWT/OIDC convention."
         },
@@ -139,7 +139,7 @@
     },
 
     "SessionResponseEnvelope": {
-      "description": "First-party session + framing controls the north face sets/requires on UI and data responses. Cookie attributes and CSP header values are SOURCED verbatim to NFR-SEC-83/84; the CSRF token wire name/transport is TBD (the NFR pins the property, not the name).",
+      "description": "First-party session + framing controls the Web UI service sets/requires on UI and data responses. Cookie attributes and CSP header values are SOURCED verbatim to NFR-SEC-83/84; the CSRF token wire name/transport is TBD (the NFR pins the property, not the name).",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -190,13 +190,13 @@
     },
 
     "ContentDisposition": {
-      "description": "Download disposition. SOURCED (PoC download_file): ?download=1 forces attachment (octet-stream); the default serves inline by the real MIME. This IS the downloadable-disposition wire mechanism, coupled to the broker-resolved downloadable axis (NFR-SEC-73): the broker refuses the byte path for a non-downloadable object regardless of this flag.",
+      "description": "Download disposition. SOURCED (PoC download_file): ?download=1 forces attachment (octet-stream); the default serves inline by the real MIME. This IS the downloadable-disposition wire mechanism, coupled to the Web-UI-resolved downloadable axis (NFR-SEC-73): the Web UI service refuses the byte path for a non-downloadable object regardless of this flag.",
       "type": "string",
       "enum": ["attachment", "inline"]
     },
 
     "InboundBound": {
-      "description": "North-face inbound byte-path bound (NFR-SEC-78). The gateway rejects an over-ceiling body before staging, never partially buffered; per-validated-caller rate limits apply distinctly from the per-sandbox quota (NFR-SEC-46) and the per-caller connection ceiling (NFR-SEC-53). Values are NFR-derived defaults, not frozen.",
+      "description": "Web UI inbound byte-path bound (NFR-SEC-78). The gateway rejects an over-ceiling body before staging, never partially buffered; per-validated-caller rate limits apply distinctly from the per-sandbox quota (NFR-SEC-46) and the per-caller connection ceiling (NFR-SEC-53). Values are NFR-derived defaults, not frozen.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -253,7 +253,7 @@
       "required": ["resolved_type", "declared_mismatch"],
       "properties": {
         "resolved_type": {
-          "description": "Broker-resolved content type (magic-byte + declared). Authoritative on metadata before any mount visibility.",
+          "description": "Web-UI-resolved content type (magic-byte + declared). Authoritative on metadata before any mount visibility.",
           "type": "string"
         },
         "declared_mismatch": {
@@ -265,7 +265,7 @@
     },
 
     "FileActivityEvent": {
-      "description": "North-face file-activity audit event (NFR-SEC-79), gateway-authored, hash-chained into the NFR-SEC-03 pipeline, fail-closed (operation denied if the audit write fails), under host-attested identity (NFR-SEC-09). OCSF File System Activity (class_uid 1001, category_uid 1). Mandatory fields enumerated verbatim by NFR-SEC-79. The activity_id assignment is OCU-DESIGN (OCSF has no native upload/download id; Create/Read/Delete/Open are the mapped ids). This is direct-fetch via embed-token + cookie, NOT share-by-link; no capability_id / two-event chain belongs here.",
+      "description": "Web UI file-activity audit event (NFR-SEC-79), gateway-authored, hash-chained into the NFR-SEC-03 pipeline, fail-closed (operation denied if the audit write fails), under host-attested identity (NFR-SEC-09). OCSF File System Activity (class_uid 1001, category_uid 1). Mandatory fields enumerated verbatim by NFR-SEC-79. The activity_id assignment is OCU-DESIGN (OCSF has no native upload/download id; Create/Read/Delete/Open are the mapped ids). This is direct-fetch via embed-token + cookie, NOT share-by-link; no capability_id / two-event chain belongs here.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -298,7 +298,7 @@
           "x-ocu-design": "activity_id mapping for upload(1)/list(2)/download(2)/delete(4)/preview(14) (NFR-SEC-79); OCSF has no native upload/download id, list maps to Read(2)."
         },
         "actor": {
-          "description": "Authenticated caller resolved gateway-side (host-attested, NFR-SEC-09). The data-plane client is never the authoritative author of its own audit event (NFR-SEC-47 sibling for the north face).",
+          "description": "Authenticated caller resolved gateway-side (host-attested, NFR-SEC-09). The data-plane client is never the authoritative author of its own audit event (NFR-SEC-47 sibling for the Web UI).",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -308,7 +308,7 @@
         },
         "filesystem_id": { "$ref": "#/$defs/FilesystemId" },
         "object_handle": {
-          "description": "The {filesystem_id, path} handle (NOT an opaque object id — none exists in this surface).",
+          "description": "The resolved {filesystem_id, path} object reference logged on the audit event. The public north face addresses by the opaque, scope-bound file_id (ADR-0023); the event records the resolved object reference, not that public file_id.",
           "$ref": "#/$defs/RelativePath"
         },
         "byte_count": {
@@ -318,7 +318,7 @@
         },
         "intent": { "$ref": "#/$defs/Intent" },
         "downloadable": {
-          "description": "Downloadable disposition resolved broker-side at read (NFR-SEC-73).",
+          "description": "Downloadable disposition resolved by the Web UI service at read (NFR-SEC-73).",
           "type": "boolean"
         },
         "outcome": {
@@ -341,7 +341,7 @@
     },
 
     "DenyReason": {
-      "description": "Structured deny vocabulary for the north face, carrying no internal topology (NFR-SEC-51, NFR-SEC-17). The south face (file-ops.schema.json) carries its own; the north-face-specific codes derive from NFR-SEC-78/80/81/82/84 and the three-axis authz. The PoC is open-no-auth and pins NO deny vocabulary, so this set is an OCU default pending NFR-SEC-51 sign-off, not frozen.",
+      "description": "Structured deny vocabulary for the Web UI, carrying no internal topology (NFR-SEC-51, NFR-SEC-17). The mount-plane (file-ops.schema.json) carries its own; the Web-UI-specific codes derive from NFR-SEC-78/80/81/82/84 and the three-axis authz. The PoC is open-no-auth and pins NO deny vocabulary, so this set is an OCU default pending NFR-SEC-51 sign-off, not frozen.",
       "type": "string",
       "x-ocu-default": "default-deny vocabulary, pending NFR-SEC-51 sign-off; not a frozen const set.",
       "enum": [
@@ -363,15 +363,15 @@
 
   "x-ocu-tbd-bodies": {
     "status": "tbd",
-    "reason": "No field-level source pins the per-operation request/response message bodies. The operation set, the route shape (chat-scope + relative path; ?download=1 -> attachment vs inline-by-MIME), the sourced list/metadata fields (FileEntry), the embed-token verify contract, the cookie/CSRF/CSP response envelope, and the body/archive/classification ceilings are known; full request/response bodies are not. Fill each entry below only when a field-level source exists; do not invent bodies, an opaque object id, list pagination, resumable/chunked upload, or share-by-link capability URLs — none are sourced for this surface.",
+    "reason": "Superseded by ADR-0023: the public north contract is now the Files-API (/v1/files) with an opaque, scope-bound, server-minted file_id and opaque-id cursor pagination; new work lands there, not on this PoC op-shape. The PoC route shape (chat-scope + relative path; ?download=1 -> attachment vs inline-by-MIME), the sourced list/metadata fields (FileEntry), the embed-token verify contract, the cookie/CSRF/CSP response envelope, and the body/archive/classification ceilings are the surviving auth/transport wrapper. Resumable/chunked upload and share-by-link capability URLs remain un-sourced for either surface.",
     "operations": {
       "upload": "POST to a {filesystem_id, path} target; multipart form field `file` (SOURCED). Response carries status + filename + size + md5 (SOURCED PoC shape). Bound by InboundBound (NFR-SEC-78); archive bodies validated pre-extraction (NFR-SEC-80); body classified on ingest (NFR-SEC-81). Full envelope TBD.",
       "listFiles": "GET list under a filesystem scope; returns FileEntry[] + total (SOURCED union of PoC uploads-list and outputs-list shapes). The unification of the two PoC route families into one operation is OCU-DESIGN. NO pagination cursor (PoC returns the full list; do not adopt one without a source). Full envelope TBD.",
       "getManifest": "GET checksum map under a filesystem scope; returns {relative-path: md5} (SOURCED PoC manifest). Whether this folds into listFiles metadata is a design call not yet made (TBD).",
-      "download": "GET a {filesystem_id, path} object; ?download=1 -> Content-Disposition: attachment (octet-stream), else inline by real MIME (SOURCED). Broker resolves downloadable at read (NFR-SEC-73); a non-downloadable object's byte path to the browser is refused. Full envelope TBD.",
+      "download": "GET a {filesystem_id, path} object; ?download=1 -> Content-Disposition: attachment (octet-stream), else inline by real MIME (SOURCED). The Web UI service resolves downloadable at read (NFR-SEC-73); a non-downloadable object's byte path to the browser is refused. Full envelope TBD.",
       "downloadArchive": "GET the outputs of a filesystem scope as a zip; Content-Disposition: attachment (SOURCED PoC). Full envelope TBD.",
       "previewRender": "GET the embeddable SPA for a filesystem scope (SOURCED PoC SPA route). Render/parser isolation model is OCU-DESIGN with mechanism TBD (#218). Carries the SessionResponseEnvelope framing headers (NFR-SEC-83). Full envelope TBD.",
-      "delete": "NO PoC route. The operation exists by NFR (NFR-SEC-79 names delete in the north-face activity set), but its request/response wire body is TBD — no field-level source pins it. Needs its own tracking issue before the body is filled. Do not invent it."
+      "delete": "ADR-0023 authorizes the DELETE /v1/files/{file_id} route on the Files-API north surface (the operation NFR-SEC-79 names in the Web UI activity set); it unlinks the handle so the file_id stops resolving and makes no byte-erasure guarantee. New work lands on that Files-API route, not on this superseded PoC op-shape."
     },
     "tbd-issues": {
       "embed-token-replay-binding": "https://github.com/Wide-Moat/open-computer-use/issues/217",
