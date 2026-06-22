@@ -1,109 +1,201 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 #
-# One-click-solo deployment: the storage broker on the local-volume engine,
-# zero external dependencies. Bring it up with a single command from the
-# repo root:
+# COMPONENT-TEST topology for the storage broker (component-04), contract
+# v0.2. This is NOT the assembled app and NOT a guest-facing deployment: it
+# brings up the broker's OWN south face on TLS plus a REAL object-store
+# backend, and the test harness drives the south face directly while presenting
+# the edge-injected Authorization: Bearer the live edge would inject.
 #
-#   docker compose -f deploy/docker-compose.yml up -d --build
+#   guest --[mount-facing]--> EDGE --[edge-backend]--> filestore:8444 (TLS)
 #
-# (With a published release image available, drop --build and set
-# OCU_FILESTORE_TAG to the release tag.)
+# In the assembled topology the guest never dials the broker: the EDGE is the
+# single hop (validate the weak session JWT, strip it, exchange it, inject the
+# real backend credential). The whole storage path is Phase 2, gated on the
+# egress ADRs and an unimplemented edge. So this compose has NO guest and NO
+# edge service — it stands up the honest component boundary: the broker's TLS
+# south face (`filestore:8444`) on the backend network, plus the real MinIO
+# the s3 engine writes through. The integration test presents the
+# edge-injected Bearer itself (the same harness pattern the live south-face
+# tests use), which is the honest component-level emulation of the edge.
 #
-# Posture notes:
-# - The root filesystem is read-only; the ONLY writable surfaces are the
-#   three named volumes the daemon needs: the engine root (customer
-#   workspace bytes), the audit sink (fail-closed OCSF records,
-#   NFR-SEC-79), and the per-session socket directory.
-# - `sessions` is the shared socket volume: the sandbox peer mounts it at
-#   the same path to dial the per-session unix socket. The broker's accept
-#   gate admits ONLY a peer whose kernel-attested uid equals the broker's
-#   own uid (NFR-SEC-76), so the peer container must also run as 65532.
-# - Network isolation: `network_mode: none` gives the container its own empty
-#   network namespace with loopback only — no veth, no external reachability.
-#   The south face serves over unix sockets and the north face is deferred, so
-#   no traffic ever leaves the container. The daemon DOES bind a loopback-only
-#   TCP ops listener (127.0.0.1:9464: /metrics, /healthz, /readyz) inside that
-#   isolated netns; the healthcheck below dials it via the daemon's own
-#   -health-check self-probe. It is reachable only from within the container's
-#   own loopback, never from any other namespace. The -ops-listen address is
-#   pinned explicitly in the command block so this posture does not ride on a
-#   flag default.
-# - stop_grace_period is 30s, above the daemon's bounded 25s in-flight
-#   drain, so `docker compose stop` always lets the graceful path (drain,
-#   erase-before-reuse teardown, socket removal — NFR-SEC-54) finish before
-#   the SIGKILL fallback.
-# - The healthcheck execs `-health-check` (T2-3): the daemon dials its own
-#   loopback ops listener /healthz and exits 0 (alive) or non-zero
-#   (unreachable). This replaces the -version liveness proxy.
+# Bring it up from the repo root (build the broker image, wait for both
+# services' healthchecks):
+#
+#   OCU_FILESTORE_TLS_CERT_DIR=/abs/path/to/certs \
+#     docker compose -f deploy/docker-compose.yml up -d --build --wait
+#
+# The cert directory must hold tls-cert.pem + tls-key.pem whose leaf SAN
+# covers BOTH `filestore` and `ocu-filestore` (the two names the broker is
+# reachable as on ocu-edge-backend). The integration test
+# (internal/composeit) generates that throwaway cert and points
+# OCU_FILESTORE_TLS_CERT_DIR at it; a manual bring-up supplies its own.
+#
+# Posture notes (UNCHANGED from the hardened baseline — the recut moved only
+# the transport/topology, never the security posture):
+# - Root filesystem read-only; the only writable surfaces are the named
+#   volumes the daemon needs (the fail-closed audit sink, NFR-SEC-79) and the
+#   read-only cert mount.
+# - The s3 engine is the backing store, so there is NO local engine-root
+#   volume: customer bytes live in MinIO, never on the broker's filesystem
+#   (ephemeral workspace — the broker takes on no durable retention).
+# - The backend credential reaches the engine ONLY through the dedicated
+#   OCU_S3_ACCESS_KEY_ID / OCU_S3_SECRET_ACCESS_KEY env vars (one credential,
+#   one client — NFR-SEC-25). No second component speaks the object-store
+#   protocol; the guest's edge-injected Bearer is a DIFFERENT credential path.
+# - cap_drop ALL + no-new-privileges + the default-deny seccomp profile
+#   (NFR-SEC-02) all carry over from the pre-recut posture.
+# - stop_grace_period 30s sits above the daemon's bounded 25s in-flight drain,
+#   so a graceful stop always lets the drain + erase-before-reuse teardown
+#   (NFR-SEC-54) finish before the SIGKILL fallback.
+# - The loopback ops listener (127.0.0.1:9464: /metrics, /healthz, /readyz)
+#   is bound inside the container and is the readiness source: the healthcheck
+#   execs the daemon's own -health-check self-probe, which dials that live ops
+#   listener and exits 0 only once the daemon is fully serving (the listener
+#   binds AFTER engine construction + scope provisioning, so a passing probe
+#   means the s3 scope is provisioned and the south face is up — a real
+#   readiness signal, never a sleep). depends_on waits on both services'
+#   healthchecks via service_healthy.
 
 services:
-  broker:
+  ocu-filestore:
     image: ghcr.io/wide-moat/ocu-filestore:${OCU_FILESTORE_TAG:-latest}
     build:
       context: ..
       dockerfile: Dockerfile
+    # Reachable on the backend net as BOTH `filestore` (the v0.2 pin host) and
+    # the service name `ocu-filestore`; the south-face leaf SAN covers both.
+    networks:
+      ocu-edge-backend:
+        aliases:
+          - filestore
     user: "65532:65532"
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-      # Compose resolves a relative seccomp path against the CWD of the
-      # `docker compose` invocation, which the docs pin to the repo root
-      # (`docker compose -f deploy/docker-compose.yml ...`). The profile lives
-      # at deploy/seccomp/, so it must be referenced as ./deploy/seccomp/ for
-      # the default-deny hardening (T2-15, NFR-SEC-02) to actually apply.
-      - seccomp:./deploy/seccomp/ocu-filestored.json
-    network_mode: none
+      # A relative seccomp profile path is resolved against the directory of
+      # THIS compose file (deploy/), not the invocation CWD. The profile lives
+      # at deploy/seccomp/ocu-filestored.json, so the file-relative reference is
+      # ./seccomp/ocu-filestored.json — that is what makes the default-deny
+      # hardening (NFR-SEC-02) actually load at container create.
+      - seccomp:./seccomp/ocu-filestored.json
     stop_grace_period: 30s
+    environment:
+      # The s3 engine's OWN backend credential (one credential, one client —
+      # NFR-SEC-25). These reach the engine through objectstore's dedicated env
+      # intake, never through a flag value. Throwaway MinIO test-rig values.
+      OCU_S3_ACCESS_KEY_ID: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
+      OCU_S3_SECRET_ACCESS_KEY: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
     command:
       - -engine
-      - local-volume
-      - -engine-root
-      - /var/lib/ocu-filestore/engine-root
+      - s3
+      - -s3-endpoint
+      - http://minio:9000
+      - -s3-bucket
+      - ${OCU_S3_TEST_BUCKET:-ocu-conformance}
+      - -s3-region
+      - us-east-1
+      - -s3-path-style
+      # South-face TLS HTTPS/REST listener. The bind is :8444 on the backend
+      # net, so the service is reachable as `filestore:8444` (the v0.2 pin).
+      - -south-bind
+      - :8444
+      - -tls-cert
+      - /etc/ocu-filestore/tls/tls-cert.pem
+      - -tls-key
+      - /etc/ocu-filestore/tls/tls-key.pem
       - -audit-sink
       - /var/log/ocu-filestore/audit.ocsf.jsonl
-      - -south-socket-dir
-      - /run/ocu-filestore/sessions
       - -filesystem-id
-      - ${OCU_FILESYSTEM_ID:-solo-session}
+      - ${OCU_FILESYSTEM_ID:-fs-component-test}
       - -broker-max-file-size
       - ${OCU_BROKER_MAX_FILE_SIZE:-1073741824}
       - -granted-intents
       - ${OCU_GRANTED_INTENTS:-read,write}
+      # /pub is downloadable so the read path (readFile, fileDownload) reaches
+      # the engine; downloadable resolves at read from this prefix grant, never
+      # stamped at write (NFR-SEC-73).
+      - -downloadable-prefixes
+      - ${OCU_DOWNLOADABLE_PREFIXES:-/pub}
       - -profile
       - trusted_operator
       - -tenancy
       - single-tenant
       # Loopback-only ops listener (/metrics, /healthz, /readyz). Pinned
-      # explicitly so the healthcheck target and the posture documented above
-      # do not ride on the daemon's flag default.
+      # explicitly so the healthcheck target and the readiness posture above do
+      # not ride on the daemon's flag default.
       - -ops-listen
       - 127.0.0.1:9464
-      # -downloadable-prefixes is deliberately absent: empty means nothing
-      # resolves downloadable (deny-by-default, NFR-SEC-73). Opt prefixes in
-      # explicitly when the deployment needs them.
     volumes:
-      - engine-root:/var/lib/ocu-filestore/engine-root
+      # Fail-closed audit sink (NFR-SEC-79): an audit-write failure denies the
+      # operation, so this volume filling up stops file activity, not auditing.
       - audit:/var/log/ocu-filestore
-      - sessions:/run/ocu-filestore/sessions
+      # The south-face TLS material, mounted read-only. The leaf SAN covers
+      # `filestore` and `ocu-filestore`; the directory is supplied by the
+      # caller via OCU_FILESTORE_TLS_CERT_DIR (the integration test generates a
+      # throwaway cert there).
+      - ${OCU_FILESTORE_TLS_CERT_DIR:-./testdata/tls}:/etc/ocu-filestore/tls:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
     healthcheck:
+      # Real readiness probe against the live loopback ops listener: the
+      # daemon's own -health-check self-probe dials /healthz (served only once
+      # the daemon is fully up — the ops listener binds AFTER engine
+      # construction + s3 scope provisioning). Never a sleep.
       test: ["CMD", "/usr/local/bin/ocu-filestored", "-health-check"]
-      interval: 30s
+      interval: 5s
       timeout: 5s
-      retries: 3
+      retries: 10
+      start_period: 10s
+
+  # Real object-store backend for the s3 engine — no mocks. ONE MinIO
+  # definition of record is shared with deploy/docker-compose.test.yml via the
+  # same pinned-digest image and the same bucket-init pattern; the credentials
+  # are throwaway test-rig values, never secrets.
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    networks:
+      - ocu-edge-backend
+    environment:
+      MINIO_ROOT_USER: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
+      MINIO_ROOT_PASSWORD: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
       start_period: 5s
 
+  # One-shot bucket provisioning: creates the engine's backing bucket and
+  # exits 0. depends_on service_completed_successfully gates the broker on it.
+  bucket-init:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    networks:
+      - ocu-edge-backend
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set rig http://minio:9000 "${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}" "${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}"
+        mc mb --ignore-existing "rig/${OCU_S3_TEST_BUCKET:-ocu-conformance}"
+        mc ls rig
+
+networks:
+  # The storage-dedicated backend lane: the edge's backend leg reaches the
+  # broker here, and the broker reaches MinIO here. NOT a guest-facing net,
+  # NOT the retired data-plane net.
+  ocu-edge-backend:
+    driver: bridge
+
 volumes:
-  # Customer workspace bytes for the local-volume engine. Ephemeral
-  # workspace by design: the broker never takes on durable retention —
-  # long-term retention belongs to the customer's store.
-  engine-root:
-  # Fail-closed audit sink: an audit-write failure denies the file
-  # operation, so this volume filling up stops file activity, not auditing.
+  # Fail-closed audit sink — an audit-write failure denies the file operation,
+  # so this volume filling up stops file activity, not auditing.
   audit:
-  # Shared per-session socket directory. Mount this same volume into the
-  # sandbox peer (read access to the directory is enough to connect; the
-  # peer must run as uid 65532 to pass the accept gate).
-  sessions:
