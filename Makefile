@@ -33,6 +33,11 @@ GOLANGCI_LINT_VERSION := v2.12.2
 # go-gremlins mutation tester version pinned in CI (mutation.yml install step).
 GREMLINS_VERSION := v0.6.0
 
+# go-mutesting: a second, advisory mutation lens for local runs only (not in CI,
+# not in `make check`). It resolves packages via `go list`, so unlike gremlins
+# it is immune to the comment-led go.mod first-line parse issue.
+GO_MUTESTING_VERSION := v1.2.0
+
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
 
@@ -66,7 +71,7 @@ E2E_MODCACHE_WARM := $(if $(filter runsc,$(RUNTIME)),echo "--- (runsc) warming o
 E2E_MODCACHE_CLEAN := $(if $(filter runsc,$(RUNTIME)),; status=$$?; docker volume rm $(E2E_MODCACHE_VOL) >/dev/null 2>&1 || true; exit $$status)
 
 .PHONY: help build bin test test-race cover spdx contract identity vet fmt \
-        staticcheck lint mutation deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
+        staticcheck lint mutation mutation-go-mutesting deadcode goversion-guard check e2e-linux s3-rig-up s3-rig-down
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -197,9 +202,10 @@ deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0
 # see. The coverpkg scope is read from .gremlins.yaml at the repo root.
 #
 # gremlins unleash takes a single path argument, so the packages are run in a
-# loop. Advisory and deliberately excluded from `make check`: gremlins is slow
-# (and its coverage-to-mutant matching is not yet reliable on this Go
-# toolchain), so it is a standalone target, not a pre-push gate.
+# loop. Advisory and deliberately excluded from `make check`: gremlins is slow,
+# and on a comment-led go.mod it mis-derives the module path (it reads only the
+# first line of go.mod; see .gremlins.yaml for the full rationale), so it is a
+# standalone advisory target, not a pre-push gate.
 
 mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings — pinned to $(GREMLINS_VERSION)
 	@if ! command -v gremlins >/dev/null 2>&1; then \
@@ -221,6 +227,23 @@ mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings �
 	  | sed 's#internal/##; s/\./\\./g' | paste -sd'|' -); \
 	gremlins unleash --exclude-files "$$SF_EXC" ./internal/southface/ \
 	  || echo "gremlins reported a non-zero exit for credscope.go (advisory)"
+
+# go-mutesting is a SECOND, independent mutation lens — local and advisory only.
+# It is NOT in CI and NOT in `make check`. Because it resolves packages through
+# `go list`, it is immune to the comment-led go.mod first-line parse issue that
+# makes gremlins report phantom 0-killed here, so it gives a real efficacy read
+# on the authz resolver while the gremlins gate stays advisory. It never fails
+# the build: a non-zero exit is reported and swallowed, exactly like `mutation`.
+mutation-go-mutesting: ## go-mutesting mutation test (advisory, local only) on internal/authz — pinned to $(GO_MUTESTING_VERSION)
+	@echo "--- advisory: go-mutesting is a local second lens; it never fails the build ---"
+	@if ! command -v go-mutesting >/dev/null 2>&1; then \
+	  echo "go-mutesting not found — install with:"; \
+	  echo "  go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@$(GO_MUTESTING_VERSION)"; \
+	  exit 0; \
+	fi
+	@echo "--- go-mutesting ./internal/authz/... ---"
+	@go-mutesting ./internal/authz/... \
+	  || echo "go-mutesting reported a non-zero exit for internal/authz (advisory)"
 
 # ── checks ───────────────────────────────────────────────────────────────────
 
