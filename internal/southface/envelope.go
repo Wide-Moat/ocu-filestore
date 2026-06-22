@@ -57,8 +57,13 @@ var (
 	errRouteOpMismatch = errors.New("southface: route op disagrees with envelope op")
 )
 
-// knownOps is the closed set of routable operations: all 18 from the frozen
-// southface.Op enum. A route op outside this set is unknown.
+// knownOps is the closed set of ROUTABLE operations: the 18 frozen-enum ops
+// whose bodies are pinned (or pinned-and-streamed) enough to route. The frozen
+// OperationName enum carries three further members (fileDelete,
+// readFileMetadata, releaseQuarantinedFiles) whose bodies are x-ocu-tbd; they
+// have Op constants for full-enum coverage but are deliberately NOT routable
+// here, so a route naming one of them is unknown (404) until the contract pins
+// its body. A route op outside this set is unknown.
 var knownOps = map[Op]struct{}{
 	OpListDirectory:     {},
 	OpMakeDirectory:     {},

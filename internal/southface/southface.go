@@ -41,6 +41,18 @@ const (
 	OpImportZip         Op = "importZip"
 	OpMigrateFilesystem Op = "migrateFilesystem"
 	OpRemoveFilesystem  Op = "removeFilesystem"
+
+	// The next three are frozen contract OperationName-enum members whose
+	// request/response bodies are still x-ocu-tbd in the contract. They are
+	// DISTINCT enum names — not aliases of OpRemoveFile/OpReadMetadata/
+	// OpGetFileMetadata — so the Op set covers the whole frozen enum
+	// (TestOpEnumMatchesContract). No handler, no required-intent row, and no
+	// knownOps entry: they are not routable until the contract pins their
+	// bodies. Adding a handler here would mean inventing a body the contract has
+	// not frozen, which this package never does.
+	OpFileDelete              Op = "fileDelete"
+	OpReadFileMetadata        Op = "readFileMetadata"
+	OpReleaseQuarantinedFiles Op = "releaseQuarantinedFiles"
 )
 
 // Server is the south-face listener seam. The implementation binds it to the
