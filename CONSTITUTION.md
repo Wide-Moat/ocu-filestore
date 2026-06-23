@@ -3,7 +3,7 @@
 
 # CONSTITUTION — ocu-filestore
 
-The storage service's load-bearing invariants. These eight never-rules are the
+The storage service's load-bearing invariants. These nine never-rules are the
 architect's mandate: each is tied to its NFR row, the component invariant it
 upholds, and the ADR that decided it. Every one names where the code enforces
 it. A change here changes in the architecture repo first; this file only
