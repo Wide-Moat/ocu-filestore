@@ -104,3 +104,24 @@ read; it never starves other sessions.
 - Enforced: `internal/ceilings/ceilings.go` — `CheckDeclaredSize`,
   `Session.TryConsumeOp`, `Session.AcquireBytes`, `Session.TryAcquireFD`,
   keyed per `SessionKey` via `Registry.Session`.
+
+## 9. Never a `file_id` that is a capability
+
+A `file_id` carries no authority on its own. The resolver always takes the
+scope from the host-attested channel — never a request-supplied value — and
+asserts the stored record's scope byte-matches that attested scope before the
+handle resolves. A cross-scope `file_id`, an unknown `file_id`, and an empty
+attested scope are all indistinguishable from non-existence: each returns the
+same `not_found` sentinel, never a `forbidden`, so a probe cannot enumerate
+another scope's handles or confirm that any handle exists (anti-enumeration).
+
+- ADR-0023 (Files-API north contract), invariant 5 (recut to scope-bound
+  `file_id` resolution) — NFR-SEC-73 / NFR-SEC-25
+- Enforced: `internal/handlestore/disk.go:DiskStore.Get` and
+  `internal/handlestore/delete.go:DiskStore.Delete` reject an empty attested
+  scope before the map lookup and return the byte-identical `ErrNotFound`
+  sentinel for both the cross-scope and the absent case. This is enforced in
+  the handle-store today and binds the live path once the north Files-API
+  (component-08) lands — the durable handle-store is design-fenced behind the
+  inert north listener this phase, where the ephemeral within-session
+  `internal/southface/objectid.go:objectIDStore` backs the south mount RPC.

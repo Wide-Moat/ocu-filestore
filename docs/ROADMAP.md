@@ -43,3 +43,7 @@ ADR still `proposed`), **TBD** (contract surface not yet pinned),
   set `threshold.efficacy` / `threshold.mutant-coverage` to `floor(baseline)`
   in `.gremlins.yaml` and drop `continue-on-error` in
   `.github/workflows/mutation.yml`. See the rationale block in `.gremlins.yaml`.
+- **Handle-store hardening debt.** Two open issues track follow-up work on the
+  keystone resolver path (Files-API handle-store, above): #19 (auditgate
+  fail-open alignment) and #20 (defense-in-depth hardening). Both are scheduled
+  against the north Files-API binding, not this phase.
