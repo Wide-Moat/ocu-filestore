@@ -182,6 +182,18 @@ var ErrSymlinkUnsupported = errors.New("ingest: symlink entries unsupported")
 // (NFR-SEC-81). Match it with errors.Is.
 var ErrTypeDenied = errors.New("ingest: content type denied by policy")
 
+// ErrDuplicateEntry — two archive entries clean to the same in-namespace
+// path (an identical name, a separator-normalization collision such as
+// "dir/x" and "dir\x", or a file colliding with a directory on one name).
+// Each colliding name is individually valid, so this is deliberately
+// distinct from the lexical ErrInvalidEntry: only their coincidence is the
+// fault. Rejected fail-closed before the second colliding entry reaches the
+// sink, so the second can never silently overwrite the first with undefined
+// ordering — a zip-slip-via-collision surface — and consistent with the
+// engine's deny-by-default destination-collision posture. Match it with
+// errors.Is.
+var ErrDuplicateEntry = errors.New("ingest: duplicate entry name (path collision)")
+
 // ErrUnclassifiableEntry — the entry cannot be confidently classified as a
 // regular file: its raw Unix mode bits (carried in the central-directory
 // external attributes regardless of the archive's creator host) encode a

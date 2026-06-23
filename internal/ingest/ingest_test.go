@@ -743,6 +743,127 @@ func TestInvalidArchiveBytes(t *testing.T) {
 	}
 }
 
+// TestDuplicateEntryRejected pins ARC-02 collision safety: two entries whose
+// raw names clean to the same in-namespace path are a collision the broker
+// rejects fail-closed, before the second entry's bytes (or the colliding
+// directory) reach the sink. Without this guard the second entry silently
+// overwrites the first with undefined ordering — a zip-slip-via-collision
+// surface once the engine sink lands, and inconsistent with the engine's
+// deny-by-default destination-collision posture. The reject carries a
+// dedicated ErrDuplicateEntry sentinel, distinct from the lexical
+// ErrInvalidEntry: the colliding names are each individually safe, only their
+// coincidence is the fault.
+//
+// Non-vacuity is enforced per sub-case: the two raw names are asserted
+// byte-distinct (where they should differ) AND clean-equal at the top, so a
+// future normalization change that stops them colliding fails the test loudly
+// rather than passing on a non-collision; and the sink is asserted to have
+// seen exactly the first entry (so the archive was genuinely built and the
+// collision genuinely reached the per-entry path, not bounced off an empty
+// run).
+func TestDuplicateEntryRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rawA     string
+		rawB     string
+		bodyA    []byte
+		bodyB    []byte
+		modeA    fs.FileMode
+		modeB    fs.FileMode
+		firstHit string // the cleaned name the sink must have seen for entry A
+		stagedA  bool   // entry A is a regular file (staged) vs a directory (dir)
+	}{
+		{
+			name:     "identical raw file names",
+			rawA:     "dup.txt",
+			rawB:     "dup.txt",
+			bodyA:    []byte("first"),
+			bodyB:    []byte("second"),
+			firstHit: "dup.txt",
+			stagedA:  true,
+		},
+		{
+			name:     "backslash normalization collision",
+			rawA:     `dir/x`,
+			rawB:     `dir\x`,
+			bodyA:    []byte("forward"),
+			bodyB:    []byte("backslash"),
+			firstHit: "dir/x",
+			stagedA:  true,
+		},
+		{
+			name:     "file then directory on one name",
+			rawA:     "a",
+			rawB:     "a/",
+			bodyA:    []byte("file"),
+			modeB:    fs.ModeDir | 0o755,
+			firstHit: "a",
+			stagedA:  true,
+		},
+		{
+			name:     "directory then file on one name",
+			rawA:     "a/",
+			rawB:     "a",
+			modeA:    fs.ModeDir | 0o755,
+			bodyB:    []byte("file"),
+			firstHit: "a",
+			stagedA:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Non-vacuity guard: the two raw inputs genuinely clean to the
+			// same path. For the normalization cases the raws are also
+			// byte-distinct, so a future normalization change that diverges
+			// them fails loudly rather than passing on a non-collision.
+			if tc.name == "backslash normalization collision" && tc.rawA == tc.rawB {
+				t.Fatalf("test setup: raw names are byte-identical, not a normalization collision")
+			}
+			cleanA, errA := validateEntryName(tc.rawA)
+			cleanB, errB := validateEntryName(tc.rawB)
+			if errA != nil || errB != nil {
+				t.Fatalf("test setup: both raw names must be individually valid: %v / %v", errA, errB)
+			}
+			if cleanA != cleanB {
+				t.Fatalf("test setup: raw names do not collide after cleaning: %q vs %q", cleanA, cleanB)
+			}
+
+			data := buildZip(t,
+				zipEntry{name: tc.rawA, body: tc.bodyA, mode: tc.modeA},
+				zipEntry{name: tc.rawB, body: tc.bodyB, mode: tc.modeB},
+			)
+			sink := &recordingSink{}
+			err := ValidateZip(context.Background(), data, testConfig(), sink)
+			if !errors.Is(err, ErrDuplicateEntry) {
+				t.Fatalf("ValidateZip: got %v, want ErrDuplicateEntry", err)
+			}
+			if errors.Is(err, ErrInvalidEntry) {
+				t.Fatal("duplicate reject must stay distinct from the lexical sentinel")
+			}
+			var ae *ArchiveError
+			if !errors.As(err, &ae) || ae.EntryName == "" {
+				t.Fatalf("ArchiveError must name the colliding entry: %+v", ae)
+			}
+
+			// The first entry reached the sink (proving the collision was hit
+			// on the per-entry path, not on an empty/unbuildable run); the
+			// colliding second entry never did.
+			seen := append(append([]string{}, sink.staged...), sink.dirs...)
+			if len(seen) != 1 || seen[0] != tc.firstHit {
+				t.Fatalf("sink saw %v, want exactly the first entry %q before the collision reject", seen, tc.firstHit)
+			}
+			if tc.stagedA && (len(sink.staged) != 1 || sink.staged[0] != tc.firstHit) {
+				t.Fatalf("first (file) entry not staged before reject: staged=%v", sink.staged)
+			}
+			if !tc.stagedA && (len(sink.dirs) != 1 || sink.dirs[0] != tc.firstHit) {
+				t.Fatalf("first (dir) entry not recorded before reject: dirs=%v", sink.dirs)
+			}
+			if !sink.aborted || sink.committed {
+				t.Fatalf("sink state: aborted=%v committed=%v, want aborted only", sink.aborted, sink.committed)
+			}
+		})
+	}
+}
+
 // failingSink wraps recordingSink and fails a chosen seam, so the sink-error
 // wrap legs of processEntry (StageEntry, MakeDir) and the commit-error leg of
 // ValidateZip are exercised. It is a fault-injection fake, not a mock of a real
