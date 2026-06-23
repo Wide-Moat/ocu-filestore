@@ -23,10 +23,10 @@ func (s *nopSink) StageEntry(_ context.Context, _ string, r io.Reader, _ fs.File
 	_, err := io.Copy(io.Discard, r)
 	return err
 }
-func (s *nopSink) MakeDir(_ context.Context, _ string) error                { return nil }
-func (s *nopSink) MakeSymlink(_ context.Context, _ string, _ string) error  { return nil }
-func (s *nopSink) Commit(_ context.Context) error                           { s.committed = true; return nil }
-func (s *nopSink) Abort(_ context.Context)                                  {}
+func (s *nopSink) MakeDir(_ context.Context, _ string) error               { return nil }
+func (s *nopSink) MakeSymlink(_ context.Context, _ string, _ string) error { return nil }
+func (s *nopSink) Commit(_ context.Context) error                          { s.committed = true; return nil }
+func (s *nopSink) Abort(_ context.Context)                                 {}
 
 // corruptCentralDir returns a copy of a valid archive with its central
 // directory deliberately damaged at the chosen mutation, so the seed reaches
