@@ -116,9 +116,18 @@ anything the guest presented (NFR-SEC-25).
 is never stamped at write (NFR-SEC-73). That is why the read path can only reach
 the engine for paths under a downloadable prefix such as `/pub`.
 
-Audit is **fail-closed** (NFR-SEC-79): every file activity emits its OCSF event
-before the operation is acknowledged, and an audit-write failure denies the
-operation. A full audit volume stops file activity, not auditing.
+The south file-op producer is **durable-first fail-open** (NFR-SEC-79). Every
+file activity emits its OCSF event committed to a local durable record (an
+fsync) before any fan-out, and that local commit is the non-repudiation point —
+a failed fsync means the record never landed. A downstream sink fan-out failure,
+by contrast, does **not** deny or stall the file operation: the dropped fan-out
+is counted and reconciled, never silently lost.
+
+(Honest code-lag note: the shipped `internal/auditgate` still denies on any
+audit-write failure, i.e. fully fail-closed. That is the lag, not the target;
+it is being split into the mandatory local durable commit plus the fail-open
+sink fan-out under issue #19. This paragraph states the canon target, which the
+code does not yet reach.)
 
 On a deny, the HTTP status is authoritative; the response body carries a bounded
 diagnostic reason and is advisory only.
