@@ -224,6 +224,13 @@ func peerScopeFromCredential(r *http.Request, extractor CredentialScopeExtractor
 	return PeerScope(scope), DenyVerdict{}, true
 }
 
+// DEAD (no production callers; tracked by Wide-Moat/ocu-filestore#20): the live
+// path derives scope via peerScopeFromCredential and enforces the cross-check at
+// the STAGE-1b body comparison (env.FilesystemID != ps.FilesystemID) plus the
+// download-path record-scope guard, NOT here. This route-layer check is exercised
+// only by tests. Do not assume it protects the live request path; revive it for
+// defense-in-depth or retire it per #20.
+//
 // deriveCredScope is the A5 credential-scope check at the SERVICE/ROUTE layer.
 // It reads the edge-injected Authorization: Bearer, derives the
 // credential-bound filesystem scope via the extractor, and enforces that the
