@@ -4,9 +4,9 @@
 package southface
 
 import (
-	"encoding/json"
 	"net/http"
-	"strings"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/denywire"
 )
 
 // PHASE-7(A3-deny): frozen @ canon-rev a030b7be914b: the deny verdict is the HTTP status (authoritative)
@@ -44,59 +44,39 @@ type boundedReason struct {
 }
 
 // boundedReasonMessageMax is the BoundedReason.message length ceiling (the
-// contract's maxLength). A longer diagnostic is truncated to this many bytes
-// before it reaches the wire.
-const boundedReasonMessageMax = 256
+// contract's maxLength). It aliases the shared denywire ceiling so the two faces
+// can never disagree on the clamp.
+const boundedReasonMessageMax = denywire.BoundedReasonMessageMax
 
 // denyReasonHeader is the response header name carrying the broker-resolved
 // audit TRUTH on authorization verdicts only (permission_denied /
 // unauthenticated). It is gated by DenyVerdict.WireHeader exactly as the Connect
 // path gated it — an anti-enumeration-degraded verdict carries no truth header.
-const denyReasonHeader = "x-deny-reason"
+// It aliases the shared denywire header name.
+const denyReasonHeader = denywire.DenyReasonHeader
 
 // reasonCodeForVerdict derives the BoundedReason.reason_code from a verdict's
 // wire code: the lowercase closed Connect-code set is mapped to its
 // uppercase token (permission_denied -> PERMISSION_DENIED, not_found ->
 // NOT_FOUND, ...), which is pattern-valid (^[A-Z][A-Z0-9_]{1,63}$) and is the
 // preferred default vocabulary. The reason_code is DIAGNOSTIC only; a caller
-// never keys behaviour on it. An empty or unexpected wire code falls back to
-// INTERNAL so the body is always pattern-valid.
+// never keys behaviour on it. It delegates to the shared denywire derivation.
 func reasonCodeForVerdict(v DenyVerdict) string {
-	code := strings.ToUpper(v.WireCode)
-	if code == "" {
-		return "INTERNAL"
-	}
-	return code
-}
-
-// clampMessage bounds a diagnostic message to boundedReasonMessageMax bytes so
-// the BoundedReason body can never exceed the contract's maxLength.
-func clampMessage(message string) string {
-	if len(message) <= boundedReasonMessageMax {
-		return message
-	}
-	return message[:boundedReasonMessageMax]
+	return denywire.ReasonCodeForVerdict(toDenywire(v))
 }
 
 // writeRESTDeny writes a REST deny response from a DenyVerdict: the
-// authoritative HTTP status (DenyVerdict.WireStatus, derived from the SURVIVING
-// statusForWireCode table), the application/json BoundedReason {reason_code,
-// message} diagnostic body, and — only when the verdict gates it
-// (permission_denied / unauthenticated) — the x-deny-reason header carrying the
-// broker-resolved audit truth. It is the single pre-byte refusal path for every
-// op: the 16 unary-JSON ops and the two data-plane ops.
+// authoritative HTTP status (DenyVerdict.WireStatus), the application/json
+// BoundedReason {reason_code, message} diagnostic body, and — only when the
+// verdict gates it (permission_denied / unauthenticated) — the x-deny-reason
+// header carrying the broker-resolved audit truth. It is the single pre-byte
+// refusal path for every op: the 16 unary-JSON ops and the two data-plane ops.
+// It delegates to the shared denywire writer, so the wire form is byte-identical
+// to the north Files-API plane's deny responses (the parity test pins this).
 //
 // x-request-id is NOT set here: ServeHTTP stamps it on the response header at
 // STAGE 0 before any deny path runs, so it is already queued on w.Header() and
 // surfaces on every response — allow and deny alike.
 func writeRESTDeny(w http.ResponseWriter, v DenyVerdict, message string) {
-	if v.WireHeader {
-		w.Header().Set(denyReasonHeader, v.AuditReason)
-	}
-	w.Header().Set("Content-Type", contentTypeJSON)
-	w.WriteHeader(v.WireStatus)
-	_ = json.NewEncoder(w).Encode(boundedReason{
-		ReasonCode: reasonCodeForVerdict(v),
-		Message:    clampMessage(message),
-	})
+	denywire.WriteRESTDeny(w, toDenywire(v), message)
 }
