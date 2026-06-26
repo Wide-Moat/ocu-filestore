@@ -98,6 +98,48 @@ once the daemon is fully up — the ops listener binds after engine construction
 and scope provisioning — so a passing check means the s3 scope is provisioned
 and the south face is serving.
 
+## Fleet activation (north live)
+
+`docker-compose.fleet.yml` is the variant the cross-component fleet app
+consumes. It leaves `docker-compose.yml` (the south-only component-test
+topology) untouched and instead activates **both** faces of one broker process.
+
+North goes live because the fleet variant sets `-handle-store
+/var/lib/ocu-filestore/handles` (the durable file_id index the Files-API plane
+resolves against) and binds the listener on all interfaces with `-north-bind
+0.0.0.0:7080`. The default `127.0.0.1:7080` is loopback-only and unreachable
+across containers; `north-bind` carries no loopback guard, so the
+all-interfaces bind is taken verbatim. Because the root filesystem is read-only,
+the handle store sits on a **writable named volume** (`handles:`) mounted at
+`/var/lib/ocu-filestore` — the daemon `MkdirAll`s that directory and flocks the
+store before binding Mount B, exactly like the audit sink's writable volume.
+
+The result is a two-plane topology on the backend network:
+
+- **edge → south `filestore:8444`** — the guest-mount RPC. The stock edge dials
+  `filestore_upstream:8444` (the v0.2 pin; `7443` is only the flag default),
+  validates and strips the guest's weak session JWT, performs the RFC-8693 token
+  exchange, and injects the real backend credential. The south face is reached
+  **by** the edge, never bypassed.
+- **webui → north `filestore:7080`** — the Files-API plane (Mount B), dialed
+  **directly** with no credential. This is the F9 keystone plane.
+
+Both faces present **one identity**: Mount B reuses the south `-tls-cert` /
+`-tls-key` paths. So the single leaf the fleet cert-init mints must carry a SAN
+covering **both** `filestore` and `ocu-filestore`, and that one leaf serves the
+edge→south:8444 dial and the webui→north:7080 dial alike. This variant only
+consumes that cert read-only.
+
+The MinIO and bucket-init services carry over from the component-test rig, so
+the variant stands up a filestore + MinIO north smoke standalone. In the
+assembled fleet the shared object store and the `ocu-edge-backend` network are
+wired by the app; point `-s3-endpoint` at the shared store and drop the local
+MinIO if so. The hardening posture (read-only root, `cap_drop: ALL`,
+`no-new-privileges`, the default-deny seccomp profile, the 30s stop grace, the
+loopback ops listener as the real readiness source) is identical to the
+component-test baseline — the variant adds the north plane, never a posture
+change.
+
 ## What component-04 exposes
 
 The south face is HTTPS/REST. Each file operation is a `POST` to
