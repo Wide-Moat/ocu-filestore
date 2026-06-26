@@ -3,7 +3,7 @@
 
 # CONSTITUTION — ocu-filestore
 
-The storage service's load-bearing invariants. These nine never-rules are the
+The storage service's load-bearing invariants. These ten never-rules are the
 architect's mandate: each is tied to its NFR row, the component invariant it
 upholds, and the ADR that decided it. Every one names where the code enforces
 it. A change here changes in the architecture repo first; this file only
@@ -130,3 +130,25 @@ another scope's handles or confirm that any handle exists (anti-enumeration).
   mutation-proven through the HTTP layer. (The ephemeral within-session
   `internal/southface/objectid.go:objectIDStore` continues to back the south
   mount RPC, distinct from this durable north path.)
+
+## 10. Never north and south on one listener, router, or resolver
+
+The north face (the no-credential F9 Files-API, bound on `--north-bind`) and the
+south face (the edge-dialed mount RPC, bound on `--south-bind`) never share a
+listener, a router, or a resolver. They are two physically distinct binds with
+two distinct request paths; the north package may borrow the south face's seam
+TYPES (the resolver/guard/engine shapes and error sentinels) but never its
+request-routing surface. That physical separation is what makes the
+confused-deputy impossible — neither face can be steered onto the other's router
+to launder authority across the trust boundary.
+
+- ADR-0015 (north client/host-leg split) / ADR-0023 (Files-API north contract)
+  — invariant 8 (NFR-SEC-82 / NFR-SEC-25)
+- Enforced: `internal/filesapi/importboundary_test.go` is the import-graph guard
+  that reds if the north package ever references the south request-routing
+  surface (the router, the dispatcher, or their per-op stage entrypoints); it
+  parses every non-test source file and fails on any forbidden `southface`
+  selector. `cmd/ocu-filestored/dualserver.go` fans the two faces onto SEPARATE
+  binds with separate servers. `internal/northface/mountb.go:NewMountB` reuses
+  only the south face's certificate paths for Mount B, never its router — the
+  shared input is the cert material, not the request path.
