@@ -10,8 +10,9 @@ This repo is **public**.
 
 ## Read before implementing
 
-- `docs/architecture/components/04-storage-broker.md` — purpose, the two-face
-  split, the 10 invariants, failure modes (P4 STRIDE rows).
+- `docs/architecture/components/04-object-store-service.md` — purpose, the one
+  storage door reached by two callers, the invariants, failure modes
+  (P4-mount STRIDE rows).
 - `docs/architecture/adr/0010-storage-backend-pluggable-adapter.md` — engine
   seam (local-volume + S3 from day one).
 - `docs/architecture/adr/0011-storage-egress-lane.md` — a network engine's
@@ -31,15 +32,21 @@ This repo is **public**.
   storage lane (NFR-SEC-16, network engine only).
 - Three-axis authorization re-derived broker-side per request, deny-by-default;
   `downloadable` resolves at read, never stamped at write (NFR-SEC-73).
-- Every file activity on either face emits an OCSF File System Activity event
-  before the operation is acknowledged; an audit-write failure denies the
-  operation — fail-closed (NFR-SEC-79).
-- The north face verifies a peer-minted embed token before any session state;
-  no OCU upstream secret crosses to the browser (NFR-SEC-82).
-- Ephemeral workspace: the broker never takes on durable retention of customer
+- Every file activity on either caller leg emits an OCSF File System Activity
+  event committed to a local durable record before the operation is
+  acknowledged (NFR-SEC-79).
+- The embed-token verify, first-party session, CSRF, and CSP live in the Web UI
+  (component-08), which authenticates the external data-plane client and mints
+  the session; no OCU upstream secret crosses to the browser (NFR-SEC-82). This
+  service is the backend storage door the Web UI reaches over the F9 host leg
+  after that authentication — it mints no session and verifies no embed token.
+- Ephemeral workspace: the service never takes on durable retention of customer
   bytes; long-term retention belongs to the customer's store.
-- The north-face SPA and preview ship behind the deferred tracking issue; the
-  south-face mount path builds first (roadmap Phase 2, track C).
+- Two callers, one door: the in-guest mount client reaches the service over the
+  egress hop (guest leg) and the Web UI reaches it over the F9 host leg. The
+  mount path builds first; the durable `file_id`→handle store for the Web UI's
+  Files-API surface is owned here (ADR-0023). The client SPA and preview-render
+  are component-08's, not this service's.
 
 ## Writing discipline
 
