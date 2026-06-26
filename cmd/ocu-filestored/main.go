@@ -20,8 +20,10 @@
 // -s3-credential-file), -broker-max-file-size (>0, the whole-object ceiling),
 // -filesystem-id, -granted-intents, -downloadable-prefixes, -max-request-bytes
 // (the per-RPC-message ceiling), and the optional per-session ops token-bucket
-// tuning pair -ops-per-second (>0) / -ops-burst (>=1). -north-listen parses but
-// binds nothing this phase (the north face is deferred).
+// tuning pair -ops-per-second (>0) / -ops-burst (>=1). The north Files-API
+// listener (Mount B, ADR-0023) binds on -north-bind (deprecated alias
+// -north-listen) and is live ONLY when -handle-store is set; otherwise only the
+// south listener binds.
 package main
 
 import (
@@ -48,8 +50,10 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/authz"
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
+	"github.com/Wide-Moat/ocu-filestore/internal/filesapi"
 	"github.com/Wide-Moat/ocu-filestore/internal/flock"
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+	"github.com/Wide-Moat/ocu-filestore/internal/northface"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
@@ -209,6 +213,12 @@ const (
 	teardownTimeout  = 10 * time.Minute
 )
 
+// defaultNorthBind is the loopback bind the north Files-API listener (Mount B)
+// falls back to when cfg.northBind is empty. It matches the --north-bind flag
+// default and exists so a direct compose() call (a test that builds brokerConfig
+// without going through validate) still gets a concrete bind.
+const defaultNorthBind = "127.0.0.1:7080"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ocu-filestored:", err)
@@ -233,7 +243,11 @@ type brokerConfig struct {
 	// bindAddr/certFile/keyFile carry the TLS HTTPS south-face transport: the
 	// service_url the guest dials outbound through the Egress edge, and the
 	// service's own server certificate and private key.
-	bindAddr       string
+	bindAddr string
+	// northBind is the north Files-API TLS bind (Mount B, ADR-0023). The north
+	// listener is constructed only when handleStore is non-empty; it reuses the
+	// south certFile/keyFile (one identity, two listeners).
+	northBind      string
 	certFile       string
 	keyFile        string
 	filesystemID   string
@@ -269,8 +283,17 @@ func run(args []string) error {
 		"structured log level: debug | info | warn | error (default info)")
 	opsListen := fs.String("ops-listen", "127.0.0.1:9464",
 		"loopback-only bind address for the ops listener (/metrics); empty disables; non-loopback refused pre-bind")
-	fs.String("north-listen", "127.0.0.1:7080",
-		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
+	// North Files-API transport (Mount B): a SEPARATE TLS listener from the south
+	// mount RPC, serving the /v1/files handler (ADR-0023). --north-bind is the
+	// live flag; --north-listen is its retained DEPRECATED ALIAS (the frozen flag
+	// surface is never silently dropped — an operator setting the old name still
+	// works). The north listener is constructed only when --handle-store is set
+	// (the durable file_id index the Files-API plane resolves against); with no
+	// handle store the north plane stays inert and only the south listener binds.
+	northBind := fs.String("north-bind", "127.0.0.1:7080",
+		"north Files-API TLS bind address (Mount B, ADR-0023); live only when --handle-store is set, reusing the south TLS cert")
+	northListen := fs.String("north-listen", "",
+		"DEPRECATED alias for --north-bind (retained so the frozen flag surface is never dropped); --north-bind wins when both are set")
 	// South-face TLS transport: the service_url the guest dials outbound through
 	// the Egress edge (guest -> edge -> service direct HTTPS), and the service's
 	// own server certificate. PENDING-PHASE-7: the canon route/credential shapes
@@ -351,11 +374,28 @@ func run(args []string) error {
 		return runHealthCheck(*opsListen)
 	}
 
+	// Resolve the north bind address: --north-bind wins; --north-listen is the
+	// retained deprecated alias. The alias is honoured only when --north-bind was
+	// NOT explicitly set AND the alias carries a value, so an operator setting
+	// both gets --north-bind. The frozen --north-listen flag is never silently
+	// dropped — an operator using the old name alone still binds Mount B.
+	northBindExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "north-bind" {
+			northBindExplicit = true
+		}
+	})
+	northBindAddr := *northBind
+	if !northBindExplicit && *northListen != "" {
+		northBindAddr = *northListen
+	}
+
 	cfg, err := validate(rawFlags{
 		engine:               *engine,
 		engineRoot:           *engineRoot,
 		auditSink:            *auditSink,
 		handleStore:          *handleStore,
+		northBind:            northBindAddr,
 		southBind:            *southBind,
 		tlsCert:              *tlsCert,
 		tlsKey:               *tlsKey,
@@ -645,6 +685,7 @@ type rawFlags struct {
 	engineRoot           string
 	auditSink            string
 	handleStore          string
+	northBind            string
 	southBind            string
 	tlsCert              string
 	tlsKey               string
@@ -813,6 +854,7 @@ func validate(r rawFlags) (brokerConfig, error) {
 		auditSink:        auditSink,
 		handleStore:      r.handleStore,
 		bindAddr:         southBind,
+		northBind:        r.northBind,
 		certFile:         tlsCert,
 		keyFile:          tlsKey,
 		filesystemID:     filesystemID,
@@ -904,6 +946,7 @@ var envFallbackMap = func() map[string]string {
 		"health-check",
 		"log-level",
 		"ops-listen",
+		"north-bind",
 		"north-listen",
 		"engine",
 		"max-request-bytes",
@@ -1234,11 +1277,22 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		}
 	}()
 
+	// Build the broker adapters ONCE so the south spine and the north Files-API
+	// plane (Mount B) share the same stateless seam wrappers — one set of
+	// adapters, both planes (the Q-SEAMREUSE ruling). The adapters are stateless
+	// views over the shared resolver/sink/registry/engine, so reusing them across
+	// the two listeners is correct (and the only honest wiring: one broker, one
+	// audit gate, one credential).
+	resolverSeam := broker.NewResolver(resolver)
+	guardSeam := broker.NewGuard(sink)
+	ceilingsSeam := broker.NewCeilings(reg)
+	engineSeam := broker.NewEngine(eng)
+
 	srv, err := southface.Serve(southface.Config{
-		Resolver:          broker.NewResolver(resolver),
-		Guard:             broker.NewGuard(sink),
-		Ceilings:          broker.NewCeilings(reg),
-		Engine:            broker.NewEngine(eng),
+		Resolver:          resolverSeam,
+		Guard:             guardSeam,
+		Ceilings:          ceilingsSeam,
+		Engine:            engineSeam,
 		CredExtractor:     newCredentialScopeExtractor(cfg),
 		BindAddr:          cfg.bindAddr,
 		CertFile:          cfg.certFile,
@@ -1250,6 +1304,47 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// North Files-API listener (Mount B, ADR-0023): constructed ONLY when a
+	// durable handle store is configured — the Files-API plane resolves file_ids
+	// against it, so with no store the north plane stays inert and only the south
+	// listener binds. Mount B is a SEPARATE TLS listener reusing the south cert
+	// SOURCE (the same cert/key PATHS), serving the filesapi handler; it is the
+	// physical trust boundary between the no-credential /v1/files plane and the
+	// egress-credential south mount RPC. The dualServer fans Serve/Close across
+	// both; a nil north degrades to south-only.
+	var north northface.Server
+	if hStore != nil {
+		// Default the north bind if a caller (e.g. a direct compose test that
+		// constructs brokerConfig without going through validate) left it empty,
+		// so the Mount B listener always has a concrete loopback bind.
+		northBind := cfg.northBind
+		if northBind == "" {
+			northBind = defaultNorthBind
+		}
+		handler, herr := filesapi.NewHandler(filesapi.Deps{
+			Resolver:    resolverSeam,
+			Guard:       guardSeam,
+			Engine:      engineSeam,
+			Ceilings:    ceilingsSeam,
+			Store:       hStore,
+			Scope:       filesapi.NewFencedScopeSource(),
+			SizeCeiling: cfg.maxRequestByte,
+			Logger:      l,
+		})
+		if herr != nil {
+			_ = srv.Close()
+			return nil, herr
+		}
+		mountB, merr := northface.NewMountB(northBind, cfg.certFile, cfg.keyFile, handler, l)
+		if merr != nil {
+			_ = srv.Close()
+			return nil, merr
+		}
+		north = mountB
+		l.Info("north Files-API listener constructed (Mount B)",
+			slog.String("north_bind", northBind))
 	}
 
 	// Register /healthz and /readyz on the ops listener if one was provided.
@@ -1300,10 +1395,15 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// the deferred erase above does not double-tear-down a live scope.
 	committed = true
 
+	// Fan the south listener and the optional north Files-API listener into one
+	// southface.Server handle (the daemon lifecycle drives a single Serve/Close).
+	// A nil north degrades the dualServer to south-only.
+	fanned := newDualServer(srv, north)
+
 	// Wrap the server so Close also tears down the scope (erase-before-reuse)
 	// and releases the per-session ceilings (NFR-SEC-54).
 	return &teardownServer{
-		Server:      srv,
+		Server:      fanned,
 		engine:      eng,
 		ceiling:     reg,
 		scope:       scope,
