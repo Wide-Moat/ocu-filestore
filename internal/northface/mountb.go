@@ -125,6 +125,3 @@ func (m *MountB) Close() error {
 	}
 	return shutdownErr
 }
-
-// Addr returns the listener bind address (test/observability helper).
-func (m *MountB) Addr() string { return m.bindAddr }
