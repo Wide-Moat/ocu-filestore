@@ -120,8 +120,13 @@ another scope's handles or confirm that any handle exists (anti-enumeration).
 - Enforced: `internal/handlestore/disk.go:DiskStore.Get` and
   `internal/handlestore/delete.go:DiskStore.Delete` reject an empty attested
   scope before the map lookup and return the byte-identical `ErrNotFound`
-  sentinel for both the cross-scope and the absent case. This is enforced in
-  the handle-store today and binds the live path once the north Files-API
-  (component-08) lands — the durable handle-store is design-fenced behind the
-  inert north listener this phase, where the ephemeral within-session
-  `internal/southface/objectid.go:objectIDStore` backs the south mount RPC.
+  sentinel for both the cross-scope and the absent case. The north Files-API
+  listener now binds this live path: `internal/filesapi/route.go:writeNotFound`
+  is the single not_found token on the wire — an unknown path, an unknown
+  `file_id`, and a cross-scope `file_id` all collapse to one header-less 404,
+  never a 403, so the wire layer cannot leak a scope or existence distinction.
+  The route layer derives the host-attested scope ONCE per request from the
+  attested F9 channel and resolves the durable handle-store; the keystone is
+  mutation-proven through the HTTP layer. (The ephemeral within-session
+  `internal/southface/objectid.go:objectIDStore` continues to back the south
+  mount RPC, distinct from this durable north path.)
