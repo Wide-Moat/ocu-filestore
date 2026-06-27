@@ -3,7 +3,7 @@
 
 # CONSTITUTION — ocu-filestore
 
-The storage service's load-bearing invariants. These eleven never-rules are the
+The storage service's load-bearing invariants. These thirteen never-rules are the
 architect's mandate: each is tied to its NFR row, the component invariant it
 upholds, and the ADR that decided it. Every one names where the code enforces
 it. A change here changes in the architecture repo first; this file only
@@ -177,3 +177,65 @@ is createFile's membership in the fenced set, not the rule.
   body is unpinned. The guard is `internal/filesapi/create_fenced_test.go:TestCreateIsFenced501`
   — it asserts `POST /v1/files` returns 501 AND that the fenced create touched
   nothing (no store, no engine) while the body is `x-ocu-tbd`.
+
+## 12. Never resolve a north file_id through the ephemeral store
+
+The north `/v1/files` surface resolves the DURABLE handle store ONLY — never the
+within-session ephemeral object-id store. That ephemeral store mints and resolves
+a session-scoped object handle to back the SOUTH mount RPC; it holds no durable
+retention and dies with the session. A north `file_id` is a durable, scope-bound
+record in the handle authority, not a within-session uuid. The two stores are
+distinct authorities for distinct faces, and the north handler binds exactly one
+of them. Resolving a north `file_id` through the ephemeral store would let a
+session-scoped, non-durable handle stand in for the durable Files-API record —
+collapsing the durable/ephemeral boundary the recut split keeps apart.
+
+- ADR-0023 (Files-API durable handle home) / ADR-0015 (north client/host-leg
+  split) — NFR-SEC-73 / NFR-SEC-25
+- Enforced: `internal/filesapi/deps.go` binds `Store handlestore.Store` as the
+  ONE store the north handler resolves through — the durable handle authority,
+  never the ephemeral one. `internal/filesapi/importboundary_test.go` is the
+  import-graph guard that reds if the north package ever references the south
+  ephemeral object-id store (`internal/southface/objectid.go`'s `objectIDStore`,
+  its constructor, or its handle mint) through a `southface` selector — the same
+  parser that guards #10's router surface now also forbids the ephemeral-store
+  surface, so a north resolution path can never borrow the session-scoped store.
+
+## 13. Never let internal coverage fall below the committed floor
+
+The Go internal line-coverage floor is a CI gate that FAILS the build below a
+committed threshold — it is not advisory. The floor is `86.0%` over
+`./internal/...`; the integrated suite runs with the real S3 backend leg so the
+S3 engine counts toward the measure and the floor is never lowered to absorb new
+code. A drop below the floor reds the build with a named diagnostic, not a silent
+ratchet-down.
+
+- The project's coverage-floor build discipline (CLAUDE.md "Build discipline":
+  86.0% floor over `./internal/...`, blocking; no-bypass)
+- Enforced: `.github/workflows/go.yml` coverage job — the "enforce the
+  line-coverage floor" step compares the measured `go tool cover` total against
+  `floor=86.0` and emits `::error::go internal coverage %.1f%% below floor %.1f%%`
+  with `exit 1` when measured `< 86.0`. The gate reds firsthand in CI; it was
+  witnessed GREEN at the F9 read-plane measure of `89.5% >= 86.0%` on the
+  read-plane PR. The reddening branch is live (a sub-floor measure exits 1), so
+  the floor is a real gate, not a printed number.
+
+## Aspirational (not yet mechanically guarded)
+
+The architect's self-check directive requires any load-bearing behavior that is
+NOT yet behind a reddening guard to be named here explicitly, never left silently
+among the enforced invariants above. Each entry below is real, intended behavior
+with NO guard that reds today; it graduates into the enforced set only when a
+guard that provably reds is written for it.
+
+- **Write-plane upload semantics (ceilings + audit-before-ack on createFile) —
+  pending #304.** The eventual `POST /v1/files` upload handler must enforce the
+  per-session ceilings and emit the audit event before acknowledging the write.
+  That behavior has NO guard yet because the handler does not yet exist: the
+  upload body is `x-ocu-tbd` and createFile serves a clean 501 (invariant #11
+  guards the fence, and #11's test asserts the fenced create touches no store and
+  no engine). What #11 does NOT guard is the upload-ceilings / audit-before-ack
+  behavior of the real handler — there is nothing to guard until #304 → #305 pin
+  the body and land the handler. When the write path lands, its ceilings and
+  audit-before-ack semantics need their own reddening guard before they may be
+  restated as an enforced invariant. Until then this is aspirational-pending-#304.
