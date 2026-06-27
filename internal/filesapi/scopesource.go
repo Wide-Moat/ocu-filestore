@@ -10,13 +10,14 @@ import (
 )
 
 // ScopeSource derives the host-attested PeerScope for an F9 Files-API request.
-// It is a narrow seam with exactly one method that reads the ratified ADR-0025
+// It is a narrow seam with exactly one method that reads the ADR-0025
 // scope-field transport: the attested filesystem_id presented as a request
 // header on the trusted intra-deployment F9 channel (NFR-SEC-43 — scope is read
-// from the attested channel, never from a request body). The shape is frozen
-// (tracking issue #304 / ADR-0025 §Decision); the canon merge to origin/next/v1
-// is owner-gated and still pending, so the binding is architect-ratified but not
-// yet origin-canon-merged.
+// from the attested channel, never from a request body). The shape is
+// architect-agreed (tracking issue #304 / ADR-0025 §Decision, status:proposed);
+// the canon merge to origin/next/v1 is owner-gated and still pending, so the
+// binding is architect-agreed-pending-canon-merge — NOT yet canon-ratified on
+// origin/next/v1.
 //
 // Q-F9AUTH (architect ruling): the F9 HOST leg does NOT cross egress, so there
 // is NO edge-injected Authorization: Bearer to read — the south credscope
@@ -40,13 +41,15 @@ type ScopeSource interface {
 // fencedScopeHeader is the request header the ScopeSource reads the host-attested
 // filesystem_id from.
 //
-// This header IS the ADR-0025 scope-field transport (ratified in tracking issue
-// #304 / ADR-0025 §Decision): on the F9 host leg the attested filesystem_id is
-// carried as this request header over the trusted intra-deployment channel, and
-// scope is taken from the attested channel, never from a request body
-// (NFR-SEC-43). It is a wire commitment, not a throwaway placeholder; the shape
-// is frozen, with the canon merge to origin/next/v1 still owner-gated and
-// pending. The header name is deliberately host-attested-only: on the real F9
+// This header IS the ADR-0025 scope-field transport (architect-agreed in
+// tracking issue #304 / ADR-0025 §Decision, status:proposed): on the F9 host leg
+// the attested filesystem_id is carried as this request header over the trusted
+// intra-deployment channel, and scope is taken from the attested channel, never
+// from a request body (NFR-SEC-43). It is a wire commitment, not a throwaway
+// placeholder; the shape is architect-agreed, with the canon merge to
+// origin/next/v1 still owner-gated and pending (so the binding is
+// architect-agreed-pending-canon-merge, not yet canon-ratified). The header
+// name is deliberately host-attested-only: on the real F9
 // host leg the trusted intra-deployment channel attests it; a guest never
 // reaches this plane (Mount B is a separate listener, not the south guest path),
 // so there is no guest-spoofing surface. This is NOT credscope reuse: there is no
@@ -71,14 +74,16 @@ var fencedGrantedIntents = []southface.Intent{southface.IntentRead}
 // with the read intent grant. An absent or empty header is ok=false
 // (fail-closed).
 //
-// The transport shape is ratified (tracking issue #304 / ADR-0025 §Decision);
-// the canon merge to origin/next/v1 is owner-gated and still pending, so the
-// binding is architect-ratified but not yet origin-canon-merged.
+// The transport shape is architect-agreed (tracking issue #304 / ADR-0025
+// §Decision, status:proposed); the canon merge to origin/next/v1 is owner-gated
+// and still pending, so the binding is architect-agreed-pending-canon-merge —
+// NOT yet canon-ratified on origin/next/v1.
 type headerScopeSource struct{}
 
 // NewFencedScopeSource returns the ScopeSource Mount B wires this build: the
-// reader of the ratified ADR-0025 scope-field transport (tracking issue #304),
-// pending only the owner-gated canon merge to origin/next/v1.
+// reader of the architect-agreed ADR-0025 scope-field transport (tracking issue
+// #304, ADR-0025 status:proposed), pending the owner-gated canon merge to
+// origin/next/v1.
 func NewFencedScopeSource() ScopeSource { return headerScopeSource{} }
 
 // Scope reads the host-attested filesystem_id from the fenced header and returns
