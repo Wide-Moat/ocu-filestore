@@ -124,6 +124,11 @@ jobs:
           name: ocu-filestored
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
+      - name: red-probe the s3-leg liveness gate (two-sided, before the rig)
+        # Prove the liveness assertion does not lie in either direction BEFORE
+        # spending a MinIO rig boot on it: a real pass -> exit 0, a skipped or
+        # absent target -> non-zero. Fails fast if the gate itself regresses.
+        run: bash scripts/check-s3-leg-ran-redprobe.sh
       - name: boot the MinIO rig
         run: |
           docker compose -f deploy/docker-compose.test.yml up -d --wait minio
@@ -141,6 +146,11 @@ jobs:
         # suite, and a skip counts as a pass — a var typo would otherwise report
         # green while exercising no live S3. TestComposeS3RealEngineServes runs
         # ONLY against the rig, so its real pass is the unique liveness signal.
+        #
+        # The liveness assertion lives in scripts/check-s3-leg-ran.sh (single
+        # source, red-probed below): it jq-selects the test's own pass object
+        # from the go-test-json stream — robust to JSON field order and line
+        # buffering, unlike a two-stage grep pipe which false-reds a real green.
         run: |
           set -uo pipefail
           code=0
@@ -148,12 +158,7 @@ jobs:
             | tee /tmp/e2e-s3.json >/dev/null || code=$?
           grep -oE '"Output":"[^"]*"' /tmp/e2e-s3.json \
             | sed -E 's/^"Output":"//; s/"$//; s/\\n$//; s/\\t/\t/g' || true
-          if ! grep -E '"Action":"pass"' /tmp/e2e-s3.json \
-            | grep -qE '"Test":"TestComposeS3RealEngineServes"'; then
-            echo "::error::the s3-leg case TestComposeS3RealEngineServes did not pass — the rig env never reached the live slice (every s3 case skipped)"
-            exit 1
-          fi
-          echo "s3 e2e leg ran: TestComposeS3RealEngineServes passed against real MinIO"
+          bash scripts/check-s3-leg-ran.sh /tmp/e2e-s3.json
           exit "$code"
       - name: tear the rig down
         if: always()
