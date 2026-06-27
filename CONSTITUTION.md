@@ -3,7 +3,7 @@
 
 # CONSTITUTION — ocu-filestore
 
-The storage service's load-bearing invariants. These ten never-rules are the
+The storage service's load-bearing invariants. These eleven never-rules are the
 architect's mandate: each is tied to its NFR row, the component invariant it
 upholds, and the ADR that decided it. Every one names where the code enforces
 it. A change here changes in the architecture repo first; this file only
@@ -152,3 +152,28 @@ to launder authority across the trust boundary.
   binds with separate servers. `internal/northface/mountb.go:NewMountB` reuses
   only the south face's certificate paths for Mount B, never its router — the
   shared input is the cert material, not the request path.
+
+## 11. Never serve an op whose wire body the canon has not pinned
+
+This service never serves a frozen-named operation whose per-operation
+request/response body the canon contract has not yet pinned. It returns 501
+(unimplemented) rather than invent a wire body and code against it. Inventing a
+TBD body and building on it is the forbidden shortcut — the corner cut under
+ship-pressure — and it is forbidden for every verb, present and future, not just
+the one fenced today.
+
+The current application is `POST /v1/files` (createFile): its upload body is
+marked `x-ocu-tbd-bodies` in the frozen contract pending #304 / ADR-0025, so it
+serves a clean 501. When #304 pins the upload body, createFile LEAVES the fenced
+set and the write path lands; #11 itself still stands, guarding the next
+frozen-named verb whose body the canon has not yet pinned. What resolves at #304
+is createFile's membership in the fenced set, not the rule.
+
+- Frozen-wire-contract discipline: the contract's `x-ocu-tbd-bodies` marker and
+  CLAUDE.md's "never invent a body" rule — ADR-0023 (north contract) / ADR-0025
+  (F9 scope-field transport, the upload-body pin)
+- Enforced: `internal/filesapi/create_fenced.go:serveCreate` returns the
+  `Unimplemented` deny (501) and touches no store and no engine while the upload
+  body is unpinned. The guard is `internal/filesapi/create_fenced_test.go:TestCreateIsFenced501`
+  — it asserts `POST /v1/files` returns 501 AND that the fenced create touched
+  nothing (no store, no engine) while the body is `x-ocu-tbd`.
