@@ -137,7 +137,7 @@ func TestMountBServeCloseRoundTrip(t *testing.T) {
 	// Wait for the listener to accept, then GET over TLS (skip-verify: the cert
 	// is an ephemeral self-signed loopback cert).
 	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // ephemeral self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // ephemeral self-signed test cert
 		Timeout:   3 * time.Second,
 	}
 	var resp *http.Response

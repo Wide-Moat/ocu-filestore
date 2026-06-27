@@ -75,7 +75,7 @@ func TestNorthEndToEndPutThenGet(t *testing.T) {
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // ephemeral self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // ephemeral self-signed test cert
 		Timeout:   3 * time.Second,
 	}
 
@@ -129,7 +129,7 @@ func TestNorthEndToEndCrossScopeIs404(t *testing.T) {
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // ephemeral self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // ephemeral self-signed test cert
 		Timeout:   3 * time.Second,
 	}
 	var resp *http.Response

@@ -17,7 +17,7 @@ import (
 func tlsGet(t *testing.T, addr, path string) *http.Response {
 	t.Helper()
 	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // ephemeral self-signed test cert
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // ephemeral self-signed test cert
 		Timeout:   3 * time.Second,
 	}
 	deadline := time.Now().Add(3 * time.Second)
