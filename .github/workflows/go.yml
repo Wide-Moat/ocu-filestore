@@ -286,17 +286,21 @@ jobs:
       # and file-artifact-api.schema.json; we do not vendor mount-config).
       # We vendor only those two files — mount-config belongs to the guest.
       #
-      # The prior pin (0ebf93e) was the commit the v0.9.6.0 tag pointed to
-      # when we first vendored; the canon remote later moved that tag to a
-      # different commit (23ffdc9) that does not contain contracts/storage/
-      # at all, and the old 0ebf93e ref was dropped from the remote. The
-      # new pin below is the canon HEAD that does carry those contracts and
-      # is verified byte-identical. Bump this SHA deliberately when
-      # re-vendoring; verify byte-identity (sha256) before bumping.
+      # The prior pin (73e82c6) predated the storage-recut (#273) that retired
+      # the broker/sandbox formulation for object-store-service/mount-plane: its
+      # contracts/storage/ still carried "Session sandbox -> Storage broker",
+      # while our vendored copies carry the recut "Mount-plane ... object-store
+      # service" wording. 73e82c6 is NOT an ancestor of next/v1 (divergent,
+      # stale), so the gate failed against the wrong formulation. The pin below
+      # is the current next/v1 HEAD (the authoritative branch), an immutable SHA
+      # whose contracts/storage/ tree is byte-identical to our vendored copies
+      # (file-ops.schema.json + file-artifact-api.schema.json; mount-config
+      # belongs to the guest and is not vendored). Bump this SHA deliberately
+      # when re-vendoring; verify byte-identity (sha256) before bumping.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: Wide-Moat/open-computer-use
-          ref: 73e82c66a2df834683276ead83aa1571a1476ed0
+          ref: 62f5eeb598f2f4e0370d3c35d5d70b8f204df7de
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
