@@ -164,6 +164,44 @@ func TestContentExplicitRangeReadsWindow(t *testing.T) {
 	}
 }
 
+// TestContentOffsetOnlyReadsToEOF pins the offset-only window: a request with an
+// offset but NO length param reads [offset, EOF) — NOT an empty body. The handler
+// must Stat the size and resolve length = info.Size - offset when the length param
+// is absent (the nil-range whole-object formula at offset 0 generalised). A bare
+// offset that skips the Stat and passes length=0 to the engine silently returns an
+// empty 200 (data loss) -> this goes RED.
+func TestContentOffsetOnlyReadsToEOF(t *testing.T) {
+	guard := &fakeGuard{}
+	h, eng, _ := contentSetup(southface.Grant{Downloadable: true}, guard)
+	w := doReq(h, http.MethodGet, "/v1/files/fid-known/content?offset=2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if w.Body.String() != "llo" {
+		t.Fatalf("offset-only body = %q, want %q (bytes [offset, EOF))", w.Body.String(), "llo")
+	}
+	// The length param is absent, so the handler must Stat to learn info.Size.
+	if eng.statCalls != 1 {
+		t.Fatalf("Stat called %d times for an offset-only read; want 1 (length resolved by Stat)", eng.statCalls)
+	}
+}
+
+// TestContentOffsetOnlyAtEOF pins the EOF edge: an offset equal to the object size
+// (no length param) is a correct empty 200 — distinct from the offset-only data
+// loss bug. offset==Size reads zero bytes legitimately; the body is empty AND the
+// status is 200.
+func TestContentOffsetOnlyAtEOF(t *testing.T) {
+	guard := &fakeGuard{}
+	h, _, _ := contentSetup(southface.Grant{Downloadable: true}, guard)
+	w := doReq(h, http.MethodGet, "/v1/files/fid-known/content?offset=5")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (offset==Size is a legitimate empty read)", w.Code)
+	}
+	if w.Body.String() != "" {
+		t.Fatalf("offset-at-EOF body = %q, want empty (offset==Size reads zero bytes)", w.Body.String())
+	}
+}
+
 // TestContentAuditBeforeAckMandateFailsIs503ZeroBytes pins audit-before-ack: an
 // ALLOW Mandate failure (audit down) denies 503 with ZERO bytes and
 // engine.ReadRange NEVER called.

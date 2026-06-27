@@ -4,6 +4,7 @@
 package handlestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -19,9 +20,18 @@ const maxListLimit = 100
 // cursorV1 is the version prefix byte stamped on every minted handle-store
 // cursor. A version byte keeps this phase's cursors distinguishable from any
 // future cursor shape so a stale token decodes to a clean rejection rather than
-// a silent mis-walk. The handle-store cursor is keyed on file_id (the stable
-// per-record tiebreak), distinct from the south-face path-keyed cursor.
+// a silent mis-walk. The handle-store cursor carries the FULL (CreatedAt,
+// FileID) sort key — the same key recordLess orders on — so a resume is a strict
+// tuple comparison, not a bare-FileID walk that mis-resumes against a
+// CreatedAt-primary order (which repeats or strands a record on a deleted
+// boundary). It is distinct from the south-face path-keyed cursor.
 const cursorV1 byte = 1
+
+// cursorFieldSep delimits the two cursor fields (CreatedAt then FileID) inside
+// the encoded token. It is a NUL byte: an RFC-3339 timestamp and a 32-hex
+// file_id can never contain one, so the split is unambiguous and neither field
+// can forge a boundary.
+const cursorFieldSep byte = 0
 
 // errMalformedCursor names a cursor token that is not a base64url-decodable,
 // non-empty, correctly-versioned token the store minted. The store only ever
@@ -30,33 +40,40 @@ const cursorV1 byte = 1
 // branch on it directly, the wire layer maps it.
 var errMalformedCursor = errors.New("handlestore: malformed cursor")
 
-// encodeCursor mints an opaque keyset cursor encoding the file_id of the
-// last-emitted record on a page. The wire form is
-// base64url(version-byte || raw-file_id-bytes) with no padding; the store emits
-// exactly the bytes it will later decode, so the round-trip is byte-identical.
-// An empty afterFileID still mints a non-empty token (the version byte alone),
-// distinct from the empty no-more-pages cursor.
-func encodeCursor(afterFileID string) string {
-	buf := make([]byte, 0, 1+len(afterFileID))
+// encodeCursor mints an opaque keyset cursor encoding the FULL sort key
+// (CreatedAt, FileID) of the last-emitted record on a page. The wire form is
+// base64url(version-byte || createdAt || NUL || file_id) with no padding; the
+// store emits exactly the bytes it will later decode, so the round-trip is
+// byte-identical. Carrying both fields lets the resume be a strict tuple
+// comparison matching recordLess, so a deleted boundary record neither repeats
+// nor strands a surviving record.
+func encodeCursor(afterCreatedAt, afterFileID string) string {
+	buf := make([]byte, 0, 2+len(afterCreatedAt)+len(afterFileID))
 	buf = append(buf, cursorV1)
+	buf = append(buf, afterCreatedAt...)
+	buf = append(buf, cursorFieldSep)
 	buf = append(buf, afterFileID...)
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
 // decodeCursor reverses encodeCursor. An empty token is the genuine first-page
-// / no-cursor case and returns ("", nil). A token that is not base64url-
-// decodable, decodes to zero bytes, or carries the wrong version byte returns
-// errMalformedCursor. Otherwise the bytes after the version prefix are the
-// resume-after file_id (which the caller compares against the sorted order).
-func decodeCursor(tok string) (string, error) {
+// / no-cursor case and returns ("", "", nil). A token that is not base64url-
+// decodable, decodes to zero bytes, carries the wrong version byte, or lacks the
+// single field separator returns errMalformedCursor. Otherwise it returns the
+// (CreatedAt, FileID) sort key to resume strictly after.
+func decodeCursor(tok string) (createdAt, fileID string, err error) {
 	if tok == "" {
-		return "", nil
+		return "", "", nil
 	}
-	b, err := base64.RawURLEncoding.DecodeString(tok)
-	if err != nil || len(b) == 0 || b[0] != cursorV1 {
-		return "", errMalformedCursor
+	b, derr := base64.RawURLEncoding.DecodeString(tok)
+	if derr != nil || len(b) == 0 || b[0] != cursorV1 {
+		return "", "", errMalformedCursor
 	}
-	return string(b[1:]), nil
+	sep := bytes.IndexByte(b[1:], cursorFieldSep)
+	if sep < 0 {
+		return "", "", errMalformedCursor
+	}
+	return string(b[1 : 1+sep]), string(b[1+sep+1:]), nil
 }
 
 // recordLess imposes the STABLE total order List pages walk: ascending
@@ -97,7 +114,7 @@ func (s *DiskStore) List(ctx context.Context, in ListInput) (ListPage, error) {
 	// List leg of the empty-scope reject; Get/Delete reject before the map
 	// lookup. Decode the cursor first so a malformed cursor is still a 400 even
 	// under an empty scope (a client fault is named regardless of scope).
-	after, err := decodeCursor(in.Cursor)
+	afterCreatedAt, afterFileID, err := decodeCursor(in.Cursor)
 	if err != nil {
 		return ListPage{}, err
 	}
@@ -128,7 +145,7 @@ func (s *DiskStore) List(ctx context.Context, in ListInput) (ListPage, error) {
 	// starts at the first record that sorts strictly after it.
 	start := 0
 	if in.Cursor != "" {
-		start = resumeIndex(matched, after)
+		start = resumeIndex(matched, afterCreatedAt, afterFileID)
 	}
 
 	page := matched[start:]
@@ -148,32 +165,42 @@ func (s *DiskStore) List(ctx context.Context, in ListInput) (ListPage, error) {
 	}
 	if hasMore {
 		out.HasMore = true
-		out.NextCursor = encodeCursor(out.LastID)
+		// Mint the cursor from the FULL sort key of the last emitted record so
+		// the next page resumes by a strict (CreatedAt, FileID) tuple comparison.
+		boundary := page[len(page)-1]
+		out.NextCursor = encodeCursor(boundary.CreatedAt, boundary.FileID)
 	}
 	return out, nil
 }
 
-// resumeIndex returns the index in the (CreatedAt, FileID)-sorted slice at
-// which a page resuming strictly after the record named by afterFileID should
-// start. The cursor names the last record of the prior page by its globally
-// unique file_id: locate that exact record and resume at the following index.
+// resumeIndex returns the index in the (CreatedAt, FileID)-sorted slice at which
+// a page resuming strictly after the (afterCreatedAt, afterFileID) sort key
+// should start. The cursor carries the FULL sort key of the prior page's last
+// record, so the resume is a strict TUPLE comparison matching recordLess: the
+// first record that sorts strictly AFTER the cursor key, i.e. the first record
+// for which (CreatedAt > afterCreatedAt) OR (CreatedAt == afterCreatedAt AND
+// FileID > afterFileID).
 //
-// If no record carries that file_id (it was deleted between pages), the walk
-// must neither strand nor repeat: fall back to the first record whose file_id
-// sorts strictly greater than the cursor's. Because file_id is unique and the
-// boundary record is gone, this resumes at or after where the deleted record
-// sat — every still-present record after the deletion boundary is emitted
-// exactly once.
-func resumeIndex(sorted []Record, afterFileID string) int {
+// Because the comparison is on the same key the order sorts by, the resume point
+// is well-defined whether or not the boundary record still exists: if it was
+// deleted between pages, the first record sorting after its key is exactly where
+// the next page must begin — every surviving record after the boundary is
+// emitted exactly once, with no repeat and no strand.
+func resumeIndex(sorted []Record, afterCreatedAt, afterFileID string) int {
 	for i := range sorted {
-		if sorted[i].FileID == afterFileID {
-			return i + 1
-		}
-	}
-	for i := range sorted {
-		if sorted[i].FileID > afterFileID {
+		if sortsAfter(sorted[i], afterCreatedAt, afterFileID) {
 			return i
 		}
 	}
 	return len(sorted)
+}
+
+// sortsAfter reports whether rec sorts strictly after the (createdAt, fileID)
+// key under the recordLess order: ascending CreatedAt primary, ascending FileID
+// tiebreak. It is the cursor-resume mirror of recordLess.
+func sortsAfter(rec Record, createdAt, fileID string) bool {
+	if rec.CreatedAt != createdAt {
+		return rec.CreatedAt > createdAt
+	}
+	return rec.FileID > fileID
 }

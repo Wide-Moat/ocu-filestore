@@ -40,8 +40,10 @@ const contentTypeOctetStream = "application/octet-stream"
 //   - downloadable AT READ from the broker-resolved grant (NFR-SEC-73): a
 //     non-downloadable grant denies 403 with engine.ReadRange NEVER called.
 //   - resolve the read window: a negative offset/length is invalid_argument
-//     (400); a nil range is the WHOLE object, whose length is a Stat run BEFORE
-//     the ALLOW Mandate (a vanished object records one deny, not allow-then-deny).
+//     (400); an ABSENT length reads from offset to EOF (the whole object when
+//     offset is 0, an offset-only [offset, EOF) window otherwise), whose length
+//     is a Stat (info.Size - offset, clamped >= 0) run BEFORE the ALLOW Mandate
+//     (a vanished object records one deny, not allow-then-deny).
 //   - Mandate the ALLOW BEFORE any byte (audit-before-ack, SEC-79); an audit
 //     failure denies 503 with zero bytes.
 //   - fd ceiling around the engine read window.
@@ -98,15 +100,23 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 		h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.Malformed, "negative range offset or length", reqID)
 		return
 	}
-	if !hasExplicitRange(r) {
-		// nil range -> WHOLE object: Stat the size BEFORE the ALLOW Mandate so a
-		// vanished object records a single deny, never allow-then-deny.
+	if !hasLength(r) {
+		// The length param is ABSENT: the window runs from offset to EOF. This
+		// covers BOTH the nil range (offset 0 -> whole object) and an offset-only
+		// request (offset N -> [N, EOF)) — a missing length is never zero bytes.
+		// Stat the size BEFORE the ALLOW Mandate so a vanished object records a
+		// single deny, never allow-then-deny.
 		info, serr := h.deps.Engine.Stat(r.Context(), ps.FilesystemID, engPath)
 		if serr != nil {
 			h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.NotFound, "not found", reqID)
 			return
 		}
-		length = info.Size
+		// length = info.Size - offset, clamped to >= 0: an offset at or past EOF
+		// reads zero bytes (a legitimate empty 200), never a negative window.
+		length = info.Size - offset
+		if length < 0 {
+			length = 0
+		}
 	}
 
 	// --- audit ALLOW before any byte (audit-before-ack, SEC-79) ---
@@ -173,12 +183,13 @@ const (
 	contentLengthParam = "length"
 )
 
-// hasExplicitRange reports whether the request carries an explicit read window
-// (either offset or length query parameter present). When false the whole object
-// is read (its size resolved by a Stat).
-func hasExplicitRange(r *http.Request) bool {
-	q := r.URL.Query()
-	return q.Has(contentOffsetParam) || q.Has(contentLengthParam)
+// hasLength reports whether the request carries an explicit length query
+// parameter. When false the window runs from offset to EOF (length resolved by a
+// Stat as info.Size - offset): a missing length is read-to-end, NOT zero bytes.
+// The offset alone never determines the window length, so an offset-only request
+// (offset present, length absent) takes the Stat path just like a nil range.
+func hasLength(r *http.Request) bool {
+	return r.URL.Query().Has(contentLengthParam)
 }
 
 // parseContentRange parses the optional offset/length query parameters into the

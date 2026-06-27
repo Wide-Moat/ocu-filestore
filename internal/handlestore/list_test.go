@@ -146,6 +146,102 @@ func TestListCursorRoundTripsAndPages(t *testing.T) {
 	}
 }
 
+// seedRec installs a record DIRECTLY into the store map with a caller-chosen
+// FileID and CreatedAt, bypassing Put's random-mint / clock-stamp. A test needs
+// this to construct a (CreatedAt, FileID) order that is INVERTED — an earlier
+// CreatedAt paired with a lexically-larger FileID — which is the precise
+// condition that exposes a bare-FileID cursor walking a CreatedAt-primary order.
+func seedRec(s *DiskStore, fileID, scope, created string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recs[fileID] = Record{FileID: fileID, Scope: scope, CreatedAt: created, ObjectRef: "obj/" + fileID}
+}
+
+// TestListKeysetCursorNoRepeatOnDeletedBoundary asserts the exactly-once promise
+// across a deleted-boundary page break. The records are constructed so FileID
+// order is INVERTED relative to CreatedAt order (the earlier-CreatedAt record
+// carries the lexically-LARGER FileID), then the page-1 boundary record (the
+// record the NextCursor points at) is DELETED before page 2 is fetched. A cursor
+// that encodes only the bare FileID resumes by FileID against a CreatedAt-primary
+// order — so on a deleted boundary a still-present record either REPEATS (two
+// pages) or STRANDS (skipped). The fix encodes the full (CreatedAt, FileID) sort
+// key and resumes by a strict tuple comparison, so every surviving record appears
+// EXACTLY ONCE -> this goes RED on the bare-FileID cursor.
+func TestListKeysetCursorNoRepeatOnDeletedBoundary(t *testing.T) {
+	_, s := newTestStore(t)
+	// CreatedAt order: r1 < r2 < r3 (the walk order).
+	// FileID order is INVERTED: r1 has the LARGEST FileID, r3 the smallest.
+	// So a bare-FileID resume after r2's FileID (mid-range "bbb...") mis-walks.
+	const (
+		t1 = "2026-01-01T00:00:01Z"
+		t2 = "2026-01-01T00:00:02Z"
+		t3 = "2026-01-01T00:00:03Z"
+	)
+	// 32-hex FileIDs chosen so lexical order is r3 < r2 < r1 (inverted vs time).
+	r1 := "ccccccccccccccccccccccccccccccc1"
+	r2 := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2"
+	r3 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"
+	seedRec(s, r1, "fs-A", t1)
+	seedRec(s, r2, "fs-A", t2)
+	seedRec(s, r3, "fs-A", t3)
+
+	// Page 1, limit 2: walk order is (t1,r1),(t2,r2); boundary record is r2.
+	p1, err := s.List(context.Background(), ListInput{Scope: "fs-A", Limit: 2})
+	if err != nil {
+		t.Fatalf("List page1: %v", err)
+	}
+	if len(p1.Records) != 2 || p1.Records[0].FileID != r1 || p1.Records[1].FileID != r2 {
+		t.Fatalf("page1 = %+v, want [r1, r2] in CreatedAt order", recIDs(p1.Records))
+	}
+	if !p1.HasMore || p1.NextCursor == "" {
+		t.Fatalf("page1 HasMore=%v NextCursor=%q, want a continuation", p1.HasMore, p1.NextCursor)
+	}
+
+	// Delete the boundary record r2 (the record the cursor names) between pages.
+	s.mu.Lock()
+	delete(s.recs, r2)
+	s.mu.Unlock()
+
+	// Page 2: must yield exactly r3 (the only surviving record after the
+	// boundary). A bare-FileID cursor encoding r2 ("bbb...2") resumes at the
+	// first FileID > "bbb...2" — which is r1 ("ccc...1"), REPEATING r1 and
+	// STRANDING r3.
+	p2, err := s.List(context.Background(), ListInput{Scope: "fs-A", Cursor: p1.NextCursor, Limit: 2})
+	if err != nil {
+		t.Fatalf("List page2: %v", err)
+	}
+
+	// Tally every record across both pages; each surviving record exactly once,
+	// the deleted r2 zero times, no repeats.
+	count := map[string]int{}
+	for _, r := range p1.Records {
+		count[r.FileID]++
+	}
+	for _, r := range p2.Records {
+		count[r.FileID]++
+	}
+	if count[r1] != 1 {
+		t.Fatalf("r1 appeared %d times across pages, want exactly 1 (repeat/strand bug)", count[r1])
+	}
+	if count[r3] != 1 {
+		t.Fatalf("r3 appeared %d times across pages, want exactly 1 (stranded by bare-FileID cursor)", count[r3])
+	}
+	if count[r2] != 1 {
+		// r2 was on page 1 before its deletion; it must appear exactly once
+		// (page 1), never again on page 2.
+		t.Fatalf("deleted boundary r2 appeared %d times, want exactly 1 (page 1 only)", count[r2])
+	}
+}
+
+// recIDs projects a record slice to its FileIDs for readable failure output.
+func recIDs(recs []Record) []string {
+	out := make([]string, len(recs))
+	for i, r := range recs {
+		out[i] = r.FileID
+	}
+	return out
+}
+
 // TestListMalformedCursorRejected asserts a non-mintable cursor -> errMalformed
 // Cursor. Mutation: skipping the decodeCursor error return makes the garbage
 // token silently page from the start -> this goes RED.
