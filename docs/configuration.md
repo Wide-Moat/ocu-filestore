@@ -5,10 +5,10 @@ Copyright (c) 2025 Open Computer Use Contributors
 
 # ocu-filestored configuration reference
 
-`ocu-filestored` reads its configuration from command-line flags.
-Every flag (except credential-bearing ones — see below) also accepts a
-corresponding `OCU_FILESTORE_*` environment variable as a fallback when the
-flag is absent from the command line.
+`ocu-filestored` serves a TLS HTTPS/HTTP-2 REST-JSON south face and reads its
+configuration from command-line flags. Every flag (except credential-bearing
+ones — see below) also accepts a corresponding `OCU_FILESTORE_*` environment
+variable as a fallback when the flag is absent from the command line.
 
 ## Precedence rule
 
@@ -25,7 +25,6 @@ error as a malformed flag value.
 |------|---------------------|------|---------|-------------|
 | `-audit-sink` | `OCU_FILESTORE_AUDIT_SINK` | string | _(required)_ | Fail-closed audit gate file-sink path (NFR-SEC-79) |
 | `-broker-max-file-size` | `OCU_FILESTORE_BROKER_MAX_FILE_SIZE` | int64 | _(required)_ | Whole-object upload ceiling in bytes (> 0) |
-| `-ca-bundle` | `OCU_FILESTORE_CA_BUNDLE` | string | `` | PEM bundle appended to the system cert pool for the storage-lane proxy CA (requires `-storage-lane`) |
 | `-downloadable-prefixes` | `OCU_FILESTORE_DOWNLOADABLE_PREFIXES` | string | `` | Comma-separated broker-side downloadable prefixes (NFR-SEC-73) |
 | `-engine` | `OCU_FILESTORE_ENGINE` | string | `local-volume` | Backend object-store engine: `local-volume` or `s3` (ADR-0010) |
 | `-engine-root` | `OCU_FILESTORE_ENGINE_ROOT` | string | _(required for local-volume)_ | Local-volume engine root directory |
@@ -43,12 +42,10 @@ error as a malformed flag value.
 | `-s3-endpoint` | `OCU_FILESTORE_S3_ENDPOINT` | string | _(required for s3)_ | Backend S3 endpoint URL |
 | `-s3-path-style` | `OCU_FILESTORE_S3_PATH_STYLE` | bool | `false` | Path-style S3 addressing (required by most single-host S3-compatible backends) |
 | `-s3-region` | `OCU_FILESTORE_S3_REGION` | string | `us-east-1` | S3 engine signing region |
-| `-s3-sts-endpoint` | `OCU_FILESTORE_S3_STS_ENDPOINT` | string | `` | STS endpoint override for S3-compatible rigs (requires `-s3-sts-role-arn`) |
-| `-s3-sts-role-arn` | `OCU_FILESTORE_S3_STS_ROLE_ARN` | string | `` | IAM role ARN for STS-per-session credential kind |
-| `-south-socket-dir` | `OCU_FILESTORE_SOUTH_SOCKET_DIR` | string | `/run/ocu-filestore/sessions` | Host-owned 0700 directory for per-session unix sockets |
-| `-storage-lane` | `OCU_FILESTORE_STORAGE_LANE` | string | `` | Storage egress lane proxy URL (ADR-0011, NFR-SEC-16/85); required for `-engine s3` in production |
-| `-storage-lane-dev-direct` | `OCU_FILESTORE_STORAGE_LANE_DEV_DIRECT` | bool | `false` | **Dev rigs only** — dial the S3 backend without the storage lane; never set in production |
+| `-south-bind` | `OCU_FILESTORE_SOUTH_BIND` | string | `127.0.0.1:7443` | South-face TLS HTTPS bind address (the `service_url` the guest dials outbound through the Egress edge) |
 | `-tenancy` | `OCU_FILESTORE_TENANCY` | string | `single-tenant` | Tenancy mode: `single-tenant`, `multi-tenant` |
+| `-tls-cert` | `OCU_FILESTORE_TLS_CERT` | string | _(required)_ | South-face TLS server certificate PEM path |
+| `-tls-key` | `OCU_FILESTORE_TLS_KEY` | string | _(required)_ | South-face TLS server private-key PEM path |
 | `-version` | `OCU_FILESTORE_VERSION` | bool | `false` | Print the build identity and exit 0 |
 
 ## Credential-bearing flags — excluded from the generic env map
@@ -67,6 +64,16 @@ The raw S3 access-key-id and secret-access-key travel only through the
 `OCU_FILESTORE_*` map. Credential values are never logged (only the
 credential file *path* may appear in logs at INFO level).
 
+These flags configure the **engine's own backend credential** (NFR-SEC-25) —
+the static host-local key the single object-store client uses to reach the
+backing store. That is distinct from the **guest's filestore credential**,
+which the service never holds in flag or env form: the Egress edge validates
+and strips the guest's weak session JWT, exchanges it (RFC 8693) for the real
+filestore credential, and injects that on the request's `Authorization: Bearer`
+header. The service forwards the injected credential to the engine unmodified
+and mints/signs nothing (invariant 3); the engine enforces `filesystem_id`
+scope on it. There is no flag for the guest credential.
+
 ## Example: systemd drop-in using env vars
 
 ```ini
@@ -77,7 +84,9 @@ Environment=OCU_FILESTORE_ENGINE_ROOT=/var/lib/ocu-filestore/data
 Environment=OCU_FILESTORE_AUDIT_SINK=/var/log/ocu-filestore/audit.jsonl
 Environment=OCU_FILESTORE_FILESYSTEM_ID=fs-prod-01
 Environment=OCU_FILESTORE_BROKER_MAX_FILE_SIZE=5368709120
-Environment=OCU_FILESTORE_SOUTH_SOCKET_DIR=/run/ocu-filestore/sessions
+Environment=OCU_FILESTORE_SOUTH_BIND=127.0.0.1:7443
+Environment=OCU_FILESTORE_TLS_CERT=/etc/ocu-filestore/tls/server.crt
+Environment=OCU_FILESTORE_TLS_KEY=/etc/ocu-filestore/tls/server.key
 Environment=OCU_FILESTORE_LOG_LEVEL=info
 Environment=OCU_FILESTORE_OPS_LISTEN=127.0.0.1:9464
 ```

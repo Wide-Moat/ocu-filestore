@@ -32,12 +32,14 @@ func okCeilings() *fakeCeilingsRegistry {
 	return &fakeCeilingsRegistry{session: &fakeCeilingsSession{}}
 }
 
-// scopedRequest builds a POST request for op carrying the given body, the
-// required Connect headers, and a PeerScope bound to scope/intents in the
-// request context (mimicking the listener's ConnContext stash).
+// scopedRequest builds a POST REST request for op carrying the given body, the
+// application/json Content-Type, and a PeerScope bound to scope/intents in the
+// request context. The dispatcher's credExtractor is nil in these tests, so
+// STAGE-0 reads the PeerScope from this injected context (the unix-transport
+// fallback source) — the credential-scope source is exercised separately in
+// credscope_test.go and router_test.go.
 func scopedRequest(op Op, body string, scope string, intents []Intent) *http.Request {
-	r := httptest.NewRequest(http.MethodPost, servicePrefix+string(op), strings.NewReader(body))
-	r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+	r := httptest.NewRequest(http.MethodPost, restBase+string(op), strings.NewReader(body))
 	r.Header.Set("Content-Type", contentTypeJSON)
 	r.ContentLength = int64(len(body))
 	ps := PeerScope{FilesystemID: scope, GrantedIntents: intents, UID: 4242, PID: 7}
@@ -49,14 +51,28 @@ func bodyFor(scope string, intent Intent) string {
 	return fmt.Sprintf(`{"filesystem_id":%q,"path":"/p","authorization_metadata":{"intent":%q,"downloadable":false}}`, scope, intent)
 }
 
-// decodeErrBody parses a Connect error body.
-func decodeErrBody(t *testing.T, w *httptest.ResponseRecorder) connectError {
+// wireErr is the {Code, Message} shape the unary deny tests assert against. The
+// REST deny body is a BoundedReason {reason_code, message}; decodeErrBody maps
+// it into this shape (lowercasing the reason_code to the closed wire-code token)
+// so the existing assertions stay portable across the transport pivot.
+type wireErr struct {
+	Code    string
+	Message string
+}
+
+// decodeErrBody parses a REST deny body (BoundedReason {reason_code, message})
+// into a wireErr the unary tests assert against: the reason_code is the
+// uppercased wire code, so lowercasing it recovers the closed wire-code token
+// (permission_denied / not_found / ...) the existing assertions compare to. The
+// HTTP status remains the authoritative verdict; this helper exists only to keep
+// the diagnostic-body assertions portable across the transport pivot.
+func decodeErrBody(t *testing.T, w *httptest.ResponseRecorder) wireErr {
 	t.Helper()
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
+	var br boundedReason
+	if err := json.Unmarshal(w.Body.Bytes(), &br); err != nil {
 		t.Fatalf("error body not JSON: %v (%q)", err, w.Body.String())
 	}
-	return ce
+	return wireErr{Code: strings.ToLower(br.ReasonCode), Message: br.Message}
 }
 
 // TestMandateBeforeAck pins NFR-SEC-79: the recording fake Guard proves
@@ -260,11 +276,12 @@ func TestPropChannelScope(t *testing.T) {
 // x-deny-reason. readFile (OPS-04) is implemented over an engine, so against
 // this nil-engine test dispatcher its registry entry stays unimplemented and
 // it is included here (the engine-backed readFile success/deny paths are
-// pinned in handlers_test.go). The two STREAMING ops (fileUpload, fileDownload)
-// no longer ride the unary registry — ServeHTTP routes them to serveStreaming
-// before the unary content-type/registry gate (phase 10), so they are
-// validated on the streaming path (fileDownload's unimplemented trailer and
-// the fileUpload routing are pinned in stream_handler_test.go), not here.
+// pinned in handlers_test.go). The two DATA-PLANE ops (fileUpload, fileDownload)
+// no longer ride the unary registry — the REST router routes them to their
+// dedicated entrypoints (serveUploadMultipart / serveDownloadOctetStream)
+// before the unary content-type/registry gate, so they are validated on the
+// data-plane path (upload_multipart_test.go / download_octetstream_test.go),
+// not here.
 func TestRegistryUnimplemented(t *testing.T) {
 	unaryUnimplemented := []Op{
 		OpListDirectory, OpMakeDirectory, OpMoveDirectory, OpRemoveDirectory,
@@ -371,24 +388,28 @@ func TestDispatchSizeAndHeaderGates(t *testing.T) {
 		}
 	})
 
-	t.Run("missing version header -> invalid_argument", func(t *testing.T) {
+	t.Run("missing content-type -> invalid_argument", func(t *testing.T) {
+		// The REST transport pins no protocol-version header (the Connect version
+		// gate is gone); the surviving STAGE-0 header gate is the Content-Type
+		// check, which refuses anything that is not application/json (400).
 		d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
 		w := httptest.NewRecorder()
 		r := scopedRequest(OpReadFile, bodyFor(boundScope, IntentRead), boundScope, []Intent{IntentRead})
-		r.Header.Del(connectProtocolVersionHeader)
+		r.Header.Del("Content-Type")
 		d.ServeHTTP(w, r)
 		if w.Code != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400 (no version)", w.Code)
+			t.Fatalf("status = %d, want 400 (no content-type)", w.Code)
 		}
 	})
 
 	t.Run("missing channel scope -> internal/500", func(t *testing.T) {
 		d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
 		w := httptest.NewRecorder()
-		// No PeerScope in context.
-		r := httptest.NewRequest(http.MethodPost, servicePrefix+"readFile", strings.NewReader(bodyFor(boundScope, IntentRead)))
-		r.Header.Set(connectProtocolVersionHeader, connectProtocolVersion)
+		// No PeerScope in context and no credential extractor wired: the unary
+		// STAGE-0 fallback source finds no channel scope and fails closed.
+		r := httptest.NewRequest(http.MethodPost, restBase+"readFile", strings.NewReader(bodyFor(boundScope, IntentRead)))
 		r.Header.Set("Content-Type", contentTypeJSON)
+		r.ContentLength = int64(len(bodyFor(boundScope, IntentRead)))
 		d.ServeHTTP(w, r)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500 (no channel scope)", w.Code)
@@ -401,7 +422,7 @@ func TestDispatchSizeAndHeaderGates(t *testing.T) {
 	t.Run("non-POST -> 405", func(t *testing.T) {
 		d := newTestDispatcher(&fakeResolver{}, &fakeGuard{}, okCeilings())
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, servicePrefix+"readFile", nil)
+		r := httptest.NewRequest(http.MethodGet, restBase+"readFile", nil)
 		d.ServeHTTP(w, r)
 		if w.Code != http.StatusMethodNotAllowed {
 			t.Fatalf("status = %d, want 405", w.Code)
@@ -466,10 +487,7 @@ func TestDenyWarnLogsAuditReason(t *testing.T) {
 	d.ServeHTTP(w, r)
 
 	// Wire body must still be the standard deny (unchanged anti-enumeration).
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("wire body not valid JSON: %v", err)
-	}
+	ce := decodeErrBody(t, w)
 	// The scope_mismatch deny maps to permission_denied wire code.
 	if ce.Code != wireCodePermissionDenied {
 		t.Errorf("wire code = %q, want %q", ce.Code, wireCodePermissionDenied)

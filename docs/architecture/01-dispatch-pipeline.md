@@ -22,7 +22,8 @@ the NFR-SEC rows the dispatch path is responsible for: scope binding
 (NFR-SEC-43), engine-credential isolation (NFR-SEC-16/25), the three-axis
 deny-by-default authorization with `downloadable` resolved at read
 (NFR-SEC-49, NFR-SEC-73), audit-before-acknowledge fail-closed
-(NFR-SEC-79), the host-peer accept gate (NFR-SEC-76), and the per-request and
+(NFR-SEC-79), the per-tenant scope binding the engine verifies on the
+edge-injected credential (NFR-SEC-76), and the per-request and
 whole-object size ceilings (NFR-SEC-46/78).
 
 All code references below name the actual file and function in
@@ -45,7 +46,7 @@ The pipeline is:
 
 | Stage | Name | What it establishes | Trusts the body? |
 |-------|------|---------------------|------------------|
-| 0 | Header / throttle gate | Route, protocol version, content type, channel scope, declared-size pre-buffer reject, ops/s throttle — **no body byte is read** | No |
+| 0 | Header / throttle gate | Route, content type, channel scope, declared-size pre-buffer reject, ops/s throttle — **no body byte is read** | No |
 | 1 | Strict envelope decode | The body is a single well-formed JSON object; its scope/intent fields are now readable | Reads, does not yet trust |
 | 1b | Channel-scope cross-check | The body's `filesystem_id` equals the channel-bound scope | Now trusted for scope |
 | 2 | Route-op → required-intent authz | The route op (not the wire intent) determines the required intent; the resolver re-derives the grant | Trusted |
@@ -73,8 +74,8 @@ sequenceDiagram
     participant H as Handler (STAGE 4)
     participant E as Engine
 
-    G->>S: POST /…/FilesystemService/<op> (Connect unary JSON)
-    Note over S: STAGE 0 — mint x-request-id, parse route,<br/>check version + Content-Type, read PeerScope,<br/>Content-Length pre-buffer reject, ops/s throttle
+    G->>S: POST <service_url>/v1/filestore/fs/<op> (REST-JSON over HTTPS)
+    Note over S: STAGE 0 — mint x-request-id, parse route,<br/>check Content-Type, read channel scope,<br/>Content-Length pre-buffer reject, ops/s throttle
     Note over S: No body byte read yet
     S->>S: STAGE 1 — buffer body once (MaxBytesReader), strict-decode envelope
     S->>S: STAGE 1b — env.filesystem_id == PeerScope.FilesystemID ?
@@ -92,7 +93,7 @@ sequenceDiagram
     S->>H: STAGE 4 — registry[op](deps, ctx)
     H->>E: engine verb (Stat/List/MakeDir/…)
     E-->>H: result
-    H-->>G: 200 + op body (or framed handler-stage deny)
+    H-->>G: 200 + op body (or handler-stage writeRESTDeny status)
 ```
 
 ---
@@ -120,45 +121,52 @@ it (NFR-SEC-76/78). The steps, in order:
 3. **Register panic containment.** `defer d.recoverDispatch(w, &reqLog)()` —
    see [§8](#8-panic-containment).
 
-4. **Parse the route.** `envelope.go:parseRoute` matches the method and path.
-   A non-POST is `errBadMethod` → a 405 with an `Allow: POST` header (the
-   Connect code stays `invalid_argument`, but HTTP method semantics demand
-   405, applied through `DenyVerdict.withStatus`). A path outside the service
-   prefix `/ocu.filestore.v1alpha.FilesystemService/` or naming an op outside
-   the closed `knownOps` set is `errUnknownRoute` → `invalid_argument`. No body
-   byte has been read.
+4. **Parse the route** (`PENDING-PHASE-7(A1-route)`, frozen pending #292).
+   `envelope.go:parseRoute` matches the method and path. Every south-face
+   operation is `POST <service_url>/v1/filestore/fs/<operation>` — the route
+   base is `envelope.go:restBase` (`/v1/filestore/fs/`) and the operation name
+   is the trailing path segment. A non-POST to a `restBase`-shaped route is
+   `errBadMethod` → a 405 with an `Allow: POST` header (the wire code stays
+   `invalid_argument`, but HTTP method semantics demand 405, applied through
+   `DenyVerdict.withStatus`). A path outside `restBase`, or one naming an op
+   outside the closed `knownOps` set, is `errUnknownRoute` → `invalid_argument`
+   at the spine. No body byte has been read. The concrete route shape is
+   impl-sourced and sibling-proven; the verb names and authorization axes are
+   canon (component-04). See [06-transport.md](06-transport.md) for the router
+   boundary that fronts this spine.
 
-5. **Streaming branch (here, by per-op flag).** If `isStreamingOp(op)` is true
-   (`fileUpload` or `fileDownload`), dispatch hands off to
-   `stream_handler.go:serveStreaming` and returns. This branch is taken
-   **before** the unary content-type and Content-Length checks on purpose: the
-   unary `checkContentType` hard-equals `application/json` and the unary
-   Content-Length pre-buffer reject would both kill a chunked
-   `application/connect+json` upload. The branch is on a per-op flag, not a
-   content-type sniff. See [§7](#7-streaming-dispatch).
+5. **Data-plane ops have already been split off — the spine serves only the
+   16 unary-JSON ops.** `fileUpload` and `fileDownload` never reach this
+   `ServeHTTP`: `router.go:restRouter` routes them to their dedicated REST
+   entrypoints (`upload_multipart.go:serveUploadMultipart`,
+   `download_octetstream.go:serveDownloadOctetStream`) **before** the request
+   reaches the unary spine. There is no in-spine streaming branch and no
+   per-op flag check here; a data-plane op that somehow reached this spine
+   directly (a caller that bypassed the router) would fall through the unary
+   Content-Type / Content-Length gate below and be refused — the correct
+   fail-closed behaviour. See [§8](#8-streaming-dispatch).
 
-6. **Version header.** `checkVersion` requires `Connect-Protocol-Version: 1`;
-   absent or wrong is `invalid_argument` before the body is parsed.
+6. **Content-Type.** `checkContentType` requires `application/json` (a trailing
+   `;charset=…` parameter is tolerated). The REST listener pins **no**
+   protocol-version header — there is no version check in STAGE 0.
 
-7. **Content-Type.** `checkContentType` requires `application/json` (a trailing
-   `;charset=…` parameter is tolerated).
+7. **Channel scope from the connection context.** `peerScopeFromContext` reads
+   the host-attested channel identity (filesystem id / granted intents) bound to
+   the request — the session scope the engine verifies on the edge-injected
+   filestore credential, never a value the body supplies. Its **absence is a
+   wiring fault and fails closed** to `internal`/500 — the spine never proceeds
+   without a channel binding (NFR-SEC-43/76).
 
-8. **PeerScope from the connection context.** `peerScopeFromContext` reads the
-   host-attested channel identity (UID/PID/filesystem id/granted intents)
-   established at accept time. Its **absence is a wiring fault and fails
-   closed** to `internal`/500 — the spine never proceeds without a channel
-   binding (NFR-SEC-43/76).
-
-9. **Declared-size pre-buffer reject (NFR-SEC-78).** A unary request carries a
+8. **Declared-size pre-buffer reject (NFR-SEC-78).** A unary request carries a
    known-size body, so an **absent Content-Length** (`r.ContentLength < 0`) is
    refused (`malformed_envelope`) before any byte is read; a Content-Length **above the
    per-message ceiling** is a `size_exceeded` deny. This is the cheap reject
    that runs before the buffer is even allocated.
 
-10. **Ops/s throttle, keyed on the CHANNEL scope.** `d.ceilings.Session(ps.FilesystemID).TryConsumeOp()`.
-    The throttle key is the channel scope (`PeerScope`), **never** a body field —
-    consistent with the rule that nothing trusts the body before STAGE 1b. A
-    throttle breach is `resource_exhausted` with **no** `x-deny-reason` header.
+9. **Ops/s throttle, keyed on the CHANNEL scope.** `d.ceilings.Session(ps.FilesystemID).TryConsumeOp()`.
+   The throttle key is the channel scope (`PeerScope`), **never** a body field —
+   consistent with the rule that nothing trusts the body before STAGE 1b. A
+   throttle breach is `resource_exhausted` with **no** `x-deny-reason` header.
 
 Faults before the op is known (unknown route, bad method) record no
 `ops_total` entry because there is no op to label; they use the plain
@@ -384,12 +392,14 @@ op unimplemented.
 | `moveFile` | `handleMoveFile` | unary |
 | `removeFile` | `handleRemoveFile` | unary |
 | `readFile` | `handleReadFile` | unary |
-| `fileUpload` | `handleFileUpload` | **streaming** (out-of-band, [§8](#8-streaming-dispatch)) |
-| `fileDownload` | `handleFileDownload` | **streaming** (out-of-band) |
+| `fileUpload` | `handleFileUploadMultipart` | **multipart** (router-split, [§8](#8-streaming-dispatch)) |
+| `fileDownload` | `handleDownloadOctetStream` | **octet-stream** (router-split) |
 
-`fileUpload` and `fileDownload` are dispatched out-of-band via
-`serveStreaming` and are **never read from the registry**, so their registry
-entries stay `unimplemented` and are never reached on the streaming path.
+`fileUpload` and `fileDownload` are routed to their dedicated REST entrypoints
+(`serveUploadMultipart` / `serveDownloadOctetStream`) by `router.go:restRouter`
+**before** the unary spine and are **never read from the registry**, so their
+registry entries stay `unimplemented` and are never reached on the data-plane
+path.
 
 **8 unimplemented** (TBD per the frozen contract — the bodies are not pinned, so
 no handler is invented):
@@ -404,132 +414,168 @@ The registry is complete; those bodies are not.
 ## 8. Streaming dispatch
 
 The two highest-volume data-plane ops, `fileUpload` and `fileDownload`, run on
-a streaming path that diverges from the unary spine at STAGE 0. The contract:
-**the stream is always HTTP 200**; every verdict — allow or deny — rides in a
-framed trailer, never a unary error body. This is so the guest's
-trailer-authoritative retry logic always sees the verdict in the same place.
+dedicated REST entrypoints that the router (`router.go:restRouter`) splits off
+**before** the request reaches the unary spine — never on a branch inside
+`ServeHTTP`. The data-plane framing is impl-sourced and sibling-proven; the
+verb names and the three-axis authorization are canon (component-04). The
+concrete wire shapes — multipart upload, chunked octet-stream download, the
+deny envelope — are `PENDING-PHASE-7(A2-multipart)` / `PENDING-PHASE-7(A2-octet)`,
+frozen pending #292. See [06-transport.md](06-transport.md) for the full data-plane
+framing reference.
 
-### 8.1 The 5-byte frame envelope
+There is **no** 5-byte Connect frame and **no** always-200 framed-trailer
+contract on this transport. Each op chooses its native HTTP shape: `fileUpload`
+streams a `multipart/form-data` request and a deny is a real HTTP status until
+the terminal success; `fileDownload` streams a chunked `application/octet-stream`
+**response** of raw bytes, and a deny reached before the first byte is a real
+HTTP status. Both reject paths share the unary deny mapper
+(`restdeny.go:writeRESTDeny`), so every south-face refusal carries one wire-code
+mapping and one optional `x-deny-reason`.
 
-`stream.go` defines the codec, byte-identical to the guest framer:
+### 8.1 No frame envelope — native HTTP framing per op
 
-```
-+--------+--------+--------+--------+--------+===============+
-| flag   |        payload length (uint32 BE) |   payload …   |
-| 1 byte |        4 bytes, big-endian         | compact JSON  |
-+--------+--------+--------+--------+--------+===============+
-```
+Neither data-plane op carries a per-message frame header. The bytes ride the
+HTTP body directly:
 
-- **byte 0 — flag.** `0x00` = data frame (params or chunk on intake; content
-  on a download response). `0x02` = end-stream frame carrying the verdict
-  (`{}` success, or `{"error":{code,message}}`).
-- **bytes 1–4 — payload length** as a big-endian `uint32`.
-- **payload** — compact JSON.
+- **`fileUpload`** (`upload_multipart.go`) — a `POST` with two ordered
+  multipart parts: a form **field** `params` whose value is the upload params
+  JSON (`uploadParamsFrame`: top-level `filesystem_id`, `path`,
+  `declared_size_bytes` **required**, `overwrite_existing` omitempty, write
+  `authorization_metadata`), then a file **part** `file` streaming the **raw**
+  source bytes with **no** per-chunk envelope and **no** base64. The closing
+  multipart boundary is the authoritative end of the part. The body must yield
+  **exactly** `declared_size_bytes`; both over- and under-declaration are
+  refused pre-assembly, staging nothing.
+- **`fileDownload`** (`download_octetstream.go`) — a `POST` with a small JSON
+  request body (`fileDownloadRequest`: top-level `filesystem_id`, `uuid`
+  addressing the object, optional `range{offset,length}` as an omitempty
+  pointer, read `authorization_metadata`). On success the **response** is
+  HTTP 200 + `Content-Type: application/octet-stream` whose body is the **raw**
+  object bytes streamed chunked — no JSON, no per-chunk envelope, no base64.
 
-`readFrame` checks the declared length against `maxInboundFrame` (4 MiB)
-**before allocating any payload buffer**, so a corrupt or desynced length
-cannot drive a multi-GiB allocation; an over-cap length is `errFrameTooLarge` →
-`resource_exhausted` (a **transport** reject, distinct from the policy
-`size_exceeded` deny applied to `declared_size_bytes`). `writeFrame` writes the
-header then the payload (a zero-length payload writes only the header).
-`writeEndStream` writes the terminal `0x02` trailer — a nil error writes the
-literal `{}` success body; the trailer writer **is** the frame writer, the
-single path every reject and the success path use, and it is written **before**
-intake is closed on a mid-stream reject.
+A streamed upload is read in `uploadReadChunk` (256 KiB) buffers; a download is
+copied through a `flushingResponseWriter` that flushes each engine read toward
+the client. Each side re-arms a per-read / per-flush deadline (NFR-SEC-46) so a
+stall trips the next read/write while a slow-but-progressing transfer is fine.
 
 ### 8.2 Streaming STAGE-0 gate
 
-`serveStreaming` mirrors the unary STAGE-0 with three differences:
+`serveUploadMultipart` and `serveDownloadOctetStream` mirror the unary STAGE-0
+prologue (mint the correlation id, stamp `x-request-id`, derive the
+request-scoped logger, install the panic-recovery net) and the channel-scope /
+throttle gate, with three differences from the unary spine:
 
-1. **PeerScope first.** Without the channel binding there is no scope to key
-   audit/ceilings on. This is the **one** streaming fault written as a unary
-   error (`internal`) — there is no session to frame a trailer against, and the
-   200 header has not yet been committed.
-2. **Then commit the HTTP 200 header** (`application/connect+json`). From here
-   every refusal is a framed `0x02` trailer.
-3. It admits `application/connect+json` (not `application/json`) via
-   `checkStreamContentType`, and **does not** apply the unary Content-Length
-   pre-buffer reject (a chunked body has no fixed length; size policy moves to
-   `declared_size_bytes` after the params frame). The ops/s throttle is still
-   keyed on the channel scope.
+1. **No HTTP 200 is committed in the prologue.** Unlike a framed-trailer
+   contract, a STAGE-0 refusal is a **real** `writeRESTDeny` status. Upload
+   commits 200 only on a fully reassembled, size-matched success; download
+   commits 200 only when the first object byte is about to flow.
+2. **No unary Content-Length pre-buffer reject.** A multipart upload body has
+   no fixed length; size policy moves to `declared_size_bytes` (the params
+   field) enforced both directions during reassembly. The download request body
+   is bounded by the per-message ceiling on read.
+3. **Content negotiation is the router's job.** The router routes `fileUpload`
+   to the multipart entry and `fileDownload` to the octet-stream entry; neither
+   entry runs the unary `checkContentType` `application/json` gate (the upload
+   request is `multipart/form-data`; the download **request** is
+   `application/json`, its **response** `application/octet-stream`). The ops/s
+   throttle is still keyed on the channel scope.
 
-Each streaming STAGE-0 deny records `ops_total` directly, mirroring the unary
-`denyOp` choke point.
+Each streaming STAGE-0 deny records `ops_total` directly (`recordOp`), mirroring
+the unary `denyOp` choke point.
 
-### 8.3 Upload contract (`handleFileUpload`)
+### 8.3 Upload contract (`handleFileUploadMultipart`)
+
+`PENDING-PHASE-7(A2-multipart)`, frozen pending #292. The handler ports the
+surviving upload algorithm to the multipart transport: only the transport edges
+change (the params-frame-then-chunk-frames loop becomes multipart
+`NextPart()`/part reads; the framed trailer becomes plain HTTP).
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant G as Guest
-    participant U as handleFileUpload
+    participant U as handleFileUploadMultipart
     participant R as Resolver
     participant A as Guard (audit)
     participant P as io.Pipe
     participant E as engine.WriteStream
 
-    G->>U: 0x00 params frame {filesystem_id, path, declared_size_bytes, overwrite_existing}
-    Note over U: read EXACTLY one params frame (per-frame read deadline armed)
+    G->>U: multipart part 1 — field "params" {filesystem_id, path, declared_size_bytes, overwrite_existing}
+    Note over U: read params part FIRST (must be the "params" field)
     U->>U: declared_size_bytes > 0 ? (else invalid_argument)
-    U->>U: params.filesystem_id == channel scope ? (else scope_mismatch trailer)
+    U->>U: params.filesystem_id == channel scope ? (else scope_mismatch deny)
     U->>R: Resolve(intent=write) from channel scope
     R-->>U: Grant
-    U->>U: checkDeclaredSize(declared, maxFileSize) BEFORE any chunk (SEC-46)
-    U->>A: Mandate ALLOW before any chunk (audit-before-ack)
+    U->>U: checkDeclaredSize(declared, maxFileSize) BEFORE any byte (SEC-46)
+    U->>A: Mandate ALLOW before any byte (audit-before-ack)
     alt audit down
-        U-->>G: 0x02 unavailable trailer
+        U-->>G: writeRESTDeny unavailable (503)
     end
     U->>U: TryAcquireFD (fd ceiling)
-    loop each 0x00 chunk frame
-        G->>U: 0x00 {chunk:"<base64>"}
-        U->>U: acc += n; acc > declared ? → size_exceeded trailer (atomic abort)
+    loop read "file" part in 256 KiB buffers (per-read deadline armed)
+        G->>U: raw bytes (no per-chunk envelope)
+        U->>U: acc += n; acc > declared ? → size_exceeded deny (atomic abort)
         U->>U: AcquireBytes(n) (in-flight byte ceiling)
         U->>P: pw.Write(chunk)
         P->>E: WriteStream reassembles (temp + rename)
     end
-    G->>U: 0x02 end-stream (client half-close = authoritative end)
-    U->>U: acc == declared ? (else size_exceeded trailer, atomic abort)
+    G->>U: closing multipart boundary (authoritative end of "file" part)
+    U->>U: acc == declared ? (else size_exceeded deny, atomic abort)
     U->>P: pw.Close() → WriteStream commits (object visible only now)
-    U-->>G: 0x02 success trailer ( = the ack)
+    U-->>G: HTTP 200 (the ack)
 ```
 
 Load-bearing details from the code:
 
-- **One params frame first.** A read error or a leading end-stream frame is a
-  hard abort. `declared_size_bytes` is **required** (`<= 0` denies
+- **Params part first.** A missing params part, a first part that is not the
+  `params` field, or an undecodable params JSON is a hard reject
+  (`invalid_argument`). `declared_size_bytes` is **required** (`<= 0` denies
   `invalid_argument`, no escape hatch).
 - **Everything keys on the channel scope**, never the params value; a params
   `filesystem_id` that disagrees is `scope_mismatch`.
-- **Pre-buffer size reject** (`checkDeclaredSize`, NFR-SEC-46) runs **before
-  any chunk byte is read** — zero chunk bytes read on reject. `checkDeclaredSize`
+- **Pre-assembly size reject** (`checkDeclaredSize`, NFR-SEC-46) runs **before
+  any file byte is read** — zero file bytes read on reject. `checkDeclaredSize`
   is a single `>` comparison (overflow-safe; never a subtraction); a declaration
   exactly at the ceiling is admitted (strict `>`). The whole-object ceiling
   `maxFileSize` is **distinct** from the per-message ceiling `sizeCeiling`: an
   unwired dispatcher leaves `maxFileSize` at 0 and therefore **refuses any
   non-empty upload** — fail-closed and loud, never a silent placeholder.
-- **Audit ALLOW before any chunk**; an audit-down error denies before any
-  chunk.
+- **Audit ALLOW before any file byte**; an audit-down error denies before any
+  byte is read.
 - **Ceilings released on every exit.** The fd ceiling brackets the open handle;
   the in-flight byte ceiling brackets reassembly, released via `defer` on every
   path.
 - **Atomicity on abort.** Reassembly is a single `io.Pipe` →
   `engine.WriteStream(overwrite=params.OverwriteExisting)`. An aborted upload
-  closes the pipe with the non-EOF `errStreamAborted` sentinel, **never** raw
+  closes the pipe with a non-EOF sentinel (`errUploadOverDeclared` on a size
+  abort, `errStreamAborted` on a truncated/stalled body), **never** raw
   `io.EOF` — `io.Copy` inside `WriteStream` treats a pipe read returning EOF as
   a clean end-of-stream and would commit the partial bytes, so the sentinel
   forces `WriteStream` to fail and reclaim the temp. An aborted upload stages
   nothing visible.
 - **Size enforcement is two-directional.** Over-declaration (`acc > declared`)
-  aborts at the ceiling; under-declaration (`acc != declared` at half-close)
-  also aborts — both `size_exceeded`, staging nothing.
-- **Every reject writes the `0x02` trailer before closing intake**; the deny
-  trailer's own Mandate-failure path degrades to `unavailable`, mirroring the
-  unary `mandateDeny` rule.
-- **The success ack IS the trailer.** The allow Mandate already preceded it.
+  aborts before the excess reaches the engine; under-declaration
+  (`acc != declared` at the closing boundary) also aborts — both
+  `size_exceeded`, staging nothing.
+- **Every reject is a real `writeRESTDeny` status** (no 200 is committed until
+  success); the deny path's own Mandate-failure degrades to `unavailable`
+  (`denyUpload`), mirroring the unary `mandateDeny` rule.
+- **The success ack IS the HTTP 200.** The allow Mandate already preceded it.
+  The success-body shape is the client-ignored tolerated form (an empty 200;
+  the optional `{"file":FilesystemFile}` body is deferred — TBD until the
+  success-body pin lands).
 
-### 8.4 Download contract (`handleFileDownload`)
+### 8.4 Download contract (`handleDownloadOctetStream`)
 
-- Read **exactly one** `0x00` params frame; strict-decode it.
+`PENDING-PHASE-7(A2-octet)`, frozen pending #292. The handler ports the
+surviving download algorithm to the octet-stream transport: only the transport
+edges change (the framed end-stream trailer plus base64 data frames become a
+pre-byte `writeRESTDeny` or, on success, a raw `io.Copy` of `engine.ReadRange`
+into the response).
+
+- Strict-decode the JSON request body (`fileDownloadRequest`: `filesystem_id`,
+  `uuid`, optional `range{offset,length}`, read `authorization_metadata`); an
+  undecodable or unknown-field body is `invalid_argument`.
 - Cross-check `filesystem_id` against the channel scope.
 - Resolve the `uuid → (scope, path)` through the **session-scoped**
   `objectIDStore`. An unknown uuid is `not_found`. A **cross-scope** uuid (the
@@ -544,15 +590,17 @@ Load-bearing details from the code:
 - A whole-object read (nil `Range`) resolves its length from a `Stat` run
   **before** the ALLOW Mandate, so a vanished object records a single deny, not
   an allow-then-deny pair. That `Stat` is panic-contained
-  (`statSizeContained`) so it cannot escape the streaming contract.
-- **Mandate the ALLOW before the first data frame**; an audit-write failure
+  (`statSizeContained`) so it cannot escape into a half-written response.
+- **Mandate the ALLOW before the first response byte**; an audit-write failure
   denies before any byte is sent.
-- Stream the bytes via `engine.ReadRange(offset, length)` in
-  `downloadChunkSize` (256 KiB) chunks, each a `0x00` data frame
-  `{"data":"<base64>"}`, then a `0x02` success trailer. A mid-stream engine
-  error terminates with a `0x02` error trailer. A client disconnect mid-stream
-  books the verdict as `aborted` so the dropped download is still visible in
-  `ops_total`.
+- Acquire the fd slot, then commit HTTP 200 + `Content-Type:
+  application/octet-stream` and `io.Copy` the raw `engine.ReadRange(offset,
+  length)` bytes into a `flushingResponseWriter` that flushes each chunk toward
+  the client (no base64, no per-chunk envelope). Once the 200 header is on the
+  wire the status cannot change: a **mid-stream** engine error simply terminates
+  the stream (logged; the client reads to EOF / its own cap and detects the
+  short read) and books the verdict by its audited truth so a faulted or
+  client-aborted download is still visible in `ops_total`.
 
 ---
 
@@ -632,9 +680,9 @@ truth), never the degraded wire reason (`denyWith` / `denyWithLog`).
   known set fails closed to `internal`.
 - `envelope.go:denyClassForDecodeErr` maps envelope/route decode sentinels:
   `size_exceeded` for the size sentinel; `malformed_envelope` for the
-  malformed-envelope / unknown-route / bad-version / bad-content-type /
-  route-op-mismatch sentinels; `internal` otherwise. (`errBadMethod` is handled
-  out of band as the 405.)
+  malformed-envelope / unknown-route / bad-content-type / route-op-mismatch
+  sentinels; `internal` otherwise. (`errBadMethod` is handled out of band as
+  the 405.)
 - `handlers.go:auditTruthForEngineErr` names the audited truth for engine
   errors (the path-escape → `scope_mismatch` truth that degrades to the
   `not_found` wire class is the D8 case).
@@ -656,19 +704,21 @@ safety net. On a panic it:
    cancelled or panicking) so the panic is audited per the NFR-SEC-79
    fail-closed intent. This is wrapped in a nested `recover()` so a panicking
    guard cannot undo the wire deny.
-3. Writes a structured `internal`/500 Connect error — the caller sees a typed
-   error, **never** a naked connection drop or an unfinished response. Also
-   wrapped in a nested `recover()`.
+3. Writes a structured `internal`/500 deny through the shared `writeRESTDeny`
+   mapper — the caller sees a typed error, **never** a naked connection drop or
+   an unfinished response. Also wrapped in a nested `recover()`.
 
-The streaming engine goroutines have their own containment:
-`recoverWriteStream` and `recoverReadStream` catch a panicking engine
-`WriteStream` / `ReadRange`, close the pipe with the `errInternalPanic`
-sentinel (unblocking the peer side of the pipe immediately), and send the
-sentinel on the error channel so the streaming handler drains and writes a deny
-trailer. `errInternalPanic` maps through `denyClassForEngineErr` →
-`internal` → `wireCodeInternal`, the same path as any other unrecognised engine
-fault. The engine's temp+rename atomicity guarantees no torn object is visible
-after a recovered upload panic.
+The data-plane handlers carry their own containment. The upload pipe goroutine
+is wrapped by `recoverWriteStream`: a panicking engine `WriteStream` closes the
+pipe with the `errInternalPanic` sentinel (unblocking the producer side
+immediately) and sends the sentinel on `writeErrCh`, so the upload handler
+drains and aborts cleanly. The download's whole-object size probe is wrapped by
+`statSizeContained`, which recovers a panicking engine `Stat` into the same
+`errInternalPanic` sentinel before any byte is committed. `errInternalPanic`
+maps through `denyClassForEngineErr` → `internal`, the same path as any other
+unrecognised engine fault: a pre-byte panic becomes a `writeRESTDeny`
+`internal`/500, and a recovered upload panic stages nothing because the engine's
+temp+rename atomicity guarantees no torn object is visible.
 
 ---
 
@@ -685,7 +735,7 @@ after a recovered upload panic.
 | Handler-stage refusal emits a compensating deny event | `mandateDeny` hook | SEC-79 |
 | Audited truth may differ from the degraded wire reason | `DenyVerdict` / `mapDenyDegraded` (D8) | — |
 | Per-request and whole-object size ceilings, fail-closed | STAGE-0 pre-buffer reject; `checkDeclaredSize` | SEC-46/78 |
-| Streaming verdict always in an HTTP-200 framed trailer | `serveStreaming` / `writeEndStream` | — |
+| Data-plane deny is a real HTTP status until success commits the 200 | `serveUploadMultipart` / `serveDownloadOctetStream` / `writeRESTDeny` | — |
 | Panic returns a typed deny, audited best-effort, never a naked drop | `recoverDispatch` | SEC-79 |
 | One mapper for every refusal; deny vocabulary single-sourced | `deny.go` / `internal/denyclass` | — |
 

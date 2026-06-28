@@ -10,6 +10,7 @@ import (
 	"errors"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/denyclass"
+	"github.com/Wide-Moat/ocu-filestore/internal/denywire"
 )
 
 // Deny classes. The token strings are owned by the shared, zero-dependency
@@ -61,18 +62,23 @@ const (
 	denyclassNone = denyclass.None
 )
 
-// Connect wire codes (closed set).
+// Connect wire codes (closed set). The token strings are owned by the shared
+// internal/denywire package — the SINGLE source of the wire mapping consumed by
+// both the south face (here) and the north Files-API handler. The local names
+// below are aliases so the rest of this package (the deny table, the parity
+// fixtures) reads unchanged; the parity test pins south behaviour byte-identical
+// to denywire.
 const (
-	wireCodeInvalidArgument   = "invalid_argument"
-	wireCodeUnauthenticated   = "unauthenticated"
-	wireCodePermissionDenied  = "permission_denied"
-	wireCodeNotFound          = "not_found"
-	wireCodeAlreadyExists     = "already_exists"
-	wireCodeAborted           = "aborted"
-	wireCodeResourceExhausted = "resource_exhausted"
-	wireCodeUnimplemented     = "unimplemented"
-	wireCodeUnavailable       = "unavailable"
-	wireCodeInternal          = "internal"
+	wireCodeInvalidArgument   = denywire.WireCodeInvalidArgument
+	wireCodeUnauthenticated   = denywire.WireCodeUnauthenticated
+	wireCodePermissionDenied  = denywire.WireCodePermissionDenied
+	wireCodeNotFound          = denywire.WireCodeNotFound
+	wireCodeAlreadyExists     = denywire.WireCodeAlreadyExists
+	wireCodeAborted           = denywire.WireCodeAborted
+	wireCodeResourceExhausted = denywire.WireCodeResourceExhausted
+	wireCodeUnimplemented     = denywire.WireCodeUnimplemented
+	wireCodeUnavailable       = denywire.WireCodeUnavailable
+	wireCodeInternal          = denywire.WireCodeInternal
 )
 
 // DenyVerdict is the deny mapper's output — the single source of truth for
@@ -127,49 +133,46 @@ var denyTable = map[string]denyRow{
 }
 
 // statusForWireCode derives the HTTP status from a Connect wire code
-// (closed set). An unknown code is a wiring bug and maps to 500.
+// (closed set). An unknown code is a wiring bug and maps to 500. It delegates
+// to the shared denywire mapping so the south and north faces never re-derive
+// the status table independently.
 func statusForWireCode(code string) int {
-	switch code {
-	case wireCodeInvalidArgument:
-		return 400
-	case wireCodeUnauthenticated:
-		return 401
-	case wireCodePermissionDenied:
-		return 403
-	case wireCodeNotFound:
-		return 404
-	case wireCodeAlreadyExists, wireCodeAborted:
-		return 409
-	case wireCodeResourceExhausted:
-		return 429
-	case wireCodeUnimplemented:
-		return 501
-	case wireCodeUnavailable:
-		return 503
-	default:
-		return 500
+	return denywire.StatusForWireCode(code)
+}
+
+// fromDenywire converts a shared denywire.DenyVerdict into the south-face
+// DenyVerdict. The two structs are field-identical; the conversion exists only
+// because south keeps its own named type (it carries the withStatus method the
+// 405 path uses). The CorrelationID a caller later stamps is preserved by every
+// south call site exactly as before — denywire never auto-mints one.
+func fromDenywire(v denywire.DenyVerdict) DenyVerdict {
+	return DenyVerdict{
+		AuditReason:   v.AuditReason,
+		WireCode:      v.WireCode,
+		WireStatus:    v.WireStatus,
+		WireHeader:    v.WireHeader,
+		CorrelationID: v.CorrelationID,
+	}
+}
+
+// toDenywire is the inverse of fromDenywire: it lowers a south DenyVerdict into
+// the shared shape the denywire writer consumes.
+func toDenywire(v DenyVerdict) denywire.DenyVerdict {
+	return denywire.DenyVerdict{
+		AuditReason:   v.AuditReason,
+		WireCode:      v.WireCode,
+		WireStatus:    v.WireStatus,
+		WireHeader:    v.WireHeader,
+		CorrelationID: v.CorrelationID,
 	}
 }
 
 // mapDeny maps a deny class to its verdict with the wire reason equal to
 // the audited truth (no degrade, no correlation id). An unknown class fails
-// closed to internal/500 with no header.
+// closed to internal/500 with no header. It delegates to the shared denywire
+// mapper; the parity test pins the result byte-identical.
 func mapDeny(class string) DenyVerdict {
-	row, ok := denyTable[class]
-	if !ok {
-		return DenyVerdict{
-			AuditReason: class,
-			WireCode:    wireCodeInternal,
-			WireStatus:  500,
-			WireHeader:  false,
-		}
-	}
-	return DenyVerdict{
-		AuditReason: class,
-		WireCode:    row.wireCode,
-		WireStatus:  statusForWireCode(row.wireCode),
-		WireHeader:  row.header,
-	}
+	return fromDenywire(denywire.MapDeny(class))
 }
 
 // mapDenyDegraded builds the verdict for the audited-truth vs wire-reason
@@ -179,11 +182,10 @@ func mapDeny(class string) DenyVerdict {
 // id (T2-18) so the audit record, the x-request-id response header, and
 // the log line all share ONE id rather than two. A caller that does not set
 // CorrelationID explicitly gets an empty string — acceptable for code paths
-// that do not have a request context (e.g., direct unit tests).
+// that do not have a request context (e.g., direct unit tests). It delegates
+// to the shared denywire mapper.
 func mapDenyDegraded(auditReason, wireClass string) DenyVerdict {
-	v := mapDeny(wireClass)
-	v.AuditReason = auditReason
-	return v
+	return fromDenywire(denywire.MapDenyDegraded(auditReason, wireClass))
 }
 
 // denyClassForErr names the deny class for a consumer-side seam sentinel.

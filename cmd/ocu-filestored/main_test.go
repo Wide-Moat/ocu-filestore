@@ -5,10 +5,17 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -25,6 +32,62 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 	"github.com/Wide-Moat/ocu-filestore/internal/telemetry"
 )
+
+// testTLSCertPaths writes a fresh self-signed loopback certificate + key to two
+// PEM files under a short temp dir and returns their paths. The south-face TLS
+// transport requires a real cert+key, so the composition and run tests mint an
+// ephemeral one rather than depend on an on-disk fixture.
+func testTLSCertPaths(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ocu-filestore-main-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey: %v", err)
+	}
+	dir := shortDir(t)
+	certFile = filepath.Join(dir, "tls-cert.pem")
+	keyFile = filepath.Join(dir, "tls-key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	return certFile, keyFile
+}
+
+// freeLoopbackAddr returns a currently-free loopback host:port for the south
+// face to bind. There is a small race between the probe close and the rebind,
+// acceptable in a single-process test.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
 
 // testLogger returns a discard logger for use in tests; it avoids polluting
 // test output with daemon lifecycle logs.
@@ -47,11 +110,14 @@ func shortDir(t *testing.T) string {
 func validBrokerConfig(t *testing.T) brokerConfig {
 	t.Helper()
 	root := shortDir(t)
+	certFile, keyFile := testTLSCertPaths(t)
 	return brokerConfig{
 		engineKind:     objectstore.LocalVolume,
 		engineRoot:     filepath.Join(root, "engine"),
 		auditSink:      filepath.Join(root, "audit.jsonl"),
-		socketDir:      filepath.Join(root, "sock"),
+		bindAddr:       freeLoopbackAddr(t),
+		certFile:       certFile,
+		keyFile:        keyFile,
 		filesystemID:   "fs-main-01",
 		maxFileSize:    1 << 30,
 		maxRequestByte: 4 << 20,
@@ -135,31 +201,68 @@ func TestComposeCrashRestartErasesScope(t *testing.T) {
 	}
 }
 
-// TestComposeRefusedTripleBindsNoSocket pins SEC-60: a non-admitted
+// TestComposeServeConstructionFailureTearsDownScope pins FILESTORED-11: when
+// compose provisions a scope (eng.ProvisionScope) and a LATER step fails
+// before ownership passes to teardownServer — here southface.Serve's TLS
+// construction rejecting a malformed certificate — compose must roll back the
+// just-provisioned scope (engine.TeardownScope), never leak a dirty scope onto
+// the error path. The LocalVolume erase signature is observable: a freshly
+// provisioned scope holds a .ocu-staging subdir; the rollback teardown
+// re-creates the scope dir EMPTY, so the staging subdir is gone.
+func TestComposeServeConstructionFailureTearsDownScope(t *testing.T) {
+	cfg := validBrokerConfig(t)
+	// Corrupt the certificate AFTER admission/provision but on the path Serve
+	// loads: tls.LoadX509KeyPair on this garbage fails, and Serve returns the
+	// error — the post-provision failure window FILESTORED-11 guards.
+	if err := os.WriteFile(cfg.certFile, []byte("-----BEGIN CERTIFICATE-----\nnot a real cert\n-----END CERTIFICATE-----\n"), 0o600); err != nil {
+		t.Fatalf("plant malformed cert: %v", err)
+	}
+
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
+	if err == nil {
+		_ = srv.Close()
+		t.Fatal("compose with a malformed TLS cert returned nil error; want a Serve-construction failure")
+	}
+	if srv != nil {
+		t.Fatalf("compose returned a non-nil Server on the failure path; want nil")
+	}
+
+	// The scope was provisioned then must have been torn down: the LocalVolume
+	// erase re-creates the scope dir empty, so the .ocu-staging subdir left by
+	// ProvisionScope is gone. Its survival would prove the leak FILESTORED-11
+	// fixes (provisioned-but-never-torn-down).
+	scopeDir := filepath.Join(cfg.engineRoot, cfg.filesystemID)
+	staging := filepath.Join(scopeDir, ".ocu-staging")
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging dir after a failed compose: stat err = %v, want erased — the provisioned scope was NOT torn down (FILESTORED-11)", err)
+	}
+}
+
+// TestComposeRefusedTripleBindsNoListener pins SEC-60: a non-admitted
 // profile/tenancy/credential triple returns the admission refusal and binds NO
-// socket under -south-socket-dir.
-func TestComposeRefusedTripleBindsNoSocket(t *testing.T) {
+// south-face TLS listener — compose refuses with a nil Server before
+// southface.Serve is ever reached.
+func TestComposeRefusedTripleBindsNoListener(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	// multi-tenant + host-local-long-lived is NOT admitted (only
 	// trusted_operator + single_tenant + host_local_long_lived is).
 	cfg.tenancy = admission.TenancyMultiTenant
 
-	_, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if !errors.Is(err, admission.ErrAdmissionRefused) && !errors.Is(err, admission.ErrTenancyRefused) {
 		t.Fatalf("compose(refused triple): got %v, want an admission refusal", err)
 	}
-	// No socket file was minted under the socket dir.
-	entries, _ := os.ReadDir(cfg.socketDir)
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".sock" {
-			t.Fatalf("a socket %q was bound on a refused triple; want none", e.Name())
-		}
+	// The refusal returns no Server: nothing was bound on the south-face TLS
+	// bind address (the listener is opened inside southface.Serve, which the
+	// admission refusal short-circuits).
+	if srv != nil {
+		t.Fatalf("compose(refused triple) returned a non-nil Server; want nil (no listener bound)")
 	}
 }
 
 // TestComposeS3EngineRefusesPreBind pins the s3 composition's fail-closed
 // intake: with no credential source available the composition refuses with
-// the typed credential error BEFORE any socket exists — the daemon never
+// the typed credential error BEFORE any listener exists — the daemon never
 // serves an s3 engine it cannot sign for.
 func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 	t.Setenv(objectstore.EnvS3AccessKeyID, "")
@@ -170,25 +273,22 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 	cfg.s3Bucket = "ocu-bucket"
 	cfg.s3Endpoint = "http://127.0.0.1:9000"
 	cfg.s3Region = "us-east-1"
-	cfg.laneDevDirect = true
 
-	_, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
+	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if !errors.Is(err, objectstore.ErrCredentialMissing) {
 		t.Fatalf("compose(engine=s3, no credential): got %v, want ErrCredentialMissing", err)
 	}
-	// The refusal happened pre-bind: no socket file under the socket dir.
-	entries, _ := os.ReadDir(cfg.socketDir)
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".sock" {
-			t.Fatalf("a socket %q was bound for the refused s3 engine; want none", e.Name())
-		}
+	// The refusal happened pre-bind: compose returns no Server, so no south-face
+	// TLS listener was opened for the s3 engine it cannot sign for.
+	if srv != nil {
+		t.Fatalf("compose(engine=s3, no credential) returned a non-nil Server; want nil (no listener bound)")
 	}
 }
 
 // TestComposeS3RealEngineServes pins the 13-16 composition end-to-end against
-// the live rig (gated): dev-direct transport + static env credentials compose
-// the REAL s3 engine, ProvisionScope runs against MinIO for real, the daemon
-// serves on a real socket, and Close tears the scope down.
+// the live rig (gated): static env credentials compose the REAL s3 engine,
+// ProvisionScope runs against MinIO for real, the daemon serves on a real
+// south-face TLS listener, and Close tears the scope down.
 func TestComposeS3RealEngineServes(t *testing.T) {
 	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
 	if endpoint == "" {
@@ -208,7 +308,6 @@ func TestComposeS3RealEngineServes(t *testing.T) {
 	cfg.s3Endpoint = endpoint
 	cfg.s3Region = "us-east-1"
 	cfg.s3PathStyle = true
-	cfg.laneDevDirect = true
 
 	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
@@ -224,30 +323,29 @@ func TestComposeS3RealEngineServes(t *testing.T) {
 	}
 }
 
-// TestRunS3EngineRefusesWithFullFlagSet pins the e2e-observable shape: a full,
-// otherwise-valid required-flag set with -engine s3 and NO lane posture
-// refuses with the typed ADR-0011 lane requirement — every other flag defect
-// reports first, so this refusal provably means "flags valid, lane missing"
-// (13-15). With the loud dev-direct override and no credential, the refusal
-// moves to the credential intake (the composition gate).
-func TestRunS3EngineRefusesWithFullFlagSet(t *testing.T) {
+// TestRunS3EngineRequiresCredential pins the e2e-observable shape: a full,
+// otherwise-valid required-flag set with -engine s3 and no backend credential
+// refuses at the credential intake (the composition gate) — the guest-path
+// storage lane is retired (Wave 5), so the s3 engine's own backend credential
+// is the only remaining gate.
+func TestRunS3EngineRequiresCredential(t *testing.T) {
 	t.Setenv(objectstore.EnvS3AccessKeyID, "")
 	t.Setenv(objectstore.EnvS3SecretAccessKey, "")
 	root := shortDir(t)
+	certFile, keyFile := testTLSCertPaths(t)
 	full := []string{
 		"--engine", "s3",
 		"--s3-bucket", "ocu-bucket",
 		"--s3-endpoint", "http://127.0.0.1:9000",
 		"--audit-sink", filepath.Join(root, "audit.jsonl"),
-		"--south-socket-dir", filepath.Join(root, "sock"),
+		"--south-bind", freeLoopbackAddr(t),
+		"--tls-cert", certFile,
+		"--tls-key", keyFile,
 		"--filesystem-id", "fs1",
 		"--broker-max-file-size", "1",
 	}
-	if err := run(full); !errors.Is(err, errStorageLaneRequired) {
-		t.Fatalf("run(-engine s3, full flags, no lane): got %v, want errStorageLaneRequired (ADR-0011)", err)
-	}
-	if err := run(append(full, "--storage-lane-dev-direct")); !errors.Is(err, objectstore.ErrCredentialMissing) {
-		t.Fatalf("run(-engine s3, dev-direct, no creds): got %v, want ErrCredentialMissing", err)
+	if err := run(full); !errors.Is(err, objectstore.ErrCredentialMissing) {
+		t.Fatalf("run(-engine s3, no creds): got %v, want ErrCredentialMissing", err)
 	}
 }
 
@@ -275,12 +373,11 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := validate(rawFlags{
-				engine: tc.engine, engineRoot: tc.engineRoot, auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+				engine: tc.engine, engineRoot: tc.engineRoot, auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 				profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 				maxFileSize: 1024, maxRequestBytes: 4096,
 				opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-				laneDevDirect: tc.engine == "s3", // dev-direct posture for the s3 rows
-				s3Bucket:      tc.s3Bucket, s3Endpoint: tc.s3Endpoint, s3Region: tc.s3Region, s3PathStyle: tc.s3PathStyle,
+				s3Bucket: tc.s3Bucket, s3Endpoint: tc.s3Endpoint, s3Region: tc.s3Region, s3PathStyle: tc.s3PathStyle,
 				logLevelStr: "info",
 			})
 			if tc.wantErr && !errors.Is(err, errMissingRequiredFlag) {
@@ -293,77 +390,16 @@ func TestValidateEngineConditionalRequiredFlags(t *testing.T) {
 	}
 }
 
-// TestValidateStorageLaneMatrix pins the 13-15 refusal matrix (ADR-0011,
-// NFR-SEC-16/85): s3 without a lane posture refuses naming the ADR; lane +
-// dev-direct together refuse as ambiguous; any lane flag on local-volume
-// refuses (a silent no-op would lie); -ca-bundle requires -storage-lane.
-func TestValidateStorageLaneMatrix(t *testing.T) {
-	call := func(engine, lane, bundle string, devDirect bool) error {
-		engineRoot, bucket, endpoint := "/x", "", ""
-		if engine == "s3" {
-			engineRoot, bucket, endpoint = "", "ocu-bucket", "http://127.0.0.1:9000"
-		}
-		_, err := validate(rawFlags{
-			engine: engine, engineRoot: engineRoot, auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
-			profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
-			maxFileSize: 1024, maxRequestBytes: 4096,
-			opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-			storageLane: lane, caBundle: bundle, laneDevDirect: devDirect,
-			s3Bucket: bucket, s3Endpoint: endpoint, s3Region: "us-east-1",
-			logLevelStr: "info",
-		})
-		return err
-	}
-
-	if err := call("s3", "", "", false); !errors.Is(err, errStorageLaneRequired) {
-		t.Fatalf("s3 + no lane posture = %v, want errStorageLaneRequired", err)
-	}
-	if err := call("s3", "http://lane:3128", "", true); !errors.Is(err, errStorageLaneAmbiguous) {
-		t.Fatalf("s3 + lane + dev-direct = %v, want errStorageLaneAmbiguous", err)
-	}
-	if err := call("s3", "http://lane:3128", "", false); err != nil {
-		t.Fatalf("s3 + lane = %v, want nil", err)
-	}
-	if err := call("s3", "", "", true); err != nil {
-		t.Fatalf("s3 + dev-direct = %v, want nil (loud dev override)", err)
-	}
-	if err := call("s3", "http://lane:3128", "/etc/ocu/lane-ca.pem", false); err != nil {
-		t.Fatalf("s3 + lane + ca-bundle = %v, want nil", err)
-	}
-	if err := call("s3", "", "/etc/ocu/lane-ca.pem", true); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("ca-bundle without lane = %v, want refusal", err)
-	}
-	if err := call("local-volume", "http://lane:3128", "", false); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("local-volume + lane = %v, want refusal", err)
-	}
-	if err := call("local-volume", "", "", true); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("local-volume + dev-direct = %v, want refusal", err)
-	}
-	if err := call("local-volume", "", "/etc/ocu/lane-ca.pem", false); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("local-volume + ca-bundle = %v, want refusal", err)
-	}
-
-	// The lane refusal text names the ADR and the SEC row — the operator
-	// (and the e2e smoke) must see WHY a direct dial is refused.
-	msg := errStorageLaneRequired.Error()
-	for _, want := range []string{"ADR-0011", "SEC-16", "-storage-lane-dev-direct"} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("lane refusal text %q does not name %q", msg, want)
-		}
-	}
-}
-
 // TestValidateStoresEngineKindS3LocalUnaffected pins that validate carries the
 // parsed engine kind into brokerConfig (it was previously discarded) and that
 // local-volume remains the composed default.
 func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 	cfg, err := validate(rawFlags{
-		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		engine: "s3", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		laneDevDirect: true,
-		s3Bucket:      "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
 		logLevelStr: "info",
 	})
 	if err != nil {
@@ -373,7 +409,7 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 		t.Fatalf("validate(engine=s3) stored kind %q, want %q", cfg.engineKind, objectstore.S3)
 	}
 	cfg, err = validate(rawFlags{
-		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
@@ -394,12 +430,12 @@ func TestValidateStoresEngineKindS3LocalUnaffected(t *testing.T) {
 // silently inert credential flag would lie about the deployment posture.
 func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	cfg, err := validate(rawFlags{
-		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		engine: "s3", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3CredentialFile: "/etc/ocu/s3.cred", laneDevDirect: true,
-		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
+		s3CredentialFile: "/etc/ocu/s3.cred",
+		s3Bucket:         "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
 		logLevelStr: "info",
 	})
 	if err != nil {
@@ -410,7 +446,7 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	}
 
 	_, err = validate(rawFlags{
-		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+		engine: "local-volume", engineRoot: "/x", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 		maxFileSize: 1024, maxRequestBytes: 4096,
 		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
@@ -423,69 +459,12 @@ func TestValidateS3CredentialFileFlagGate(t *testing.T) {
 	}
 }
 
-// TestValidateSTSFlagGate pins the 13-14 flag matrix: the STS flags refuse
-// on a non-s3 engine, -s3-sts-endpoint requires -s3-sts-role-arn, and a
-// valid s3 STS pair is carried into brokerConfig.
-func TestValidateSTSFlagGate(t *testing.T) {
-	const arn = "arn:aws:iam::000000000000:role/ocu-session"
-
-	cfg, err := validate(rawFlags{
-		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
-		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
-		maxFileSize: 1024, maxRequestBytes: 4096,
-		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3STSRoleARN: arn, s3STSEndpoint: "http://sts.local:9000", laneDevDirect: true,
-		s3Bucket: "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
-		logLevelStr: "info",
-	})
-	if err != nil {
-		t.Fatalf("validate(s3 + sts pair): %v", err)
-	}
-	if cfg.s3STSRoleARN != arn || cfg.s3STSEndpoint != "http://sts.local:9000" {
-		t.Fatalf("config carries sts %q/%q, want the flag values", cfg.s3STSRoleARN, cfg.s3STSEndpoint)
-	}
-
-	if _, err := validate(rawFlags{
-		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
-		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
-		maxFileSize: 1024, maxRequestBytes: 4096,
-		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3STSRoleARN: arn,
-		s3Region:     "us-east-1",
-		logLevelStr:  "info",
-	}); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("validate(local-volume + role arn) = %v, want refusal", err)
-	}
-	if _, err := validate(rawFlags{
-		engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
-		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
-		maxFileSize: 1024, maxRequestBytes: 4096,
-		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3STSEndpoint: "http://sts.local:9000",
-		s3Region:      "us-east-1",
-		logLevelStr:   "info",
-	}); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("validate(local-volume + sts endpoint) = %v, want refusal", err)
-	}
-	if _, err := validate(rawFlags{
-		engine: "s3", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
-		profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
-		maxFileSize: 1024, maxRequestBytes: 4096,
-		opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
-		s3STSEndpoint: "http://sts.local:9000",
-		s3Bucket:      "ocu-bucket", s3Endpoint: "http://127.0.0.1:9000", s3Region: "us-east-1",
-		logLevelStr: "info",
-	}); !errors.Is(err, errMissingRequiredFlag) {
-		t.Fatalf("validate(s3 endpoint without role arn) = %v, want refusal", err)
-	}
-}
-
-// TestSelectCredentialSourceKindFlows pins the 13-14 selection: without a
-// role ARN the static source serves (host_local_long_lived); with one, the
-// STS source serves (sts_per_session) — and BOTH kinds are admitted for the
-// trusted_operator/single-tenant cell, so the credential kind genuinely
-// flows from the source into admission (selection wired, no rows invented).
-// A hostile filesystem id refuses before any policy text exists.
+// TestSelectCredentialSourceKindFlows pins the credential selection: the engine's
+// OWN backend credential is the static host-local source (host_local_long_lived),
+// which is admitted for the trusted_operator/single-tenant cell, so the
+// credential kind genuinely flows from the source into admission. The broker
+// mints/signs nothing (invariant 3) — the STS / AssumeRole per-session minting
+// path is retired (Wave 5).
 func TestSelectCredentialSourceKindFlows(t *testing.T) {
 	t.Setenv(objectstore.EnvS3AccessKeyID, "AKIDTEST")
 	t.Setenv(objectstore.EnvS3SecretAccessKey, "test-secret-value")
@@ -501,25 +480,6 @@ func TestSelectCredentialSourceKindFlows(t *testing.T) {
 	}
 	if err := admission.Admit(cfg.profile, cfg.tenancy, src.Kind()); err != nil {
 		t.Fatalf("Admit(static kind): %v", err)
-	}
-
-	cfg.s3STSRoleARN = "arn:aws:iam::000000000000:role/ocu-session"
-	src, err = selectCredentialSource(cfg, "ocu-bucket", "us-east-1")
-	if err != nil {
-		t.Fatalf("selectCredentialSource(sts): %v", err)
-	}
-	if got := src.Kind(); got != admission.CredSTSPerSession {
-		t.Fatalf("sts path Kind() = %q, want %q", got, admission.CredSTSPerSession)
-	}
-	if err := admission.Admit(cfg.profile, cfg.tenancy, src.Kind()); err != nil {
-		t.Fatalf("Admit(sts kind): %v", err)
-	}
-
-	// A hostile scope id refuses at source construction — the inline policy
-	// text for it is never built (validateScopeID runs first).
-	cfg.filesystemID = "../escape"
-	if _, err := selectCredentialSource(cfg, "ocu-bucket", "us-east-1"); !errors.Is(err, objectstore.ErrInvalidScopeID) {
-		t.Fatalf("selectCredentialSource(hostile scope) = %v, want ErrInvalidScopeID", err)
 	}
 }
 
@@ -613,17 +573,11 @@ func TestRunMissingRequiredFlags(t *testing.T) {
 		{"fractional_ops_burst", append(append([]string{}, required...), "--ops-burst", "0.5")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sockDir := shortDir(t)
-			err := run(append(append([]string{}, tc.args...), "--south-socket-dir", sockDir))
+			// The refusal happens at validate, before compose binds any
+			// south-face TLS listener: run returns the typed error directly.
+			err := run(append([]string{}, tc.args...))
 			if !errors.Is(err, errMissingRequiredFlag) {
 				t.Fatalf("run(%s): got %v, want errMissingRequiredFlag", tc.name, err)
-			}
-			// The refusal happens before composition — no socket was bound.
-			entries, _ := os.ReadDir(sockDir)
-			for _, e := range entries {
-				if filepath.Ext(e.Name()) == ".sock" {
-					t.Fatalf("run(%s) bound socket %q despite the typed refusal; want none", tc.name, e.Name())
-				}
 			}
 		})
 	}
@@ -643,7 +597,7 @@ func TestValidateOpsCeilingPlumbing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := validate(rawFlags{
-				engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+				engine: "local-volume", engineRoot: "/x", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 				profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 				maxFileSize: 1024, maxRequestBytes: 4096,
 				opsPerSecond: tc.rate, opsBurst: tc.brst,
@@ -679,8 +633,10 @@ func TestRunValidatesProfileAndTenancy(t *testing.T) {
 // TestRunRejectsUnknownIntent pins that a -granted-intents token outside
 // read/write/preview refuses with the typed sentinel.
 func TestRunRejectsUnknownIntent(t *testing.T) {
+	certFile, keyFile := testTLSCertPaths(t)
 	args := []string{
 		"--engine-root", "/x", "--audit-sink", "/y", "--filesystem-id", "fs1",
+		"--south-bind", freeLoopbackAddr(t), "--tls-cert", certFile, "--tls-key", keyFile,
 		"--broker-max-file-size", "1024", "--granted-intents", "read,delete",
 	}
 	if err := run(args); !errors.Is(err, errBadIntent) {
@@ -736,7 +692,6 @@ func (s *fakeLifecycleServer) Close() error {
 // with a non-404 status (200 liveness; 200/503 readiness — never 404).
 func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
 	root := shortDir(t)
-	sockDir := shortDir(t)
 	auditSink := filepath.Join(root, "audit.jsonl")
 	engineRoot := filepath.Join(root, "engine")
 
@@ -748,12 +703,15 @@ func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
 	opsAddr := probeLn.Addr().String()
 	_ = probeLn.Close() // release so the daemon can bind it
 
+	certFile, keyFile := testTLSCertPaths(t)
 	args := []string{
 		"--engine-root", engineRoot,
 		"--audit-sink", auditSink,
 		"--filesystem-id", "fs-health-01",
 		"--broker-max-file-size", "1024",
-		"--south-socket-dir", sockDir,
+		"--south-bind", freeLoopbackAddr(t),
+		"--tls-cert", certFile,
+		"--tls-key", keyFile,
 		"--ops-listen", opsAddr,
 	}
 
@@ -822,7 +780,6 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 	defer syscall.Umask(oldUmask)
 
 	root := shortDir(t)
-	sockDir := shortDir(t)
 	// The audit-sink lives in a not-yet-existing subdirectory so run() must
 	// create (and pin) it.
 	auditDir := filepath.Join(root, "audit-sink-dir")
@@ -838,12 +795,15 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 	opsAddr := probeLn.Addr().String()
 	_ = probeLn.Close()
 
+	certFile, keyFile := testTLSCertPaths(t)
 	args := []string{
 		"--engine-root", engineRoot,
 		"--audit-sink", auditSink,
 		"--filesystem-id", "fs-chmod-01",
 		"--broker-max-file-size", "1024",
-		"--south-socket-dir", sockDir,
+		"--south-bind", freeLoopbackAddr(t),
+		"--tls-cert", certFile,
+		"--tls-key", keyFile,
 		"--ops-listen", opsAddr,
 	}
 
@@ -1105,7 +1065,7 @@ func TestStartupEchoNoCredential(t *testing.T) {
 		engineKind:       objectstore.LocalVolume,
 		engineRoot:       filepath.Join(root, "engine"),
 		auditSink:        filepath.Join(root, "audit.jsonl"),
-		socketDir:        filepath.Join(root, "sock"),
+		bindAddr:         "127.0.0.1:0",
 		filesystemID:     "fs-redact-01",
 		maxFileSize:      1 << 20,
 		maxRequestByte:   4 << 20,
@@ -1125,7 +1085,7 @@ func TestStartupEchoNoCredential(t *testing.T) {
 	l.Info("ocu-filestored starting",
 		slog.String("version", version),
 		slog.String("engine", string(cfg.engineKind)),
-		slog.String("socket_dir", cfg.socketDir),
+		slog.String("south_bind", cfg.bindAddr),
 		slog.String("audit_sink", cfg.auditSink),
 		slog.String(observ.KeyScope, cfg.filesystemID),
 		slog.String("profile", string(cfg.profile)),
@@ -1151,7 +1111,7 @@ func TestStartupEchoNoCredential(t *testing.T) {
 func TestOpsListenFlagBehavior(t *testing.T) {
 	call := func(addr string) (brokerConfig, error) {
 		return validate(rawFlags{
-			engine: "local-volume", engineRoot: "/x", auditSink: "/y", socketDir: "/s", filesystemID: "fs1",
+			engine: "local-volume", engineRoot: "/x", auditSink: "/y", southBind: "127.0.0.1:0", tlsCert: "/c", tlsKey: "/k", filesystemID: "fs1",
 			profile: "trusted_operator", tenancy: "single-tenant", grantedIntents: "read",
 			maxFileSize: 1024, maxRequestBytes: 4096,
 			opsPerSecond: defaultOpsPerSecond, opsBurst: defaultOpsBurst,
@@ -1335,8 +1295,8 @@ func TestEnvVarName(t *testing.T) {
 		{"audit-sink", "OCU_FILESTORE_AUDIT_SINK"},
 		{"log-level", "OCU_FILESTORE_LOG_LEVEL"},
 		{"ops-per-second", "OCU_FILESTORE_OPS_PER_SECOND"},
-		{"s3-sts-role-arn", "OCU_FILESTORE_S3_STS_ROLE_ARN"},
-		{"storage-lane-dev-direct", "OCU_FILESTORE_STORAGE_LANE_DEV_DIRECT"},
+		{"broker-max-file-size", "OCU_FILESTORE_BROKER_MAX_FILE_SIZE"},
+		{"downloadable-prefixes", "OCU_FILESTORE_DOWNLOADABLE_PREFIXES"},
 	} {
 		if got := envVarName(tc.in); got != tc.want {
 			t.Errorf("envVarName(%q) = %q, want %q", tc.in, got, tc.want)
@@ -1449,12 +1409,14 @@ func TestApplyEnvFallbacksEmptyEnvRetainsDefault(t *testing.T) {
 // uses run() and expects errMissingRequiredFlag to confirm the flags reached
 // validate (not a parse error).
 func TestEnvFallbackEndToEndViaRun(t *testing.T) {
-	sockDir := shortDir(t)
+	certFile, keyFile := testTLSCertPaths(t)
 	t.Setenv("OCU_FILESTORE_ENGINE_ROOT", "/x")
 	t.Setenv("OCU_FILESTORE_AUDIT_SINK", "/y")
 	t.Setenv("OCU_FILESTORE_FILESYSTEM_ID", "fs-env-01")
 	t.Setenv("OCU_FILESTORE_BROKER_MAX_FILE_SIZE", "1024")
-	t.Setenv("OCU_FILESTORE_SOUTH_SOCKET_DIR", sockDir)
+	t.Setenv("OCU_FILESTORE_SOUTH_BIND", freeLoopbackAddr(t))
+	t.Setenv("OCU_FILESTORE_TLS_CERT", certFile)
+	t.Setenv("OCU_FILESTORE_TLS_KEY", keyFile)
 
 	// With those env vars set, run() should pass flag parsing and reach
 	// validate / compose, failing at validate because the paths don't
@@ -1465,7 +1427,7 @@ func TestEnvFallbackEndToEndViaRun(t *testing.T) {
 	err := run(nil) // no explicit flags
 	if errors.Is(err, errMissingRequiredFlag) {
 		// Check whether it's complaining about one of the flags we set via env.
-		for _, envFlag := range []string{"engine-root", "audit-sink", "filesystem-id", "broker-max-file-size"} {
+		for _, envFlag := range []string{"engine-root", "audit-sink", "filesystem-id", "broker-max-file-size", "south-bind", "tls-cert", "tls-key"} {
 			if strings.Contains(err.Error(), envFlag) {
 				t.Errorf("run(via env vars) returned errMissingRequiredFlag naming %q — env fallback did not apply for that flag: %v", envFlag, err)
 			}
@@ -1594,20 +1556,18 @@ func TestEnvFallbackMapContainsAllNonCredentialFlags(t *testing.T) {
 	fs.Bool("health-check", false, "")
 	fs.String("log-level", "info", "")
 	fs.String("ops-listen", "127.0.0.1:9464", "")
-	fs.String("north-listen", "127.0.0.1:7080", "")
+	fs.String("north-bind", "127.0.0.1:7080", "")
+	fs.String("north-listen", "", "")
 	fs.String("engine", "local-volume", "")
 	fs.Int64("max-request-bytes", 52428800, "")
-	fs.String("south-socket-dir", "/run/ocu-filestore/sessions", "")
+	fs.String("south-bind", "127.0.0.1:7443", "")
+	fs.String("tls-cert", "", "")
+	fs.String("tls-key", "", "")
 	fs.String("audit-sink", "", "")
 	fs.String("profile", "trusted_operator", "")
 	fs.String("tenancy", "single-tenant", "")
 	fs.String("engine-root", "", "")
 	fs.String("s3-credential-file", "", "")
-	fs.String("s3-sts-role-arn", "", "")
-	fs.String("s3-sts-endpoint", "", "")
-	fs.String("storage-lane", "", "")
-	fs.Bool("storage-lane-dev-direct", false, "")
-	fs.String("ca-bundle", "", "")
 	fs.String("s3-bucket", "", "")
 	fs.String("s3-endpoint", "", "")
 	fs.String("s3-region", "us-east-1", "")
@@ -1629,26 +1589,23 @@ func TestEnvFallbackMapContainsAllNonCredentialFlags(t *testing.T) {
 	})
 }
 
-// TestMultiScopeSharedSocketDirBothCompose pins the multi-scope topology fix
+// TestMultiScopeDistinctBindsBothCompose pins the multi-scope topology fix
 // (T2-7): two compose() calls with DISTINCT filesystem_id values (and therefore
-// distinct audit-sinks) sharing the SAME socket directory must both succeed.
+// distinct audit-sinks) on DISTINCT south-face TLS bind addresses must both
+// succeed.
 //
-// Before the fix, a per-directory flock prevented the second daemon from
-// starting. The per-scope audit-sink lock is now the sole guard; distinct
-// scopes have distinct sinks and therefore distinct lock files, so they coexist
-// even when their -south-socket-dir is the same directory.
-func TestMultiScopeSharedSocketDirBothCompose(t *testing.T) {
-	sharedSocketDir := shortDir(t)
-
-	// Scope A: first daemon, its own engine root and audit sink.
+// The per-scope audit-sink lock (acquired in run, not compose) is the sole
+// single-instance guard; distinct scopes have distinct sinks and therefore
+// distinct lock files, so they coexist as N daemons (one per filesystem_id).
+func TestMultiScopeDistinctBindsBothCompose(t *testing.T) {
+	// Scope A: first daemon, its own engine root, audit sink, and TLS bind.
 	cfgA := validBrokerConfig(t)
-	cfgA.socketDir = sharedSocketDir
 	cfgA.filesystemID = "fs-scope-a"
 	cfgA.auditSink = filepath.Join(shortDir(t), "audit-a.jsonl")
 
 	srvA, err := compose(cfgA, testLogger(), telemetry.NewBrokerMetrics("test-a"))
 	if err != nil {
-		t.Fatalf("compose(scope-a, shared socket-dir): %v", err)
+		t.Fatalf("compose(scope-a): %v", err)
 	}
 	serveErrA := make(chan error, 1)
 	go func() { serveErrA <- srvA.Serve() }()
@@ -1657,17 +1614,16 @@ func TestMultiScopeSharedSocketDirBothCompose(t *testing.T) {
 		<-serveErrA
 	}()
 
-	// Scope B: second daemon, DISTINCT filesystem_id (distinct audit-sink),
-	// but the SAME socket directory. This must succeed — the shared socket dir
-	// is not locked; only the per-scope audit-sink lock guards the chain.
+	// Scope B: second daemon, DISTINCT filesystem_id (distinct audit-sink) on a
+	// DISTINCT TLS bind. This must succeed — distinct scopes coexist; only the
+	// per-scope audit-sink lock guards the chain.
 	cfgB := validBrokerConfig(t)
-	cfgB.socketDir = sharedSocketDir
 	cfgB.filesystemID = "fs-scope-b"
 	cfgB.auditSink = filepath.Join(shortDir(t), "audit-b.jsonl")
 
 	srvB, err := compose(cfgB, testLogger(), telemetry.NewBrokerMetrics("test-b"))
 	if err != nil {
-		t.Fatalf("compose(scope-b, shared socket-dir): %v — the per-directory lock regression is back; distinct scopes must coexist in one socket dir", err)
+		t.Fatalf("compose(scope-b): %v — distinct scopes must coexist as N daemons", err)
 	}
 	serveErrB := make(chan error, 1)
 	go func() { serveErrB <- srvB.Serve() }()

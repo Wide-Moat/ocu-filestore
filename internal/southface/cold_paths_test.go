@@ -45,10 +45,7 @@ func TestDenyWithNonRequestScoped(t *testing.T) {
 	if h := w.Header().Get("x-deny-reason"); h != "" {
 		t.Fatalf("x-deny-reason = %q on a degraded not_found wire, want none", h)
 	}
-	var ce connectError
-	if err := json.Unmarshal(w.Body.Bytes(), &ce); err != nil {
-		t.Fatalf("denyWith body not Connect JSON: %v (%q)", err, w.Body.String())
-	}
+	ce := decodeErrBody(t, w)
 	if ce.Code != wireCodeNotFound {
 		t.Fatalf("denyWith wire code = %q, want %q", ce.Code, wireCodeNotFound)
 	}

@@ -4,10 +4,10 @@
 package southface
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"strings"
 	"sync"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/objectid"
 )
 
 // idKey is the forward-map key: a (scope, path) pair uniquely names an object
@@ -128,14 +128,11 @@ func (s *objectIDStore) lookup(uuid string) (idVal, bool) {
 	return v, ok
 }
 
-// newObjectID returns a 32-char lowercase hex object handle from 16 bytes of
-// crypto/rand, reusing the spine's correlation-id shape (deny.go) — no uuid
-// dependency, zero new packages (CLAUDE.md minimal shelf). A failing kernel
-// CSPRNG is unrecoverable — fail loud.
+// newObjectID returns a 32-char lowercase hex object handle. The mint body now
+// lives in the shared zero-dependency internal/objectid package so the durable
+// Files-API handle store reuses the IDENTICAL shape and CSPRNG-failure contract;
+// this wrapper keeps the session-scoped objectIDStore's call site and byte-shape
+// unchanged. A failing kernel CSPRNG is unrecoverable — objectid.New panics.
 func newObjectID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("southface: crypto/rand failed: " + err.Error())
-	}
-	return hex.EncodeToString(b[:])
+	return objectid.New()
 }

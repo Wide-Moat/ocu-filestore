@@ -4,75 +4,98 @@
 package northface
 
 import (
-	"encoding/json"
-	"os"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// artifactAPISchema models just the slice this test asserts against: the
-// north-face OperationName enum. The vendored copy is byte-identical to the
-// canonical contract (enforced by scripts/check-contract-identity.sh); this
-// test is the in-repo drift alarm between the Go Op set and the pinned wire
-// surface, mirroring the south-face contract-parity test.
-type artifactAPISchema struct {
-	Defs struct {
-		OperationName struct {
-			Enum []string `json:"enum"`
-		} `json:"OperationName"`
-	} `json:"$defs"`
+// The SUPERSEDED 7-op PoC Op enum and ErrEmbedTokenInvalid were dropped
+// (ADR-0023 recut the surface to the five Files-API endpoints on component-08
+// plus the file_id handle-store here; embed-token verification is
+// component-08's, NFR-SEC-82). This file pins the SURVIVING northface symbols
+// and guards against a re-introduction of the retired ones.
+
+// TestSurvivingSymbols asserts the package still exports the two symbols Mount B
+// and the daemon depend on: the Server listener seam and the ErrNotImplemented
+// scaffold sentinel. A compile reference is the strongest possible assertion —
+// if either were removed this test would not build.
+func TestSurvivingSymbols(t *testing.T) {
+	var _ Server // the listener seam survives (Mount B implements it)
+
+	if ErrNotImplemented == nil {
+		t.Fatal("ErrNotImplemented sentinel was removed")
+	}
+	if !errors.Is(ErrNotImplemented, ErrNotImplemented) {
+		t.Fatal("ErrNotImplemented does not match itself under errors.Is")
+	}
 }
 
-func loadArtifactAPIContract(t *testing.T) artifactAPISchema {
-	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", "storage", "file-artifact-api.schema.json"))
+// TestRetiredSymbolsStayRetired parses the package source and asserts the
+// retired identifiers (the 7-op Op enum constants, the Op type, and
+// ErrEmbedTokenInvalid) are NOT re-introduced as top-level declarations. It is
+// the drift alarm that keeps the dead PoC scaffold from creeping back: deadcode
+// would only flag an UNREACHABLE export, but a re-introduced symbol referenced
+// by a stray test would slip past it — this source-level scan does not.
+func TestRetiredSymbolsStayRetired(t *testing.T) {
+	retired := map[string]bool{
+		"Op":                   true,
+		"OpUpload":             true,
+		"OpListFiles":          true,
+		"OpGetManifest":        true,
+		"OpDownload":           true,
+		"OpDownloadArchive":    true,
+		"OpPreviewRender":      true,
+		"OpDelete":             true,
+		"ErrEmbedTokenInvalid": true,
+	}
+
+	// Scan every production .go file in the package directory (test files
+	// excluded — the scan targets production declarations only). parser.ParseFile
+	// is the non-deprecated per-file API; ParseDir is deprecated.
+	goFiles, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("read vendored artifact-api contract: %v", err)
+		t.Fatalf("glob package files: %v", err)
 	}
-	var s artifactAPISchema
-	if err := json.Unmarshal(raw, &s); err != nil {
-		t.Fatalf("parse vendored artifact-api contract: %v", err)
-	}
-	return s
-}
-
-// TestOpEnumMatchesContract asserts the Go Op constants and the contract's
-// OperationName enum are the same set: every contract name has an Op value
-// and no Op value exists outside the contract. The Op constants are hand
-// copied from the frozen enum, so this test is what ties them to it — adding
-// an operation is a contract change in the architecture repo first.
-func TestOpEnumMatchesContract(t *testing.T) {
-	contract := loadArtifactAPIContract(t)
-
-	goOps := []Op{
-		OpUpload, OpListFiles, OpGetManifest, OpDownload,
-		OpDownloadArchive, OpPreviewRender, OpDelete,
-	}
-
-	contractSet := make(map[string]bool, len(contract.Defs.OperationName.Enum))
-	for _, name := range contract.Defs.OperationName.Enum {
-		if contractSet[name] {
-			t.Fatalf("contract enum carries duplicate %q: %v", name, contract.Defs.OperationName.Enum)
+	fset := token.NewFileSet()
+	scanned := 0
+	for _, fileName := range goFiles {
+		if strings.HasSuffix(fileName, "_test.go") {
+			continue
 		}
-		contractSet[name] = true
-	}
-	if len(contractSet) == 0 {
-		t.Fatal("contract OperationName enum is empty; vendored copy is wrong")
-	}
-
-	goSet := make(map[string]bool, len(goOps))
-	for _, op := range goOps {
-		if goSet[string(op)] {
-			t.Fatalf("duplicate Go Op value %q", op)
+		file, perr := parser.ParseFile(fset, fileName, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", fileName, perr)
 		}
-		goSet[string(op)] = true
-		if !contractSet[string(op)] {
-			t.Errorf("Go Op %q is not in the contract OperationName enum", op)
+		scanned++
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if retired[s.Name.Name] {
+							t.Errorf("%s re-introduces retired type %q", fileName, s.Name.Name)
+						}
+					case *ast.ValueSpec:
+						for _, n := range s.Names {
+							if retired[n.Name] {
+								t.Errorf("%s re-introduces retired identifier %q", fileName, n.Name)
+							}
+						}
+					}
+				}
+			case *ast.FuncDecl:
+				if d.Recv == nil && retired[d.Name.Name] {
+					t.Errorf("%s re-introduces retired function %q", fileName, d.Name.Name)
+				}
+			}
 		}
 	}
-	for name := range contractSet {
-		if !goSet[name] {
-			t.Errorf("contract operation %q has no Go Op constant", name)
-		}
+	if scanned == 0 {
+		t.Fatal("no production .go files scanned; the retired-symbol guard is vacuous")
 	}
 }

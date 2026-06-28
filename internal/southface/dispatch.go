@@ -45,29 +45,7 @@ const (
 	activityDelete = 4 // delete / remove
 )
 
-// connectError is the Connect unary error body: a Connect code and a human
-// message. details are omitted in this build (the contract leaves them
-// optional).
-type connectError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-// writeConnectError writes a Connect error response from a DenyVerdict: the
-// derived HTTP status, the application/json body, and — only when the verdict
-// gates it (permission_denied / unauthenticated, n3) — the x-deny-reason
-// header carrying the audited truth. It is the single response path for every
-// refusal the spine produces.
-func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
-	if v.WireHeader {
-		w.Header().Set("x-deny-reason", v.AuditReason)
-	}
-	w.Header().Set("Content-Type", contentTypeJSON)
-	w.WriteHeader(v.WireStatus)
-	_ = json.NewEncoder(w).Encode(connectError{Code: v.WireCode, Message: message})
-}
-
-// denyWith writes the Connect error response, emits a WARN log carrying the
+// denyWith writes the REST deny response, emits a WARN log carrying the
 // broker-resolved AuditReason truth (never the degraded wire reason), and
 // records the deny in ops_total. The log carries deny_class (the truth) so
 // operators see the real reason even when the WIRE degrades it for
@@ -78,12 +56,17 @@ func writeConnectError(w http.ResponseWriter, v DenyVerdict, message string) {
 //
 // denyWith uses the dispatcher's base logger (no request_id); call denyWithLog
 // from request-scoped paths where a request_id-bearing logger is available.
+//
+// PENDING-PHASE-7(A3-deny): the refusal is written as a REST response — the
+// authoritative HTTP status plus a BoundedReason {reason_code, message}
+// diagnostic body (writeRESTDeny). Every op (the 16 unary-JSON ops and the two
+// data-plane ops) now writes its pre-byte refusal this way.
 func (d *dispatcher) denyWith(w http.ResponseWriter, v DenyVerdict, message string) {
 	d.logger.Warn("broker deny",
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
-	writeConnectError(w, v, message)
+	writeRESTDeny(w, v, message)
 }
 
 // denyWithLog is the request-scoped variant of denyWith: it uses the supplied
@@ -94,7 +77,7 @@ func (d *dispatcher) denyWithLog(w http.ResponseWriter, l *slog.Logger, v DenyVe
 		slog.String(observ.KeyDenyClass, v.AuditReason),
 		slog.String(observ.KeyReason, message),
 	)
-	writeConnectError(w, v, message)
+	writeRESTDeny(w, v, message)
 }
 
 // recordAllow records ops_total{op, outcome=allow, deny_class=none} after a
@@ -181,23 +164,40 @@ type dispatcher struct {
 	// CLOSED and loudly rather than silently inheriting a placeholder ceiling.
 	// Tests set a small value directly (the package is in-package).
 	maxFileSize int64
-	// frameReadTimeout bounds the wait for EACH inbound stream frame
-	// (NFR-SEC-46): a peer that opens an upload and stalls would otherwise
-	// pin the goroutine, an fd-ceiling slot, and any acquired in-flight
-	// bytes for the session's lifetime. The streaming handler extends a
-	// per-connection read deadline by this much before every frame read; an
-	// expired deadline surfaces as a readFrame error and aborts through the
-	// existing hard-abort path. Defaulted in newDispatcherWithEngine; tests
-	// shrink it.
+	// frameReadTimeout bounds the wait for EACH inbound read off the streamed
+	// upload body (NFR-SEC-46): a peer that opens an upload and stalls would
+	// otherwise pin the goroutine, an fd-ceiling slot, and any acquired
+	// in-flight bytes for the session's lifetime. serveUploadMultipart RE-ARMS
+	// a frameReadTimeout-from-now read deadline (via http.NewResponseController)
+	// before every filePart.Read, so a slow-but-progressing transfer keeps
+	// pushing the deadline out while a STALL trips it: the deadline-exceeded
+	// read surfaces as a non-EOF read error and aborts through the existing
+	// hard-abort path (release fd/bytes, no torn object). LIVE: read by the
+	// upload handler. Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameReadTimeout time.Duration
-	// frameWriteTimeout bounds the wait for EACH outbound data frame on the
-	// download stream (NFR-SEC-46, crutch-01): the symmetric mirror of
-	// frameReadTimeout for the egress leg. The download handler arms a
-	// per-connection write deadline by this much before every writeFrame; a
-	// stalled reader makes the next writeFrame error and aborts through the
-	// existing drain path that closes the ReadRange pipe and releases the fd
-	// slot. Defaulted in newDispatcherWithEngine; tests shrink it.
+	// frameWriteTimeout bounds the wait for EACH outbound flush on the download
+	// stream (NFR-SEC-46, crutch-01): the symmetric mirror of frameReadTimeout
+	// for the egress leg. serveDownloadOctetStream RE-ARMS a
+	// frameWriteTimeout-from-now write deadline (via http.NewResponseController)
+	// before every flush; a stalled reader makes the next write error, which
+	// propagates out of the flushing writer into engine.ReadRange, terminating
+	// the stream and releasing the fd slot (the 200 header is already committed,
+	// so the status cannot change). LIVE: read by the download handler.
+	// Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameWriteTimeout time.Duration
+
+	// credExtractor is the A5 credential-scope source for the UNARY REST path:
+	// when non-nil, STAGE-0 derives the request's host-attested PeerScope from
+	// the edge-injected Authorization: Bearer (deriveCredScope) rather than from
+	// the unix peer-cred stashed in the connection context. When nil the unary
+	// path falls back to peerScopeFromContext, the unix-transport source — so the
+	// streaming branch (still on the Connect path this wave) and any caller that
+	// injects PeerScope via contextWithPeerScope continue to work unchanged.
+	//
+	// PENDING-PHASE-7(A5-credscope): the production wiring binds a
+	// CredentialScopeExtractor here; the streaming branch keeps the unix peer
+	// scope until the data-plane ops pivot in a later wave.
+	credExtractor CredentialScopeExtractor
 }
 
 // newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
@@ -225,9 +225,8 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		reg[OpMoveFile] = handleMoveFile
 		reg[OpRemoveFile] = handleRemoveFile
 		// readFile (OPS-04) rides the unary dispatch unchanged. fileUpload
-		// (OPS-05) is dispatched OUT-OF-BAND via serveStreaming and never read
-		// from this registry, so its entry stays unimplemented (see
-		// handler_stub.go).
+		// (OPS-05) is REST-routed to serveUploadMultipart and never read from
+		// this registry, so its entry stays unimplemented (see handler_stub.go).
 		reg[OpReadFile] = handleReadFile
 	}
 	return &dispatcher{
@@ -253,9 +252,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 //
 //	STAGE 0 header gate (NO body byte read): mint request id -> set
 //	  x-request-id header -> derive request-scoped logger -> route ->
-//	  version -> Content-Type -> PeerScope from context ->
-//	  declared-size pre-buffer on Content-Length -> ops/s throttle keyed
-//	  on the CHANNEL scope (never the body)
+//	  Content-Type -> PeerScope (credential-scope on the unary REST path, or
+//	  the unix peer scope from context for the streaming branch / injected
+//	  callers) -> declared-size pre-buffer on Content-Length -> ops/s
+//	  throttle keyed on the CHANNEL scope (never the body)
 //	STAGE 1 strict envelope decode (through the MaxBytesReader backstop)
 //	STAGE 1b channel-scope cross-check on the DECODED body (D2)
 //	STAGE 2 authz (Resolver.Resolve with caller evidence from the channel)
@@ -312,36 +312,48 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// STREAMING BRANCH (per-op flag, NOT content-type sniffing): a streaming
-	// op (fileUpload, fileDownload) has its own STAGE-0 gate
-	// (application/connect+json, no Content-Length pre-buffer reject) and
-	// emits a framed HTTP-200 trailer for every verdict. It MUST branch HERE,
-	// before the unary checkContentType (hard-equals application/json) and the
-	// unary Content-Length pre-buffer reject would kill a chunked connect+json
-	// upload (Pitfalls 1, 2). The unary path below is unchanged.
-	if isStreamingOp(op) {
-		d.serveStreaming(w, r, op, reqID, reqLog)
-		return
-	}
+	// DATA-PLANE OPS are NOT dispatched here. Both fileUpload (multipart) and
+	// fileDownload (octet-stream) are REST-routed by the router to their dedicated
+	// entrypoints (serveUploadMultipart / serveDownloadOctetStream) BEFORE the
+	// request reaches this unary spine, so this ServeHTTP path now serves ONLY the
+	// 16 unary-JSON ops. The retired Connect serveStreaming branch is gone — no op
+	// rides it. A data-plane op reaching this spine directly (a caller that bypassed
+	// the router) would fall through the unary Content-Type/Content-Length gate
+	// below and be refused, which is the correct fail-closed behaviour for an
+	// out-of-band call.
 
-	// STAGE 0: version header (D1).
-	if err := checkVersion(r); err != nil {
-		denyOp(mapDeny(denyClassForDecodeErr(err)), "missing or wrong Connect-Protocol-Version")
-		return
-	}
-
-	// STAGE 0: Content-Type.
+	// STAGE 0: Content-Type. The unary REST ops are application/json; the
+	// Connect version header is gone (the REST transport pins no protocol-version
+	// header).
 	if err := checkContentType(r); err != nil {
 		denyOp(mapDeny(denyClassForDecodeErr(err)), "Content-Type must be application/json")
 		return
 	}
 
-	// STAGE 0: PeerScope from the connection context — the host-attested
-	// channel identity. Its absence is a wiring fault: fail closed.
-	ps, ok := peerScopeFromContext(r.Context())
-	if !ok {
-		denyOp(mapDeny(denyInternal), "no channel scope on connection")
-		return
+	// STAGE 0: PeerScope — the host-attested channel identity. The SOURCE is
+	// gated (A5): when a credential extractor is wired, the unary REST path
+	// derives the scope from the edge-injected Authorization: Bearer
+	// (peerScopeFromCredential); otherwise it reads the unix peer scope stashed
+	// in the connection context (the streaming branch's source this wave, and the
+	// source any test that injects PeerScope via contextWithPeerScope relies on).
+	// A missing/rejected credential is unauthenticated (401); an absent context
+	// scope on the fallback path is a wiring fault and fails closed.
+	var ps PeerScope
+	if d.credExtractor != nil {
+		var v DenyVerdict
+		var ok bool
+		ps, v, ok = peerScopeFromCredential(r, d.credExtractor)
+		if !ok {
+			denyOp(v, "credential rejected")
+			return
+		}
+	} else {
+		var ok bool
+		ps, ok = peerScopeFromContext(r.Context())
+		if !ok {
+			denyOp(mapDeny(denyInternal), "no channel scope on connection")
+			return
+		}
 	}
 
 	// STAGE 0: declared-size pre-buffer on the Content-Length (SEC-78). A
@@ -432,6 +444,25 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	env.Path = canonPath
 
+	// STAGE 1b -> 2 BOUNDARY (crutch-04): canonicalize the SECOND-LEG paths of the
+	// two-path namespace ops (moveDirectory, copyFile, moveFile) through the SAME
+	// canonicalizePath the primary path went through above, BEFORE STAGE 2 authz
+	// and STAGE 3 audit. The two-path handlers used to feed req.Source/
+	// req.Destination RAW into the engine (slash-strip only), so authz/audit
+	// decided on the primary path while the engine validated a different,
+	// un-canonicalized leg — the canonicalize-once-before-authz invariant
+	// (bypass-01/03) held for the primary path but was broken for move/copy. The
+	// engine-side ValidatePath/os.Root is still defense-in-depth (no escape), but
+	// the authorized/audited leg must be the exact leg the engine touches. A
+	// canonicalize error on either leg is denyMalformed HERE — symmetric with the
+	// primary path — and the handler is never reached. canonSrc/canonDst are
+	// empty for single-path ops, which never read them.
+	canonSrc, canonDst, perr := canonicalizeMoveCopyLegs(op, bodyBytes)
+	if perr != nil {
+		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
+		return
+	}
+
 	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
 	// The route op is AUTHORITATIVE for what the request does; the wire
 	// authorization_metadata.intent is an untrusted hint. The authz intent
@@ -475,7 +506,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// audit-down verdict (n3). This pre-handler allow-Mandate stays HERE,
 	// before STAGE 4 — the phase-8 ordering test still passes; a handler-stage
 	// refusal emits a SECOND deny event through the mandateDeny hook below.
-	allowEvent := d.auditEvent(op, ps, req, grant, bodyBytes)
+	allowEvent := d.auditEvent(op, ps, req, grant, canonDst)
 	allowEvent.RequestID = reqID
 	mandateStart := time.Now()
 	mandateErr := d.guard.Mandate(r.Context(), mapAuditEvent(allowEvent))
@@ -515,7 +546,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (the truth header only ever accompanies a recorded truth), mirroring the
 	// STAGE-3 allow-Mandate failure path above.
 	mandateDeny := func(auditReason, wireClass, message string) {
-		denyEvent := d.denyAuditEvent(op, ps, req, grant, bodyBytes, auditReason)
+		denyEvent := d.denyAuditEvent(op, ps, req, grant, canonDst, auditReason)
 		denyEvent.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(denyEvent)); err != nil {
 			denyOp(mapDeny(denyAuditDown), "audit gate unavailable")
@@ -536,6 +567,8 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		op:          op,
 		body:        bodyBytes,
 		canonPath:   env.Path, // the spine-canonicalized primary path (bypass-01/03)
+		canonSource: canonSrc, // the spine-canonicalized move/copy source leg (crutch-04)
+		canonDest:   canonDst, // the spine-canonicalized move/copy destination leg (crutch-04)
 		ps:          ps,
 		grant:       grant,
 		mandateDeny: mandateDeny,
@@ -581,47 +614,80 @@ func activityForOp(op Op) int {
 	}
 }
 
-// objectHandleForOp derives the audited object handle for an op. For
-// move/copy the handle is the DESTINATION (the produced object); for the
-// others it is the envelope path. The destination is read from the buffered
-// body so the audit record names the produced handle even though the spine
-// envelope carries no destination field.
+// canonicalizeMoveCopyLegs canonicalizes the SECOND-LEG paths (source and
+// destination) of the two-path namespace ops (moveDirectory, copyFile,
+// moveFile) through the SAME canonicalizePath the spine applies to the primary
+// path at the STAGE 1b->2 boundary (crutch-04). It runs on the buffered body
+// AFTER the channel-scope cross-check has cleared (nothing trusts the body
+// before STAGE 1b) and BEFORE STAGE 2 authz / STAGE 3 audit, so the
+// authorized/audited leg is the exact leg the engine touches.
 //
-// The destination path is canonicalized through canonicalizePath — the same
-// canonicalizer the dispatch boundary applies to the primary path at STAGE
-// 1b/2 (bypass-01/03) — so the durable audit record names the
-// broker-resolved truth and never a raw wire path that could encode traversal
-// segments ("/pub/../priv/stolen") while the engine wrote a different object
-// ("/priv/stolen"). If the body cannot be decoded or the destination is
-// lexically invalid, the handle falls back to the canonicalized primary path
-// (req.Path), which the spine already cleaned at STAGE 1b (NFR-SEC-79).
-func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) string {
-	path := req.Path
-	var rawDst string
-	var gotDst bool
+// A body that cannot be decoded is treated as a missing leg ("" returned,
+// no error): the op handler's strict decodeOp re-decodes the same bytes and
+// owns the malformed-body refusal — this helper never pre-empts that with its
+// own malformed verdict. A leg that decodes but is lexically invalid or escapes
+// the scope (canonicalizePath error) returns the error so the spine denies
+// denyMalformed before the engine — symmetric with the primary path.
+//
+// Both returned legs are in the guest leading-slash convention; the handler
+// trims them through enginePath for the engine call. For a single-path op the
+// returned legs are empty and the handler never reads them.
+func canonicalizeMoveCopyLegs(op Op, body []byte) (src string, dst string, err error) {
+	var rawSrc, rawDst string
 	switch op {
 	case OpMoveDirectory:
 		var b moveDirectoryRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
 	case OpCopyFile:
 		var b copyFileRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
 	case OpMoveFile:
 		var b moveFileRequest
-		if json.Unmarshal(body, &b) == nil {
-			rawDst, gotDst = b.Destination, true
+		if json.Unmarshal(body, &b) != nil {
+			return "", "", nil
 		}
+		rawSrc, rawDst = b.Source, b.Destination
+	default:
+		return "", "", nil
 	}
-	if gotDst {
-		if clean, err := canonicalizePath(rawDst); err == nil {
-			path = clean
+	src, err = canonicalizePath(rawSrc)
+	if err != nil {
+		return "", "", err
+	}
+	dst, err = canonicalizePath(rawDst)
+	if err != nil {
+		return "", "", err
+	}
+	return src, dst, nil
+}
+
+// objectHandleForOp derives the audited object handle for an op. For
+// move/copy the handle is the DESTINATION (the produced object); for the
+// others it is the envelope path. The destination passed in is the
+// spine-canonicalized destination leg (canonDst) — cleaned through the SAME
+// canonicalizer the dispatch boundary applies to the primary path at STAGE
+// 1b/2 (bypass-01/03, crutch-04) — so the durable audit record names the
+// broker-resolved truth and never a raw wire path that could encode traversal
+// segments ("/pub/../priv/stolen") while the engine wrote a different object
+// ("/priv/stolen"). The audited destination is now the EXACT leg the engine
+// receives, because the spine canonicalizes it once and both the audit record
+// and the engine call derive from that single cleaned form. A single-path op
+// (or a two-path op whose body failed to decode, leaving canonDst empty) names
+// the canonicalized primary path (req.Path), which the spine already cleaned at
+// STAGE 1b (NFR-SEC-79).
+func objectHandleForOp(op Op, scope string, req ResolveRequest, canonDst string) string {
+	path := req.Path
+	switch op {
+	case OpMoveDirectory, OpCopyFile, OpMoveFile:
+		if canonDst != "" {
+			path = canonDst
 		}
-		// If canonicalizePath rejects the destination (lexically invalid), path
-		// stays as req.Path — the already-canonical primary path.
 	}
 	return scope + ":" + path
 }
@@ -631,8 +697,9 @@ func objectHandleForOp(op Op, scope string, req ResolveRequest, body []byte) str
 // passes an opaque value through Guard.Mandate exactly as the real gate
 // consumes it. The op-aware fields (ActivityID, ObjectHandle, Intent,
 // Downloadable) are populated per Q7; the committed envelope fields keep their
-// meaning.
-func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte) auditEvent {
+// meaning. canonDst is the spine-canonicalized destination leg for a two-path
+// op (crutch-04), empty for a single-path op.
+func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, canonDst string) auditEvent {
 	return auditEvent{
 		Op:           op,
 		Scope:        ps.FilesystemID,
@@ -642,7 +709,7 @@ func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant G
 		PeerPID:      ps.PID,
 		AccessTime:   nil,
 		ActivityID:   activityForOp(op),
-		ObjectHandle: objectHandleForOp(op, ps.FilesystemID, req, body),
+		ObjectHandle: objectHandleForOp(op, ps.FilesystemID, req, canonDst),
 		ByteCount:    0,
 		Downloadable: grant.Downloadable,
 	}
@@ -652,9 +719,10 @@ func (d *dispatcher) auditEvent(op Op, ps PeerScope, req ResolveRequest, grant G
 // refusal: the same op-aware shape as the allow event, carrying the
 // broker-resolved truth as the DenyReason. It is emitted through the spine's
 // guard (via the mandateDeny hook) BEFORE the wire deny so the durable record
-// captures that the op did not take effect (T-09-04 / NFR-SEC-79).
-func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, body []byte, auditReason string) auditEvent {
-	e := d.auditEvent(op, ps, req, grant, body)
+// captures that the op did not take effect (T-09-04 / NFR-SEC-79). canonDst is
+// the spine-canonicalized destination leg for a two-path op (crutch-04).
+func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, grant Grant, canonDst string, auditReason string) auditEvent {
+	e := d.auditEvent(op, ps, req, grant, canonDst)
 	e.DenyReason = auditReason
 	return e
 }
@@ -697,8 +765,10 @@ type auditEvent struct {
 }
 
 // withStatus returns a copy of the verdict with an overridden HTTP status,
-// used only for the 405 method-not-allowed path where the Connect code stays
-// invalid_argument but the HTTP method semantics demand 405.
+// used only for the 405 method-not-allowed path where the deny class stays
+// malformed (invalid_argument) but the HTTP method semantics demand 405. The
+// BoundedReason body still carries the malformed reason_code; only the
+// authoritative status is overridden.
 func (v DenyVerdict) withStatus(status int) DenyVerdict {
 	v.WireStatus = status
 	return v

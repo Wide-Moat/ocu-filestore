@@ -5,7 +5,6 @@ package broker
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/authz"
@@ -60,32 +59,46 @@ func TestPrefixDownloadablePolicyMatchesPrefix(t *testing.T) {
 	}
 }
 
-// TestPrefixPolicyFeedsResolverReadDenyEgress pins SEC-73 end to end through
-// the real resolver: a downloadable-prefixed object resolves to a grant with
-// Downloadable=true on intent=read, while an unconfigured object is denied
-// egress (ErrNotDownloadable) — readable in session, denied egress.
-func TestPrefixPolicyFeedsResolverReadDenyEgress(t *testing.T) {
+// TestPrefixPolicyFeedsResolverReadEgressBit pins SEC-73 / invariant 5 end to
+// end through the real resolver: the downloadable prefix policy resolves the
+// EGRESS-ARTIFACT bit on intent=read without ever turning a non-downloadable
+// object into a read deny. A prefixed object grants Downloadable=true; an
+// unconfigured object is "readable in-session but yields no egress-eligible
+// artifact" — the read is ALLOWED with Grant{Downloadable: false}, and the
+// egress deny is the consuming op's decision on that bit, not a resolver error.
+//
+// This assertion was previously pinned to ErrNotDownloadable for the
+// unconfigured path — an over-deny that refused the whole read. It is flipped
+// here to match canon invariant 5 ("a non-downloadable object is readable
+// in-session but yields no egress-eligible artifact"), not to make the test
+// green: the policy func is unchanged (it still reports false for the
+// unconfigured path); only the resolver's verdict for a clean false tag moved
+// from deny to read-allowed-with-the-bit-withheld.
+func TestPrefixPolicyFeedsResolverReadEgressBit(t *testing.T) {
 	tag := NewPrefixDownloadablePolicy([]string{"/pub"})
 	res := authz.New(tag)
 	ev := authz.CallerEvidence{Scope: "fs1", GrantedIntents: []authz.Intent{authz.IntentRead}}
 
-	// Under the downloadable prefix: read grants egress.
+	// Under the downloadable prefix: read allowed, egress artifact grantable.
 	g, err := res.Resolve(context.Background(), ev, authz.Request{
 		Filesystem: "fs1", Path: "/pub/report.pdf", Intent: authz.IntentRead,
 	})
 	if err != nil {
-		t.Fatalf("read under /pub: err %v, want grant", err)
+		t.Fatalf("read under /pub: err %v, want a grant", err)
 	}
 	if !g.Downloadable {
 		t.Fatalf("read under /pub: Downloadable false, want true")
 	}
 
-	// Outside any prefix: read is denied egress (fail-closed).
-	_, err = res.Resolve(context.Background(), ev, authz.Request{
+	// Outside any prefix: read is ALLOWED in-session, egress artifact withheld.
+	g, err = res.Resolve(context.Background(), ev, authz.Request{
 		Filesystem: "fs1", Path: "/private/secret.bin", Intent: authz.IntentRead,
 	})
-	if !errors.Is(err, authz.ErrNotDownloadable) {
-		t.Fatalf("read outside prefix: got %v, want ErrNotDownloadable (deny egress)", err)
+	if err != nil {
+		t.Fatalf("read outside prefix: got %v, want nil (readable in-session, invariant 5)", err)
+	}
+	if g.Downloadable {
+		t.Fatalf("read outside prefix: Downloadable true, want false (egress artifact withheld)")
 	}
 }
 

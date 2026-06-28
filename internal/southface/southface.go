@@ -7,12 +7,14 @@
 // authorization axes are pinned; per-operation bodies marked TBD there stay
 // TBD here — this package never invents a body).
 //
-// Accept-time rules: the listener accepts a connection only from the host
-// peer (non-host peers dropped before any frame is parsed, NFR-SEC-76), and
-// every operation is attributed by host-derived identity — a guest-supplied
-// session/tenant id is a hint cross-checked against it, never the identity
-// (NFR-SEC-43). Per-session file-ops/s, in-flight-byte, and fd ceilings
-// throttle fail-closed per session, not broker-wide (NFR-SEC-46).
+// Transport: REST over the edge-injected-credential HTTPS the guest dials
+// (guest -> edge -> service). Every operation is attributed by the
+// credential-bound filesystem scope the edge injects on Authorization: Bearer —
+// a guest-supplied filesystem_id is a hint cross-checked against it, never the
+// identity (NFR-SEC-43). The service mints/signs nothing (invariant 3); the
+// edge owns weak-JWT validation and the credential exchange. Per-session
+// file-ops/s, in-flight-byte, and fd ceilings throttle fail-closed per session,
+// not broker-wide (NFR-SEC-46).
 package southface
 
 // Op names one south-face file operation, mirroring the file-ops contract
@@ -39,16 +41,27 @@ const (
 	OpImportZip         Op = "importZip"
 	OpMigrateFilesystem Op = "migrateFilesystem"
 	OpRemoveFilesystem  Op = "removeFilesystem"
+
+	// The next three are frozen contract OperationName-enum members whose
+	// request/response bodies are still x-ocu-tbd in the contract. They are
+	// DISTINCT enum names — not aliases of OpRemoveFile/OpReadMetadata/
+	// OpGetFileMetadata — so the Op set covers the whole frozen enum
+	// (TestOpEnumMatchesContract). No handler, no required-intent row, and no
+	// knownOps entry: they are not routable until the contract pins their
+	// bodies. Adding a handler here would mean inventing a body the contract has
+	// not frozen, which this package never does.
+	OpFileDelete              Op = "fileDelete"
+	OpReadFileMetadata        Op = "readFileMetadata"
+	OpReleaseQuarantinedFiles Op = "releaseQuarantinedFiles"
 )
 
-// Server is the south-face listener seam. The implementation PR binds it to
-// the host-side per-session channel, wires the authz resolver and the
-// audit gate in front of the object-store client, and carries the
-// per-session ceilings. The transport and message-set encoding are
-// component-spec choices, not contract.
+// Server is the south-face listener seam. The implementation binds it to the
+// TLS HTTP/2 server, wires the authz resolver and the audit gate in front of
+// the object-store client, and carries the per-session ceilings. The transport
+// and message-set encoding are component-spec choices, not contract.
 type Server interface {
-	// Serve accepts host-peer connections until the context is cancelled
-	// or a fatal listener error occurs.
+	// Serve binds the listener and accepts connections until Close shuts the
+	// server down or a fatal listener error occurs.
 	Serve() error
 	// Close releases the listener; in-flight operations finish or fail
 	// fail-closed, never half-acknowledged.

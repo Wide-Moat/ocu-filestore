@@ -829,20 +829,25 @@ func TestReadFileDeferredOpsUnimplemented(t *testing.T) {
 	}
 }
 
-// TestAuditHandleCanonicalForCopyMove pins bypass-02b (audit-truth, NFR-SEC-79):
-// a copy or move whose Destination (or Source on a move) carries traversal
-// segments ("/pub/../priv/stolen") must record the BROKER-RESOLVED canonical
-// path ("/priv/stolen") in the audit ObjectHandle — the same canonicalization
-// the spine applies to the primary path at STAGE 1b/2. A raw wire path in the
-// durable record would let the audit claim a different object than the engine
-// actually wrote.
+// TestAuditHandleCanonicalForCopyMove pins bypass-02b + crutch-04 (audit-truth,
+// NFR-SEC-79): a copy or move whose Destination (or Source on a move) carries
+// traversal segments ("/pub/../priv/stolen") must record the BROKER-RESOLVED
+// canonical path ("/priv/stolen") in the audit ObjectHandle — the same
+// canonicalization the spine applies to the primary path at STAGE 1b/2 — AND
+// the engine must receive that SAME canonical leg. Before crutch-04 the engine
+// saw the raw wire path while authz/audit saw the canonical one; the spine now
+// canonicalizes source/destination once before authz, so the audited leg and
+// the engine leg are identical.
 func TestAuditHandleCanonicalForCopyMove(t *testing.T) {
 	// copyFile: non-canonical destination. The destination "/pub/../dst.txt"
-	// canonicalizes to "/dst.txt". The engine receives the raw form, rejects
-	// it as an invalid path (errInvalidPath → not_found), so the response is
-	// 404. The STAGE-3 allow event (events[0]) is emitted BEFORE the engine
-	// call and must record the canonical "/dst.txt" in ObjectHandle.
-	t.Run("copyFile_non_canonical_destination_is_cleaned_in_audit_handle", func(t *testing.T) {
+	// canonicalizes to the in-scope "/dst.txt" (engine-relative "dst.txt"). After
+	// crutch-04 the spine cleans it BEFORE the engine call, so the engine receives
+	// the canonical leg and the copy SUCCEEDS (200) — the source exists and the
+	// canonical destination is a valid in-scope path. The STAGE-3 allow event
+	// (events[0]) records the canonical "/dst.txt" in ObjectHandle, and the engine
+	// records the mutation at the canonical engine path "dst.txt" (never the raw
+	// "pub/../dst.txt" form), proving the audited leg and the engine leg agree.
+	t.Run("copyFile_non_canonical_destination_is_cleaned_for_engine_and_audit", func(t *testing.T) {
 		eng := newFakeEngine()
 		eng.putFile(opScope, "src.txt", 10)
 		g := &fakeGuard{}
@@ -852,8 +857,8 @@ func TestAuditHandleCanonicalForCopyMove(t *testing.T) {
 			`{"filesystem_id":%q,"source":"/src.txt","destination":"/pub/../dst.txt","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
 			opScope)
 		w := serveOp(d, OpCopyFile, body, opScope, okIntents())
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404 (raw destination invalid at engine); body %s", w.Code, w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (canonical destination is a valid in-scope path); body %s", w.Code, w.Body.String())
 		}
 
 		if len(g.events) < 1 {
@@ -868,6 +873,11 @@ func TestAuditHandleCanonicalForCopyMove(t *testing.T) {
 		wantHandle := opScope + ":/dst.txt"
 		if ev.ObjectHandle != wantHandle {
 			t.Fatalf("copyFile STAGE-3 audit ObjectHandle = %q, want the canonical %q", ev.ObjectHandle, wantHandle)
+		}
+		// The engine received the CANONICAL destination leg "dst.txt" (crutch-04),
+		// not the raw "pub/../dst.txt" — the audited leg and the engine leg agree.
+		if got := eng.mutations(); len(got) != 1 || got[0] != "dst.txt" {
+			t.Fatalf("engine mutation targets = %v, want exactly [\"dst.txt\"] (the canonical leg, not the raw traversal form)", got)
 		}
 	})
 
@@ -933,6 +943,106 @@ func TestAuditHandleCanonicalForCopyMove(t *testing.T) {
 		wantHandle := opScope + ":/x/dstdir"
 		if ev.ObjectHandle != wantHandle {
 			t.Fatalf("moveDirectory STAGE-3 audit ObjectHandle = %q, want the canonical %q", ev.ObjectHandle, wantHandle)
+		}
+	})
+}
+
+// TestMoveCopySourceDestCanonicalizedAtSpine pins crutch-04: the spine runs the
+// SAME canonicalizePath over the SECOND-LEG paths (source/destination) of the
+// two-path ops that it runs over the primary path at the STAGE 1b->2 boundary,
+// BEFORE authz and audit. A source or destination the canonicalizer REJECTS (a
+// scheme-shaped backend handle — one of the lexical classes canonicalizePath
+// refuses regardless of which engine is bound) is denied denyMalformed /
+// invalid_argument (400) at the spine, the resolver and audit guard are NEVER
+// consulted, and the engine is NEVER touched — symmetric with the primary path.
+// A clean source/destination still succeeds and the engine receives the
+// canonical leg.
+func TestMoveCopySourceDestCanonicalizedAtSpine(t *testing.T) {
+	// Each case names the op, the JSON body (one of source/destination carries a
+	// canonicalizer-rejected value), and whether the rejected leg is the source.
+	rejected := []struct {
+		name string
+		op   Op
+		body string
+	}{
+		{
+			name: "copyFile_url_scheme_destination",
+			op:   OpCopyFile,
+			body: `{"filesystem_id":%q,"source":"/src.txt","destination":"s3://bucket/key","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+		},
+		{
+			name: "copyFile_url_scheme_source",
+			op:   OpCopyFile,
+			body: `{"filesystem_id":%q,"source":"s3://bucket/src","destination":"/dst.txt","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+		},
+		{
+			name: "moveFile_url_scheme_destination",
+			op:   OpMoveFile,
+			body: `{"filesystem_id":%q,"source":"/src.txt","destination":"https://evil/key","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+		},
+		{
+			name: "moveDirectory_url_scheme_destination",
+			op:   OpMoveDirectory,
+			body: `{"filesystem_id":%q,"source":"/srcdir","destination":"file:///etc/dstdir","authorization_metadata":{"intent":"write","downloadable":false}}`,
+		},
+	}
+	for _, c := range rejected {
+		t.Run(c.name, func(t *testing.T) {
+			eng := newFakeEngine()
+			eng.putFile(opScope, "src.txt", 10)
+			eng.mkdirSeed(opScope, "srcdir")
+			rec := &callRecorder{}
+			res := &fakeResolver{rec: rec, grant: Grant{Downloadable: true}}
+			g := &fakeGuard{rec: rec}
+			d := newEngineDispatcher(res, g, okCeilings(), eng)
+
+			w := serveOp(d, c.op, fmt.Sprintf(c.body, opScope), opScope, okIntents())
+			// invalid_argument / 400, the SAME class the primary path's
+			// canonicalize reject produces.
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (invalid_argument: rejected source/dest at the canonicalizer); body %s", w.Code, w.Body.String())
+			}
+			// A canonicalize reject on the second leg degrades to invalid_argument
+			// with NO x-deny-reason header (denyMalformed), like the primary path.
+			if h := w.Header().Get("x-deny-reason"); h != "" {
+				t.Fatalf("x-deny-reason = %q on a malformed-path deny, want none", h)
+			}
+			// The deny precedes STAGE-2 authz and STAGE-3 audit: neither the
+			// resolver nor the audit guard was consulted.
+			for _, call := range rec.snapshot() {
+				if call == "resolve" {
+					t.Fatalf("resolver consulted on a rejected-path request; the deny must precede STAGE-2 authz")
+				}
+				if call == "mandate" {
+					t.Fatalf("audit guard consulted on a rejected-path request; the deny must precede STAGE-3 audit")
+				}
+			}
+			// The engine was NEVER touched: defense-in-depth is not the boundary
+			// — the spine refuses before any engine verb runs.
+			if got := eng.mutations(); len(got) != 0 {
+				t.Fatalf("engine recorded mutations %v on a rejected-path request, want none (deny precedes the engine)", got)
+			}
+		})
+	}
+
+	// Clean source/destination still succeeds, and the engine receives the
+	// canonical engine-relative leg.
+	t.Run("clean_source_dest_succeeds_engine_sees_canonical_leg", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putFile(opScope, "src.txt", 10)
+		d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
+
+		// Redundant-but-clean segments on both legs: "/./src.txt" -> "/src.txt"
+		// (engine "src.txt"); "/sub/../dst.txt" -> "/dst.txt" (engine "dst.txt").
+		body := fmt.Sprintf(
+			`{"filesystem_id":%q,"source":"/./src.txt","destination":"/sub/../dst.txt","overwrite_existing":false,"authorization_metadata":{"intent":"write","downloadable":false}}`,
+			opScope)
+		assertBareAck(t, serveOp(d, OpCopyFile, body, opScope, okIntents()))
+
+		// The engine received the CANONICAL destination leg "dst.txt", proving the
+		// spine cleaned the second leg before the engine call (crutch-04).
+		if got := eng.mutations(); len(got) != 1 || got[0] != "dst.txt" {
+			t.Fatalf("engine mutation targets = %v, want exactly [\"dst.txt\"] (the canonical leg)", got)
 		}
 	})
 }

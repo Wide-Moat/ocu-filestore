@@ -46,10 +46,17 @@ func ValidateZip(ctx context.Context, staged []byte, cfg Config, sink ExtractSin
 	}
 
 	// The running decompressed total is shared across ALL entries: the
-	// ceiling bounds the archive, not each entry (ARC-01).
+	// ceiling bounds the archive, not each entry (ARC-01). seen tracks the
+	// cleaned name of every entry already accepted this archive, so a second
+	// entry that cleans to the same in-namespace path is rejected fail-closed
+	// before it reaches the sink rather than silently overwriting the first
+	// with undefined ordering (a file/file, file/dir, or
+	// separator-normalization collision); deny-by-default, consistent with the
+	// engine's destination-collision posture.
 	var total int64
+	seen := make(map[string]bool, len(r.File))
 	for _, f := range r.File {
-		if err := processEntry(ctx, f, cfg, &total, sink); err != nil {
+		if err := processEntry(ctx, f, cfg, &total, seen, sink); err != nil {
 			return err
 		}
 	}
@@ -65,11 +72,21 @@ func ValidateZip(ctx context.Context, staged []byte, cfg Config, sink ExtractSin
 // symlink -> classify -> policy -> stage. It is a helper so each entry's
 // reader Close is deferred per entry — a defer inside the caller's range
 // loop would accumulate open readers across the whole archive.
-func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, sink ExtractSink) error {
+func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, seen map[string]bool, sink ExtractSink) error {
 	cleanName, err := validateEntryName(f.Name)
 	if err != nil {
 		return &ArchiveError{Code: ErrInvalidEntry, EntryName: f.Name}
 	}
+
+	// Collision check before any sink call: a second entry cleaning to a name
+	// already accepted this archive is rejected fail-closed, so it can never
+	// overwrite the first (or stage a file where a directory was made, or
+	// vice versa) with undefined ordering. Recorded only after the name is
+	// known safe, so an invalid name never poisons the seen set.
+	if seen[cleanName] {
+		return &ArchiveError{Code: ErrDuplicateEntry, EntryName: f.Name}
+	}
+	seen[cleanName] = true
 
 	fi := f.FileInfo()
 
@@ -83,12 +100,18 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 	if fi.Mode()&fs.ModeSymlink != 0 {
 		rc, err := f.Open()
 		if err != nil {
-			return fmt.Errorf("ingest: open symlink entry %q: %w", cleanName, err)
+			// The staged bytes are an in-memory buffer, so a per-entry open
+			// failure is never an I/O fault — it is the archive's local
+			// header or compression metadata being malformed. Surface it as
+			// the typed parse-failure sentinel so callers classify every
+			// corrupt-archive condition uniformly (errors.Is ErrInvalidArchive)
+			// rather than receiving an untyped wrap.
+			return fmt.Errorf("%w: open symlink entry %q: %v", ErrInvalidArchive, cleanName, err)
 		}
 		target, rerr := io.ReadAll(io.LimitReader(rc, 4096))
 		rc.Close()
 		if rerr != nil {
-			return fmt.Errorf("ingest: read symlink target %q: %w", cleanName, rerr)
+			return fmt.Errorf("%w: read symlink target %q: %v", ErrInvalidArchive, cleanName, rerr)
 		}
 		if err := validateSymlinkTarget(cleanName, string(target), cfg.DestDir); err != nil {
 			return &ArchiveError{Code: ErrSymlinkEscape, EntryName: f.Name}
@@ -117,7 +140,9 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 
 	rc, err := f.Open()
 	if err != nil {
-		return fmt.Errorf("ingest: open entry %q: %w", cleanName, err)
+		// In-memory staged bytes: a per-entry open failure is malformed-archive
+		// metadata, not an I/O fault. Typed so callers classify it uniformly.
+		return fmt.Errorf("%w: open entry %q: %v", ErrInvalidArchive, cleanName, err)
 	}
 	defer rc.Close()
 
@@ -127,7 +152,7 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 	firstBuf := make([]byte, 512)
 	n, rerr := io.ReadFull(rc, firstBuf)
 	if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
-		return fmt.Errorf("ingest: read entry %q: %w", cleanName, rerr)
+		return fmt.Errorf("%w: read entry %q: %v", ErrInvalidArchive, cleanName, rerr)
 	}
 	firstBuf = firstBuf[:n]
 
@@ -141,13 +166,42 @@ func processEntry(ctx context.Context, f *zip.File, cfg Config, total *int64, si
 
 	// The tee routes every byte the sink consumes through the counting
 	// writer, so the cross-entry total is enforced on actual decompressed
-	// bytes as they stream — never on a header claim.
+	// bytes as they stream — never on a header claim. The zip reader is
+	// wrapped so a corruption error it raises mid-decompression (a malformed
+	// local header or truncated compressed data the central directory did not
+	// reveal) is captured at its source and distinguished from a genuine sink
+	// fault: the former is a typed malformed-archive condition, the latter is
+	// the sink's own error preserved verbatim for errors.Is matching.
+	src := &errCapturingReader{r: rc}
 	cw := &countingWriter{w: io.Discard, total: total, ceiling: cfg.TotalUncompressedCeiling}
-	entry := io.TeeReader(io.MultiReader(bytes.NewReader(firstBuf), rc), cw)
+	entry := io.TeeReader(io.MultiReader(bytes.NewReader(firstBuf), src), cw)
 	if err := sink.StageEntry(ctx, cleanName, entry, fi.Mode()); err != nil {
+		if src.err != nil {
+			// The fault originated in the zip reader, not the sink: the
+			// archive bytes are malformed. Type it so callers classify every
+			// corrupt-archive condition uniformly (errors.Is ErrInvalidArchive).
+			return fmt.Errorf("%w: read entry %q: %v", ErrInvalidArchive, cleanName, src.err)
+		}
 		return fmt.Errorf("ingest: stage entry %q: %w", cleanName, err)
 	}
 	return nil
+}
+
+// errCapturingReader records the first non-EOF read error raised by the
+// underlying zip-entry reader, so a corruption surfaced mid-decompression can
+// be distinguished from a sink fault after StageEntry returns. io.EOF is not
+// captured: it is the clean end of the entry, not a fault.
+type errCapturingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errCapturingReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF {
+		e.err = err
+	}
+	return n, err
 }
 
 // Unix S_IFMT file-type bits as carried in the high 16 bits of a zip entry's

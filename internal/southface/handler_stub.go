@@ -47,8 +47,20 @@ type handlerCtx struct {
 	// decision can never disagree with the bytes touched. It is in the guest
 	// leading-slash convention; enginePath trims it for the engine call.
 	canonPath string
-	ps        PeerScope
-	grant     Grant
+	// canonSource and canonDest are the spine-canonicalized SECOND-LEG paths for
+	// the two-path namespace ops (moveDirectory, copyFile, moveFile). The spine
+	// cleans req.Source/req.Destination through the SAME canonicalizePath it
+	// applies to the primary path at the STAGE 1b->2 boundary (crutch-04), BEFORE
+	// authz and audit, so the authorized/audited leg is the exact leg the engine
+	// touches — never a raw, un-canonicalized wire path. A canonicalize error on
+	// either leg is denied denyMalformed at the spine and the handler is never
+	// reached, symmetric with the primary path. Both are in the guest
+	// leading-slash convention; the handler trims them through enginePath for the
+	// engine call. They are empty for single-path ops, which never read them.
+	canonSource string
+	canonDest   string
+	ps          PeerScope
+	grant       Grant
 
 	mandateDeny func(auditReason, wireClass, message string)
 }
@@ -112,13 +124,18 @@ func outcomeDeny(class string) opOutcome { return opOutcome{denyClass: class} }
 // for the dispatched op (southface-01).
 type opHandler func(d *handlerDeps, hc handlerCtx) opOutcome
 
-// unimplemented writes the Connect unimplemented error (501) with no
-// x-deny-reason header. Every op the seven phase-9 handlers do not replace
-// resolves to this — the registry is complete, those bodies are not. It writes
-// the wire error directly (no mandateDeny hook), so it returns the deny class
-// for the spine to record the single ops_total entry.
+// unimplemented writes the REST unimplemented deny (501) with no x-deny-reason
+// header. Every op the seven phase-9 handlers do not replace resolves to this —
+// the registry is complete, those bodies are not. It writes the wire error
+// directly (no mandateDeny hook), so it returns the deny class for the spine to
+// record the single ops_total entry.
+//
+// PHASE-7(A3-deny): frozen @ canon-rev a030b7be914b: the body is the BoundedReason {reason_code,
+// contract FORM ratified by #292 @ a030b7be914b; governing ADR remains status:proposed — freezes the wire FORM, not ADR acceptance
+// message} REST shape (writeRESTDeny), not the Connect error frame; the HTTP
+// 501 status is authoritative.
 func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {
-	writeConnectError(hc.w, mapDeny(denyUnimplemented), "operation not implemented in this build")
+	writeRESTDeny(hc.w, mapDeny(denyUnimplemented), "operation not implemented in this build")
 	return outcomeDeny(denyUnimplemented)
 }
 
@@ -130,10 +147,11 @@ func unimplemented(_ *handlerDeps, hc handlerCtx) opOutcome {
 // would route it to a nil handler.
 //
 // fileUpload (OPS-05) and fileDownload (OPS-06) are dispatched OUT-OF-BAND:
-// the ServeHTTP streaming branch routes them to serveStreaming before the
-// registry is consulted, so their registry entries stay unimplemented and are
-// never reached on the streaming path. getFileMetadata/listFiles stay
-// unimplemented (deferred).
+// the REST router routes them to their dedicated entrypoints
+// (serveUploadMultipart / serveDownloadOctetStream) before this registry is
+// consulted, so their registry entries stay unimplemented and are never reached
+// on the data-plane path. getFileMetadata/listFiles stay unimplemented
+// (deferred).
 func newHandlerRegistry() map[Op]opHandler {
 	reg := make(map[Op]opHandler, len(knownOps))
 	for op := range knownOps {

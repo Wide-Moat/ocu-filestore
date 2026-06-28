@@ -80,6 +80,10 @@ assistance. If it was not, omit it.
 
 - **English only** — all code, comments, commit messages, PR titles and
   descriptions, and documentation. No exceptions.
+- **Documentation standard** — prose docs (package READMEs, architecture
+  pages, wire references) follow [docs/documentation-standard.md](docs/documentation-standard.md):
+  name code by identifier rather than line coordinate, let structure earn its
+  shape, and state each fact once.
 - **Project's own words** — state facts as this project knows them. Do not
   name any third-party system or upstream project as the origin of a
   behaviour, design choice, or implementation detail. Cite public open-source
@@ -101,7 +105,7 @@ assistance. If it was not, omit it.
 
 ```sh
 make check
-# runs: fmt + vet + staticcheck + spdx + contract + identity + test
+# runs: fmt + vet + staticcheck + lint + spdx + contract + identity + test
 ```
 
 Individual targets:
@@ -111,6 +115,8 @@ Individual targets:
 | `make fmt` | `gofmt -l .` (fails if unformatted) | `go / gofmt` |
 | `make vet` | `go vet ./...` | `go / vet` |
 | `make staticcheck` | `staticcheck ./...` @ `2026.1` | `go / staticcheck` |
+| `make lint` | `golangci-lint run` (`.golangci.yml`) | `go / golangci` |
+| `make mutation` | go-gremlins mutation test (advisory) on the pure-logic packages | `mutation / gremlins` |
 | `make test` | `go test ./...` | `go / test` |
 | `make test-race` | `go test -race ./... -timeout 600s` | `go / race` |
 | `make cover` | Coverage over `./internal/...`, floor enforced | `go / coverage` |
@@ -120,14 +126,21 @@ Individual targets:
 | `make e2e-linux` | Linux-only e2e in a container (darwin escape hatch) | `e2e / e2e` |
 | `make s3-rig-up` | Start MinIO test rig | needed for live-S3 legs |
 
-Prerequisites: Go >= 1.25 (match `go.mod`), GNU make, Docker (for
+Prerequisites: Go >= 1.26 (match `go.mod`), GNU make, Docker (for
 `e2e-linux` and the MinIO rig).
 
-Install `staticcheck` once:
+Install the two pinned linters once:
 
 ```sh
 go install honnef.co/go/tools/cmd/staticcheck@2026.1
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 ```
+
+`golangci-lint` (`.golangci.yml`) is the structural meta-linter: beyond the
+single-purpose `go / vet` and `go / staticcheck` gates it runs the security and
+correctness set this daemon needs — `gosec`, `errorlint`, `bodyclose`, and
+peers. Its config-level exclusions are scoped and commented; do not add bare
+`//nolint` to source.
 
 ### Gated legs that loud-skip without extra setup
 
@@ -216,6 +229,7 @@ Every PR must clear all of the following CI jobs before merge:
 | Format | `go / gofmt` | Any unformatted Go file |
 | Vet | `go / vet` | `go vet` findings |
 | Static analysis | `go / staticcheck` | `staticcheck` findings |
+| Meta-linter | `go / golangci` | `golangci-lint` findings (`.golangci.yml`) |
 | Unit tests | `go / test` | Any test failure |
 | Race detector | `go / race` | Data race detected |
 | Coverage floor | `go / coverage` | Coverage below 86.0% over `./internal/...` |
@@ -226,12 +240,23 @@ Every PR must clear all of the following CI jobs before merge:
 | Secrets scan | `security / secrets-gitleaks` | Any secret detected by gitleaks |
 | Secrets scan | `security / secrets-trufflehog` | Any secret detected by trufflehog |
 | SAST | `security / sast-semgrep` | CRITICAL semgrep finding |
+| Dataflow analysis | `codeql / analyze` | CodeQL `security-and-quality` finding on Go |
 | SCA | `security / sca-trivy-fs` | CRITICAL trivy finding |
 | Conventional commits | `security / conventional-commits` | PR title not in Conventional Commits format |
 | Real-binary e2e | `e2e / e2e` | Daemon smoke or Integration/E2E failure |
 
 Additionally, `govulncheck` (`go / govulncheck`) runs on every PR and fails
 on known-exploitable vulnerabilities reachable from this module.
+
+The `mutation / gremlins` job (go-gremlins) runs on every PR and on a weekly
+cron, scoped to the pure-logic leaf packages (`internal/authz`,
+`internal/denyclass`, `internal/ceilings`). It measures assertion strength —
+it rewrites covered source and re-runs the suite, so a surviving mutant marks a
+line the tests execute but do not assert on, a gap line coverage cannot see. It
+is **advisory** (`continue-on-error`): it surfaces the efficacy summary in the
+job log but does not block merge yet. The scope lives in `.gremlins.yaml`. Run
+`make mutation` locally to reproduce it. The ratchet plan (a threshold floor,
+then dropping the advisory flag) is recorded in `.github/workflows/mutation.yml`.
 
 Security workflow jobs also run on a weekly cron schedule against `main`.
 

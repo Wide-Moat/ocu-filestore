@@ -59,7 +59,7 @@ compose:
    ProvisionScope  (erase-at-provision)            ── NFR-SEC-54 crash path
         │
         ▼
-   southface.Serve  (bind the per-session unix socket + accept gate)
+   southface.Serve  (build the per-session TLS HTTPS/HTTP-2 server)
         │
         ▼
 serveUntilSignal           (main.go)  ── serve until a signal or listener fault
@@ -149,8 +149,13 @@ ERROR line the moment the fail-closed latch trips.
 
 It then provisions the scope (`eng.ProvisionScope`, [§3.1](#31-provision--erase-
 at-provision)) under a bounded one-minute context, and finally calls
-`southface.Serve`, which binds the per-session unix socket and wraps it in the
-peer-cred accept gate ([§2](#2-the-south-face-accept-loop)).
+`southface.Serve`, which builds the per-session south-face TLS HTTPS/HTTP-2
+server — loading the certificate/key at construction and wiring the
+credential-scope source — ready to bind `-south-bind` on the first `Serve` call
+([§2](#2-the-south-face-server)). The guest reaches that listener outbound
+through the Egress trust-edge (guest → edge → service), an HTTPS `service_url`
+dial on every tier; the host-dials-guest unix-socket/vsock ladder carries the
+exec/control channel only, never storage (ADR-0014 §Decision).
 
 The returned `Server` is wrapped in a `teardownServer` so that `Close` also runs
 the scope erase and releases the ceilings entry ([§3.2](#32-teardown--erase-
@@ -167,60 +172,85 @@ indefinitely.
 
 ---
 
-## 2. The south-face accept loop
+## 2. The south-face server
 
-The south face is a per-session HTTP/1.1 server over a unix-domain socket, bound
-to exactly one filesystem scope. It is built by `provisionSession`
-([`internal/southface/listener.go`](../../internal/southface/listener.go)):
+The south face is a per-session TLS HTTPS/HTTP-2 server bound to exactly one
+filesystem scope. It is built by `newTLSServer`
+([`internal/southface/tlsserver.go`](../../internal/southface/tlsserver.go)) and
+returned by `southface.Serve`. The guest does not dial a host-private socket: it
+reaches this listener **outbound through the Egress trust-edge** (guest → edge →
+service), an HTTPS `service_url` dial that holds on every sandbox tier because
+every tier gives the guest a network stack (ADR-0014 §Decision). The
+host-dials-guest unix-socket/vsock ladder carries the exec/control channel only,
+never storage (ADR-0014 §Decision); nothing on the storage path binds a unix
+socket, so the south face depends on no Linux-only socket option and runs on any
+platform Go's `crypto/tls` supports.
 
-1. Derive the socket path from the scope (`socketPathForScope`). A scope unfit
-   for a single filename — empty, `.`, `..`, or carrying a path separator —
-   refuses with `errBadScopeName`, so the joined path can never escape the
-   host-owned directory.
-2. Ensure the directory exists at mode `0700` (`MkdirAll` + `Chmod`,
-   umask-independent).
-3. Remove any stale socket left by a crashed predecessor before bind (a stale
-   socket would otherwise block `net.Listen`).
-4. Bind, register the scope in the session registry keyed by socket path, and
-   wrap the listener in the `gatedListener` accept gate.
+Construction is fail-loud and happens before the first byte serves:
 
-### 2.1 The SO_PEERCRED gate
+1. Refuse an empty bind address or an absent certificate/key pair
+   (`errTLSConfig`) — a half-configured listener never binds.
+2. Load the certificate/key from `-tls-cert` / `-tls-key` at construction
+   (`tls.LoadX509KeyPair`). A defect refuses startup here, never as a lazy
+   failure on the first request; the wrapped error carries the paths, never a
+   key byte.
+3. Pin `MinVersion` TLS 1.2 and advertise `h2` then `http/1.1` via ALPN, so the
+   server negotiates HTTP/2 where the peer supports it and still serves a peer
+   that only speaks HTTP/1.1.
+4. Wrap the REST router (the dispatch spine — STAGE-ordering locked — behind
+   `POST <service_url>/v1/filestore/fs/<operation>`, a route frozen pending the
+   #292 canon merge, not yet canon-pinned: `envelope.go:restBase`,
+   `PENDING-PHASE-7(A1-route)`) as the server handler. The listener is not opened
+   until `Serve` calls `net.Listen("tcp", -south-bind)` followed by `ServeTLS`.
 
-`gatedListener.Accept` is the kernel-credential gate (NFR-SEC-76). For each
-accepted connection it extracts the peer's kernel-attested uid/pid and, **without
-reading a single byte**, closes any connection whose peer-cred extraction fails
-or whose uid is not the broker's host uid. Only a host-peer connection is ever
-handed to `http.Server`. The platform peer-cred extractor is build-tagged;
-SO_PEERCRED is Linux-only (see [`../operations.md`](../operations.md), the
-Linux-only requirement).
+### 2.1 The credential-scope source
 
-The gate is the **single** identity-extraction point. An admitted connection is
-wrapped in a `credConn` carrying the attested `(uid, pid)`, and the
-`http.Server` `ConnContext` stashes those into a `PeerScope` in every request's
-context. Nothing downstream re-derives identity; a handler reached without the
-channel binding (a wiring fault) carries no scope and the dispatch spine fails
-closed — an audit actor never defaults to uid 0.
+Identity no longer arrives as a kernel peer credential. The Egress edge
+validates and strips the guest's weak session JWT, exchanges it for the real
+filestore credential, and injects that credential on the request's
+`Authorization: Bearer` header; the service receives only the injected
+credential (spec §Owned state, the credential flow). The **single**
+identity-extraction point is the credential-scope source
+([`internal/southface/credscope.go`](../../internal/southface/credscope.go)): on
+every admitted request it derives the credential-bound `filesystem_id` scope —
+and the carried intent grant set — from that bearer, and stashes it into the
+same `PeerScope` the dispatch spine's STAGE-0 already reads. Nothing downstream
+re-derives identity; a handler reached without a scope (a wiring fault, or a
+request carrying no usable bearer) fails closed — an audit actor never defaults
+to uid 0.
 
-### 2.2 EMFILE survival
+Scope is the engine's decision, re-derived per request: the request's top-level
+`filesystem_id` is a hint cross-checked against the credential-bound scope, never
+the identity (NFR-SEC-43). A foreign `filesystem_id` is rejected with HTTP 403
+PermissionDenied; a missing or expired credential is 401 (spec invariant 4). The
+service mints and signs nothing — the edge owns weak-JWT validation and the
+credential exchange (invariant 3). The actor `uid`/`pid` carried into the audit
+record are credential-derived-or-zero: a REST transport has no kernel peer, so a
+field is omitted when the credential carries none.
+
+### 2.2 Transient accept survival
 
 A burst of concurrent connections can exhaust the process file-descriptor table.
-`isTemporaryAcceptErr` classifies `EMFILE` (too many open fds), `ENFILE`
-(system file table full), and `ECONNABORTED` (peer reset mid-handshake) as
-*temporary*. On a temporary accept error the loop backs off with a capped
-exponential delay (`acceptBackoffInitial` 5 ms doubling to `acceptBackoffCap`
-1 s) and **continues**, instead of returning the error to `http.Server`, which
-would shut the server down. A successful accept resets the backoff. A
-closed-listener error (`net.ErrClosed`) is *not* temporary — it means shutdown,
-and the loop exits. This keeps the daemon alive through transient fd exhaustion
-(RES-08) rather than self-terminating on a load spike.
+`ServeTLS`'s accept loop classifies a transient accept error (`EMFILE` too many
+open fds, `ENFILE` system file table full, a peer reset mid-handshake) as
+temporary and backs off with a capped exponential delay rather than returning
+the error, which would shut the server down; a successful accept resets the
+backoff, and a closed-listener error (`net.ErrClosed`) means shutdown and exits
+the loop. This keeps the daemon alive through transient fd exhaustion (RES-08)
+rather than self-terminating on a load spike.
 
 ### 2.3 Connection timeouts
 
-The `http.Server` sets `ReadHeaderTimeout` (10 s) to bound a peer that connects
-and never finishes its headers, and `IdleTimeout` (2 min) to reap idle
-keep-alive connections (NFR-SEC-46). `ReadTimeout` is deliberately **unset**: it
-would cap a whole legitimate chunked upload; a per-frame read deadline inside the
-streaming handler covers a stalled body instead.
+The server sets `ReadHeaderTimeout` (10 s) to bound a peer that connects and
+never finishes its request headers, and `IdleTimeout` (2 min) to reap idle
+keep-alive connections (NFR-SEC-46). `ReadTimeout` and `WriteTimeout` are
+deliberately **unset**: a connection-wide cap would kill a legitimately long
+chunked upload (spec invariant 6 — a large transfer crosses as chunked
+multipart) or download. A stall is bounded instead inside the data-plane
+handlers, which re-arm a per-iteration read or write deadline before every body
+read or flush (`http.NewResponseController`), so a slow-but-progressing transfer
+keeps extending its deadline while a true stall trips it and aborts the
+operation fail-closed.
 
 ---
 
@@ -314,18 +344,21 @@ to `errAlreadyRunning`, logs the lock path, and refuses to start). The kernel
 releases the lock on process exit **even on SIGKILL**, so there is no stale-lock
 problem across crashes; `run` also defers `afl.Release()` for the clean path.
 
-### 4.2 The topology fix — why not key on the socket directory
+### 4.2 The topology fix — key on the scope, not the bind resource
 
-An earlier design keyed a lock on the **session socket directory**. That
-over-restricts the legitimate deployment topology: *N* daemons, one per
-`filesystem_id`, sharing **one** socket directory, each binding its own
-`<filesystem_id>.sock` there. A per-directory lock refuses the second through
-*N*th daemons in that topology. The per-scope audit-sink lock fully preserves
-the no-interleaved-chain guarantee **without** imposing that restriction:
-distinct scopes have distinct sinks, take distinct locks, and coexist in one
-socket directory. (The `flock` package still documents an optional
-socket-directory lock as an available second resource, but the daemon takes only
-the audit-sink lock — the topology fix.)
+The legitimate deployment topology is *N* daemons, one per `filesystem_id`
+(per-tenant instantiation, NFR-SEC-76), each a distinct scope. The lock must not
+over-restrict that topology: keying the *audit-chain* guard on a resource the
+daemons share — as a retired design that keyed it on a shared bind directory once
+did — would refuse the second through *N*th daemons even though they corrupt no
+common audit chain. The per-scope audit-sink lock fully preserves the
+no-interleaved-chain guarantee **without** imposing that restriction: distinct
+scopes have distinct sinks, take distinct locks, and coexist. (The `flock`
+package documents two resources it can lock — the audit sink and the south-face
+bind address — and the bind-address lock remains current as a distinct guard
+against a same-address double-start; under REST/TLS that bind resource is a TCP
+listen address rather than a unix socket. The retired thing is *keying the audit
+guard on the bind resource*, not the bind-address lock itself.)
 
 ---
 
@@ -402,23 +435,23 @@ contract itself:
    signal, so a **second** `SIGTERM`/`SIGINT` during a wedged drain hits the
    default disposition and **hard-kills** the process instead of being
    swallowed. `SdNotifyStopping` then sends `STOPPING=1`.
-3. **Bounded drain.** `srv.Close` runs the session's drain. Inside
-   `session.Close` ([`internal/southface/listener.go`](../../internal/southface/listener.go)),
-   `srv.Shutdown` is given a bounded `shutdownDrainTimeout` (**25 s**) for
+3. **Bounded drain.** `srv.Close` runs the server's drain. Inside
+   `tlsServer.Close` ([`internal/southface/tlsserver.go`](../../internal/southface/tlsserver.go)),
+   `srv.Shutdown` is given a bounded `tlsShutdownDrainTimeout` (**25 s**) for
    in-flight operations to finish. If the drain expires, the straggling
    connections are **force-closed** (`srv.Close`) so teardown can always
    proceed; both the drain-expiry and the force-close errors surface via
    `errors.Join`. The 25 s bound sits deliberately under a typical service
    manager's 30 s stop-grace, so the drain, the force-close, **and** the scope
-   erase all fit before a `SIGKILL`. A wedged peer can never hold the session
+   erase all fit before a `SIGKILL`. A wedged peer can never hold the server
    open indefinitely, because the caller's teardown runs *after* `Close`
    returns.
 4. **Teardown always runs.** `teardownServer.Close` runs `TeardownScope`
-   (erase-before-reuse, NFR-SEC-54) **unconditionally** after the session close
-   — a clean stop signal must never skip the erase — then releases the ceilings
-   entry. The session's own `Close` already released the registry binding and
-   unlinked the socket (the unix listener's `SetUnlinkOnClose` removes it, and
-   `Close` removes it explicitly too to cover the shutdown-before-serve path).
+   (erase-before-reuse, NFR-SEC-54) **unconditionally** after the server close —
+   a clean stop signal must never skip the erase — then releases the ceilings
+   entry. The graceful drain leaves no host-side artifact to unlink: the TLS
+   listener is a TCP socket the kernel reclaims on close, so the
+   shutdown-before-serve path needs no explicit socket removal.
 5. **errors.Join everywhere.** Every exit path combines the serve, close, and
    ops-listener results with `errors.Join`, so a teardown error is never
    silently dropped behind a serve error or vice versa.
@@ -478,7 +511,7 @@ stateDiagram-v2
     Composing --> Exit_NonAdmit: audit sink unwritable (NFR-SEC-79)
     Composing --> Provisioned: seams built + ProvisionScope (erase-at-provision)
 
-    Provisioned --> Serving: southface.Serve binds socket + accept gate; SdNotifyReady
+    Provisioned --> Serving: southface.Serve binds -south-bind TLS HTTPS/HTTP-2 listener; SdNotifyReady
 
     Serving --> Draining: SIGTERM / SIGINT
     Serving --> Draining: Serve returns (listener fault)
@@ -487,7 +520,7 @@ stateDiagram-v2
     Draining --> TearingDown: in-flight ops finished within bound
     ForceClosing --> TearingDown: stragglers force-closed
 
-    TearingDown --> Exit_Clean: TeardownScope erase-before-reuse (NFR-SEC-54) + socket unlink + ceilings release + flock release
+    TearingDown --> Exit_Clean: TeardownScope erase-before-reuse (NFR-SEC-54) + ceilings release + flock release
 
     Serving --> [*]: 2nd SIGTERM/SIGINT during wedged drain (hard kill, default disposition)
 
@@ -516,10 +549,12 @@ stateDiagram-v2
 
 - [`../operations.md`](../operations.md) — operator runbook: signal/shutdown
   contract, audit-latch recovery, health/metrics endpoints, sd_notify unit
-  wiring, the Linux-only SO_PEERCRED requirement.
+  wiring, the south-face TLS transport and credential custody (the
+  edge-injected `Authorization: Bearer`, the `-south-bind`/`-tls-cert`/`-tls-key`
+  surface).
 - [`../configuration.md`](../configuration.md) — the flag/env surface and the
   flag→env precedence rule.
 - [`../engines.md`](../engines.md) — engine selection, the erase-before-reuse
   guarantee per engine, the storage egress lane.
 - [`../testing.md`](../testing.md) — which lifecycle tests skip on darwin
-  (SO_PEERCRED, live-S3) and how to run the full suite.
+  (live-S3) and how to run the full suite.

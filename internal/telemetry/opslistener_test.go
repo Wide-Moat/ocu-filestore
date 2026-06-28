@@ -69,7 +69,6 @@ func TestOpsListenLoopbackAccepted(t *testing.T) {
 // valid Prometheus text-format body over the loopback listener.
 func TestOpsListenMetricsEndpoint(t *testing.T) {
 	m := telemetry.NewBrokerMetrics("v0.0.0-test")
-	m.PeerAccepted()
 	m.RecordOp("readFile", "allow", "none")
 
 	l, err := telemetry.NewOpsListener("127.0.0.1:0", m, discardLogger())
@@ -99,9 +98,6 @@ func TestOpsListenMetricsEndpoint(t *testing.T) {
 	bodyStr := string(body)
 	if !strings.Contains(bodyStr, "ops_total") {
 		t.Fatalf("ops_total missing from /metrics:\n%s", bodyStr)
-	}
-	if !strings.Contains(bodyStr, "peer_accepted_total 1") {
-		t.Fatalf("peer_accepted_total not 1:\n%s", bodyStr)
 	}
 }
 

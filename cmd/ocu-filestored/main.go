@@ -4,28 +4,36 @@
 // Command ocu-filestored is the storage-broker daemon (component-04): one
 // process, two faces (guest-mount south, data-plane-client north), one backend
 // credential. This build composes the south face into a real, dialable daemon:
-// it parses the frozen flag surface, runs the startup admission gate BEFORE
-// binding any socket (NFR-SEC-60), constructs the local-volume engine, the
-// three-axis resolver, the fail-closed audit sink, and the per-session
-// ceilings registry, wraps them in the broker adapters, provisions a session
-// scope, and serves the per-session unix-socket listener.
+// it parses the flag surface, runs the startup admission gate BEFORE binding
+// any listener (NFR-SEC-60), constructs the local-volume engine, the three-axis
+// resolver, the fail-closed audit sink, and the per-session ceilings registry,
+// wraps them in the broker adapters, provisions a session scope, and serves the
+// south-face TLS HTTPS listener. The guest reaches that listener outbound
+// through the Egress edge (guest -> edge -> service direct HTTPS); there is no
+// unix socket.
 //
-// The south-face flag surface is API and frozen: -south-socket-dir (the
-// host-owned 0700 directory per-session sockets are minted into),
-// -tenancy/-profile (the admission axes), -audit-sink, -engine/-engine-root,
-// -broker-max-file-size (>0, the whole-object ceiling), -filesystem-id,
-// -granted-intents, -downloadable-prefixes, -max-request-bytes (the
-// per-RPC-message ceiling), and the optional per-session ops token-bucket
-// tuning pair -ops-per-second (>0) / -ops-burst (>=1). -north-listen parses
-// but binds nothing this phase (the north face is deferred).
+// The south-face transport flags are -south-bind (the service_url the guest
+// dials through the edge) and the REQUIRED -tls-cert / -tls-key (the service's
+// own server certificate and private key). The rest of the surface: -tenancy /
+// -profile (the admission axes), -audit-sink, -engine / -engine-root, the s3
+// backing-store flags (-s3-bucket / -s3-endpoint / -s3-region / -s3-path-style /
+// -s3-credential-file), -broker-max-file-size (>0, the whole-object ceiling),
+// -filesystem-id, -granted-intents, -downloadable-prefixes, -max-request-bytes
+// (the per-RPC-message ceiling), and the optional per-session ops token-bucket
+// tuning pair -ops-per-second (>0) / -ops-burst (>=1). The north Files-API
+// listener (Mount B, ADR-0023) binds on -north-bind (deprecated alias
+// -north-listen) and is live ONLY when -handle-store is set; otherwise only the
+// south listener binds.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,7 +50,10 @@ import (
 	"github.com/Wide-Moat/ocu-filestore/internal/authz"
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/ceilings"
+	"github.com/Wide-Moat/ocu-filestore/internal/filesapi"
 	"github.com/Wide-Moat/ocu-filestore/internal/flock"
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+	"github.com/Wide-Moat/ocu-filestore/internal/northface"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
 	"github.com/Wide-Moat/ocu-filestore/internal/observ"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
@@ -139,7 +150,7 @@ var errBadIntent = errors.New("ocu-filestored: unknown granted intent")
 // auditLockSuffix names the exclusive flock file that guards the audit hash
 // chain. It is the audit-sink path plus this suffix, so the lock is keyed on
 // the very resource it protects: two daemons pointed at the same -audit-sink
-// collide on this lock regardless of their -south-socket-dir, and a daemon
+// collide on this lock regardless of their -south-bind address, and a daemon
 // pointed at a different sink takes a distinct lock (T2-7, LIFE-07).
 const auditLockSuffix = ".lock"
 
@@ -147,17 +158,11 @@ const auditLockSuffix = ".lock"
 // names the resource so the operator knows which lock to inspect.
 var errAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the audit-sink lock)")
 
-// errStorageLaneRequired refuses `-engine s3` without a storage lane: the
-// s3 backend leg transits the storage-dedicated egress lane (ADR-0011) and
-// a direct backend dial is refused (NFR-SEC-16, NFR-SEC-85). Dev rigs must
-// say -storage-lane-dev-direct EXPLICITLY to dial direct. Match it with
-// errors.Is.
-var errStorageLaneRequired = errors.New("ocu-filestored: -engine s3 requires -storage-lane (ADR-0011: the s3 backend leg transits the storage egress lane; a direct backend dial is refused, NFR-SEC-16) — dev rigs may set -storage-lane-dev-direct explicitly")
-
-// errStorageLaneAmbiguous refuses -storage-lane together with
-// -storage-lane-dev-direct: the operator must pick exactly one dial
-// posture. Match it with errors.Is.
-var errStorageLaneAmbiguous = errors.New("ocu-filestored: -storage-lane and -storage-lane-dev-direct are mutually exclusive")
+// errHandleStoreAlreadyRunning is the handle-store analog of errAlreadyRunning:
+// a SEPARATE flock on <handle-store>.lock guards the durable file_id log against
+// two daemons interleaving appends, so the resource named in the refusal is the
+// handle store, not the audit sink (the two stores can live on distinct paths).
+var errHandleStoreAlreadyRunning = errors.New("ocu-filestored: another instance is already running (holds the handle-store lock)")
 
 // tenancyAdmission maps the Phase-8-frozen hyphenated -tenancy flag values to
 // the admission package's underscored constants. The flag value set is frozen
@@ -208,6 +213,12 @@ const (
 	teardownTimeout  = 10 * time.Minute
 )
 
+// defaultNorthBind is the loopback bind the north Files-API listener (Mount B)
+// falls back to when cfg.northBind is empty. It matches the --north-bind flag
+// default and exists so a direct compose() call (a test that builds brokerConfig
+// without going through validate) still gets a concrete bind.
+const defaultNorthBind = "127.0.0.1:7080"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ocu-filestored:", err)
@@ -220,26 +231,34 @@ type brokerConfig struct {
 	engineKind       objectstore.EngineKind
 	engineRoot       string
 	s3CredentialFile string
-	s3STSRoleARN     string
-	s3STSEndpoint    string
-	storageLane      string
-	caBundle         string
-	laneDevDirect    bool
 	s3Bucket         string
 	s3Endpoint       string
 	s3Region         string
 	s3PathStyle      bool
 	auditSink        string
-	socketDir        string
-	filesystemID     string
-	maxFileSize      int64
-	maxRequestByte   int64
-	opsPerSecond     float64
-	opsBurst         float64
-	grantedIntents   []southface.Intent
-	dlPrefixes       []string
-	profile          admission.WorkloadTrustProfile
-	tenancy          admission.Tenancy
+	// handleStore is the durable file_id->handle store path (ADR-0023). Empty
+	// disables the index this phase (the north listener is inert), so it is
+	// OPTIONAL and validated only for parent-dir creatability when non-empty.
+	handleStore string
+	// bindAddr/certFile/keyFile carry the TLS HTTPS south-face transport: the
+	// service_url the guest dials outbound through the Egress edge, and the
+	// service's own server certificate and private key.
+	bindAddr string
+	// northBind is the north Files-API TLS bind (Mount B, ADR-0023). The north
+	// listener is constructed only when handleStore is non-empty; it reuses the
+	// south certFile/keyFile (one identity, two listeners).
+	northBind      string
+	certFile       string
+	keyFile        string
+	filesystemID   string
+	maxFileSize    int64
+	maxRequestByte int64
+	opsPerSecond   float64
+	opsBurst       float64
+	grantedIntents []southface.Intent
+	dlPrefixes     []string
+	profile        admission.WorkloadTrustProfile
+	tenancy        admission.Tenancy
 	// logLevel is the validated slog.Level for the daemon's JSON logger.
 	logLevel slog.Level
 	// opsListen is the bind address for the loopback-only ops listener
@@ -264,16 +283,35 @@ func run(args []string) error {
 		"structured log level: debug | info | warn | error (default info)")
 	opsListen := fs.String("ops-listen", "127.0.0.1:9464",
 		"loopback-only bind address for the ops listener (/metrics); empty disables; non-loopback refused pre-bind")
-	fs.String("north-listen", "127.0.0.1:7080",
-		"file/UI ingress bind address (north face); PARSED BUT INERT this phase — binds nothing")
+	// North Files-API transport (Mount B): a SEPARATE TLS listener from the south
+	// mount RPC, serving the /v1/files handler (ADR-0023). --north-bind is the
+	// live flag; --north-listen is its retained DEPRECATED ALIAS (the frozen flag
+	// surface is never silently dropped — an operator setting the old name still
+	// works). The north listener is constructed only when --handle-store is set
+	// (the durable file_id index the Files-API plane resolves against); with no
+	// handle store the north plane stays inert and only the south listener binds.
+	northBind := fs.String("north-bind", "127.0.0.1:7080",
+		"north Files-API TLS bind address (Mount B, ADR-0023); live only when --handle-store is set, reusing the south TLS cert")
+	northListen := fs.String("north-listen", "",
+		"DEPRECATED alias for --north-bind (retained so the frozen flag surface is never dropped); --north-bind wins when both are set")
+	// South-face TLS transport: the service_url the guest dials outbound through
+	// the Egress edge (guest -> edge -> service direct HTTPS), and the service's
+	// own server certificate. PENDING-PHASE-7: the canon route/credential shapes
+	// are sibling-proven but not yet frozen in component-04.
+	southBind := fs.String("south-bind", "127.0.0.1:7443",
+		"south-face TLS HTTPS bind address (the service_url the guest dials outbound through the Egress edge)")
+	tlsCert := fs.String("tls-cert", "",
+		"REQUIRED south-face TLS server certificate PEM path")
+	tlsKey := fs.String("tls-key", "",
+		"REQUIRED south-face TLS server private-key PEM path")
 	engine := fs.String("engine", "local-volume",
 		"backend object-store engine: local-volume | s3 (ADR-0010)")
 	maxRequestBytes := fs.Int64("max-request-bytes", 52428800,
 		"per-RPC-message inbound body ceiling, rejected pre-buffer (NFR-SEC-78); default 50 MiB")
-	socketDir := fs.String("south-socket-dir", "/run/ocu-filestore/sessions",
-		"host-owned 0700 directory the south face provisions per-session unix sockets into")
 	auditSink := fs.String("audit-sink", "",
 		"REQUIRED audit gate file-sink path; an audit-write failure denies the operation (NFR-SEC-79)")
+	handleStore := fs.String("handle-store", "",
+		"durable file_id->handle store path (Files-API north face, ADR-0023); empty disables the index this phase")
 	profile := fs.String("profile", "trusted_operator",
 		"admission profile: trusted_operator | internal_workforce | untrusted")
 	tenancy := fs.String("tenancy", "single-tenant",
@@ -282,16 +320,6 @@ func run(args []string) error {
 		"REQUIRED local-volume engine root: the customer workspace volume directory")
 	s3CredentialFile := fs.String("s3-credential-file", "",
 		"s3 engine only: PATH to a 0600 daemon-owned file holding access_key_id=/secret_access_key= lines; the secret itself NEVER arrives as a flag value (T1-7). Env fallback: "+objectstore.EnvS3AccessKeyID+"/"+objectstore.EnvS3SecretAccessKey)
-	s3STSRoleARN := fs.String("s3-sts-role-arn", "",
-		"s3 engine only: assume this role per session via STS with a scope-prefix inline policy (sts_per_session credential kind); an ARN is not a secret. Empty = the static host-local credential")
-	s3STSEndpoint := fs.String("s3-sts-endpoint", "",
-		"s3 engine only: STS endpoint override for S3-compatible rigs; requires -s3-sts-role-arn")
-	storageLane := fs.String("storage-lane", "",
-		"s3 engine only: storage egress lane proxy URL — the FIXED proxy every backend request transits (ADR-0011); proxy env vars are never consulted")
-	laneDevDirect := fs.Bool("storage-lane-dev-direct", false,
-		"DEV RIGS ONLY: dial the s3 backend directly without the storage lane. This violates the ADR-0011 deployment posture; never set it in production")
-	caBundle := fs.String("ca-bundle", "",
-		"optional PEM bundle APPENDED to a cloned system cert pool for an inspecting storage-lane proxy's CA; requires -storage-lane; a missing or garbled bundle refuses startup")
 	s3Bucket := fs.String("s3-bucket", "",
 		"REQUIRED for -engine s3: the single backend bucket all scopes live under")
 	s3Endpoint := fs.String("s3-endpoint", "",
@@ -303,7 +331,7 @@ func run(args []string) error {
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
-		"REQUIRED host-attested filesystem scope bound to the session socket")
+		"REQUIRED host-attested filesystem scope bound to the session")
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
@@ -346,11 +374,31 @@ func run(args []string) error {
 		return runHealthCheck(*opsListen)
 	}
 
+	// Resolve the north bind address: --north-bind wins; --north-listen is the
+	// retained deprecated alias. The alias is honoured only when --north-bind was
+	// NOT explicitly set AND the alias carries a value, so an operator setting
+	// both gets --north-bind. The frozen --north-listen flag is never silently
+	// dropped — an operator using the old name alone still binds Mount B.
+	northBindExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "north-bind" {
+			northBindExplicit = true
+		}
+	})
+	northBindAddr := *northBind
+	if !northBindExplicit && *northListen != "" {
+		northBindAddr = *northListen
+	}
+
 	cfg, err := validate(rawFlags{
 		engine:               *engine,
 		engineRoot:           *engineRoot,
 		auditSink:            *auditSink,
-		socketDir:            *socketDir,
+		handleStore:          *handleStore,
+		northBind:            northBindAddr,
+		southBind:            *southBind,
+		tlsCert:              *tlsCert,
+		tlsKey:               *tlsKey,
 		filesystemID:         *filesystemID,
 		profile:              *profile,
 		tenancy:              *tenancy,
@@ -361,11 +409,6 @@ func run(args []string) error {
 		opsPerSecond:         *opsPerSecond,
 		opsBurst:             *opsBurst,
 		s3CredentialFile:     *s3CredentialFile,
-		s3STSRoleARN:         *s3STSRoleARN,
-		s3STSEndpoint:        *s3STSEndpoint,
-		storageLane:          *storageLane,
-		caBundle:             *caBundle,
-		laneDevDirect:        *laneDevDirect,
 		s3Bucket:             *s3Bucket,
 		s3Endpoint:           *s3Endpoint,
 		s3Region:             *s3Region,
@@ -409,7 +452,7 @@ func run(args []string) error {
 	l.Info("ocu-filestored starting",
 		slog.String("version", version),
 		slog.String("engine", string(cfg.engineKind)),
-		slog.String("socket_dir", cfg.socketDir),
+		slog.String("south_bind", cfg.bindAddr),
 		slog.String("audit_sink", cfg.auditSink),
 		slog.String(observ.KeyScope, cfg.filesystemID),
 		slog.String("profile", string(cfg.profile)),
@@ -489,6 +532,56 @@ func run(args []string) error {
 	// Release the audit-sink lock when the daemon exits (after teardown).
 	defer afl.Release()
 	l.Info("single-instance audit-sink lock acquired", slog.String("lock_file", auditLockPath))
+
+	// Handle-store single-instance guard: when --handle-store is set, acquire a
+	// SEPARATE exclusive flock on <handle-store>.lock BEFORE compose opens the
+	// durable log, mirroring the audit-sink guard. The durable file_id log is an
+	// append-only stream a second daemon must not interleave; the lock is keyed
+	// on the handle-store resource so two daemons sharing a handle store collide
+	// while distinct stores take distinct locks. An empty --handle-store skips
+	// the guard entirely (no store this phase). The parent directory is created
+	// 0700 like the audit sink's, so the durable log never sits world-traversable.
+	if cfg.handleStore != "" {
+		handleStoreAbs, hsAbsErr := filepath.Abs(cfg.handleStore)
+		if hsAbsErr != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return hsAbsErr
+		}
+		handleStoreDir := filepath.Dir(handleStoreAbs)
+		if err := os.MkdirAll(handleStoreDir, 0o700); err != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return err
+		}
+		// Chmod ignores umask, so this PINS 0700 on the leaf directory even when
+		// MkdirAll landed it at 0755 under the default umask (same rationale as
+		// the audit-sink leaf).
+		if err := os.Chmod(handleStoreDir, 0o700); err != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			return err
+		}
+		handleLockPath := handleStoreAbs + auditLockSuffix
+		hfl, handleLockErr := flock.Acquire(handleLockPath)
+		if handleLockErr != nil {
+			if opsListener != nil {
+				_ = opsListener.Close()
+			}
+			if errors.Is(handleLockErr, flock.ErrAlreadyRunning) {
+				l.Error("single-instance guard: another daemon holds the handle-store lock; refusing to start",
+					slog.String("lock_file", handleLockPath),
+				)
+				return errHandleStoreAlreadyRunning
+			}
+			return handleLockErr
+		}
+		defer hfl.Release()
+		l.Info("single-instance handle-store lock acquired", slog.String("lock_file", handleLockPath))
+	}
 
 	srv, err := compose(cfg, l, m, opsListener)
 	if err != nil {
@@ -584,14 +677,18 @@ func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemet
 // daemon's command-line flags one field per flag, BEFORE any parsing or
 // admission. Passing this struct (instead of a long positional argument list)
 // names every value at the call site, so a reorder of two same-typed fields
-// (e.g. the s3Bucket/s3Endpoint/s3Region strings, or the laneDevDirect/
-// s3PathStyle bools) can no longer compile silently into a swapped meaning.
+// (e.g. the s3Bucket/s3Endpoint/s3Region strings, or the southBind/tlsCert/
+// tlsKey strings) can no longer compile silently into a swapped meaning.
 // validate consumes a rawFlags and returns the validated brokerConfig.
 type rawFlags struct {
 	engine               string
 	engineRoot           string
 	auditSink            string
-	socketDir            string
+	handleStore          string
+	northBind            string
+	southBind            string
+	tlsCert              string
+	tlsKey               string
 	filesystemID         string
 	profile              string
 	tenancy              string
@@ -602,11 +699,6 @@ type rawFlags struct {
 	opsPerSecond         float64
 	opsBurst             float64
 	s3CredentialFile     string
-	s3STSRoleARN         string
-	s3STSEndpoint        string
-	storageLane          string
-	caBundle             string
-	laneDevDirect        bool
 	s3Bucket             string
 	s3Endpoint           string
 	s3Region             string
@@ -631,7 +723,9 @@ func validate(r rawFlags) (brokerConfig, error) {
 	engine := r.engine
 	engineRoot := r.engineRoot
 	auditSink := r.auditSink
-	socketDir := r.socketDir
+	southBind := r.southBind
+	tlsCert := r.tlsCert
+	tlsKey := r.tlsKey
 	filesystemID := r.filesystemID
 	profile := r.profile
 	tenancy := r.tenancy
@@ -642,11 +736,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 	opsPerSecond := r.opsPerSecond
 	opsBurst := r.opsBurst
 	s3CredentialFile := r.s3CredentialFile
-	s3STSRoleARN := r.s3STSRoleARN
-	s3STSEndpoint := r.s3STSEndpoint
-	storageLane := r.storageLane
-	caBundle := r.caBundle
-	laneDevDirect := r.laneDevDirect
 	s3Bucket := r.s3Bucket
 	s3Endpoint := r.s3Endpoint
 	s3Region := r.s3Region
@@ -679,36 +768,6 @@ func validate(r rawFlags) (brokerConfig, error) {
 	// would lie about the deployment's credential posture.
 	if s3CredentialFile != "" && kind != objectstore.S3 {
 		return cfg, fmt.Errorf("%w: -s3-credential-file is only valid with -engine s3", errMissingRequiredFlag)
-	}
-	if s3STSRoleARN != "" && kind != objectstore.S3 {
-		return cfg, fmt.Errorf("%w: -s3-sts-role-arn is only valid with -engine s3", errMissingRequiredFlag)
-	}
-	if s3STSEndpoint != "" && kind != objectstore.S3 {
-		return cfg, fmt.Errorf("%w: -s3-sts-endpoint is only valid with -engine s3", errMissingRequiredFlag)
-	}
-	if s3STSEndpoint != "" && s3STSRoleARN == "" {
-		return cfg, fmt.Errorf("%w: -s3-sts-endpoint requires -s3-sts-role-arn", errMissingRequiredFlag)
-	}
-
-	// Storage-lane refusal matrix (ADR-0011, NFR-SEC-16/85). The lane is a
-	// network-engine concept: on local-volume a lane flag would be a silent
-	// no-op, and a silent no-op lies.
-	if kind != objectstore.S3 {
-		if storageLane != "" {
-			return cfg, fmt.Errorf("%w: -storage-lane is only valid with -engine s3", errMissingRequiredFlag)
-		}
-		if laneDevDirect {
-			return cfg, fmt.Errorf("%w: -storage-lane-dev-direct is only valid with -engine s3", errMissingRequiredFlag)
-		}
-		if caBundle != "" {
-			return cfg, fmt.Errorf("%w: -ca-bundle is only valid with -engine s3", errMissingRequiredFlag)
-		}
-	}
-	if storageLane != "" && laneDevDirect {
-		return cfg, errStorageLaneAmbiguous
-	}
-	if caBundle != "" && storageLane == "" {
-		return cfg, fmt.Errorf("%w: -ca-bundle requires -storage-lane", errMissingRequiredFlag)
 	}
 
 	prof, ok := profileAdmission[profile]
@@ -754,6 +813,18 @@ func validate(r rawFlags) (brokerConfig, error) {
 	if auditSink == "" {
 		return cfg, fmt.Errorf("%w: -audit-sink is required", errMissingRequiredFlag)
 	}
+	// South-face TLS transport (the service the guest dials through the edge):
+	// the bind address and the server cert+key are required — the service speaks
+	// REST over HTTPS, so a missing cert/key is a wiring fault, not a default.
+	if southBind == "" {
+		return cfg, fmt.Errorf("%w: -south-bind is required", errMissingRequiredFlag)
+	}
+	if tlsCert == "" {
+		return cfg, fmt.Errorf("%w: -tls-cert is required (the south-face TLS server certificate)", errMissingRequiredFlag)
+	}
+	if tlsKey == "" {
+		return cfg, fmt.Errorf("%w: -tls-key is required (the south-face TLS server private key)", errMissingRequiredFlag)
+	}
 	if filesystemID == "" {
 		return cfg, fmt.Errorf("%w: -filesystem-id is required", errMissingRequiredFlag)
 	}
@@ -772,28 +843,20 @@ func validate(r rawFlags) (brokerConfig, error) {
 		return cfg, err
 	}
 
-	// The lane requirement is the LAST gate: every other flag defect
-	// reports first, so this refusal provably means "flags valid, lane
-	// posture missing" (the e2e smoke pins exactly that shape).
-	if kind == objectstore.S3 && storageLane == "" && !laneDevDirect {
-		return cfg, errStorageLaneRequired
-	}
-
 	cfg = brokerConfig{
 		engineKind:       kind,
 		engineRoot:       engineRoot,
 		s3CredentialFile: s3CredentialFile,
-		s3STSRoleARN:     s3STSRoleARN,
-		s3STSEndpoint:    s3STSEndpoint,
-		storageLane:      storageLane,
-		caBundle:         caBundle,
-		laneDevDirect:    laneDevDirect,
 		s3Bucket:         s3Bucket,
 		s3Endpoint:       s3Endpoint,
 		s3Region:         s3Region,
 		s3PathStyle:      s3PathStyle,
 		auditSink:        auditSink,
-		socketDir:        socketDir,
+		handleStore:      r.handleStore,
+		bindAddr:         southBind,
+		northBind:        r.northBind,
+		certFile:         tlsCert,
+		keyFile:          tlsKey,
 		filesystemID:     filesystemID,
 		maxFileSize:      maxFileSize,
 		maxRequestByte:   maxRequestBytes,
@@ -883,19 +946,18 @@ var envFallbackMap = func() map[string]string {
 		"health-check",
 		"log-level",
 		"ops-listen",
+		"north-bind",
 		"north-listen",
 		"engine",
 		"max-request-bytes",
-		"south-socket-dir",
+		"south-bind",
+		"tls-cert",
+		"tls-key",
 		"audit-sink",
+		"handle-store",
 		"profile",
 		"tenancy",
 		"engine-root",
-		"s3-sts-role-arn",
-		"s3-sts-endpoint",
-		"storage-lane",
-		"storage-lane-dev-direct",
-		"ca-bundle",
 		"s3-bucket",
 		"s3-endpoint",
 		"s3-region",
@@ -955,31 +1017,93 @@ func applyEnvFallbacks(fs *flag.FlagSet) error {
 	return nil
 }
 
-// selectCredentialSource picks the s3 backend credential source from the
-// flag surface: with -s3-sts-role-arn set, the static intake becomes the
-// PARENT credential and STS-per-session mints the scope-prefix-confined
-// session credential; otherwise the static host-local source serves
-// directly. The admitted credential KIND flows from the returned source's
-// Kind() — never hard-wired for the s3 engine (the local-volume path keeps
-// the hard-wired host-local kind: it exercises a filesystem permission, not
-// a backend credential). bucket and region arrive from the s3 engine
-// configuration at composition time.
-func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstore.CredentialSource, error) {
-	static, err := objectstore.NewStaticCredentialSource(cfg.s3CredentialFile)
-	if err != nil {
-		return nil, err
-	}
-	if cfg.s3STSRoleARN == "" {
-		return static, nil
-	}
-	return objectstore.NewSTSCredentialSource(objectstore.STSConfig{
-		RoleARN:  cfg.s3STSRoleARN,
-		Endpoint: cfg.s3STSEndpoint,
-		Region:   region,
-		Bucket:   bucket,
-		Scope:    objectstore.ScopeID(cfg.filesystemID),
-		Parent:   static,
+// selectCredentialSource picks the s3 backend credential source from the flag
+// surface: the static host-local intake (the engine's OWN backend credential,
+// NFR-SEC-25). The admitted credential KIND flows from the returned source's
+// Kind() — never hard-wired for the s3 engine (the local-volume path keeps the
+// hard-wired host-local kind: it exercises a filesystem permission, not a
+// backend credential). The bucket/region parameters are retained on the
+// signature for the composition call site but no longer drive a per-session
+// policy (the broker mints nothing).
+//
+// The broker mints/signs nothing (invariant 3): the broker-signs / AssumeRole
+// per-session credential-minting path is retired. The engine's OWN backend
+// credential is the static host-local source; the edge performs the RFC-8693
+// credential exchange for the guest, not the service.
+func selectCredentialSource(cfg brokerConfig, _, _ string) (objectstore.CredentialSource, error) {
+	return objectstore.NewStaticCredentialSource(cfg.s3CredentialFile)
+}
+
+// backendDialTimeout / backendTLSHandshakeTimeout / backendIdleConnTimeout /
+// backendExpectContinue bound the engine's backend dial so a wedged backend can
+// never hang a dial or handshake indefinitely. Verb-level deadlines stay with
+// the caller's ctx.
+const (
+	backendDialTimeout         = 10 * time.Second
+	backendTLSHandshakeTimeout = 10 * time.Second
+	backendIdleConnTimeout     = 90 * time.Second
+	backendExpectContinue      = 1 * time.Second
+)
+
+// newCredentialScopeExtractor wires the daemon's credential-scope source: it
+// derives the credential-bound filesystem scope from the edge-injected
+// Authorization: Bearer the service receives on every admitted request.
+//
+// PENDING-PHASE-7(A5-credscope): the credential authority's contract for HOW
+// the bound filesystem_id and intent grant are carried on the injected
+// credential is unpinned. In the interim single-tenant trusted_operator cell,
+// the edge has already validated+stripped the guest's weak session JWT and
+// injected the real backend credential; the daemon binds every PRESENT bearer
+// to the configured single-tenant scope (filesystem-id + granted-intents). The
+// per-request filesystem_id cross-check (the surviving channel-scope check)
+// still rejects a body that disagrees with this bound scope (403). An ABSENT
+// bearer is rejected upstream (errMissingBearer -> 401). The bind does NOT
+// JWKS-verify the bearer — the edge owns weak-JWT validation; the service
+// mints/signs nothing (invariant 3).
+func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtractor {
+	fsid := cfg.filesystemID
+	intents := cfg.grantedIntents
+	return southface.NewCredentialScopeExtractor(func(bearer string) (southface.CredentialScope, error) {
+		// A present-but-empty token is rejected before this bind by
+		// bearerFromRequest; an empty bound FilesystemID is treated as a
+		// rejection by the extractor. The interim bind binds a present bearer to
+		// the single-tenant configured scope.
+		if bearer == "" {
+			return southface.CredentialScope{}, nil
+		}
+		return southface.CredentialScope{
+			FilesystemID:   fsid,
+			GrantedIntents: intents,
+		}, nil
 	})
+}
+
+// newBackendTLSClient builds the s3 engine's backend HTTP client: a strict
+// fail-closed TLS transport (MinVersion TLS 1.2, no InsecureSkipVerify path),
+// HTTP/2 attempted, bounded timeouts, and — critically — http.Transport.Proxy
+// left NIL: an HTTPS_PROXY/HTTP_PROXY/NO_PROXY environment variable can neither
+// redirect nor bypass the backend leg (NFR-SEC-16, NFR-SEC-85). It is the
+// engine's OWN backend dial (NFR-SEC-25), distinct from the guest's
+// edge-injected credential path.
+//
+// PENDING-PHASE-7(engine-leg-egress): whether this backend leg retains an
+// egress proxy is an unfrozen ADR-0011-vs-new-model reconciliation; this client
+// is a plain direct strict-TLS dial in the interim (docs/pending-phase7.md).
+func newBackendTLSClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: (&net.Dialer{
+				Timeout:   backendDialTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			TLSHandshakeTimeout:   backendTLSHandshakeTimeout,
+			IdleConnTimeout:       backendIdleConnTimeout,
+			ExpectContinueTimeout: backendExpectContinue,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 }
 
 // compose runs the startup admission gate and, on admit, constructs the seams,
@@ -995,8 +1119,7 @@ func selectCredentialSource(cfg brokerConfig, bucket, region string) (objectstor
 //
 // m is the broker metric set; it is wired into the southface dispatcher for
 // ops_total and stage-latency instrumentation, and into the accept gate for
-// peer counters. Peer counter callbacks are wired via Config.OnPeerAccepted
-// and Config.OnPeerDropped.
+// peer counters.
 //
 // ol is the loopback ops listener; when non-nil compose registers /healthz and
 // /readyz with the audit-latch and engine-root readiness probes. A nil
@@ -1025,14 +1148,13 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		// Constructed after admission below.
 	case objectstore.S3:
 		var err error
-		if cfg.laneDevDirect {
-			s3Client, err = objectstore.NewDevDirectTransport(cfg.caBundle)
-		} else {
-			s3Client, err = objectstore.NewLaneTransport(cfg.storageLane, cfg.caBundle)
-		}
-		if err != nil {
-			return nil, err
-		}
+		// PENDING-PHASE-7(engine-leg-egress): the engine's OWN backend leg
+		// dials with a plain strict-TLS client (MinVersion 1.2, ForceAttemptHTTP2,
+		// never http.ProxyFromEnvironment). The retired storage-lane fixed-proxy
+		// transport carried the GUEST data path, which is now guest->edge->service
+		// direct HTTPS; whether the engine's backend dial retains an egress proxy
+		// is an unfrozen ADR-0011-vs-new-model reconciliation (docs/pending-phase7.md).
+		s3Client = newBackendTLSClient()
 		source, err := selectCredentialSource(cfg, cfg.s3Bucket, cfg.s3Region)
 		if err != nil {
 			return nil, err
@@ -1090,6 +1212,25 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		m.SetAuditSinkLatched(1)
 	})
 
+	// Durable file_id handle store (ADR-0023). OPTIONAL this phase: an empty
+	// --handle-store leaves hStore nil (the north listener is inert, so the
+	// index is unused). When set, NewDiskStore opens/replays the log under the
+	// flock run() already holds, and the on-latch callback emits an ERROR line
+	// and flips the handle_store_latched gauge — making the fail-closed durable
+	// latch observable exactly like the audit sink's.
+	var hStore *handlestore.DiskStore
+	if cfg.handleStore != "" {
+		hStore, err = handlestore.NewDiskStore(cfg.handleStore)
+		if err != nil {
+			return nil, err
+		}
+		hStore.SetOnLatch(func() {
+			l.Error("handle store latched; durable file_id index refusing mutations until restart",
+				slog.String(observ.KeyReason, "handle_store_latch"))
+			m.SetHandleStoreLatched(1)
+		})
+	}
+
 	reg := ceilings.NewRegistry(ceilings.Config{
 		OpsPerSecond:         cfg.opsPerSecond,
 		OpsBurst:             cfg.opsBurst,
@@ -1108,25 +1249,102 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		return nil, err
 	}
 
+	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
+	// post-provision step fails before ownership passes to teardownServer
+	// (whose Close runs TeardownScope), compose returns nil,err WITHOUT a
+	// closer for that scope — the erase-before-reuse contract would be left
+	// to the next ProvisionScope, but the dirty scope persists meanwhile.
+	// This deferred rollback erases the just-provisioned scope on every
+	// post-provision error path, bounded by teardownTimeout, and is disarmed
+	// (committed = true) only once the teardownServer takes ownership.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		// Release the durable handle-store descriptor on the rollback path so a
+		// failed compose does not leak an open log fd (ownership has not yet
+		// passed to teardownServer).
+		if hStore != nil {
+			_ = hStore.Close()
+		}
+		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
+		defer cancelTeardown()
+		if err := eng.TeardownScope(teardownCtx, scope); err != nil {
+			l.Error("rolling back a provisioned scope after a failed compose",
+				slog.String(observ.KeyReason, "compose_rollback"),
+				slog.String("error", err.Error()))
+		}
+	}()
+
+	// Build the broker adapters ONCE so the south spine and the north Files-API
+	// plane (Mount B) share the same stateless seam wrappers — one set of
+	// adapters, both planes (the Q-SEAMREUSE ruling). The adapters are stateless
+	// views over the shared resolver/sink/registry/engine, so reusing them across
+	// the two listeners is correct (and the only honest wiring: one broker, one
+	// audit gate, one credential).
+	resolverSeam := broker.NewResolver(resolver)
+	guardSeam := broker.NewGuard(sink)
+	ceilingsSeam := broker.NewCeilings(reg)
+	engineSeam := broker.NewEngine(eng)
+
 	srv, err := southface.Serve(southface.Config{
-		Resolver:          broker.NewResolver(resolver),
-		Guard:             broker.NewGuard(sink),
-		Ceilings:          broker.NewCeilings(reg),
-		Engine:            broker.NewEngine(eng),
-		Registry:          southface.NewSessionRegistry(),
-		Entry:             southface.SessionEntry{FilesystemID: cfg.filesystemID, GrantedIntents: cfg.grantedIntents},
-		Dir:               cfg.socketDir,
+		Resolver:          resolverSeam,
+		Guard:             guardSeam,
+		Ceilings:          ceilingsSeam,
+		Engine:            engineSeam,
+		CredExtractor:     newCredentialScopeExtractor(cfg),
+		BindAddr:          cfg.bindAddr,
+		CertFile:          cfg.certFile,
+		KeyFile:           cfg.keyFile,
 		SizeCeiling:       cfg.maxRequestByte,
 		BrokerMaxFileSize: cfg.maxFileSize,
-		CheckPeer:         southface.HostPeerChecker(),
-		HostUID:           uint32(os.Getuid()),
 		Logger:            l,
 		BrokerMetrics:     m,
-		OnPeerAccepted:    m.PeerAccepted,
-		OnPeerDropped:     m.PeerDropped,
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// North Files-API listener (Mount B, ADR-0023): constructed ONLY when a
+	// durable handle store is configured — the Files-API plane resolves file_ids
+	// against it, so with no store the north plane stays inert and only the south
+	// listener binds. Mount B is a SEPARATE TLS listener reusing the south cert
+	// SOURCE (the same cert/key PATHS), serving the filesapi handler; it is the
+	// physical trust boundary between the no-credential /v1/files plane and the
+	// egress-credential south mount RPC. The dualServer fans Serve/Close across
+	// both; a nil north degrades to south-only.
+	var north northface.Server
+	if hStore != nil {
+		// Default the north bind if a caller (e.g. a direct compose test that
+		// constructs brokerConfig without going through validate) left it empty,
+		// so the Mount B listener always has a concrete loopback bind.
+		northBind := cfg.northBind
+		if northBind == "" {
+			northBind = defaultNorthBind
+		}
+		handler, herr := filesapi.NewHandler(filesapi.Deps{
+			Resolver:    resolverSeam,
+			Guard:       guardSeam,
+			Engine:      engineSeam,
+			Ceilings:    ceilingsSeam,
+			Store:       hStore,
+			Scope:       filesapi.NewFencedScopeSource(),
+			SizeCeiling: cfg.maxRequestByte,
+			Logger:      l,
+		})
+		if herr != nil {
+			_ = srv.Close()
+			return nil, herr
+		}
+		mountB, merr := northface.NewMountB(northBind, cfg.certFile, cfg.keyFile, handler, l)
+		if merr != nil {
+			_ = srv.Close()
+			return nil, merr
+		}
+		north = mountB
+		l.Info("north Files-API listener constructed (Mount B)",
+			slog.String("north_bind", northBind))
 	}
 
 	// Register /healthz and /readyz on the ops listener if one was provided.
@@ -1153,17 +1371,44 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 				},
 			},
 		}
+		// handle_store_latch readiness: when the store is configured, /readyz
+		// turns unhealthy the moment its durable write/sync latch trips, so an
+		// orchestrator can stop routing to a daemon whose file_id index can no
+		// longer durably record mutations. An unconfigured store contributes no
+		// probe (the index is inert this phase).
+		if hStore != nil {
+			probes = append(probes, telemetry.ReadyProbe{
+				Name: "handle_store_latch",
+				Check: func() error {
+					if hStore.Latched() {
+						return errors.New("handle store latched")
+					}
+					return nil
+				},
+			})
+		}
 		telemetry.RegisterOpsListenerHealthHandlers(opsListener, probes)
 	}
+
+	// Ownership of the provisioned scope now passes to teardownServer, whose
+	// Close runs TeardownScope. Disarm the rollback latch (FILESTORED-11) so
+	// the deferred erase above does not double-tear-down a live scope.
+	committed = true
+
+	// Fan the south listener and the optional north Files-API listener into one
+	// southface.Server handle (the daemon lifecycle drives a single Serve/Close).
+	// A nil north degrades the dualServer to south-only.
+	fanned := newDualServer(srv, north)
 
 	// Wrap the server so Close also tears down the scope (erase-before-reuse)
 	// and releases the per-session ceilings (NFR-SEC-54).
 	return &teardownServer{
-		Server:  srv,
-		engine:  eng,
-		ceiling: reg,
-		scope:   scope,
-		fsid:    cfg.filesystemID,
+		Server:      fanned,
+		engine:      eng,
+		ceiling:     reg,
+		scope:       scope,
+		fsid:        cfg.filesystemID,
+		handleStore: hStore,
 	}, nil
 }
 
@@ -1177,6 +1422,10 @@ type teardownServer struct {
 	ceiling *ceilings.Registry
 	scope   objectstore.ScopeID
 	fsid    string
+	// handleStore is the durable file_id handle store opened in compose, or nil
+	// when --handle-store was empty. Close releases its descriptor; every acked
+	// record is already fsynced, so closing loses no durable data.
+	handleStore *handlestore.DiskStore
 }
 
 // Close shuts the session down, erases the scope (erase-before-reuse), and
@@ -1190,5 +1439,12 @@ func (t *teardownServer) Close() error {
 	defer cancelTeardown()
 	teardownErr := t.engine.TeardownScope(teardownCtx, t.scope)
 	t.ceiling.Release(ceilings.SessionKey(t.fsid))
-	return errors.Join(closeErr, teardownErr)
+	// Release the durable handle-store descriptor (no-op when unconfigured).
+	// Every acked record is already fsynced, so closing loses no durable data;
+	// the error joins the others so it is never silently dropped.
+	var handleStoreErr error
+	if t.handleStore != nil {
+		handleStoreErr = t.handleStore.Close()
+	}
+	return errors.Join(closeErr, teardownErr, handleStoreErr)
 }

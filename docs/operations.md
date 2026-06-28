@@ -31,11 +31,10 @@ and have dedicated intake paths (see [Credential intake](#credential-intake)).
 |------|---------|------|---------|----------|-------------|
 | `-audit-sink` | `OCU_FILESTORE_AUDIT_SINK` | string | — | **Yes** | Path to the append-only OCSF JSONL audit sink; an audit-write failure denies the operation (NFR-SEC-79) |
 | `-broker-max-file-size` | `OCU_FILESTORE_BROKER_MAX_FILE_SIZE` | int64 | — | **Yes** (> 0) | Whole-object upload ceiling in bytes; requests above this are rejected before buffering (NFR-SEC-46/78) |
-| `-ca-bundle` | `OCU_FILESTORE_CA_BUNDLE` | string | `` | No | PEM bundle appended to the system cert pool for an inspecting storage-lane proxy CA; requires `-storage-lane`; a missing or unparseable bundle refuses startup |
 | `-downloadable-prefixes` | `OCU_FILESTORE_DOWNLOADABLE_PREFIXES` | string | `` | No | Comma-separated broker-side prefixes that resolve `downloadable`; empty means nothing is downloadable (deny-by-default, NFR-SEC-73) |
 | `-engine` | `OCU_FILESTORE_ENGINE` | string | `local-volume` | No | Backend engine: `local-volume` or `s3` (ADR-0010) |
 | `-engine-root` | `OCU_FILESTORE_ENGINE_ROOT` | string | — | **Yes** (local-volume only) | Local-volume engine root directory (the host filesystem workspace) |
-| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | — | **Yes** | Host-attested session scope identifier; bound to the Unix socket at provision time |
+| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | — | **Yes** | Host-attested session scope identifier; the engine enforces it against the edge-injected credential per request (foreign → 403) |
 | `-granted-intents` | `OCU_FILESTORE_GRANTED_INTENTS` | string | `read,write` | No | Comma-separated session intent grant set; valid tokens: `read`, `write`, `preview` |
 | `-health-check` | `OCU_FILESTORE_HEALTH_CHECK` | bool | `false` | No | Self-probe mode: dial `-ops-listen /healthz` and exit 0 (alive) or non-zero (unreachable); used by container HEALTHCHECK |
 | `-log-level` | `OCU_FILESTORE_LOG_LEVEL` | string | `info` | No | Structured JSON log level: `debug`, `info`, `warn`, `error`; unknown values refuse startup |
@@ -49,12 +48,10 @@ and have dedicated intake paths (see [Credential intake](#credential-intake)).
 | `-s3-endpoint` | `OCU_FILESTORE_S3_ENDPOINT` | string | — | **Yes** (s3 only) | Backend endpoint URL; any non-empty value is a custom endpoint and switches checksums to `WhenRequired` |
 | `-s3-path-style` | `OCU_FILESTORE_S3_PATH_STYLE` | bool | `false` | No | Path-style S3 addressing; required for most single-host S3-compatible backends (MinIO, Ceph RGW) |
 | `-s3-region` | `OCU_FILESTORE_S3_REGION` | string | `us-east-1` | **Yes** (s3 only) | S3 engine signing region |
-| `-s3-sts-endpoint` | `OCU_FILESTORE_S3_STS_ENDPOINT` | string | `` | No | STS endpoint override for S3-compatible rigs; requires `-s3-sts-role-arn` |
-| `-s3-sts-role-arn` | `OCU_FILESTORE_S3_STS_ROLE_ARN` | string | `` | No | IAM role ARN for STS-per-session credential; empty = static host-local credential |
-| `-south-socket-dir` | `OCU_FILESTORE_SOUTH_SOCKET_DIR` | string | `/run/ocu-filestore/sessions` | No | Host-owned 0700 directory for per-session Unix sockets |
-| `-storage-lane` | `OCU_FILESTORE_STORAGE_LANE` | string | `` | **Yes** (s3 in production) | Storage egress lane proxy URL; every backend request transits this fixed proxy (ADR-0011, NFR-SEC-16/85); use `-storage-lane-dev-direct` only in dev rigs |
-| `-storage-lane-dev-direct` | `OCU_FILESTORE_STORAGE_LANE_DEV_DIRECT` | bool | `false` | No | **Dev rigs only** — dial the S3 backend directly without the storage lane; never set in production |
+| `-south-bind` | `OCU_FILESTORE_SOUTH_BIND` | string | `127.0.0.1:7443` | No | South-face TLS HTTPS bind address; the `service_url` the guest dials outbound through the Egress edge |
 | `-tenancy` | `OCU_FILESTORE_TENANCY` | string | `single-tenant` | No | Tenancy mode: `single-tenant`, `multi-tenant` |
+| `-tls-cert` | `OCU_FILESTORE_TLS_CERT` | string | — | **Yes** | South-face TLS server certificate PEM path |
+| `-tls-key` | `OCU_FILESTORE_TLS_KEY` | string | — | **Yes** | South-face TLS server private-key PEM path |
 | `-version` | `OCU_FILESTORE_VERSION` | bool | `false` | No | Print the build identity (tag, VCS revision, Go toolchain) and exit 0; does not require serving flags |
 
 **Credential-bearing flags excluded from the generic env map:**
@@ -67,20 +64,33 @@ See [Credential intake](#credential-intake) for details.
 
 ---
 
-## Linux-only SO_PEERCRED requirement
+## South-face transport and credential custody
 
-The south face's peer-credential gate uses the `SO_PEERCRED` socket option.
-`SO_PEERCRED` is **Linux-only**: it is not available on macOS (darwin) or
-BSD variants.
+The south face is a TLS HTTPS/HTTP-2 REST-JSON listener bound at `-south-bind`
+and presenting the certificate/key from `-tls-cert` / `-tls-key`. The guest
+does not connect to a host Unix socket; it reaches the listener **outbound
+through the Egress trust-edge** (guest → edge → service direct HTTPS). The
+transport is **platform neutral** — it depends on no Linux-only socket option,
+so the broker runs on Linux, macOS, or any platform Go's `crypto/tls` supports.
 
-**In production:** the broker must run on Linux. The accept gate extracts the
-kernel-attested `(uid, pid)` of every connecting peer and closes — without
-reading a byte — any connection whose uid does not match the broker's own uid
-(NFR-SEC-76). Only a same-uid peer is ever admitted.
+Every operation is `POST <service_url>/v1/filestore/fs/<operation>` (the
+operation name is the trailing path segment). A deny is carried by the HTTP
+status (authoritative) plus a `BoundedReason {reason_code, message}` diagnostic
+body.
 
-**In development on macOS:** the Unix-socket e2e tests skip with the message
-`skip: SO_PEERCRED is Linux-only`. Use `make e2e-linux` to run the full slice
-in a Linux container. See [docs/testing.md](testing.md).
+**Credential custody.** The Egress edge validates and strips the guest's weak
+session JWT, exchanges it (RFC 8693) for the real filestore credential, and
+injects that on the request's `Authorization: Bearer` header. The service
+receives only the injected credential, forwards it to the engine unmodified,
+and **mints/signs nothing** (invariant 3). The engine enforces `filesystem_id`
+scope on it: a foreign scope is `403`, a missing or expired credential is `401`.
+The service does **not** JWKS-verify the bearer — the edge owns weak-JWT
+validation. The engine's own backend credential (NFR-SEC-25) is separate and
+configured via the s3 credential intake (see [Credential intake](#credential-intake)).
+
+The route, deny shape, and credential-custody axes are sibling-proven and
+frozen pending the #292 canon merge; see
+[docs/pending-phase7.md](pending-phase7.md).
 
 ---
 
@@ -99,8 +109,8 @@ exits with code 1. Common refusal causes:
 | Unknown `-profile` or `-tenancy` | `ocu-filestored: unknown admission profile …` |
 | Unknown token in `-granted-intents` | `ocu-filestored: unknown granted intent …` |
 | Non-loopback `-ops-listen` | `ocu-filestored: -ops-listen … ops listener bind address is not a loopback address` |
-| `-engine s3` without `-storage-lane` or `-storage-lane-dev-direct` | `ocu-filestored: -engine s3 requires -storage-lane (ADR-0011 …)` |
-| Both `-storage-lane` and `-storage-lane-dev-direct` set | `ocu-filestored: -storage-lane and -storage-lane-dev-direct are mutually exclusive` |
+| Missing `-tls-cert` | `required flag missing or invalid: -tls-cert is required (the south-face TLS server certificate)` |
+| Missing `-tls-key` | `required flag missing or invalid: -tls-key is required (the south-face TLS server private key)` |
 | `-engine s3` without required s3 flags | `required flag missing or invalid: -s3-bucket …` |
 | S3-only flags with `-engine local-volume` | `required flag missing or invalid: -s3-bucket is only valid with -engine s3` |
 | `-engine-root` with `-engine s3` | `required flag missing or invalid: -engine-root is not valid for the s3 engine` |
@@ -124,7 +134,7 @@ The daemon registers `SIGTERM` and `SIGINT`. On either signal:
    force-closed.
 4. `TeardownScope` runs **unconditionally** regardless of drain outcome —
    the erase-before-reuse (NFR-SEC-54) is never skipped by a clean stop.
-5. The per-session Unix socket is removed.
+5. The south-face TLS listener shuts down.
 6. The ops listener shuts down.
 7. The daemon exits; both the serve error and the teardown error (if any)
    are joined and written to stderr.
@@ -293,8 +303,6 @@ Returns the metric set in Prometheus text format (content-type
 |--------|------|-------------|
 | `ops_total{op,outcome,deny_class}` | Counter | File operations dispatched, by operation name, outcome (`allow`/`deny`), and deny class |
 | `stage_latency_seconds{stage}` | Histogram | Latency of the three dispatch stages: `audit_mandate`, `engine`, `authz` |
-| `peer_accepted_total` | Counter | Connections admitted through the peer-cred accept gate |
-| `peer_dropped_total` | Counter | Connections rejected at the peer-cred accept gate |
 | `ceilings_in_flight_bytes` | Gauge | Current in-flight bytes for the active session |
 | `ceilings_fd_in_use` | Gauge | Current open file descriptor count for the active session |
 | `ceilings_ops_tokens` | Gauge | Current ops token-bucket level |
@@ -357,8 +365,6 @@ The daemon writes JSON lines to **stderr** via `log/slog`. Key log fields:
 | `level` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `msg` | Human-readable event description |
 | `scope` | The session `filesystem_id` |
-| `peer_uid` | Kernel-attested peer uid (peer-gate WARNs) |
-| `peer_pid` | Kernel-attested peer pid (peer-gate WARNs) |
 | `reason` | Machine-readable deny or warning class |
 | `err` | Error string (never a credential byte or payload) |
 
@@ -395,7 +401,10 @@ command-line listings):
 These two env vars are **not** in the generic `OCU_FILESTORE_*` fallback map;
 they are handled directly by `internal/objectstore`.
 
-STS-per-session (`-s3-sts-role-arn`) uses the static credential above as the
-**parent** to sign `AssumeRole` calls; the short-lived session credential is
-scoped to the tenant's key prefix via an inline IAM policy. See
+This static credential is the **engine's own backend credential** (NFR-SEC-25),
+distinct from the guest's filestore credential. The guest credential is minted
+by the Control plane, validated/stripped/exchanged (RFC 8693) and injected by
+the Egress edge, and arrives on the request's `Authorization: Bearer` header;
+the service forwards it to the engine unmodified and signs nothing (invariant 3),
+and the engine enforces `filesystem_id` scope on it. See
 [docs/engines.md](engines.md) for details.

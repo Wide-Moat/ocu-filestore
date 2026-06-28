@@ -93,62 +93,10 @@ func TestRequestIDPresentOnUnaryAllow(t *testing.T) {
 	}
 }
 
-// TestRequestIDPresentOnStreamingDeny asserts that x-request-id is set on a
-// streaming deny (scope-mismatch upload → 200 with error trailer). Assertion
-// (a) [deny/streaming].
-func TestRequestIDPresentOnStreamingDeny(t *testing.T) {
-	g := &fakeGuard{}
-	d, _ := newCorrelationDispatcher(g)
-
-	// Params frame with wrong filesystem_id → scope_mismatch at the channel
-	// cross-check inside the streaming STAGE 0.
-	pf := paramsFrame(t, "wrong-scope", "/file.txt", 5)
-	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
-
-	if w.Code != 200 {
-		t.Fatalf("status = %d, want 200 (streaming always 200)", w.Code)
-	}
-	assertErrorTrailer(t, w, wireCodePermissionDenied)
-
-	reqID := w.Header().Get(requestIDHeader)
-	if !reqIDRe.MatchString(reqID) {
-		t.Fatalf("x-request-id on streaming deny = %q, want 32-char lowercase hex", reqID)
-	}
-}
-
-// TestRequestIDPresentOnStreamingAllow asserts that x-request-id is set on a
-// streaming allow response (successful upload). Assertion (a) [allow/streaming].
-func TestRequestIDPresentOnStreamingAllow(t *testing.T) {
-	g := &fakeGuard{}
-	eng := newFakeEngine()
-	d := newDispatcherWithEngine(
-		&fakeResolver{grant: Grant{Downloadable: true}},
-		g,
-		okCeilings(),
-		1<<20,
-		eng,
-	)
-	d.maxFileSize = 1 << 20
-	var logBuf bytes.Buffer
-	d.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	payload := []byte("hello")
-	pf := paramsFrame(t, streamScope, "/up.txt", int64(len(payload)))
-	cf := chunkFrame(t, payload)
-	ef := endFrame(t)
-	streamBody := bytes.NewReader(concat(pf, cf, ef))
-
-	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, streamBody, streamScope, []Intent{IntentWrite}))
-
-	assertSuccessTrailer(t, w)
-
-	reqID := w.Header().Get(requestIDHeader)
-	if !reqIDRe.MatchString(reqID) {
-		t.Fatalf("x-request-id on streaming allow = %q, want 32-char lowercase hex", reqID)
-	}
-}
+// The data-plane (multipart upload / octet-stream download) x-request-id
+// presence is pinned end-to-end by the REST data-plane handler tests
+// (upload_multipart_test.go / download_octetstream_test.go), whose STAGE-0
+// prologue stamps x-request-id on both the allow and the pre-byte deny paths.
 
 // TestRequestIDUnique asserts that two back-to-back requests receive distinct
 // request ids. Assertion (c).
@@ -230,18 +178,27 @@ func TestRequestIDInLogAndAuditRecord(t *testing.T) {
 
 // TestRequestIDUnifiedDenyAudit asserts (d): a deny's audit record carries
 // the same CorrelationUID as the x-request-id header — one id, not two. This
-// subsumes the previous D8 per-deny correlation id mechanism (T2-18).
-// Uses the streaming scope-mismatch deny which unconditionally mandates a
-// deny audit event via denyTrailer.
+// subsumes the previous D8 per-deny correlation id mechanism (T2-18). It uses
+// a HANDLER-STAGE deny (a non-downloadable readFile), which — unlike a
+// pre-handler scope/route refusal — unconditionally mandates a deny audit
+// event before the REST deny response.
 func TestRequestIDUnifiedDenyAudit(t *testing.T) {
 	g := &fakeGuard{}
-	d, logBuf := newCorrelationDispatcher(g)
+	// A non-downloadable grant: readFile resolves the egress axis to false and
+	// the handler emits a deny audit event before the 403.
+	eng := newFakeEngine()
+	eng.putBytes(boundScope, "secret.bin", []byte("S"))
+	d := newDispatcherWithEngine(&fakeResolver{grant: Grant{Downloadable: false}}, g, okCeilings(), 1<<20, eng)
+	d.maxFileSize = 1 << 20
+	var logBuf bytes.Buffer
+	d.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	// Upload params with a mismatched filesystem_id → scope_mismatch deny.
-	pf := paramsFrame(t, "wrong-scope", "/file.txt", 5)
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, streamRequest(OpFileUpload, bytes.NewReader(pf), boundScope, []Intent{IntentWrite}))
+	d.ServeHTTP(w, scopedRequest(OpReadFile, readBodyNoRange(boundScope, "/secret.bin", false), boundScope, []Intent{IntentRead}))
 
+	if w.Code != 403 {
+		t.Fatalf("status = %d, want 403 (not_downloadable deny); body %s", w.Code, w.Body.String())
+	}
 	reqID := w.Header().Get(requestIDHeader)
 	if !reqIDRe.MatchString(reqID) {
 		t.Fatalf("x-request-id = %q, want 32-char lowercase hex", reqID)
@@ -250,7 +207,7 @@ func TestRequestIDUnifiedDenyAudit(t *testing.T) {
 	// Deny audit event must carry CorrelationUID = reqID (d).
 	events := correlationEvents(g)
 	if len(events) == 0 {
-		t.Fatal("no audit events mandated on streaming scope-mismatch deny")
+		t.Fatal("no audit events mandated on the handler-stage deny")
 	}
 	denyEv := events[len(events)-1]
 	if denyEv.CorrelationUID != reqID {

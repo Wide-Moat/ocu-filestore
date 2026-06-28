@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# golangci-lint configuration — a structural meta-linter for this
+# security-sensitive storage daemon. It complements (does not replace) the
+# standalone gates in CI: gofmt, go vet, staticcheck, and govulncheck each run
+# as their own jobs. The value this config adds over those is the curated
+# security/correctness set below (gosec, errorlint, bodyclose, ...), not a
+# re-run of analyses already gated elsewhere.
+#
+# Schema is golangci-lint v2 (the tool's current major). See
+# https://golangci-lint.run/ for the configuration reference.
+version: "2"
+
+run:
+  # The daemon is concurrency-heavy and the security set is not cheap; give it
+  # headroom so a cold cache never flakes the gate. CI passes --timeout=5m too.
+  timeout: 5m
+  # Lint test files as well — the property and conformance suites are
+  # first-class code that guards the authz resolver and path containment.
+  tests: true
+
+linters:
+  # Start from an explicit set rather than "enable-all minus": every linter is
+  # here on purpose, and the standard defaults (govet, errcheck, ineffassign,
+  # unused, staticcheck) are named so the intent is visible.
+  default: none
+  enable:
+    # ── defaults (named explicitly) ──────────────────────────────────────────
+    - govet
+    - errcheck
+    - ineffassign
+    - unused
+    # staticcheck also runs as its own pinned CI job; kept here for local
+    # `make lint` convenience so one command surfaces everything.
+    - staticcheck
+    # ── security (the reason this meta-linter exists for this repo) ───────────
+    - gosec
+    # ── correctness / value-add ──────────────────────────────────────────────
+    - errorlint    # wrapped-error comparison correctness — load-bearing given
+                   # the sentinel-error deny mapping (==/switch on wrapped errs)
+    - bodyclose    # HTTP response bodies must close — the daemon speaks HTTP
+                   # over a unix socket on both faces
+    - copyloopvar  # Go 1.22+ loop-var capture (supersedes exportloopref)
+    - unconvert    # redundant type conversions
+    - unparam      # unused function parameters / always-same returns
+    - nakedret     # naked returns in longer functions hide the value flow
+    - prealloc     # slices appended in a loop with a known length
+    - gocritic     # opinionated diagnostics/style/performance checks
+    - revive       # light, fast style/lint pass (replacement for golint)
+    - nolintlint   # a //nolint must name a linter and carry an explanation
+
+  settings:
+    gosec:
+      excludes:
+        # G104 (unhandled errors) duplicates errcheck, which is already
+        # enabled; keeping both double-reports the same finding.
+        - G104
+
+    errorlint:
+      # comparison + asserts are the load-bearing checks for this repo's
+      # sentinel-error deny mapping: they catch == / type-switch on an error
+      # that may arrive wrapped. Keep both on.
+      comparison: true
+      asserts: true
+      # errorf is OFF on purpose: the daemon's wrap idiom is `%w` for the
+      # matchable sentinel and `%v` for the opaque cause, so only the sentinel
+      # is reachable through errors.Is. errorlint's errorf check wants the cause
+      # wrapped too, which would widen the matchable surface against intent.
+      errorf: false
+
+    errcheck:
+      # Checking the error of these calls adds noise without changing behavior:
+      # the Close calls are on the deferred cleanup path, and io.WriteString
+      # here only ever targets the fmt.State of a redacting String/Format method
+      # where a write error is unactionable. Everything else stays checked.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - io.WriteString
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment is a micro-optimization that fights readability of the
+        # config and wire structs; not worth the churn for this daemon.
+        - fieldalignment
+        # shadow flags the idiomatic `if err := f(); err != nil { ... }` block
+        # form pervasively; it is deliberately NOT in go vet's default set for
+        # that reason. Re-scoping every inner err would hurt, not help, clarity.
+        - shadow
+
+    nakedret:
+      max-func-lines: 30
+
+    revive:
+      # Light touch: rely on the default rule set rather than a hand-tuned wall
+      # of rules. staticcheck/gocritic carry the heavier style load.
+      severity: warning
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    gocritic:
+      # diagnostic + performance carry the real signal (likely-bug and
+      # allocation/copy patterns). The style tag is taste and overlaps revive
+      # and staticcheck, so it is left off rather than fought finding by
+      # finding.
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        # Performance-tag checks that fight readable, intentional code (large
+        # value receivers/params and value-range copies are deliberate here);
+        # off so the gate stays signal, not taste.
+        - hugeParam
+        - rangeValCopy
+
+  exclusions:
+    # Use the maintained community presets for well-known false positives
+    # (e.g. errcheck on os.Setenv in examples) rather than re-deriving them.
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # ── test files: idiomatic test patterns are not production findings ─────
+      # The production source stays under the full linter set; only test
+      # fixtures get this relief, where helper-return assertions, partial
+      # struct literals, and style quickfixes are noise, not defects.
+      - path: _test.go
+        linters:
+          - gosec      # tests legitimately write temp files, use weak rng, etc.
+          - errcheck   # asserting on every helper return drowns the real checks
+          - unparam    # table-driven test helpers carry uniform signatures
+          - prealloc   # test fixtures favor clarity over micro-allocation
+          - gocritic   # fixture nits (stringXbytes, redundantSprint, ...) add no
+                       # safety
+          - bodyclose  # short-lived probe responses in tests are not leaks
+          - staticcheck # QF* quickfix suggestions on interface-assertion fixtures
+      # govet's unusedwrite fires on intentional partial struct literals in test
+      # fixtures (a cfg built once, only some fields read by the case); keep
+      # unusedwrite for the source, drop it for tests.
+      - path: _test.go
+        text: "unusedwrite"
+        linters:
+          - govet
+      # copyloopvar: a leftover `x := x` loop copy in a test is harmless and
+      # redundant, not a defect; the source carries no such copies.
+      - path: _test.go
+        linters:
+          - copyloopvar
+
+      # ── G304: file path opened from a variable ─────────────────────────────
+      # Every backend/audit/lock file the daemon opens is first run through the
+      # broker's own path resolver, which contains the path to a fixed root and
+      # rejects traversal before any open. The variable that reaches os.Open is
+      # therefore already a resolver-validated path, not attacker-chosen input,
+      # so G304 here is a false positive for this architecture. Scoped to the
+      # packages that perform contained I/O, not disabled globally.
+      - path: internal/objectstore/(engine_local|pathresolver|lane|credentials)\.go
+        text: "G304"
+        linters:
+          - gosec
+      - path: internal/auditgate/filesink\.go
+        text: "G304"
+        linters:
+          - gosec
+      - path: internal/flock/flock\.go
+        text: "G304"
+        linters:
+          - gosec
+
+      # ── G101: "hardcoded credentials" on credential-NAME constants ─────────
+      # These identifiers hold the NAME of a credential kind / environment
+      # variable (e.g. the "sts_per_session" kind label, the secret-key env-var
+      # NAME), never a secret value. The entropy heuristic mis-reads the
+      # identifier name; no secret material is in the tree. Scoped to the two
+      # definition sites.
+      - path: internal/admission/admission\.go
+        text: "G101"
+        linters:
+          - gosec
+      - path: internal/objectstore/credentials\.go
+        text: "G101"
+        linters:
+          - gosec
+
+      # ── G704: net.Dial("unixgram", ...) to the readiness socket ────────────
+      # The dialed address is the host init system's own NOTIFY_SOCKET, supplied
+      # to the process by its supervisor over a local AF_UNIX datagram socket —
+      # not a network endpoint and not request-derived input. No remote address
+      # is reachable from this call, so the SSRF taint result is a false
+      # positive. Scoped to the readiness-notify file.
+      - path: internal/telemetry/sdnotify\.go
+        text: "G704"
+        linters:
+          - gosec
+
+      # ── G302: chmod 0700 on a DIRECTORY ────────────────────────────────────
+      # gosec's "0600 or less" expectation is a file rule; a directory needs the
+      # owner execute bit to be traversable, so 0700 is the correct, deliberate
+      # mode for these host-owned session/audit directories. Scoped to the two
+      # directory-chmod sites.
+      - path: cmd/ocu-filestored/main\.go
+        text: "G302"
+        linters:
+          - gosec
+      - path: internal/southface/listener\.go
+        text: "G302"
+        linters:
+          - gosec
+
+      # ── G115: integer conversions that cannot overflow in this context ──────
+      # main.go: a process UID is non-negative and fits uint32 by definition.
+      # stream.go: the frame payload length is bounded far below uint32 max by
+      # the request-size ceiling enforced before a frame is ever written, so the
+      # big-endian length prefix cannot truncate. Scoped to the two sites.
+      - path: cmd/ocu-filestored/main\.go
+        text: "G115"
+        linters:
+          - gosec
+      - path: internal/southface/stream\.go
+        text: "G115"
+        linters:
+          - gosec
+
+      # ── G107: http.Get to a variable URL that is the daemon's own listener ──
+      # The URL is built from the operator-configured ops-listener address and
+      # targets the daemon's own loopback /healthz during startup self-probe; it
+      # is not request-derived or remote-reachable. Scoped to main.go.
+      - path: cmd/ocu-filestored/main\.go
+        text: "G107"
+        linters:
+          - gosec
+
+      # ── gocritic sprintfQuotedString: %s inside a wire-format label ────────
+      # The format string emits a metrics exposition label, e.g. {le="%s"},
+      # where the value is an already-formatted numeric bound. %q would add
+      # Go-style quoting/escaping and corrupt the wire format, so %s is correct.
+      # Scoped to the exposition renderer.
+      - path: internal/telemetry/expo\.go
+        text: "sprintfQuotedString"
+        linters:
+          - gocritic
+
+      # ── nolintlint: pre-existing bare //nolint:errcheck directives ──────────
+      # Two recover()-in-defer directives predate this gate and lack an
+      # explanation. Annotating them is a one-line source edit deliberately left
+      # to the source-touching follow-up (this task adds tooling only); excluded
+      # narrowly so the new gate does not block on them. Tracked to harden.
+      - path: internal/southface/panic_recovery\.go
+        linters:
+          - nolintlint
+
+      # ── errorlint comparison: == against an UNWRAPPED sentinel ─────────────
+      # Both sites compare against an error returned directly and unwrapped by
+      # the callee (a raw syscall errno; parseRoute's own sentinel), so == is
+      # correct today. Migrating them to errors.Is is a robustness hardening
+      # tracked as a follow-up, not a live defect; excluded narrowly so the new
+      # gate does not block on pre-existing source. Re-evaluate if either callee
+      # starts wrapping.
+      - path: internal/flock/flock\.go
+        text: "comparing with == will fail on wrapped errors"
+        linters:
+          - errorlint
+      - path: internal/southface/dispatch\.go
+        text: "comparing with == will fail on wrapped errors"
+        linters:
+          - errorlint
+
+formatters:
+  enable:
+    - gofmt

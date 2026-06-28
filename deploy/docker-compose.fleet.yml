@@ -1,0 +1,234 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# FLEET-ACTIVATION variant of the storage broker (component-04), contract v0.2.
+# Unlike deploy/docker-compose.yml — the south-only COMPONENT-TEST topology,
+# where the north Files-API plane is inert — this file activates BOTH faces so
+# the cross-component fleet app can reach the broker on its two planes:
+#
+#   edge  --[ocu-edge-backend]--> filestore:8444 (TLS, RFC-8693 cred injection)
+#   webui --[ocu-edge-backend]--> filestore:7080 (TLS, F9 keystone, no credential)
+#
+# The two planes share ONE process and ONE backend credential, but are two
+# physically separate TLS listeners:
+#
+# - SOUTH (filestore:8444): the guest-mount RPC. The stock fleet edge dials
+#   `filestore_upstream:8444` — the v0.2 pin the component-test compose also
+#   uses; 7443 is only the flag DEFAULT, never the wired bind. The edge is the
+#   single hop that validates and strips the guest's weak session JWT, performs
+#   the RFC-8693 token exchange, and injects the real backend credential. The
+#   south face is reached BY the edge, never bypassed.
+# - NORTH (filestore:7080): the Files-API plane (Mount B, ADR-0023). The fleet
+#   webui dials it DIRECTLY — no credential crosses (the F9 keystone plane). The
+#   north listener is live ONLY when -handle-store is set; this file sets it, so
+#   Mount B binds. The default -north-bind 127.0.0.1:7080 is loopback-only and
+#   unreachable cross-container, so the bind is pinned to 0.0.0.0:7080 (north-bind
+#   carries no loopback guard, so the all-interfaces bind is accepted verbatim).
+#
+# ONE identity, BOTH listeners (Mount B reuses the south cert/key PATHS). The
+# leaf SAN must therefore cover BOTH names the broker answers to on the backend
+# net — `filestore` and `ocu-filestore` — for the edge->south:8444 dial AND the
+# webui->north:7080 dial. The fleet cert-init mints that one leaf; this file just
+# consumes it read-only.
+#
+# The handle store ACTIVATES north: the daemon MkdirAll's the store's parent dir
+# 0700 and flocks <store>.lock before binding Mount B. The root filesystem is
+# read-only, so that path MUST be a WRITABLE named volume (handles:, below) —
+# exactly like the fail-closed audit sink. Without it the MkdirAll fails on the
+# read-only root and north never comes up.
+#
+# This file is runnable standalone for a filestore + MinIO north smoke: it
+# carries the same pinned-digest MinIO and one-shot bucket-init as the
+# component-test compose. The fleet wires `ocu-edge-backend` as an external
+# shared network and supplies the cert dir via OCU_FILESTORE_TLS_CERT_DIR.
+#
+# Bring it up standalone (the fleet supplies the network + cert otherwise):
+#
+#   OCU_FILESTORE_TLS_CERT_DIR=/abs/path/to/certs \
+#     docker compose -f deploy/docker-compose.fleet.yml up -d --build --wait
+#
+# Posture is UNCHANGED from the hardened component-test baseline — this variant
+# only activates the north plane and its writable handle volume, never the
+# security posture (read-only root, cap_drop ALL, no-new-privileges, the
+# default-deny seccomp profile, the 30s stop grace above the daemon's bounded
+# in-flight drain, the loopback ops listener as the real readiness source).
+
+services:
+  ocu-filestore:
+    image: ghcr.io/wide-moat/ocu-filestore:${OCU_FILESTORE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    # Reachable on the backend net as BOTH `filestore` (the v0.2 pin host the
+    # edge dials as filestore:8444) and the service name `ocu-filestore`. The
+    # ONE leaf SAN covers both, and both faces (south:8444, north:7080) present
+    # that same identity.
+    networks:
+      ocu-edge-backend:
+        aliases:
+          - filestore
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # A relative seccomp profile path is resolved against the directory of
+      # THIS compose file (deploy/), not the invocation CWD. The profile lives
+      # at deploy/seccomp/ocu-filestored.json, so the file-relative reference is
+      # ./seccomp/ocu-filestored.json — that is what makes the default-deny
+      # hardening (NFR-SEC-02) actually load at container create.
+      - seccomp:./seccomp/ocu-filestored.json
+    stop_grace_period: 30s
+    environment:
+      # The s3 engine's OWN backend credential (one credential, one client —
+      # NFR-SEC-25). These reach the engine through objectstore's dedicated env
+      # intake, never through a flag value. Throwaway MinIO test-rig values.
+      OCU_S3_ACCESS_KEY_ID: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
+      OCU_S3_SECRET_ACCESS_KEY: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
+    command:
+      - -engine
+      - s3
+      - -s3-endpoint
+      - http://minio:9000
+      - -s3-bucket
+      - ${OCU_S3_TEST_BUCKET:-ocu-conformance}
+      - -s3-region
+      - us-east-1
+      - -s3-path-style
+      # South-face TLS HTTPS listener, bound on all interfaces so the fleet edge
+      # reaches it as `filestore:8444` (the v0.2 pin; 7443 is only the flag
+      # default). The edge injects the real backend credential via RFC-8693.
+      - -south-bind
+      - 0.0.0.0:8444
+      # North Files-API TLS listener (Mount B, ADR-0023). Bound on all
+      # interfaces so the fleet webui reaches it as `filestore:7080` directly
+      # (the F9 keystone plane, no credential). The default 127.0.0.1:7080 is
+      # loopback-only; -north-bind carries no loopback guard, so 0.0.0.0 binds
+      # verbatim. North is live ONLY because -handle-store is set below.
+      - -north-bind
+      - 0.0.0.0:7080
+      # Activates north: the durable file_id->handle store (ADR-0023). The
+      # daemon MkdirAll's this path's parent 0700 + flocks <store>.lock before
+      # binding Mount B, so /var/lib/ocu-filestore is a WRITABLE named volume
+      # below (the read-only root would otherwise fail the MkdirAll).
+      - -handle-store
+      - /var/lib/ocu-filestore/handles
+      # ONE identity, BOTH listeners: the south and north faces reuse the same
+      # cert/key PATHS. The leaf SAN covers `filestore` + `ocu-filestore` for the
+      # edge->south:8444 AND webui->north:7080 dials alike.
+      - -tls-cert
+      - /etc/ocu-filestore/tls/tls-cert.pem
+      - -tls-key
+      - /etc/ocu-filestore/tls/tls-key.pem
+      - -audit-sink
+      - /var/log/ocu-filestore/audit.ocsf.jsonl
+      - -filesystem-id
+      - ${OCU_FILESYSTEM_ID:-fs-component-test}
+      - -broker-max-file-size
+      - ${OCU_BROKER_MAX_FILE_SIZE:-1073741824}
+      - -granted-intents
+      - ${OCU_GRANTED_INTENTS:-read,write}
+      # /pub is downloadable so the read path (readFile, fileDownload) reaches
+      # the engine; downloadable resolves at read from this prefix grant, never
+      # stamped at write (NFR-SEC-73).
+      - -downloadable-prefixes
+      - ${OCU_DOWNLOADABLE_PREFIXES:-/pub}
+      - -profile
+      - trusted_operator
+      - -tenancy
+      - single-tenant
+      # Loopback-only ops listener (/metrics, /healthz, /readyz). Pinned
+      # explicitly so the healthcheck target and the readiness posture do not
+      # ride on the daemon's flag default.
+      - -ops-listen
+      - 127.0.0.1:9464
+    volumes:
+      # Fail-closed audit sink (NFR-SEC-79): an audit-write failure denies the
+      # operation, so this volume filling up stops file activity, not auditing.
+      - audit:/var/log/ocu-filestore
+      # Writable durable handle store (ADR-0023): north's file_id index lives
+      # here. The daemon MkdirAll's /var/lib/ocu-filestore and creates handles +
+      # handles.lock under it, so this MUST be a writable volume (the root fs is
+      # read-only). Mirrors the audit sink's writable-volume pattern.
+      - handles:/var/lib/ocu-filestore
+      # The shared TLS material for BOTH faces, mounted read-only. The leaf SAN
+      # covers `filestore` and `ocu-filestore`; the directory is supplied by the
+      # fleet cert-init via OCU_FILESTORE_TLS_CERT_DIR.
+      - ${OCU_FILESTORE_TLS_CERT_DIR:-./testdata/tls}:/etc/ocu-filestore/tls:ro
+    # Optional local-smoke host-port publish: 127.0.0.1-scoped only (never a
+    # bare 0.0.0.0 publish), so a manual standalone bring-up can reach both
+    # faces from the host without exposing them off-box. In the fleet the edge
+    # and webui reach them by service name on ocu-edge-backend, so these are
+    # not needed there.
+    ports:
+      - "127.0.0.1:8444:8444"
+      - "127.0.0.1:7080:7080"
+    depends_on:
+      minio:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Real readiness probe against the live loopback ops listener: the
+      # daemon's own -health-check self-probe dials /healthz (served only once
+      # the daemon is fully up — the ops listener binds AFTER engine
+      # construction + s3 scope provisioning + both faces). Never a sleep.
+      test: ["CMD", "/usr/local/bin/ocu-filestored", "-health-check"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Real object-store backend for the s3 engine — no mocks. The same pinned
+  # MinIO digest and bucket-init pattern as the component-test compose, so this
+  # file stands up a filestore + MinIO north smoke standalone. In the fleet the
+  # shared object store may come from the rig instead; drop these two services
+  # and point -s3-endpoint at the shared MinIO if so.
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: server /data --console-address ":9001"
+    networks:
+      - ocu-edge-backend
+    environment:
+      MINIO_ROOT_USER: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
+      MINIO_ROOT_PASSWORD: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # One-shot bucket provisioning: creates the engine's backing bucket and
+  # exits 0. depends_on service_completed_successfully gates the broker on it.
+  bucket-init:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    networks:
+      - ocu-edge-backend
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set rig http://minio:9000 "${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}" "${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}"
+        mc mb --ignore-existing "rig/${OCU_S3_TEST_BUCKET:-ocu-conformance}"
+        mc ls rig
+
+networks:
+  # The storage-dedicated backend lane: the edge's backend leg reaches the
+  # broker's south face here, the webui reaches the north face here, and the
+  # broker reaches MinIO here. In the fleet this is the shared backend net the
+  # app wires; standalone it is a local bridge. NOT guest-facing, NOT the
+  # retired data-plane net.
+  ocu-edge-backend:
+    driver: bridge
+
+volumes:
+  # Fail-closed audit sink — an audit-write failure denies the file operation,
+  # so this volume filling up stops file activity, not auditing.
+  audit:
+  # Durable file_id->handle store (ADR-0023). Writable because the read-only
+  # root cannot host the MkdirAll + the handles/handles.lock files north needs.
+  handles:

@@ -218,7 +218,7 @@ func TestValidateOpsListenAddrMatchesNewOpsListener(t *testing.T) {
 // calls accumulate, and that an out-of-enum label value panics (a wiring bug).
 func TestCounterAdd(t *testing.T) {
 	reg := telemetry.NewRegistry()
-	c := reg.NewCounter("peer_dropped_total", "Connections rejected.",
+	c := reg.NewCounter("unlabeled_add_total", "Unlabeled counter under test.",
 		telemetry.LabelSet{},
 	)
 
@@ -227,8 +227,8 @@ func TestCounterAdd(t *testing.T) {
 
 	var buf bytes.Buffer
 	reg.WriteTo(&buf)
-	if !strings.Contains(buf.String(), "peer_dropped_total 7") {
-		t.Fatalf("expected peer_dropped_total 7 after Add(3)+Add(4):\n%s", buf.String())
+	if !strings.Contains(buf.String(), "unlabeled_add_total 7") {
+		t.Fatalf("expected unlabeled_add_total 7 after Add(3)+Add(4):\n%s", buf.String())
 	}
 
 	t.Run("labeled_add", func(t *testing.T) {
@@ -308,7 +308,6 @@ func TestIsLoopbackAddrViaValidator(t *testing.T) {
 // the ErrServerClosed-swallow branch on graceful shutdown.
 func TestOpsListenerServeShutdown(t *testing.T) {
 	m := telemetry.NewBrokerMetrics("v0.0.0-test")
-	m.PeerAccepted()
 
 	l, err := telemetry.NewOpsListener("127.0.0.1:0", m, discardLogger())
 	if err != nil {

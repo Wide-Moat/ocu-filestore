@@ -48,7 +48,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db0
 ARG VERSION=dev
 
 LABEL org.opencontainers.image.source="https://github.com/Wide-Moat/ocu-filestore" \
-      org.opencontainers.image.description="Open Computer Use storage broker (component-04): two-face file broker daemon, south-face guest mount over per-session unix sockets" \
+      org.opencontainers.image.description="Open Computer Use storage broker (component-04): two-face file broker daemon, south-face file operations over an HTTPS/REST TLS listener" \
       org.opencontainers.image.licenses="FSL-1.1-Apache-2.0" \
       org.opencontainers.image.version="${VERSION}"
 

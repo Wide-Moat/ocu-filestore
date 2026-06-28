@@ -39,12 +39,22 @@ jobs:
           retention-days: 1
 
   # e2e is the RELEASE-GATING job: it exercises the REAL daemon binary —
-  # no mocks. It is a REQUIRED check — no continue-on-error. Today the
-  # daemon is a wiring scaffold that validates its flag surface and refuses
-  # with a typed error; the smoke below asserts exactly that observable
-  # behaviour. The Integration|E2E test slice grows with the south-face
-  # implementation PRs (real unix socket, real peer-cred drop, real
-  # audit-deny) and runs under this same job.
+  # no mocks. It is a REQUIRED check — no continue-on-error. The daemon serves
+  # a TLS HTTPS/HTTP-2 REST listener; the smoke below asserts the pre-bind
+  # typed-error refusals, and the Integration|E2E slice then drives the live
+  # daemon over localhost TLS REST: it mints a throwaway loopback certificate,
+  # starts the binary with -tls-cert/-tls-key, presents an edge-injected
+  # Authorization: Bearer, and runs the non-vacuous file-op lifecycle
+  # (makeDirectory -> fileUpload -> readFile/listDirectory -> fileDownload
+  # byte-exact -> removeFile -> listing reflects the removal) plus the
+  # foreign-scope 403 and missing-bearer 401 denies. No Docker is needed for
+  # this leg — the listener is loopback TLS.
+  #
+  # TODO(container-leg): the architect's bar is the same live slice over the
+  # real runc/Docker mount substrate (guest -> Egress edge -> service direct
+  # HTTPS). That run needs a Linux runner with runc available and the edge rig
+  # stood up; it is tracked as the deferred container-e2e leg and is NOT part
+  # of this code-only wave.
   e2e:
     runs-on: ubuntu-latest
     needs: build-broker
@@ -60,12 +70,13 @@ jobs:
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
       - name: smoke — the real daemon refuses bad invocations pre-bind
-        # All three pre-bind refusals (missing required flag, unknown engine,
-        # -engine s3 without a storage lane naming ADR-0011 — NFR-SEC-16/85)
-        # live in ONE committed script so e2e and release assert the SAME
-        # invariants against the SAME binary, never drifting YAML copies.
+        # All three pre-bind refusals (a missing required flag named — -tls-cert,
+        # a load-bearing flag of the TLS REST transport; an unknown engine; an
+        # -engine s3 with its required backing-store config absent) live in ONE
+        # committed script so e2e and release assert the SAME invariants against
+        # the SAME binary, never drifting YAML copies.
         run: bash scripts/e2e-smoke.sh ./ocu-filestored
-      - name: run the Integration + E2E slice (local-volume leg)
+      - name: run the Integration + E2E slice (local-volume leg, live TLS REST)
         env:
           OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
@@ -90,12 +101,15 @@ jobs:
           platforms: linux/amd64
           push: false
 
-  # e2e-s3 is the same release-gating live-binary slice re-pointed at the
-  # REAL s3 engine against the committed MinIO rig: `-engine s3` serves live
-  # MinIO through the full daemon (ADR-0010 — both kinds real). The
-  # dev-direct dial is the rig posture only; the production lane refusal is
-  # pinned by the smoke above. The slice includes the composed
-  # credential-redaction check (TestE2ES3CredentialRedaction).
+  # e2e-s3 exercises the REAL s3 engine against the committed MinIO rig: the
+  # composed daemon serves live MinIO through the full stack (ADR-0010 — both
+  # kinds real) over a real south-face TLS listener, and the objectstore
+  # conformance/live legs drive the engine verbs against the rig. The
+  # production lane posture is pinned by the smoke above; the rig dials the
+  # backend direct. The liveness signal is TestComposeS3RealEngineServes: it
+  # composes the real s3 engine, provisions a scope against MinIO, and serves on
+  # a real TLS listener — so its pass proves the rig env reached the suite (a
+  # skip would otherwise report green while exercising no live S3).
   e2e-s3:
     runs-on: ubuntu-latest
     needs: build-broker
@@ -110,38 +124,41 @@ jobs:
           name: ocu-filestored
       - name: make the broker binary executable
         run: chmod +x ocu-filestored
+      - name: red-probe the s3-leg liveness gate (two-sided, before the rig)
+        # Prove the liveness assertion does not lie in either direction BEFORE
+        # spending a MinIO rig boot on it: a real pass -> exit 0, a skipped or
+        # absent target -> non-zero. Fails fast if the gate itself regresses.
+        run: bash scripts/check-s3-leg-ran-redprobe.sh
       - name: boot the MinIO rig
         run: |
           docker compose -f deploy/docker-compose.test.yml up -d --wait minio
           docker compose -f deploy/docker-compose.test.yml run --rm bucket-init
-      - name: run the Integration + E2E slice (s3 leg, live MinIO)
+      - name: run the s3 live legs (composed daemon + objectstore, live MinIO)
         env:
           OCU_BROKER_BIN: ${{ github.workspace }}/ocu-filestored
-          OCU_E2E_ENGINE: s3
           OCU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
           OCU_S3_TEST_BUCKET: ocu-conformance
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
         # Capture -json and positively assert the S3-engine leg actually ran.
-        # The s3 e2e cases t.Skip when OCU_E2E_ENGINE/rig env do not reach the
-        # suite (or OCU_BROKER_BIN is unset), and a skip counts as a pass — a
-        # var typo would otherwise report green while exercising no live S3.
-        # TestE2ES3CredentialRedaction runs ONLY on the s3 leg, so its real
-        # pass is the unique liveness signal for this job.
+        # The s3 live cases t.Skip when OCU_S3_TEST_ENDPOINT does not reach the
+        # suite, and a skip counts as a pass — a var typo would otherwise report
+        # green while exercising no live S3. TestComposeS3RealEngineServes runs
+        # ONLY against the rig, so its real pass is the unique liveness signal.
+        #
+        # The liveness assertion lives in scripts/check-s3-leg-ran.sh (single
+        # source, red-probed below): it jq-selects the test's own pass object
+        # from the go-test-json stream — robust to JSON field order and line
+        # buffering, unlike a two-stage grep pipe which false-reds a real green.
         run: |
           set -uo pipefail
           code=0
-          go test -run 'Integration|E2E' ./... -json -timeout 600s \
+          go test ./cmd/ocu-filestored/... ./internal/objectstore/... -json -timeout 600s \
             | tee /tmp/e2e-s3.json >/dev/null || code=$?
           grep -oE '"Output":"[^"]*"' /tmp/e2e-s3.json \
             | sed -E 's/^"Output":"//; s/"$//; s/\\n$//; s/\\t/\t/g' || true
-          if ! grep -E '"Action":"pass"' /tmp/e2e-s3.json \
-            | grep -qE '"Test":"TestE2ES3CredentialRedaction"'; then
-            echo "::error::the s3-leg e2e case TestE2ES3CredentialRedaction did not pass — the rig/engine env never reached the live slice (every s3 case skipped)"
-            exit 1
-          fi
-          echo "s3 e2e leg ran: TestE2ES3CredentialRedaction passed against real MinIO"
+          bash scripts/check-s3-leg-ran.sh /tmp/e2e-s3.json
           exit "$code"
       - name: tear the rig down
         if: always()

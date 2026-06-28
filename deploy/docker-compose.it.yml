@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Integration-test OVERLAY for deploy/docker-compose.yml. The base component
+# compose keeps the honest topology: the broker is reachable ONLY on the
+# ocu-edge-backend network (no host exposure), exactly as it would be behind
+# the edge in the assembled app. This overlay — applied ONLY by the
+# integration test (internal/composeit) — publishes two loopback host ports so
+# the test harness, running on the host, can:
+#
+#   - present the edge-injected Bearer to the broker's TLS south face
+#     (127.0.0.1:8444 -> filestore:8444), and
+#   - independently assert the bytes landed in the real MinIO bucket
+#     (127.0.0.1:9000 -> minio:9000) via a direct S3 client.
+#
+# It adds NOTHING else: same image, same hardening, same credential path. The
+# south-face leaf SAN covers `filestore`/`ocu-filestore`, so the host client
+# dials 127.0.0.1 but sets ServerName=filestore to satisfy verification.
+#
+# Apply both files (base first, overlay second):
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.it.yml \
+#     up -d --build --wait
+
+services:
+  ocu-filestore:
+    ports:
+      - "127.0.0.1:8444:8444"
+
+  minio:
+    ports:
+      - "127.0.0.1:9000:9000"

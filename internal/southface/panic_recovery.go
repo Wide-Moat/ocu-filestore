@@ -79,17 +79,17 @@ func (d *dispatcher) recoverDispatch(w http.ResponseWriter, reqLog **slog.Logger
 		// recovery for the same reason.
 		func() {
 			defer func() { recover() }() //nolint:errcheck
-			writeConnectError(w, mapDeny(denyInternal), "internal error")
+			writeRESTDeny(w, mapDeny(denyInternal), "internal error")
 		}()
 	}
 }
 
 // recoverWriteStream is the panic containment wrapper for the WriteStream pipe
-// goroutine inside handleFileUpload. When the engine's WriteStream call panics
-// the deferred recovery catches it, closes the pipe reader with an error so the
-// producer side (pw.Write in the reassembly loop) unblocks immediately, and
-// sends the sentinel on writeErrCh so the upload handler can drain and abort
-// cleanly. This guarantees:
+// goroutine inside the multipart fileUpload handler. When the engine's
+// WriteStream call panics the deferred recovery catches it, closes the pipe
+// reader with an error so the producer side (pw.Write in the reassembly loop)
+// unblocks immediately, and sends the sentinel on writeErrCh so the upload
+// handler can drain and abort cleanly. This guarantees:
 //
 //   - No goroutine leak (the pipe goroutine exits).
 //   - No torn object: the engine's temp+rename atomicity guarantees that an
@@ -108,23 +108,11 @@ func recoverWriteStream(pr *io.PipeReader, writeErrCh chan<- error) {
 	writeErrCh <- errInternalPanic
 }
 
-// recoverReadStream is the panic containment wrapper for the ReadRange pipe
-// goroutine inside handleFileDownload. A panicking engine.ReadRange is caught
-// here; the pipe writer is closed with an error so the consumer loop unblocks
-// and the error drains through readErrCh.
-func recoverReadStream(pw *io.PipeWriter, readErrCh chan<- error) {
-	v := recover()
-	if v == nil {
-		return
-	}
-	pw.CloseWithError(errInternalPanic)
-	readErrCh <- errInternalPanic
-}
-
-// errInternalPanic is the sentinel sent on the pipe-error channel when a
-// goroutine-level panic is recovered inside a streaming handler. The upload /
-// download handler maps it through denyClassForEngineErr → denyInternal →
-// wireCodeInternal, the same path as any other unrecognised engine error.
+// errInternalPanic is the sentinel returned when a goroutine-level panic is
+// recovered inside a data-plane handler (the WriteStream pipe goroutine via
+// recoverWriteStream, or the whole-object Stat probe via statSizeContained).
+// The upload / download handler maps it through denyClassForEngineErr →
+// denyInternal, the same path as any other unrecognised engine error.
 var errInternalPanic = &internalPanicError{}
 
 type internalPanicError struct{}

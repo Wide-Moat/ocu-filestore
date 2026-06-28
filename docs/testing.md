@@ -1,7 +1,7 @@
 # Testing guide — ocu-filestore
 
-This document explains how to run the test suite locally, which tests skip on
-darwin and why, how to use the containerised Linux e2e escape hatch, and the
+This document explains how to run the test suite locally, which legs loud-skip
+without a rig and why, how to use the containerised Linux e2e helper, and the
 coverage floor policy.
 
 Questions or issues: developer@widemoat.ai
@@ -21,24 +21,16 @@ variable so you know exactly what to set.
 
 ---
 
-## Platform notes — which tests skip on darwin
+## Platform notes — which legs loud-skip without a rig
 
-### SO_PEERCRED (Linux only)
+### South-face transport is platform neutral
 
-The broker enforces peer-credential authentication on its Unix domain socket
-using the `SO_PEERCRED` socket option.  `SO_PEERCRED` is a Linux-only
-syscall; it is not available on darwin (macOS) or BSDs.
-
-Any test in the `Integration` or `E2E` slice that exercises the real Unix
-socket path calls `t.Skip` on darwin with the message:
-
-```
-skip: SO_PEERCRED is Linux-only — run make e2e-linux for the full slice
-```
-
-These tests gate merges in CI (Linux runners) and must pass there before any
-PR is merged.  Running them on darwin requires the containerised escape hatch
-described below.
+The south face is a TLS HTTPS/HTTP-2 REST-JSON listener reached outbound through
+the Egress edge; it depends on no Linux-only socket option. The `Integration`
+and `E2E` slice drives the real daemon over a loopback TLS REST listener and
+runs the same on Linux and darwin — there is no platform skip for the transport.
+These tests gate merges in CI (Linux runners) and must pass there before any PR
+is merged.
 
 ### Live-S3 leg
 
@@ -96,24 +88,35 @@ make s3-rig-down
 
 ---
 
-## `make e2e-linux` — darwin escape hatch for the SO_PEERCRED slice
+## `make e2e-linux` — containerised Linux e2e run
 
-Contributors on darwin can run the Linux-only e2e leg without a VM using the
-containerised escape hatch:
+Contributors can run the full `Integration|E2E` slice against a Linux-native
+build, matching the CI runner exactly, using the containerised helper:
 
 ```sh
 make e2e-linux
 ```
 
-This runs `docker run golang:1.25.0` with the source tree bind-mounted.
-Inside the container the build system:
+This runs `docker run golang:1.25.0` with the source tree bind-mounted.  The
+live slice drives the real daemon over its TLS HTTPS/HTTP-2 REST listener; the
+test mints its own throwaway loopback certificate in-process, so the target
+supplies no certs.  Inside the container the build system:
 
 1. Copies the source tree to a writable workspace (the bind-mount is
    read-only so module cache writes succeed).
 2. Builds the static daemon binary (`CGO_ENABLED=0 go build -trimpath`) for
    Linux/amd64 inside the container.
 3. Sets `OCU_BROKER_BIN` to the freshly-built binary path.
-4. Runs `go test -run 'Integration|E2E' ./... -v -timeout 600s`.
+4. Runs `go test -run E2E ./internal/broker/ -v -timeout 600s`.
+
+The container runtime is selected by `RUNTIME` (default `runc`).  Run the
+gVisor leg with `make e2e-linux RUNTIME=runsc`.  The target honors the ambient
+docker context, so on a Linux substrate run it through `limactl shell`:
+
+```sh
+limactl shell ocu-linux -- make e2e-linux                # runc
+limactl shell ocu-linux -- make e2e-linux RUNTIME=runsc  # gVisor (runsc)
+```
 
 The container uses `--network host` so a MinIO rig started with
 `make s3-rig-up` is visible inside the container (the S3 env vars are
@@ -129,11 +132,10 @@ export OCU_S3_TEST_SECRET_KEY=ocu-test-secret-key
 make e2e-linux
 ```
 
-`--network host` is Linux-native behaviour.  On Docker Desktop for Mac the
-host network mode is emulated and `127.0.0.1` inside the container resolves
-to the VM loopback, not the Mac's loopback.  If the S3 rig is reachable only
-on the Mac's loopback, start it with the host-gateway address exposed, or use
-`docker.for.mac.localhost` as the S3 endpoint hostname.
+`--network host` is Linux-native behaviour and is the intended substrate: run
+the target on a Linux host (directly or through `limactl shell`) where the
+container and the MinIO rig share the host network, so `127.0.0.1` inside the
+container reaches the rig.
 
 ---
 
@@ -152,7 +154,7 @@ on the Mac's loopback, start it with the host-gateway address exposed, or use
 | `make test-race` | `go test -race ./... -timeout 600s` | Race detector run |
 | `make cover` | `go test -coverpkg=./internal/... -coverprofile=cover.out …` | Coverage measurement |
 | `make check` | All of the above combined | Pre-push gate |
-| `make e2e-linux` | Containerised `Integration\|E2E` slice | Linux-only e2e on darwin |
+| `make e2e-linux` | Containerised `Integration\|E2E` slice | Run the e2e slice against a Linux-native build (CI parity) |
 | `make s3-rig-up` | `docker compose … up minio + bucket-init` | Start MinIO rig |
 | `make s3-rig-down` | `docker compose … down -v` | Stop and clean MinIO rig |
 
@@ -171,7 +173,7 @@ The CI `coverage` job collects coverage over the `./internal/...` packages
 floor is **86.0%**.
 
 The floor was ratcheted to 86.0 in the daemon-wiring + e2e PR (measured 87.7%
-on Linux CI where the live-socket e2e cases run).  It is computed as
+on Linux CI where the live TLS REST e2e cases run).  It is computed as
 `floor(measured) - 1` — one point of headroom, never above measured.
 
 When adding new code:

@@ -275,8 +275,8 @@ func TestPreviewSessionNeverWritesOrDownloads(t *testing.T) {
 
 	t.Run("preview_wire_intent_refused_on_every_route", func(t *testing.T) {
 		for op := range knownOps {
-			if isStreamingOp(op) {
-				continue // the streaming branch has its own gate (upload hardcodes write)
+			if op == OpFileUpload || op == OpFileDownload {
+				continue // the data-plane ops have dedicated REST entrypoints (upload hardcodes write)
 			}
 			eng := seededEngine()
 			d := newDispatcherWithEngine(&intentResolver{}, &fakeGuard{}, okCeilings(), 1<<20, eng)
@@ -316,7 +316,7 @@ func TestMutationHandlersAssertWriteGrant(t *testing.T) {
 				ps:   PeerScope{FilesystemID: opScope, GrantedIntents: []Intent{IntentRead}},
 				mandateDeny: func(auditReason, wireClass, message string) {
 					deniedReason = auditReason
-					writeConnectError(w, mapDenyDegraded(auditReason, wireClass), message)
+					writeRESTDeny(w, mapDenyDegraded(auditReason, wireClass), message)
 				},
 			}
 			h(deps, hc)

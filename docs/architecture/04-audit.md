@@ -161,7 +161,7 @@ fields are OCU base-event / chain extensions called out below.
 | `activity_id` | OCSF activity enum | `1` create/upload, `2` read/list/download, `4` delete, `14` preview-render (preview unimplemented this build) |
 | `time` | epoch ms | **Stamped by `Mandate` from the broker clock — a caller-supplied value never reaches the record (NFR-SEC-48)** |
 | `metadata` | `{version, product}` | OCSF base_event; `Mandate` fills `1.1.0` / `ocu-filestore` when unset |
-| `actor` | `{user_uid, session_uid, process_pid}` | Host-attested identity; `process_pid` is the kernel-attested peer pid (SO_PEERCRED), omitted when none |
+| `actor` | `{user_uid, session_uid, process_pid}` | Host-attested identity from the control-plane-minted session the edge injects (the REST leg carries no kernel peer pid, so `process_pid` is omitted when none) |
 | `filesystem_id` | scope id | The channel-bound scope |
 | `object_handle` | `{filesystem_id, path}` handle | For move/copy this is the **destination** (produced object) per `objectHandleForOp` |
 | `byte_count` | bytes | Declared size on uploads; `0` on metadata-only ops |

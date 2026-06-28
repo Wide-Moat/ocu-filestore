@@ -397,8 +397,13 @@ func handleMoveDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
 	}
-	src := enginePath(req.Source)
-	dst := enginePath(req.Destination)
+	// Spine-canonicalized source/destination legs (crutch-04), never the raw
+	// body paths: authz/audit decided on these exact legs, so the engine must
+	// touch the same canonical legs. req.Source/req.Destination are decoded only
+	// so decodeOp enforces the strict body shape; the path values used here are
+	// the spine-cleaned forms.
+	src := enginePath(hc.canonSource)
+	dst := enginePath(hc.canonDest)
 	if err := d.engine.MoveDir(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, false); err != nil {
 		denyEngine(hc, err)
 		return outcomeDenyRecorded()
@@ -467,8 +472,13 @@ func handleCopyFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
 	}
-	src := enginePath(req.Source)
-	dst := enginePath(req.Destination)
+	// Spine-canonicalized source/destination legs (crutch-04), never the raw
+	// body paths: authz/audit decided on these exact legs, so the engine must
+	// touch the same canonical legs. req.Source/req.Destination are decoded only
+	// so decodeOp enforces the strict body shape; the path values used here are
+	// the spine-cleaned forms.
+	src := enginePath(hc.canonSource)
+	dst := enginePath(hc.canonDest)
 	if err := d.engine.CopyFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
 		return outcomeDenyRecorded()
@@ -489,8 +499,13 @@ func handleMoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !assertWriteGrant(hc) {
 		return outcomeDenyRecorded()
 	}
-	src := enginePath(req.Source)
-	dst := enginePath(req.Destination)
+	// Spine-canonicalized source/destination legs (crutch-04), never the raw
+	// body paths: authz/audit decided on these exact legs, so the engine must
+	// touch the same canonical legs. req.Source/req.Destination are decoded only
+	// so decodeOp enforces the strict body shape; the path values used here are
+	// the spine-cleaned forms.
+	src := enginePath(hc.canonSource)
+	dst := enginePath(hc.canonDest)
 	if err := d.engine.MoveFile(hc.ctxOrBackground(), hc.ps.FilesystemID, src, dst, req.OverwriteExisting); err != nil {
 		denyEngine(hc, err)
 		return outcomeDenyRecorded()

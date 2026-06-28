@@ -71,19 +71,31 @@ func (r *policyResolver) Resolve(ctx context.Context, caller any, req Request) (
 		return Grant{}, ErrIntentDenied
 	}
 
-	// Axis 3: downloadable resolved at read; preview is structurally
-	// non-downloadable regardless of stored tag (NFR-SEC-73).
+	// Axis 3: downloadable resolved at read (NFR-SEC-73, invariant 5). The
+	// downloadable bit is an EGRESS-ARTIFACT disposition, not a read gate: a
+	// non-downloadable object is "readable in-session but yields no
+	// egress-eligible artifact" — the read axis still clears, and the egress
+	// decision (deny the byte-path-out, withhold a presigned URL) belongs to
+	// the consuming op, which reads Grant.Downloadable. The resolver therefore
+	// never turns a successful "not downloadable" verdict into a read deny;
+	// only the tag-lookup ERROR stays fail-closed. Preview is structurally
+	// non-downloadable regardless of stored tag.
 	switch req.Intent {
 	case IntentRead:
 		dl, err := r.tag(ctx, req.Filesystem, req.Path)
 		if err != nil {
-			// Tag lookup failure denies — fail-closed.
+			// Tag lookup failure denies — fail-closed. The disposition could
+			// not be resolved, so we cannot safely allow the read at all.
 			return Grant{}, ErrNotDownloadable
 		}
 		if !dl {
-			return Grant{}, ErrNotDownloadable
+			// Read allowed, egress-eligible artifact withheld (invariant 5):
+			// the object is readable in-session; the false bit feeds the
+			// consuming op's egress-artifact decision, not a read deny.
+			return Grant{Downloadable: false}, nil
 		}
-		// The only line in this package that grants the downloadable bit.
+		// Read allowed and egress-eligible: this is the only line in this
+		// package that grants the downloadable bit.
 		return Grant{Downloadable: true}, nil
 	case IntentWrite:
 		// Write grants never carry the downloadable bit (NFR-SEC-73).

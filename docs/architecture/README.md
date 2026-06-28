@@ -19,12 +19,14 @@ A **two-faced storage broker** that custodies the backend object-store
 credential and re-derives file authorization for a guest session mount, so that
 neither the guest nor any upstream component ever holds a backend key.
 
-- **South face** — the face that terminates the file-operation RPC arriving
+- **South face** — the face that terminates the file-operation request arriving
   from the session sandbox (the guest mount). It is **built and operational**:
-  a per-session Unix-domain-socket server, a kernel-attested peer-credential
-  accept gate, the locked dispatch pipeline, three-axis authorization, the
-  fail-closed hash-chained audit sink, per-session ceilings, the engine seam,
-  and graceful erase-before-reuse shutdown.
+  a per-session TLS HTTPS/HTTP-2 REST-JSON listener the guest reaches outbound
+  through the Egress trust-edge (guest → edge → service), the edge-injected
+  filestore credential the engine verifies and scopes, the locked dispatch
+  pipeline, three-axis authorization, the fail-closed hash-chained audit sink,
+  per-session ceilings, the engine seam, and graceful erase-before-reuse
+  shutdown.
 - **North face** — the external data-plane HTTP API (file/artifact API, SPA,
   preview). It is **deferred** per the roadmap: the contract is parsed but the
   face is inert and bound in no release. Where this document speaks of "both
@@ -49,11 +51,10 @@ belongs to the customer's own store; OCU keeps the audit record, not the files.
 ```mermaid
 flowchart TD
     guest["Session sandbox<br/>(guest mount client)"]
+    edge["Egress trust-edge<br/>validates weak session JWT · exchanges (RFC 8693)<br/>· injects real filestore credential"]
 
     subgraph host["Broker host — one daemon per filesystem_id"]
-        sock["Unix socket<br/>&lt;socket-dir&gt;/&lt;filesystem_id&gt;.sock<br/>(0700 dir, stale socket removed before bind)"]
-        gate["SO_PEERCRED accept gate<br/>same-uid; non-host peer closed<br/>before any byte read (NFR-SEC-76)"]
-        srv["http.Server (HTTP/1.1)<br/>ConnContext stamps PeerScope"]
+        srv["TLS HTTPS/HTTP-2 REST-JSON listener<br/>bound at -south-bind (-tls-cert/-tls-key)<br/>engine verifies + scopes injected credential (NFR-SEC-25)"]
 
         subgraph spine["LOCKED dispatch pipeline (STAGE 0 → 4)"]
             s0["STAGE 0 — header / throttle gate<br/>no body byte read"]
@@ -79,7 +80,7 @@ flowchart TD
     disk[("Operator volume<br/>baseDir/&lt;scope&gt;/…")]
     backend[("S3-compatible bucket<br/>&lt;scope&gt;/… key prefix")]
 
-    guest -->|connect| sock --> gate --> srv --> s0
+    guest -->|"outbound HTTPS, static Bearer"| edge --> srv --> s0
     s2 -.-> authz
     s3 -.-> audit
     s0 -.-> ceil
@@ -135,7 +136,7 @@ north face; the rest are enforced in the operational south-face build today.
 9. **Per-tenant instantiation.** A multi-tenant deployment instantiates the
    broker per tenant — one broker principal per tenant filesystem scope; a
    multiplexed broker is admitted only on a single-tenant `trusted_operator`
-   shelf. *(NFR-SEC-76 — one daemon, one scope, one socket.)*
+   shelf. *(NFR-SEC-76 — one daemon, one scope.)*
 10. **Credential admission.** A long-lived host-local backend credential is
     admitted only where `workload_trust_profile = trusted_operator` and the
     deployment is single-tenant; admission rejects any other profile or a
@@ -157,7 +158,7 @@ radius change between them.
 | 3 | [03-engine-seam.md](03-engine-seam.md) | The pluggable `objectstore.Engine` seam (ADR-0010): the 13-verb interface, the local-volume and S3 engines, path containment, atomic commit, erase-before-reuse, and the conformance suite proving parity. |
 | 4 | [04-audit.md](04-audit.md) | The fail-closed, hash-chained OCSF audit subsystem: the `Mandate` seam, audit-before-ack, the OCSF event shape, the tamper-evident chain, the permanent latch, and the audit-truth-vs-wire-reason (D8) split. |
 | 5 | [05-lifecycle.md](05-lifecycle.md) | Daemon and scope lifecycle: startup composition order, admission-before-bind, the accept loop, single-instance flock, per-session ceilings, graceful shutdown, and erase-before-reuse on every exit. |
-| 6 | [06-transport.md](06-transport.md) | The south-face transport and wire surface: Connect-JSON over HTTP/1.1 on a per-session Unix socket, the peer-cred gate, the 16 unary + 2 streaming operations, the 5-byte stream frame, and the error mapping. |
+| 6 | [06-transport.md](06-transport.md) | The south-face transport and wire surface: REST-JSON over HTTPS/HTTP-2 reached guest→edge→service, the edge-injected filestore credential, the 16 unary + 2 streaming operations, chunked-multipart large transfers, and the error mapping. |
 | 7 | [07-observability.md](07-observability.md) | Logging, metrics, health, and correlation: structured slog JSON with redaction, the hand-rolled Prometheus registry with closed label enums, the loopback ops listener, the health probes, and the single request correlation id. |
 
 ### Operator documents (how to run it)
