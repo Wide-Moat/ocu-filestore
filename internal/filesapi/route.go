@@ -73,6 +73,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == filesRoot:
 		h.routeCollection(w, r, ps, reqID, reqLog)
+	case path == archivePath:
+		// The additive archive verb is a SIBLING off /v1/files, matched BEFORE the
+		// per-resource prefix below so "archive" is never parsed as a {file_id}.
+		h.routeArchive(w, r, ps, reqID, reqLog)
 	case strings.HasPrefix(path, filesPrefix):
 		h.routeResource(w, r, ps, reqID, reqLog, strings.TrimPrefix(path, filesPrefix))
 	default:
@@ -92,6 +96,17 @@ func (h *Handler) routeCollection(w http.ResponseWriter, r *http.Request, ps sou
 		h.serveCreate(w, r, ps, reqID, reqLog)
 	default:
 		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+// routeArchive dispatches the additive /v1/files/archive verb: GET streams a zip
+// of the named accessible files. Any other method is 405 + Allow: GET.
+func (h *Handler) routeArchive(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqID string, reqLog *slog.Logger) {
+	switch r.Method {
+	case http.MethodGet:
+		h.serveArchive(w, r, ps, reqID, reqLog)
+	default:
+		writeMethodNotAllowed(w, http.MethodGet)
 	}
 }
 
