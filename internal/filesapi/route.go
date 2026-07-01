@@ -18,7 +18,7 @@ import (
 
 // The five Files-API endpoints (ADR-0023):
 //
-//	POST   /v1/files              create  (FENCED -> 501, body TBD pending ADR-0025)
+//	POST   /v1/files              create  (multipart upload -> 201 + FileObject)
 //	GET    /v1/files              list
 //	GET    /v1/files/{file_id}    metadata
 //	GET    /v1/files/{file_id}/content   bytes
@@ -72,7 +72,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
 	case path == filesRoot:
-		h.routeCollection(w, r, ps, reqLog)
+		h.routeCollection(w, r, ps, reqID, reqLog)
 	case strings.HasPrefix(path, filesPrefix):
 		h.routeResource(w, r, ps, reqID, reqLog, strings.TrimPrefix(path, filesPrefix))
 	default:
@@ -83,13 +83,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // routeCollection dispatches the /v1/files collection: GET lists, POST creates
-// (fenced 501). Any other method is 405 + Allow.
-func (h *Handler) routeCollection(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqLog *slog.Logger) {
+// (multipart upload). Any other method is 405 + Allow.
+func (h *Handler) routeCollection(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqID string, reqLog *slog.Logger) {
 	switch r.Method {
 	case http.MethodGet:
 		h.serveList(w, r, ps, reqLog)
 	case http.MethodPost:
-		h.serveCreate(w, r, reqLog)
+		h.serveCreate(w, r, ps, reqID, reqLog)
 	default:
 		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}

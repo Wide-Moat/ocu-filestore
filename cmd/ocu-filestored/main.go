@@ -1351,6 +1351,10 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 			Store:       hStore,
 			Scope:       filesapi.NewFencedScopeSource(),
 			SizeCeiling: cfg.maxRequestByte,
+			// The create path's pre-assembly size reject reads the SAME whole-object
+			// ceiling the south face's upload path reads (cfg.maxFileSize, bound from
+			// the broker-max-file-size flag): one ceiling, both planes.
+			MaxFileSize: cfg.maxFileSize,
 			Logger:      l,
 		})
 		if herr != nil {

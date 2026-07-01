@@ -16,12 +16,13 @@ import (
 func TestNewHandlerFailsLoudOnEveryNilSeam(t *testing.T) {
 	full := func() Deps {
 		return Deps{
-			Resolver: &fakeResolver{},
-			Guard:    &fakeGuard{},
-			Engine:   newFakeEngine(),
-			Ceilings: newFakeCeilings(),
-			Store:    newFakeStore(),
-			Scope:    fakeScope{ok: true},
+			Resolver:    &fakeResolver{},
+			Guard:       &fakeGuard{},
+			Engine:      newFakeEngine(),
+			Ceilings:    newFakeCeilings(),
+			Store:       newFakeStore(),
+			Scope:       fakeScope{ok: true},
+			MaxFileSize: 1 << 20,
 		}
 	}
 
@@ -55,13 +56,14 @@ func TestNewHandlerFailsLoudOnEveryNilSeam(t *testing.T) {
 // without an explicit logger.
 func TestNewHandlerNormalisesNilLogger(t *testing.T) {
 	h, err := NewHandler(Deps{
-		Resolver: &fakeResolver{},
-		Guard:    &fakeGuard{},
-		Engine:   newFakeEngine(),
-		Ceilings: newFakeCeilings(),
-		Store:    newFakeStore(),
-		Scope:    fakeScope{ok: true},
-		Logger:   nil,
+		Resolver:    &fakeResolver{},
+		Guard:       &fakeGuard{},
+		Engine:      newFakeEngine(),
+		Ceilings:    newFakeCeilings(),
+		Store:       newFakeStore(),
+		Scope:       fakeScope{ok: true},
+		MaxFileSize: 1 << 20,
+		Logger:      nil,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler with nil logger = %v, want nil", err)
@@ -71,16 +73,42 @@ func TestNewHandlerNormalisesNilLogger(t *testing.T) {
 	}
 }
 
+// TestNewHandlerRejectsNonPositiveMaxFileSize pins the create-plane ceiling gate:
+// NewHandler refuses with ErrMaxFileSizeUnset when MaxFileSize is not a positive
+// whole-object ceiling. The create path's pre-assembly size reject depends on a
+// real ceiling, so an unset one is a wiring fault refused before a listener binds,
+// never a silent "no limit".
+func TestNewHandlerRejectsNonPositiveMaxFileSize(t *testing.T) {
+	for _, size := range []int64{0, -1} {
+		h, err := NewHandler(Deps{
+			Resolver:    &fakeResolver{},
+			Guard:       &fakeGuard{},
+			Engine:      newFakeEngine(),
+			Ceilings:    newFakeCeilings(),
+			Store:       newFakeStore(),
+			Scope:       fakeScope{ok: true},
+			MaxFileSize: size,
+		})
+		if h != nil {
+			t.Fatalf("MaxFileSize=%d: NewHandler returned a non-nil handler", size)
+		}
+		if !errors.Is(err, ErrMaxFileSizeUnset) {
+			t.Fatalf("MaxFileSize=%d: err = %v, want ErrMaxFileSizeUnset", size, err)
+		}
+	}
+}
+
 // TestNewHandlerAcceptsFullDeps pins the happy path: every seam wired yields a
 // handler and no error.
 func TestNewHandlerAcceptsFullDeps(t *testing.T) {
 	h, err := NewHandler(Deps{
-		Resolver: &fakeResolver{},
-		Guard:    &fakeGuard{},
-		Engine:   newFakeEngine(),
-		Ceilings: newFakeCeilings(),
-		Store:    newFakeStore(),
-		Scope:    fakeScope{ps: southface.PeerScope{FilesystemID: "fs"}, ok: true},
+		Resolver:    &fakeResolver{},
+		Guard:       &fakeGuard{},
+		Engine:      newFakeEngine(),
+		Ceilings:    newFakeCeilings(),
+		Store:       newFakeStore(),
+		Scope:       fakeScope{ps: southface.PeerScope{FilesystemID: "fs"}, ok: true},
+		MaxFileSize: 1 << 20,
 	})
 	if err != nil || h == nil {
 		t.Fatalf("NewHandler(full) = (%v, %v), want (handler, nil)", h, err)
