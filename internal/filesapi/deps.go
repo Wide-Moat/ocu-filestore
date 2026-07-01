@@ -18,11 +18,14 @@
 //     / forbidden / scope_mismatch on any file_id path. There is no branch that
 //     distinguishes the two.
 //
-//   - FENCED write: POST /v1/files (create) returns 501 — the upload body is TBD
-//     in the frozen contract and inventing one is forbidden. The scope binding
-//     (ScopeSource) is a narrow seam with a structural PLACEHOLDER reading a
-//     host-attested filesystem_id field on the F9 request; the concrete F9
-//     request shape is the deferred ADR-0025 inter-component contract.
+//   - WRITE plane: POST /v1/files (create) streams a multipart/form-data upload
+//     into the engine and Puts a durable handle, mirroring the south upload
+//     pipeline (declared-size pre-buffer reject, scope cross-check, canonicalize,
+//     Resolve(write), audit-before-ack, the fd+in-flight-bytes ceilings, and the
+//     io.Pipe -> engine.WriteStream over/under-declaration aborts). The scope
+//     binding (ScopeSource) reads a host-attested filesystem_id field on the F9
+//     request; the concrete F9 request shape is the ADR-0025 inter-component
+//     contract (architect-agreed, pending the owner-gated canon merge).
 //
 // This package REUSES the south face's consumer-seam mirror types
 // (southface.Resolver/Guard/Engine/CeilingsRegistry/PeerScope/...) rather than
@@ -45,6 +48,13 @@ import (
 // runtime condition, and is refused at construction. Match it with errors.Is.
 var ErrSeamMissing = errors.New("filesapi: a required seam is nil")
 
+// ErrMaxFileSizeUnset is the fail-loud sentinel NewHandler returns when Deps
+// carries a non-positive MaxFileSize. The create path's pre-assembly size reject
+// (NFR-SEC-46) needs a concrete whole-object ceiling; a zero or negative ceiling
+// would admit an unbounded declared size, so it is a composition defect refused
+// at construction rather than a runtime condition. Match it with errors.Is.
+var ErrMaxFileSizeUnset = errors.New("filesapi: MaxFileSize must be a positive whole-object ceiling")
+
 // Deps is the fully-wired seam set the Files-API handler needs. Every field is
 // REQUIRED and non-nil — NewHandler validates each and refuses a half-wired
 // handler. The seam types are the south face's consumer-side mirrors so the one
@@ -58,9 +68,9 @@ type Deps struct {
 	// record before the operation is acknowledged, and an audit-write failure
 	// denies (NFR-SEC-79). A non-nil Mandate return DENIES.
 	Guard southface.Guard
-	// Engine is the storage engine the content path streams bytes from
-	// (ReadRange / Stat). The Files-API plane reads only — it never writes
-	// (create is fenced).
+	// Engine is the storage engine the plane streams bytes through: the content
+	// path reads (ReadRange / Stat) and the create path writes (WriteStream). The
+	// one engine seam serves both the read and the write plane.
 	Engine southface.Engine
 	// Ceilings throttles per session (ops/s, in-flight bytes, fd slots),
 	// fail-closed per session (NFR-SEC-46). The content path acquires an fd slot
@@ -76,10 +86,20 @@ type Deps struct {
 	// (the F9 host leg has no edge-injected Bearer).
 	Scope ScopeSource
 	// SizeCeiling bounds an inbound request body read so a hostile sender cannot
-	// stream an unbounded body. The read/delete paths carry no request body of
-	// consequence, but the ceiling is threaded for symmetry with the fenced
-	// create path and any future body-bearing read parameter.
+	// stream an unbounded body. On the create path it bounds the multipart
+	// "params" FIELD read (the file PART carries the bulk bytes, bounded by
+	// MaxFileSize instead); the read/delete paths carry no request body of
+	// consequence.
 	SizeCeiling int64
+	// MaxFileSize is the WHOLE-OBJECT upload ceiling (NFR-SEC-46): the create
+	// path refuses a declared_size_bytes strictly greater than this value BEFORE
+	// staging any byte (the pre-assembly size reject). It is REQUIRED and must be
+	// positive — NewHandler refuses a handler wired with MaxFileSize <= 0, so the
+	// create plane is always live with a concrete ceiling (never silently
+	// disabled). Its value is the control-plane's BrokerMaxFileSizeBytes, mirrored
+	// from the same cfg.BrokerMaxFileSize the south face's whole-object ceiling
+	// reads.
+	MaxFileSize int64
 	// Logger is the structured logger; a nil logger is normalised to a
 	// discard-all logger so a handler never panics on a nil log.
 	Logger *slog.Logger
@@ -112,6 +132,12 @@ func NewHandler(deps Deps) (*Handler, error) {
 		return nil, errSeam("Store")
 	case deps.Scope == nil:
 		return nil, errSeam("Scope")
+	}
+	// The create path is always live; a non-positive whole-object ceiling would
+	// leave its pre-assembly size reject toothless, so it is refused here (the
+	// fail-loud composition gate, distinct from a nil seam).
+	if deps.MaxFileSize <= 0 {
+		return nil, ErrMaxFileSizeUnset
 	}
 	if deps.Logger == nil {
 		deps.Logger = slog.New(slog.DiscardHandler)

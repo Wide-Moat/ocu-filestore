@@ -286,21 +286,21 @@ jobs:
       # and file-artifact-api.schema.json; we do not vendor mount-config).
       # We vendor only those two files — mount-config belongs to the guest.
       #
-      # The prior pin (73e82c6) predated the storage-recut (#273) that retired
-      # the broker/sandbox formulation for object-store-service/mount-plane: its
-      # contracts/storage/ still carried "Session sandbox -> Storage broker",
-      # while our vendored copies carry the recut "Mount-plane ... object-store
-      # service" wording. 73e82c6 is NOT an ancestor of next/v1 (divergent,
-      # stale), so the gate failed against the wrong formulation. The pin below
-      # is the current next/v1 HEAD (the authoritative branch), an immutable SHA
-      # whose contracts/storage/ tree is byte-identical to our vendored copies
+      # The pin below is an immutable next/v1 SHA whose contracts/ tree is
+      # byte-identical to our vendored copies: contracts/storage/
       # (file-ops.schema.json + file-artifact-api.schema.json; mount-config
-      # belongs to the guest and is not vendored). Bump this SHA deliberately
-      # when re-vendoring; verify byte-identity (sha256) before bumping.
+      # belongs to the guest and is not vendored) AND contracts/openapi/
+      # files-api.openapi.yaml (the frozen Files-API body surface, ADR-0028).
+      # Bumped 62f5eeb -> 8fe7e94 to pick up the frozen Files-API bodies
+      # (ADR-0028, #323) plus the deny-status-code alignment (#330, which corrects
+      # the create/list deny statuses to the shipped deny classes and the list
+      # cursor form); the two storage schemas are unchanged at 8fe7e94, verified
+      # byte-identical alongside the openapi spec. Bump this SHA deliberately when
+      # re-vendoring; verify byte-identity before bumping.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: Wide-Moat/open-computer-use
-          ref: 62f5eeb598f2f4e0370d3c35d5d70b8f204df7de
+          ref: 8fe7e94890364a79a9d9cc4eb1b8167e9d394e47
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh

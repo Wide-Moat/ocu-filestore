@@ -240,6 +240,12 @@ func newTestHandler(d Deps) *Handler {
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
+	if d.SizeCeiling == 0 {
+		d.SizeCeiling = 1 << 20 // 1 MiB default params/message ceiling for tests
+	}
+	if d.MaxFileSize == 0 {
+		d.MaxFileSize = 1 << 20 // 1 MiB default whole-object ceiling for tests
+	}
 	h, err := NewHandler(d)
 	if err != nil {
 		panic("newTestHandler: " + err.Error())

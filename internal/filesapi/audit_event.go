@@ -79,6 +79,64 @@ func readDenyEvent(ps southface.PeerScope, rec handlestore.Record, grant southfa
 	}
 }
 
+// createAllowEvent builds the ALLOW audit event for a create/upload. ActivityID
+// is a Create; ByteCount carries the DECLARED size (the record names the bytes
+// the create is about to stage, mirroring the south upload's streamAuditEvent
+// declared-size ALLOW); ObjectHandle is the engine object reference the bytes
+// are written to; Downloadable carries the broker-resolved grant. Intent is
+// "write" (the create axis). It is Mandated BEFORE the file part is opened
+// (audit-before-ack, SEC-79): the ALLOW lands before the first inbound byte.
+//
+// Unlike the read/delete helpers this event is built from the raw engine
+// reference and grant rather than a resolved handlestore.Record: on the create
+// path the record does not exist yet (the handle is Put only AFTER the bytes are
+// durable), so the ObjectHandle is the engine path the write targets.
+func createAllowEvent(ps southface.PeerScope, engineRef string, grant southface.Grant, declared int64, reqID string) auditgate.FileActivityEvent {
+	return auditgate.FileActivityEvent{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  auditgate.ActivityCreate,
+		Actor: auditgate.ActorSubject{
+			UserUID:    strconv.FormatUint(uint64(ps.UID), 10),
+			SessionUID: ps.FilesystemID,
+			ProcessPID: ps.PID,
+		},
+		FilesystemID:   ps.FilesystemID,
+		ObjectHandle:   engineRef,
+		ByteCount:      declared,
+		Intent:         string(southface.IntentWrite),
+		Downloadable:   grant.Downloadable,
+		Outcome:        auditgate.Outcome{DispositionID: auditgate.DispositionAllow},
+		CorrelationUID: reqID,
+	}
+}
+
+// createDenyEvent builds the DENY audit event for a create refused after the
+// path/scope/authz gates (e.g. a resolver deny, a size reject, or an engine
+// refusal). It names the engine reference the refused create concerned so the
+// durable record is honest about the targeted object, and carries the
+// broker-resolved truth in XDenyReason. Downloadable carries the grant value
+// that produced (or would have produced) the refusal.
+func createDenyEvent(ps southface.PeerScope, engineRef string, grant southface.Grant, auditReason, reqID string) auditgate.FileActivityEvent {
+	return auditgate.FileActivityEvent{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  auditgate.ActivityCreate,
+		Actor: auditgate.ActorSubject{
+			UserUID:    strconv.FormatUint(uint64(ps.UID), 10),
+			SessionUID: ps.FilesystemID,
+			ProcessPID: ps.PID,
+		},
+		FilesystemID:   ps.FilesystemID,
+		ObjectHandle:   engineRef,
+		ByteCount:      0,
+		Intent:         string(southface.IntentWrite),
+		Downloadable:   grant.Downloadable,
+		Outcome:        auditgate.Outcome{DispositionID: auditgate.DispositionDeny, XDenyReason: auditReason},
+		CorrelationUID: reqID,
+	}
+}
+
 // deleteAllowEvent builds the ALLOW audit event for a delete. ActivityID is a
 // Delete; ObjectHandle is the resolved Record's backend reference. It is
 // Mandated AFTER the successful Get (the record exists and its scope matched) and
