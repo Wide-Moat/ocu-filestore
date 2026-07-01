@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: govulncheck-nightly
+
+# govulncheck scans the built binary against the Go vulnerability database
+# (T2-10, SUPPLY-03). It runs here as a SCHEDULED job plus a push-to-main scan:
+# it does not block PR merge, and a reachable non-waived advisory still surfaces
+# loudly at merge-integration time or the next night. The reachability waiver
+# (currently EMPTY — this service has no reachable advisories), the strip-guard,
+# and the RED-when-neutered red-probe are the same gate the PR pipeline carried —
+# a MOVE of the gate, NOT a weakening: the same vuln.go.dev DB, the same
+# fail-closed-on-empty posture, the same rule-1 wall against any reachable
+# non-waived finding.
+#
+# HISTORY: the "govulncheck CI hang" that motivated moving this gate off the PR
+# path was NEVER the scan, the toolchain, or the runner's process-reap. The
+# waiver script's is-the-JSON-non-empty check used a bash pattern SUBSTITUTION
+# (${JSON//[space]/}) that is QUADRATIC over the large scan stream on some
+# runners' bash — a multi-minute pure-CPU spin while the scan itself takes ~1 s.
+# The check is an O(n) glob match now (scripts/govulncheck-waiver.sh) and the job
+# completes in seconds. The nightly+push placement is kept as the chosen depth,
+# on that corrected rationale.
+#
+# The waiver (scripts/govulncheck-waiver.sh) fails on any reachable, non-waived
+# finding AND on any waived ID that vanishes (upstream fix landed -> the waiver is
+# dead and must be removed). The table is empty today; the code path is live for
+# the first advisory that ever becomes reachable. The red-probe
+# (scripts/govulncheck-waiver-redprobe.sh) proves the gate reds when neutered.
+#
+# PORTED from the fleet reference (ocu-control). A repo that copied an earlier
+# waiver script MUST carry the O(n) non-emptiness fix — the quadratic substitution
+# IS the "govulncheck-hang" class, and it wedges any bash step that assigns a
+# large scan stream to a variable and pattern-substitutes over it, per-PR and
+# scheduled alike.
+
+on:
+  schedule:
+    # 07:13 UTC daily — an off-the-hour minute so the run does not pile onto the
+    # top-of-hour scheduler surge (which delays and occasionally drops cron runs).
+    - cron: '13 7 * * *'
+  # Manual trigger so the gate can be exercised on demand (e.g. right after a
+  # dependency bump) without waiting for the nightly slot.
+  workflow_dispatch: {}
+  # Also scan on every push to main, so a merge that introduces a reachable
+  # non-waived advisory is caught at integration time, not only the next night.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: govulncheck-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    # A backstop well above the isolated-scan time (~1s) so a genuine runner-side
+    # stall fails loudly rather than burning the GitHub default 360min, while
+    # leaving ample headroom over the waiver + red-probe + egress probe.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - name: install govulncheck (pinned)
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+      # Build an UNSTRIPPED ocu-filestored for binary-mode govulncheck to scan. The
+      # waiver script runs `govulncheck -mode binary` (NOT a source scan). Binary
+      # mode needs symbols, so this build MUST NOT pass -ldflags='-s -w' (default
+      # `go build` keeps the symbol table + DWARF). The waiver's strip-guard fails
+      # closed if the binary is ever stripped, so a future -s -w here is caught, not
+      # silently fail-open. (The release build DOES strip; this gate build is
+      # deliberately separate.)
+      - name: build an unstripped ocu-filestored for the binary-mode scan
+        run: CGO_ENABLED=0 go build -trimpath -o ocu-filestored-gatescan ./cmd/ocu-filestored
+      - name: govulncheck waiver red-probe (RED-when-neutered)
+        run: bash scripts/govulncheck-waiver-redprobe.sh
+      # Diagnostic only (never fails the job): probe runner egress to the vuln DB
+      # host. A fast curl success means egress is fine and a hang is a transient
+      # stall; a curl timeout/failure means the runner cannot reach the DB at all,
+      # so a govulncheck fail-closed is correct, not a flake. Bounded so the
+      # diagnostic itself cannot hang the job.
+      - name: probe vuln-DB egress (diagnostic, non-blocking)
+        run: |
+          echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
+          curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
+            https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
+      - name: govulncheck (waiver-gated)
+        env:
+          OCU_GATE_BINARY: ${{ github.workspace }}/ocu-filestored-gatescan
+        run: bash scripts/govulncheck-waiver.sh
