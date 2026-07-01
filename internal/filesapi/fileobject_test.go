@@ -81,11 +81,24 @@ func TestListResponseEnvelope(t *testing.T) {
 }
 
 // TestListResponseEmptyPageMarshalsArray pins that an empty page marshals data
-// as [] (not null) so a caller never special-cases a JSON null.
+// as [] (not null) so a caller never special-cases a JSON null, and that the
+// optional boundary/cursor fields are ABSENT (omitempty), not empty strings: the
+// contract marks first_id, last_id, and next_cursor absent on an empty/final page
+// (min length 1 when present), so emitting "" would violate the wire schema.
 func TestListResponseEmptyPageMarshalsArray(t *testing.T) {
 	env := newListResponse(handlestore.ListPage{})
 	raw, _ := json.Marshal(env)
-	if !strings.Contains(string(raw), `"data":[]`) {
+	s := string(raw)
+	if !strings.Contains(s, `"data":[]`) {
 		t.Fatalf("empty page data is not []: %s", raw)
+	}
+	for _, field := range []string{"first_id", "last_id", "next_cursor"} {
+		if strings.Contains(s, `"`+field+`"`) {
+			t.Fatalf("empty page emitted %q (want it absent via omitempty): %s", field, raw)
+		}
+	}
+	// has_more is always present (a bool, not omitempty).
+	if !strings.Contains(s, `"has_more"`) {
+		t.Fatalf("has_more missing from the envelope: %s", raw)
 	}
 }
