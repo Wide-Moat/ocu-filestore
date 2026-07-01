@@ -49,18 +49,22 @@ func TestListEnvelopeShape(t *testing.T) {
 type pagingStore struct {
 	*fakeStore
 	page1, page2 handlestore.ListPage
+	gotCursor    string // the Cursor the most recent List call received
 }
 
 func (s *pagingStore) List(_ context.Context, in handlestore.ListInput) (handlestore.ListPage, error) {
+	s.gotCursor = in.Cursor
 	if in.Cursor == "" {
 		return s.page1, nil
 	}
 	return s.page2, nil
 }
 
-// TestListTwoPageCursorPagination pins cursor pagination: the first page carries
-// a next_cursor + has_more; passing that cursor fetches the final page with
-// has_more=false and no next_cursor.
+// TestListTwoPageCursorPagination pins ?after=<next_cursor> pagination: the first
+// page carries an opaque next_cursor + has_more; passing that token back as
+// ?after fetches the final page (has_more=false, no next_cursor). It also pins
+// the round-trip: the token the client sends as ?after reaches the store as the
+// opaque Cursor verbatim (the wire never substitutes the bare boundary id).
 func TestListTwoPageCursorPagination(t *testing.T) {
 	ps := &pagingStore{
 		fakeStore: newFakeStore(),
@@ -90,11 +94,15 @@ func TestListTwoPageCursorPagination(t *testing.T) {
 		t.Fatalf("page1 = %+v", e1)
 	}
 
-	w2 := doReq(h, http.MethodGet, "/v1/files?cursor=cur-1")
+	// Pass the opaque next_cursor back as ?after; it must reach the store verbatim.
+	w2 := doReq(h, http.MethodGet, "/v1/files?after=cur-1")
 	var e2 ListResponse
 	_ = json.Unmarshal(w2.Body.Bytes(), &e2)
 	if e2.HasMore || e2.NextCursor != "" || len(e2.Data) != 1 || e2.Data[0].ID != "f2" {
 		t.Fatalf("page2 = %+v", e2)
+	}
+	if ps.gotCursor != "cur-1" {
+		t.Fatalf("store received cursor %q, want the opaque next_cursor cur-1 passed via ?after", ps.gotCursor)
 	}
 }
 

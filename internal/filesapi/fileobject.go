@@ -52,22 +52,30 @@ func newFileObject(r handlestore.Record) FileObject {
 	}
 }
 
-// ListResponse is the Files-API list envelope (ADR-0023): the page of
-// FileObjects plus the pagination cursor and page bounds. The field names match
-// the Files dialect (data / has_more / first_id / last_id). next_cursor is the
-// opaque continuation token a caller passes back to fetch the next page.
+// ListResponse is the Files-API list envelope (ADR-0028): the page of
+// FileObjects, whether more pages follow, informational boundary ids, and the
+// opaque forward cursor. Only data and has_more are always present; first_id,
+// last_id, and next_cursor are omitted when they do not apply (an empty page has
+// no boundary ids; the final page has no next_cursor).
+//
+// first_id/last_id are INFORMATIONAL boundary markers, NOT resume keys. The
+// forward cursor is next_cursor, passed back as ?after=<next_cursor>: it is the
+// store's opaque keyset token (created-at/file-id boundary tuple), which survives
+// a deleted boundary record where a bare last_id would repeat or strand a record.
 type ListResponse struct {
 	// Data is the page of file objects in the store's stable total order.
 	Data []FileObject `json:"data"`
 	// HasMore is true when at least one more record sorts after this page.
 	HasMore bool `json:"has_more"`
-	// FirstID is the file_id of the first record on this page (empty page -> "").
-	FirstID string `json:"first_id"`
-	// LastID is the file_id of the last record on this page (empty page -> "").
-	LastID string `json:"last_id"`
-	// NextCursor is the opaque token to pass as the next page's cursor, or empty
-	// when this is the final page.
-	NextCursor string `json:"next_cursor"`
+	// FirstID is the id of the first record on this page (informational, omitted
+	// on an empty page).
+	FirstID string `json:"first_id,omitempty"`
+	// LastID is the id of the last record on this page (informational boundary
+	// marker, NOT the resume key; omitted on an empty page).
+	LastID string `json:"last_id,omitempty"`
+	// NextCursor is the opaque forward resume token passed back as ?after=; present
+	// while HasMore is true, omitted on the final page.
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
 // newListResponse builds the list envelope from a handlestore.ListPage. The Data
