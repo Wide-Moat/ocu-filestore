@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"net"
@@ -119,21 +120,24 @@ func TestRunDistinctHandleStoreNoCollision(t *testing.T) {
 	// This daemon uses store B — a distinct path, so no collision.
 	hsPath := filepath.Join(root, "mine", "handles.jsonl")
 	opsAddr := reserveOpsAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(handleStoreArgs(t, hsPath, opsAddr)) }()
+	go func() { runErr <- runCtx(ctx, handleStoreArgs(t, hsPath, opsAddr)) }()
 	waitServing(t, opsAddr)
 
 	// Healthy start: the distinct store opened and the daemon is serving.
 	if _, statErr := os.Stat(hsPath); statErr != nil {
 		t.Fatalf("distinct handle store was not created: %v", statErr)
 	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	// Stop the daemon by cancelling its context — the same clean-drain path a
+	// SIGTERM drives, but scoped to this daemon so no process-global signal can
+	// terminate the test binary.
+	cancel()
 	select {
 	case <-runErr:
 	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return within 10s of SIGTERM")
+		t.Fatal("runCtx() did not return within 10s of context cancellation")
 	}
 }
 
@@ -143,17 +147,17 @@ func TestRunDistinctHandleStoreNoCollision(t *testing.T) {
 func TestRunEmptyHandleStoreNoStoreNoLock(t *testing.T) {
 	opsAddr := reserveOpsAddr(t)
 	args := handleStoreArgs(t, "", opsAddr) // no --handle-store
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(args) }()
+	go func() { runErr <- runCtx(ctx, args) }()
 	waitServing(t, opsAddr)
 
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	cancel()
 	select {
 	case <-runErr:
 	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return within 10s of SIGTERM")
+		t.Fatal("runCtx() did not return within 10s of context cancellation")
 	}
 	// Nothing to assert on a lock file: with no path there is no lock resource.
 	// The clean serve+stop is the assertion (an empty store path must not wedge
@@ -172,8 +176,10 @@ func TestRunPinsHandleStoreDirTo0700(t *testing.T) {
 	hsPath := filepath.Join(hsDir, "handles.jsonl")
 	opsAddr := reserveOpsAddr(t)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(handleStoreArgs(t, hsPath, opsAddr)) }()
+	go func() { runErr <- runCtx(ctx, handleStoreArgs(t, hsPath, opsAddr)) }()
 	waitServing(t, opsAddr)
 
 	info, statErr := os.Stat(hsDir)
@@ -184,13 +190,11 @@ func TestRunPinsHandleStoreDirTo0700(t *testing.T) {
 		t.Errorf("handle-store directory mode = %o, want 0700 (Chmod must pin 0700 regardless of umask)", got)
 	}
 
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	cancel()
 	select {
 	case <-runErr:
 	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return within 10s of SIGTERM")
+		t.Fatal("runCtx() did not return within 10s of context cancellation")
 	}
 }
 

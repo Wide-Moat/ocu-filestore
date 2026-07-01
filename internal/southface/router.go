@@ -31,11 +31,11 @@ const multipartContentType = "multipart/form-data"
 // the dispatcher owns the LOCKED STAGE 0->4 spine and re-parses the route to
 // drive the per-op handler.
 type restRouter struct {
-	// dispatcher is the wrapped LOCKED-spine handler. A well-formed unary
-	// request (and, this wave, the still-on-Connect fileDownload) is delegated
-	// to it verbatim. The multipart fileUpload op is routed to the dispatcher's
-	// dedicated multipart entry (serveUploadMultipart) so the REST upload handler
-	// runs instead of the retired Connect streaming branch.
+	// dispatcher is the wrapped LOCKED-spine handler. A well-formed unary request
+	// is delegated to it verbatim. The two data-plane ops take dedicated REST
+	// entries on the dispatcher instead: fileUpload routes to serveUploadMultipart
+	// and fileDownload to serveDownloadOctetStream, so no op rides the retired
+	// Connect streaming branch.
 	dispatcher *dispatcher
 }
 

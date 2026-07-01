@@ -715,8 +715,10 @@ func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
 		"--ops-listen", opsAddr,
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(args) }()
+	go func() { runErr <- runCtx(ctx, args) }()
 
 	client := &http.Client{Timeout: time.Second}
 	probe := func(path string) (int, error) {
@@ -755,13 +757,11 @@ func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
 		t.Fatalf("/readyz returned 404 — readiness route was not registered before Serve")
 	}
 
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	cancel()
 	select {
 	case <-runErr:
 	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return within 10s of SIGTERM")
+		t.Fatal("runCtx() did not return within 10s of context cancellation")
 	}
 }
 
@@ -807,11 +807,13 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 		"--ops-listen", opsAddr,
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(args) }()
+	go func() { runErr <- runCtx(ctx, args) }()
 
 	// Wait until the daemon is serving (the audit-sink directory is created well
-	// before this point), so the signal handler is armed before SIGTERM.
+	// before this point).
 	client := &http.Client{Timeout: time.Second}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -834,14 +836,13 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 		t.Errorf("audit-sink directory mode = %o, want 0700 (the Chmod must pin 0700 regardless of umask)", got)
 	}
 
-	// Unwind the daemon: SIGTERM triggers the bounded drain + teardown.
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	// Unwind the daemon: cancelling the context triggers the same bounded drain +
+	// teardown a SIGTERM would, without a process-global signal.
+	cancel()
 	select {
 	case <-runErr:
 	case <-time.After(10 * time.Second):
-		t.Fatal("run() did not return within 10s of SIGTERM")
+		t.Fatal("runCtx() did not return within 10s of context cancellation")
 	}
 }
 
@@ -858,7 +859,12 @@ func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
 		closeErr:     teardownErr,
 	}
 	result := make(chan error, 1)
-	go func() { result <- serveUntilSignal(srv, testLogger(), nil) }()
+	// This test deliberately drives the REAL OS-signal path (not context
+	// cancellation): it is the single remaining self-SIGTERM test, kept so the
+	// production signal wiring stays covered. It is safe in isolation — the
+	// handler is armed before Serve launches and the test consumes exactly the
+	// one signal it sends.
+	go func() { result <- serveUntilSignal(context.Background(), srv, testLogger(), nil) }()
 
 	// Serve has started, therefore signal.NotifyContext is already armed
 	// (it is registered before the Serve goroutine launches).
@@ -894,7 +900,7 @@ func TestServeUntilSignalServeFaultStillTearsDown(t *testing.T) {
 		serveErr:     serveFault,
 		closeErr:     teardownErr,
 	}
-	err := serveUntilSignal(srv, testLogger(), nil)
+	err := serveUntilSignal(context.Background(), srv, testLogger(), nil)
 	select {
 	case <-srv.closeCalled:
 	default:
@@ -1677,8 +1683,10 @@ func TestSdNotifyWiredInServeUntilSignal(t *testing.T) {
 		closeCalled:  make(chan struct{}),
 		blockServe:   true,
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	result := make(chan error, 1)
-	go func() { result <- serveUntilSignal(srv, testLogger(), nil) }()
+	go func() { result <- serveUntilSignal(ctx, srv, testLogger(), nil) }()
 
 	// Wait for SdNotifyReady to fire (READY=1 datagram).
 	<-srv.serveStarted
@@ -1695,10 +1703,9 @@ func TestSdNotifyWiredInServeUntilSignal(t *testing.T) {
 		t.Fatalf("first datagram: got %q, want READY=1", got)
 	}
 
-	// Deliver SIGTERM to trigger SdNotifyStopping.
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("self-SIGTERM: %v", err)
-	}
+	// Stop via context cancellation, which drives the same STOPPING notification
+	// path a SIGTERM would — without a process-global signal.
+	cancel()
 	if err := ln.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}

@@ -272,7 +272,21 @@ type brokerConfig struct {
 // nil; -version prints the build identity and returns nil (exit 0). A
 // non-admitted profile/tenancy/credential triple, or a missing/invalid
 // required flag, returns a typed error BEFORE any socket is bound.
+//
+// run is the production entry (main() calls it): the serve loop stops on
+// SIGTERM/SIGINT. It delegates to runCtx with a never-cancelled background
+// context, so the only stop trigger in production is the OS signal.
 func run(args []string) error {
+	return runCtx(context.Background(), args)
+}
+
+// runCtx is run with an injectable parent context. The serve loop stops on
+// SIGTERM/SIGINT OR when ctx is cancelled (both drive the same clean-drain
+// teardown). Cancelling ctx lets a caller stop a serving daemon WITHOUT a
+// process-global signal — tests use it so a self-signal can never terminate the
+// test binary. Production passes context.Background(), which never cancels, so
+// the signal remains the sole stop trigger and behaviour is unchanged.
+func runCtx(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ocu-filestored", flag.ContinueOnError)
 
 	showVersion := fs.Bool("version", false,
@@ -603,17 +617,23 @@ func run(args []string) error {
 		go opsListener.Serve()
 		l.Info("ops listener started", slog.String("addr", opsListener.Addr()))
 	}
-	return serveUntilSignal(srv, l, opsListener)
+	return serveUntilSignal(ctx, srv, l, opsListener)
 }
 
 // serveUntilSignal serves srv until either Serve returns on its own (a
-// listener fault) or SIGTERM/SIGINT arrives. On a signal the session begins
-// its bounded drain (southface force-closes stragglers past the bound) and
-// teardown ALWAYS runs — TeardownScope erase-before-reuse plus socket
-// removal (NFR-SEC-54): a clean stop signal must never skip the erase. Every
-// exit path combines the serve and close results with errors.Join, so a
-// teardown error is never silently dropped behind a serve error (or vice
-// versa).
+// listener fault), SIGTERM/SIGINT arrives, or parent is cancelled. On a signal
+// or a parent cancellation the session begins its bounded drain (southface
+// force-closes stragglers past the bound) and teardown ALWAYS runs —
+// TeardownScope erase-before-reuse plus socket removal (NFR-SEC-54): a clean
+// stop must never skip the erase. Every exit path combines the serve and close
+// results with errors.Join, so a teardown error is never silently dropped
+// behind a serve error (or vice versa).
+//
+// parent is the caller's stop context. The signal context is derived from it,
+// so cancelling parent drives the same clean-drain path as an OS signal. In
+// production parent is context.Background() (never cancelled) and the OS signal
+// is the only trigger; a test passes a cancellable context to stop the daemon
+// without a process-global signal.
 //
 // l is the structured logger. Lifecycle events (signal received, drain
 // starting, teardown done) are emitted at INFO so operators following the
@@ -621,8 +641,8 @@ func run(args []string) error {
 //
 // opsListener is the loopback ops listener; if non-nil it is shut down
 // alongside the south face server. A nil opsListener is a no-op.
-func serveUntilSignal(srv southface.Server, l *slog.Logger, opsListener *telemetry.OpsListener) error {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+func serveUntilSignal(parent context.Context, srv southface.Server, l *slog.Logger, opsListener *telemetry.OpsListener) error {
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	l.Info("south face listening; waiting for signal")
