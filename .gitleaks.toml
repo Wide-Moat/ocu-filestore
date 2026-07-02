@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 
-# gitleaks allowlist for the ocu-filestore repository.
+# gitleaks configuration for the ocu-filestore repository.
 #
+# A gitleaks config auto-loaded from the repository root REPLACES the
+# built-in ruleset unless it explicitly extends it. Without the [extend]
+# block below, the scanner would run with ZERO detection rules — every
+# scan would report "no leaks found" no matter what was committed
+# (a silently vacuous, always-green secrets gate). [extend].useDefault
+# pulls in the full built-in ruleset first; the allowlist that follows
+# then suppresses only documented false positives on top of it.
+[extend]
+  # Load the built-in gitleaks ruleset. This is load-bearing: the CI
+  # secrets gate (.github/workflows/security.yml) runs `gitleaks detect`
+  # with no --config flag, so this root file is auto-detected and, absent
+  # useDefault, would substitute emptiness for the default rules.
+  useDefault = true
+
 # Each entry below is a documented false positive: a well-known example
 # value from public AWS documentation that appears in our own docs to
 # show the credential-file format accepted by the broker.  No real
