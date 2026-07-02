@@ -17,28 +17,27 @@
   # useDefault, would substitute emptiness for the default rules.
   useDefault = true
 
-# Each entry below is a documented false positive: a well-known example
-# value from public AWS documentation that appears in our own docs to
-# show the credential-file format accepted by the broker.  No real
-# credentials are committed; entries here are scoped as tightly as
-# possible (regex on the exact example value, confined to doc files).
+# The allowlist below suppresses a single documented false positive by its
+# EXACT value, and nothing else. It deliberately carries NO `paths` (or
+# `commits`/`stopwords`) condition: within one gitleaks allowlist the
+# conditions are OR-combined, so adding `paths = ["docs/"]` would suppress
+# EVERY finding whose file is under docs/ — a real credential committed to any
+# doc would then pass the gate silently. Scoping by the exact public example
+# value keeps the suppression to that one constant, repo-wide, with no path
+# blanket. (matchCondition = "AND" is not a fix here: gitleaks v8.30.1 ignores
+# it.)
 
 [allowlist]
-  description = "Documented false positives: AWS example credentials in docs"
+  description = "Documented false positive: the public AWS-example secret key"
 
-  # "wJalrXUtnFEMI/K7MDENG" is the canonical AWS-documentation example
-  # secret access key that has appeared in Amazon's official SDK and IAM
-  # guides for over a decade.  It appears in docs/engines.md and
-  # docs/operations.md to illustrate the two-line credential file format
-  # required by the broker's -s3-credential-file flag.  This value is
-  # publicly known, widely published, and carries no authentication
-  # capability against any real AWS account.
+  # "wJalrXUtnFEMI/K7MDENG" is the canonical AWS-documentation example secret
+  # access key that has appeared in Amazon's official SDK and IAM guides for
+  # over a decade. It appears in docs/engines.md and docs/operations.md to
+  # illustrate the two-line credential file format required by the broker's
+  # -s3-credential-file flag. This value is publicly known, widely published,
+  # and carries no authentication capability against any real AWS account, so
+  # suppressing it by its exact value repo-wide is safe. Any OTHER secret —
+  # including one in a doc file — is still caught.
   regexes = [
     "wJalrXUtnFEMI/K7MDENG",
-  ]
-
-  # Confine the allowlist to documentation files only: a real credential
-  # accidentally placed outside docs/ would NOT be suppressed.
-  paths = [
-    "docs/",
   ]
