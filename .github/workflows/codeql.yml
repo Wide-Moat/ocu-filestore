@@ -6,11 +6,20 @@ name: codeql
 # the semgrep SARIF upload in security.yml: that uploads a third-party SAST
 # report into the Security tab, whereas this runs CodeQL's own taint/dataflow
 # engine over the compiled module.
+#
+# ADVISORY, NON-BLOCKING — this is NOT a merge gate. codeql-action/analyze exits
+# 0 regardless of findings (results surface as code-scanning alerts), and the
+# CodeQL context is intentionally NOT in branch-protection required_status_checks.
+# The BLOCKING SAST floor is semgrep + gosec (both in security.yml/go.yml and both
+# required); CodeQL is defense-in-depth that monitors main and flags alerts for
+# review, not a per-PR gate. It therefore runs on push-to-main and on a weekly
+# schedule — NOT on pull_request — so it never presents a green PR check that
+# looks like a gate but never blocks. (To make CodeQL blocking in future, use a
+# GitHub "require code scanning results" ruleset thresholded on security-severity,
+# not an ad-hoc result.level check — the latter is itself vacuous.)
 
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     # Weekly cron: Monday at 02:00 UTC. Offset one day from security.yml's
