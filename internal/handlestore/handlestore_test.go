@@ -75,6 +75,7 @@ func TestNoExportedErrorMapsToScopeMismatch(t *testing.T) {
 	registry := map[string]error{
 		"ErrNotFound":         ErrNotFound,
 		"ErrStoreUnavailable": ErrStoreUnavailable,
+		"ErrMalformedCursor":  ErrMalformedCursor,
 	}
 
 	discovered := exportedErrorVarNames(t)

@@ -33,12 +33,14 @@ const cursorV1 byte = 1
 // can forge a boundary.
 const cursorFieldSep byte = 0
 
-// errMalformedCursor names a cursor token that is not a base64url-decodable,
+// ErrMalformedCursor names a cursor token that is not a base64url-decodable,
 // non-empty, correctly-versioned token the store minted. The store only ever
 // decodes cursors it minted (the token is opaque to callers); a malformed
-// token is a client fault the wire maps to 400. It is unexported: callers never
-// branch on it directly, the wire layer maps it.
-var errMalformedCursor = errors.New("handlestore: malformed cursor")
+// token — including a bare last_id that was never a valid cursor — is a client
+// fault. It is EXPORTED so the wire layer (filesapi serveList) can classify it
+// as a 400 invalid_argument (denyclass.Malformed) rather than misfiling it as a
+// retryable backend-unavailable 503.
+var ErrMalformedCursor = errors.New("handlestore: malformed cursor")
 
 // encodeCursor mints an opaque keyset cursor encoding the FULL sort key
 // (CreatedAt, FileID) of the last-emitted record on a page. The wire form is
@@ -59,7 +61,7 @@ func encodeCursor(afterCreatedAt, afterFileID string) string {
 // decodeCursor reverses encodeCursor. An empty token is the genuine first-page
 // / no-cursor case and returns ("", "", nil). A token that is not base64url-
 // decodable, decodes to zero bytes, carries the wrong version byte, or lacks the
-// single field separator returns errMalformedCursor. Otherwise it returns the
+// single field separator returns ErrMalformedCursor. Otherwise it returns the
 // (CreatedAt, FileID) sort key to resume strictly after.
 func decodeCursor(tok string) (createdAt, fileID string, err error) {
 	if tok == "" {
@@ -67,11 +69,11 @@ func decodeCursor(tok string) (createdAt, fileID string, err error) {
 	}
 	b, derr := base64.RawURLEncoding.DecodeString(tok)
 	if derr != nil || len(b) == 0 || b[0] != cursorV1 {
-		return "", "", errMalformedCursor
+		return "", "", ErrMalformedCursor
 	}
 	sep := bytes.IndexByte(b[1:], cursorFieldSep)
 	if sep < 0 {
-		return "", "", errMalformedCursor
+		return "", "", ErrMalformedCursor
 	}
 	return string(b[1 : 1+sep]), string(b[1+sep+1:]), nil
 }
@@ -101,7 +103,7 @@ func recordLess(a, b Record) bool {
 // Cursoring: in.Cursor is an opaque base64url-versioned token keyed on file_id.
 // An empty cursor starts at the first record; a non-empty cursor resumes
 // strictly AFTER the record it names in the sorted order. A malformed cursor
-// returns errMalformedCursor (the wire maps it to 400). in.Limit is clamped to
+// returns ErrMalformedCursor (the wire maps it to 400). in.Limit is clamped to
 // maxListLimit; a non-positive Limit defaults to maxListLimit.
 //
 // Scope binding (Get's keystone, replicated): only records whose Scope

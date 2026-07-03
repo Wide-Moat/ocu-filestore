@@ -178,8 +178,21 @@ func (ol *OpsListener) Serve() {
 }
 
 // Close shuts down the ops listener gracefully.
+//
+// srv.Shutdown only closes listeners the http.Server is tracking, i.e. the one
+// handed to Serve(ol.ln). On a pre-Serve refusal — any error path in the daemon
+// that constructs the listener but returns before launching Serve — ol.ln was
+// bound at construction (net.Listen in NewOpsListener) yet never handed to the
+// server, so Shutdown would close nothing and the fd/port would leak until the
+// process exits. Close ol.ln directly so the port is released whether or not
+// Serve ever ran. Closing a listener Serve already closed returns net.ErrClosed,
+// which is the expected, benign case and is swallowed.
 func (ol *OpsListener) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return ol.srv.Shutdown(ctx)
+	err := ol.srv.Shutdown(ctx)
+	if cerr := ol.ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+		err = errors.Join(err, cerr)
+	}
+	return err
 }

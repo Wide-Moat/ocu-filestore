@@ -4,6 +4,7 @@
 package filesapi
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -52,9 +53,19 @@ func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface
 		Limit:  limit,
 	})
 	if err != nil {
-		// A list failure is a transient broker-internal state (the store carries
-		// no client-attributable deny for a read listing); fail closed to 503
-		// (unavailable, retryable).
+		// A malformed ?after cursor — an undecodable/wrong-version token, or a
+		// bare last_id that was never a valid cursor — is a CLIENT fault, not a
+		// backend state. Map it to 400 invalid_argument (ADR-0028: a malformed
+		// cursor is a client rejection), matching the invalid-limit branch above
+		// and the south leg's malformed-cursor mapping. A retryable 503 here would
+		// invite an infinite retry loop on a permanently bad token.
+		if errors.Is(err, handlestore.ErrMalformedCursor) {
+			denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Malformed), "malformed cursor")
+			return
+		}
+		// Any other list failure is a transient broker-internal state (the store
+		// carries no client-attributable deny for a read listing); fail closed to
+		// 503 (unavailable, retryable).
 		reqLog.Error("files-api list error",
 			slog.String(observ.KeyReason, err.Error()))
 		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.BackendUnavailable), "list failed")
