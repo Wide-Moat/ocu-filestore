@@ -125,12 +125,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: trivy filesystem — CRITICAL blocks
+      - name: trivy filesystem — CRITICAL,HIGH blocks
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          severity: CRITICAL
+          # Block on HIGH as well as CRITICAL: a HIGH-severity dependency vuln is
+          # still a real exposure, and a CRITICAL-only floor let it merge. The
+          # tree is clean at this floor today (no .trivyignore waiver needed); a
+          # future HIGH that trivy reddens is triaged with a dated, tracked
+          # .trivyignore entry, never blindly silenced.
+          severity: CRITICAL,HIGH
           exit-code: "1"
           ignore-unfixed: "false"
 
