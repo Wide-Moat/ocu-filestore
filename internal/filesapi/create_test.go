@@ -49,6 +49,7 @@ type createEngine struct {
 	lastPath     string // engine path of the last committed write
 	alreadyExist bool   // when true and overwrite=false, refuse ErrAlreadyExists
 	writeErr     error  // when non-nil, fail the write after consuming r (fault inject)
+	bytesRead    int    // total bytes read off r across all WriteStream calls (incl. aborted ones)
 	trace        *[]string
 }
 
@@ -74,6 +75,13 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	// reassembly abort (pw.CloseWithError) surfaces here as a NON-EOF read error,
 	// so nothing is linked (temp+rename invisibility).
 	buf, rerr := io.ReadAll(r)
+	// Record the bytes that actually reached the engine reader — even on an abort
+	// io.ReadAll returns the partial bytes streamed before the pipe was closed, so
+	// a test can prove an EARLY abort streamed nothing (the bytes never left the
+	// handler's read loop) vs a late one that streamed the whole body first.
+	e.mu.Lock()
+	e.bytesRead += len(buf)
+	e.mu.Unlock()
 	if rerr != nil {
 		return rerr
 	}
@@ -539,6 +547,90 @@ func TestCreateUnderDeclarationAbortsNoObject(t *testing.T) {
 	}
 	if !sess.balanced() {
 		t.Fatalf("under-declaration gauge unbalanced")
+	}
+}
+
+// buildTruncatedCreateBody builds a valid multipart body then truncates it at the
+// end of the file content, dropping the closing boundary delimiter. The file
+// part's read therefore delivers exactly the body bytes and then a NON-EOF
+// (unexpected-EOF) read error — the "torn multipart frame, no authoritative end"
+// case the create.go:252-265 truncated-body branch must refuse. Because the cut
+// is at the end of the content, the delivered byte count equals declared, so the
+// over/under-declaration guards (:227 acc>declared and :269 acc!=declared) do NOT
+// fire — the abort is decided by the truncated-body branch alone. body must be a
+// distinctive byte string that does not also appear in paramsJSON.
+func buildTruncatedCreateBody(paramsJSON string, body []byte) (raw []byte, contentType string) {
+	full, ct := buildCreateBody(paramsJSON, body)
+	idx := bytes.LastIndex(full, body)
+	if idx < 0 {
+		panic("buildTruncatedCreateBody: body bytes not found in the multipart frame")
+	}
+	return full[:idx+len(body)], ct
+}
+
+// TestCreateTruncatedBodyAbortsNoObject pins the truncated-body abort
+// (create.go:252-265): a torn multipart frame that ends after exactly declared
+// bytes WITHOUT the closing boundary is a non-EOF read error, which must abort
+// the create, stage nothing, and mint no handle — even though the byte count
+// equals declared. This is the ONE abort site of the three that had no test: its
+// siblings (:227 over-declaration, :269 under-declaration) never fire here
+// (acc==declared), so neutering the truncated-body branch — the sentinel at :262
+// to io.EOF or the EOF check at :253 to "any error is clean" — would otherwise
+// commit the partial frame as a durable handle with the whole suite green.
+func TestCreateTruncatedBodyAbortsNoObject(t *testing.T) {
+	h, eng, store, sess := createSetup()
+	body := []byte("TORNBYTES9") // 10 distinctive bytes; declared == len(body)
+	params := createParamsJSON(t, map[string]any{"path": "/up.bin", "declared_size_bytes": len(body)})
+	raw, ct := buildTruncatedCreateBody(params, body)
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/files", bytes.NewReader(raw))
+	r.Header.Set("Content-Type", ct)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	// A torn frame is a malformed body (400), stages nothing, mints no handle.
+	assertCreateDenied(t, w, http.StatusBadRequest)
+	if eng.committed != 0 {
+		t.Fatalf("engine committed %d writes on a truncated body; want 0 (torn frame stages nothing)", eng.committed)
+	}
+	if _, ok := eng.committedBytes("up.bin"); ok {
+		t.Fatalf("an object was staged at up.bin on a truncated body; want none")
+	}
+	if store.putCalls != 0 {
+		t.Fatalf("Put called %d times on a truncated body; want 0 (no handle for a torn frame)", store.putCalls)
+	}
+	if !sess.balanced() {
+		t.Fatalf("truncated-body gauge unbalanced")
+	}
+}
+
+// TestCreateOverDeclarationEarlyAbortBoundsEngineBytes pins the EARLY abort
+// (create.go:227, acc > declared) in ISOLATION from the final :269 check. On an
+// over-declaration whose very first read already overflows the declared size, the
+// abort must fire BEFORE any byte is streamed into the engine, so at most one read
+// chunk reaches WriteStream (here: zero). The pre-existing
+// TestCreateOverDeclarationAbortsNoObject passes via the :269 guard even with :227
+// removed (both yield 400/committed=0/puts=0); this test instead observes
+// bytes-reaching-the-engine, so neutering :227 (which lets the whole multi-chunk
+// body stream into engine staging before :269 catches the size mismatch) reddens
+// it, while the :269 guard alone cannot satisfy it.
+func TestCreateOverDeclarationEarlyAbortBoundsEngineBytes(t *testing.T) {
+	h, eng, store, _ := createSetup()
+	// declared tiny, body many chunks: the first read (createReadChunk) already
+	// exceeds declared, so the early abort must fire before any pw.Write.
+	body := bytes.Repeat([]byte("X"), 3*createReadChunk)
+	params := createParamsJSON(t, map[string]any{"path": "/up.bin", "declared_size_bytes": 4})
+	w := doCreate(h, params, body)
+
+	assertCreateDenied(t, w, http.StatusBadRequest)
+	if eng.bytesRead > createReadChunk {
+		t.Fatalf("engine consumed %d bytes on over-declaration; want <= one chunk (%d) — the early abort must fire before streaming the body into staging", eng.bytesRead, createReadChunk)
+	}
+	if eng.committed != 0 {
+		t.Fatalf("engine committed %d writes on over-declaration; want 0", eng.committed)
+	}
+	if store.putCalls != 0 {
+		t.Fatalf("Put called %d times on over-declaration; want 0", store.putCalls)
 	}
 }
 

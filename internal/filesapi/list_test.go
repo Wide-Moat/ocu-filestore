@@ -133,3 +133,23 @@ func TestListStoreErrorIs503(t *testing.T) {
 		t.Fatalf("status = %d, want 503", w.Code)
 	}
 }
+
+// TestListMalformedCursorIs400 pins that a malformed ?after cursor is a CLIENT
+// fault mapped to 400 invalid_argument (denyclass.Malformed), NOT a retryable
+// 503. The store surfaces the malformed token as handlestore.ErrMalformedCursor
+// (proven end-to-end against the real keyset walk in
+// handlestore.TestListMalformedCursorRejected); this pins the wire layer's
+// classification of that sentinel — a bare last_id or any undecodable token
+// must not invite an infinite client retry loop.
+func TestListMalformedCursorIs400(t *testing.T) {
+	store := newFakeStore()
+	store.listErr = handlestore.ErrMalformedCursor
+	h := newTestHandler(Deps{
+		Store: store,
+		Scope: fakeScope{ps: southface.PeerScope{FilesystemID: "fs-alpha"}, ok: true},
+	})
+	w := doReq(h, http.MethodGet, "/v1/files?after=not-a-real-cursor")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a malformed cursor (client fault, not retryable)", w.Code)
+	}
+}

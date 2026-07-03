@@ -8,7 +8,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/denyclass"
 	"github.com/Wide-Moat/ocu-filestore/internal/denywire"
@@ -207,7 +209,7 @@ func (h *Handler) streamArchive(w http.ResponseWriter, r *http.Request, ps south
 	used := make(map[string]int, len(members))
 	for i := range members {
 		m := members[i]
-		entryName := dedupeEntryName(used, m.rec.Filename)
+		entryName := dedupeEntryName(used, sanitizeEntryName(m.rec.Filename))
 
 		// Per-file fd slot around the engine read window (NFR-SEC-46), released
 		// before the next member. An exhausted fd ceiling MID-ARCHIVE cannot change
@@ -239,11 +241,34 @@ func (h *Handler) streamArchive(w http.ResponseWriter, r *http.Request, ps south
 	}
 }
 
+// sanitizeEntryName reduces a caller-controlled stored Filename to a flat zip
+// entry name that cannot escape the archive root. The stored filename is
+// attacker-influenced (it is echoed from the create request, create.go
+// createFilename, and never sanitized at write), so a value like
+// "../../../etc/passwd" would otherwise flow verbatim into the zip entry name
+// and a naive extractor would write outside its extraction directory (zip-slip).
+// It first normalises backslashes to '/' (so a Windows-style path cannot smuggle
+// a component past path.Base, which splits only on '/'), takes path.Base to drop
+// every directory component, and refuses the traversal/degenerate leftovers
+// ("", ".", "..") by falling back to the synthetic "file". The result contains
+// no path separator and no traversal element, so it always names a member at the
+// archive root.
+func sanitizeEntryName(filename string) string {
+	name := strings.ReplaceAll(filename, "\\", "/")
+	name = path.Base(name)
+	if name == "" || name == "." || name == ".." || name == "/" {
+		return "file"
+	}
+	return name
+}
+
 // dedupeEntryName returns a zip entry name unique within the archive: an empty or
-// first-seen filename passes through (empty becomes a synthetic "file"), and a
+// first-seen name passes through (empty becomes a synthetic "file"), and a
 // collision gets a "-N" suffix before any extension so two members with the same
-// display name both survive in the bundle. It never fabricates a path separator,
-// so an entry can never escape the archive root.
+// display name both survive in the bundle. It assumes its input is already a
+// flat, separator-free name (sanitizeEntryName guarantees this upstream); it only
+// deduplicates and never fabricates a path separator. Archive-root containment is
+// sanitizeEntryName's responsibility, not this function's.
 func dedupeEntryName(used map[string]int, filename string) string {
 	name := filename
 	if name == "" {

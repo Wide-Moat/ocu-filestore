@@ -146,6 +146,32 @@ func TestOpsListenNonLoopbackBindsNothing(t *testing.T) {
 	}
 }
 
+// TestOpsListenCloseBeforeServeReleasesPort pins that Close() releases the bound
+// port even when Serve() never ran. On a pre-Serve refusal the listener was
+// bound at construction but never handed to the http.Server, so srv.Shutdown
+// (which closes only Serve-tracked listeners) would leak the fd/port. Close must
+// close ol.ln directly; the freed port must be immediately rebindable.
+func TestOpsListenCloseBeforeServeReleasesPort(t *testing.T) {
+	m := telemetry.NewBrokerMetrics("v0.0.0-test")
+	ol, err := telemetry.NewOpsListener("127.0.0.1:0", m, discardLogger())
+	if err != nil {
+		t.Fatalf("NewOpsListener: %v", err)
+	}
+	addr := ol.Addr()
+
+	// Close WITHOUT ever calling Serve — models any pre-Serve refusal path.
+	if err := ol.Close(); err != nil {
+		t.Fatalf("Close before Serve: %v", err)
+	}
+
+	// The port must be free to rebind now; a leak surfaces as EADDRINUSE.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("ops port %s still bound after Close() before Serve(): %v", addr, err)
+	}
+	_ = ln.Close()
+}
+
 // TestLoopbackIP6AndLocalhost verifies that "localhost" resolves correctly
 // (the resolver may return ::1 or 127.0.0.1 — both are loopback).
 func TestLoopbackIP6AndLocalhost(t *testing.T) {

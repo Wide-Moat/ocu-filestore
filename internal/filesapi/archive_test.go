@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
@@ -377,6 +378,70 @@ func TestArchiveDuplicateFilenamesDeduped(t *testing.T) {
 	}
 	if !bodies["ONE"] || !bodies["TWO"] {
 		t.Fatalf("deduped entries lost a member body: %v", entries)
+	}
+}
+
+// TestArchiveEntryNameSanitizedNoZipSlip pins that a caller-controlled traversal
+// filename cannot escape the archive root. The stored Filename is echoed from the
+// create request and never sanitized at write, so a value like
+// "../../../etc/passwd" must be reduced to a flat, separator-free entry name
+// before it becomes a zip entry — otherwise a naive extractor writes outside its
+// extraction directory (zip-slip). Every emitted entry name must carry no path
+// separator and no ".." component; the payload bytes must still be intact.
+func TestArchiveEntryNameSanitizedNoZipSlip(t *testing.T) {
+	guard := &fakeGuard{}
+	h, eng, store := archiveSetup(southface.Grant{Downloadable: true}, guard)
+	// A pure-traversal filename and a subdir-prefixed one: both must flatten.
+	seedFile(store, eng, "fid-evil", "fs-alpha", "obj/evil", "../../../etc/passwd", "PWNED")
+	seedFile(store, eng, "fid-sub", "fs-alpha", "obj/sub", "a/b/c.txt", "SUBDIR")
+
+	w := doReq(h, http.MethodGet, "/v1/files/archive?file_id=fid-evil&file_id=fid-sub")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	entries := readZipEntries(t, w.Body.Bytes())
+	if len(entries) != 2 {
+		t.Fatalf("zip has %d entries, want 2: %v", len(entries), entries)
+	}
+	for name := range entries {
+		if strings.ContainsAny(name, `/\`) {
+			t.Fatalf("zip entry %q carries a path separator — zip-slip escape from the archive root", name)
+		}
+		if name == ".." || strings.HasPrefix(name, "../") || strings.Contains(name, "/..") {
+			t.Fatalf("zip entry %q carries a traversal component", name)
+		}
+	}
+	// The traversal filename flattens to its base, payload intact.
+	if entries["passwd"] != "PWNED" {
+		t.Fatalf("expected the traversal filename flattened to %q=PWNED, got entries %v", "passwd", entries)
+	}
+	if entries["c.txt"] != "SUBDIR" {
+		t.Fatalf("expected the subdir filename flattened to %q=SUBDIR, got entries %v", "c.txt", entries)
+	}
+}
+
+// TestSanitizeEntryName pins the sanitizer directly: traversal and subdir
+// components are stripped to a flat base, degenerate leftovers fall back to the
+// synthetic "file", and a Windows-style backslash path cannot smuggle a
+// component past path.Base.
+func TestSanitizeEntryName(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"../../../etc/passwd", "passwd"},
+		{"a/b/c.txt", "c.txt"},
+		{`..\..\windows\system32\cmd.exe`, "cmd.exe"},
+		{"..", "file"},
+		{".", "file"},
+		{"", "file"},
+		{"/", "file"},
+		{"plain.txt", "plain.txt"},
+		{"/leading/slash.txt", "slash.txt"},
+	} {
+		if got := sanitizeEntryName(tc.in); got != tc.want {
+			t.Fatalf("sanitizeEntryName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if strings.ContainsAny(sanitizeEntryName(tc.in), `/\`) {
+			t.Fatalf("sanitizeEntryName(%q) still carries a separator", tc.in)
+		}
 	}
 }
 

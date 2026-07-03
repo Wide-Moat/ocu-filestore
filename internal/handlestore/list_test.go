@@ -263,8 +263,8 @@ func TestListMalformedCursorRejected(t *testing.T) {
 			continue
 		}
 		_, err := s.List(context.Background(), ListInput{Scope: "fs-A", Cursor: tok})
-		if !errors.Is(err, errMalformedCursor) {
-			t.Fatalf("List(cursor=%q) = %v, want errMalformedCursor", tok, err)
+		if !errors.Is(err, ErrMalformedCursor) {
+			t.Fatalf("List(cursor=%q) = %v, want ErrMalformedCursor", tok, err)
 		}
 	}
 }
