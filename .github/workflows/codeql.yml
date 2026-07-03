@@ -57,3 +57,31 @@ jobs:
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           category: "/language:${{ matrix.language }}"
+          # Emit the SARIF locally so the gate step below can inspect it. Results
+          # are still uploaded to the Security tab (upload defaults to true).
+          output: sarif-results
+      # codeql-action/analyze uploads results to the Security tab but exits 0
+      # REGARDLESS of findings, so this job was green even on a real vulnerability
+      # (a fake-green: the security job runs but never blocks). Gate the job
+      # explicitly on error-level results — CodeQL emits its high/critical
+      # security queries (e.g. go/command-injection, security-severity >= 7.0) at
+      # SARIF level "error", while maintainability/quality queries surface as
+      # warning/note. So this blocks a merge on a high-severity security finding
+      # yet lets quality noise pass (it still appears in the Security tab). Only
+      # once this job is meaningful is adding it to branch-protection
+      # required_status_checks worth doing — required + always-green would be
+      # fake-green in the second degree.
+      - name: gate on error-level CodeQL findings
+        run: |
+          shopt -s nullglob
+          total=0
+          for f in sarif-results/*.sarif; do
+            n=$(jq '[.runs[].results[]? | select(.level == "error")] | length' "$f")
+            echo "  $f: $n error-level result(s)"
+            total=$((total + n))
+          done
+          echo "CodeQL error-level findings: $total"
+          if [ "$total" -gt 0 ]; then
+            echo "::error::CodeQL reported $total error-level result(s) — see the Security tab"
+            exit 1
+          fi
