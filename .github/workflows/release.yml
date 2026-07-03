@@ -163,10 +163,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # image-scan runs trivy over the JUST-pushed image by digest — CRITICAL
+  # image-scan runs trivy over the JUST-pushed image by digest — CRITICAL,HIGH
   # blocks, same severity floor as the filesystem scan in security.yml. The
   # release job below needs this gate: binaries never ship from a run whose
-  # container image carries an unscanned or CRITICAL-vulnerable base.
+  # container image carries an unscanned or CRITICAL/HIGH-vulnerable base.
   image-scan:
     runs-on: ubuntu-latest
     needs: [ghcr-image]
@@ -181,12 +181,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: resolve the pushed image reference (registry paths are lowercase)
         run: echo "IMAGE_REF=ghcr.io/${GITHUB_REPOSITORY,,}@${{ needs.ghcr-image.outputs.digest }}" >> "$GITHUB_ENV"
-      - name: trivy image — CRITICAL blocks
+      - name: trivy image — CRITICAL,HIGH blocks
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           scan-type: image
           image-ref: ${{ env.IMAGE_REF }}
-          severity: CRITICAL
+          # Match the filesystem gate's floor (CRITICAL,HIGH) so the release image
+          # is held to the same bar as the PR-gated dependency scan.
+          severity: CRITICAL,HIGH
           exit-code: "1"
           ignore-unfixed: "false"
 
