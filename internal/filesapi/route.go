@@ -152,10 +152,14 @@ func (h *Handler) routeResource(w http.ResponseWriter, r *http.Request, ps south
 	}
 }
 
-// writeNotFound writes the header-less anti-enumeration 404 — the SINGLE
-// not_found deny token for every resolution failure (unknown path, unknown
-// file_id, cross-scope file_id). It carries no x-deny-reason header, so a probe
-// cannot distinguish the cases. This is the keystone deny path on the wire.
+// writeNotFound writes the header-less anti-enumeration 404 for an UNKNOWN-PATH
+// resolution failure: an unknown route path, an empty/malformed resource tail, or
+// the archive verb's empty accessible set. It carries no x-deny-reason header and
+// is byte-identical to writeResolutionDeny's file_id-resolution 404, so a probe
+// cannot tell an unknown path from an absent or a cross-scope file_id — the two
+// writers together present the single keystone deny SHAPE on the wire. The
+// file_id-resolution 404s themselves (absent OR cross-scope handle) are written by
+// writeResolutionDeny, not here; this writer never consults the store.
 func writeNotFound(w http.ResponseWriter) {
 	denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.NotFound), "not found")
 }
