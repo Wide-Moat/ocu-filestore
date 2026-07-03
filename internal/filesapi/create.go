@@ -284,7 +284,17 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 
 	// --- bytes are now durable: Put the durable handle referencing the engine
 	// object. DownloadablePolicyRef is deliberately left empty (Q2 deferred —
-	// downloadable resolves at read, never stamped at write). ---
+	// downloadable resolves at read, never stamped at write).
+	//
+	// DESIGN-ACCEPTED ORPHAN WINDOW: the bytes are committed to the engine
+	// namespace BEFORE the handle is Put, so a Put failure below leaves a
+	// fully-written object with NO file_id — orphan bytes reachable by no
+	// Files-API verb (List/Get/content/delete all resolve through the handle
+	// store). This is accepted, not a leak: the ALLOW was already audited, the
+	// caller gets a 503 and no id, and the orphan is reclaimed by the engine's
+	// workspace Provision/Teardown sweep (the ephemeral-workspace model — the
+	// broker takes on no durable retention). The alternative (handle-before-bytes)
+	// would mint a file_id that resolves to absent bytes — a worse contract. ---
 	rec, perr := h.deps.Store.Put(r.Context(), handlestore.PutInput{
 		Scope:     ps.FilesystemID,
 		ObjectRef: engineRef,
@@ -486,8 +496,14 @@ func canonicalizeCreatePath(wire string) (string, bool) {
 		return "", false
 	}
 	// Anchor at the scope root so a leading-slash path and a relative path clean
-	// identically; a ".." that climbs above the root surfaces as a residual
-	// leading "/.." (path.Clean keeps a leading ".." after the anchor).
+	// identically. path.Clean collapses any leading ".." against this "/" anchor
+	// down to the root itself (path.Clean("/..") == "/", path.Clean("/../x") ==
+	// "/x"), so an over-climb never survives here as a residual "/..". The check
+	// below is therefore UNREACHABLE under this anchoring — it is retained only as
+	// defense-in-depth against a future change to the anchoring above, not as a
+	// live second traversal barrier. The reachable over-climb-to-root reduces to
+	// the scope root and is refused by the eng == "" check further down (a create
+	// must name a concrete object, not the root), which is the load-bearing barrier.
 	rel := strings.TrimPrefix(wire, "/")
 	clean := path.Clean("/" + rel)
 	if clean == "/.." || strings.HasPrefix(clean, "/../") {

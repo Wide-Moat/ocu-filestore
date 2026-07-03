@@ -100,9 +100,11 @@ func recordLess(a, b Record) bool {
 // order and identical across a daemon restart — a cursor minted before a
 // restart resumes at the same boundary after the log is replayed.
 //
-// Cursoring: in.Cursor is an opaque base64url-versioned token keyed on file_id.
-// An empty cursor starts at the first record; a non-empty cursor resumes
-// strictly AFTER the record it names in the sorted order. A malformed cursor
+// Cursoring: in.Cursor is an opaque base64url-versioned token carrying the FULL
+// (CreatedAt, FileID) sort key of the prior page's last record — NOT a bare
+// file_id, which could not resume this CreatedAt-primary keyset walk. An empty
+// cursor starts at the first record; a non-empty cursor resumes strictly AFTER
+// the sort key it names in the sorted order. A malformed cursor
 // returns ErrMalformedCursor (the wire maps it to 400). in.Limit is clamped to
 // maxListLimit; a non-positive Limit defaults to maxListLimit.
 //
