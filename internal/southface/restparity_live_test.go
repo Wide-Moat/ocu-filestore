@@ -15,12 +15,24 @@ import (
 	"testing"
 )
 
-// REST parity LIVE test — the Wave-0 fixture oracle, promoted to drive a LIVE
-// server end-to-end.
+// REST parity test — the Wave-0 fixture oracle, promoted to drive the wire
+// end-to-end over a real HTTP transport.
+//
+// Scope of "live" here — read this before counting this file toward any
+// object-store coverage claim. "Live" names the TRANSPORT and the ROUTER, not
+// the backend: this test crosses an actual HTTP socket (httptest.NewServer)
+// through the PRODUCTION REST router and the real authz/ceilings/auditgate
+// seams. The engine underneath is fakeEngine — an in-memory tree engine (a
+// working implementation with real effects, not scripted returns, see
+// engine_fake_test.go), NOT a real object-store backend (S3 / local-volume).
+// So this file does NOT exercise a real object-store leg; that coverage lives
+// at the engine layer (internal/objectstore, the S3-conformance suite). Do not
+// count TestRESTParityLive as a live/composed object-store round-trip — it is a
+// live-HTTP wire-parity test over a fake engine.
 //
 // restparity_fixtures_test.go pins the south-face REST wire as self-consistent
 // Go fixtures. This file PROMOTES that oracle: it stands up the PRODUCTION REST
-// router (newRESTRouter over a real engine-backed dispatcher with the real
+// router (newRESTRouter over a fakeEngine-backed dispatcher with the real
 // authz/ceilings/auditgate seams and a credential-scope extractor that binds a
 // known filesystem_id) behind an httptest.NewServer, drives EVERY operation
 // across an actual HTTP socket, and asserts the emitted wire against the pinned
@@ -63,12 +75,14 @@ type liveServer struct {
 	ceiling *fakeCeilingsSession
 }
 
-// newLiveServer stands up the PRODUCTION restRouter over an engine-backed
-// dispatcher wired with the real consumer-side seams (a real in-memory engine,
-// an allow-by-default resolver granting Downloadable, a recording audit guard,
-// a permissive ceilings session) and a CredentialScopeExtractor that binds the
+// newLiveServer stands up the PRODUCTION restRouter over a fakeEngine-backed
+// dispatcher wired with the real consumer-side seams (a fakeEngine — an
+// in-memory tree engine with real effects, NOT a real object-store backend; an
+// allow-by-default resolver granting Downloadable, a recording audit guard, a
+// permissive ceilings session) and a CredentialScopeExtractor that binds the
 // live bearer to liveFS with read+write intents. The router is served behind an
-// httptest.NewServer so every assertion crosses an actual HTTP socket.
+// httptest.NewServer so every assertion crosses an actual HTTP socket — the
+// "live" leg is the HTTP transport, not a live object store.
 func newLiveServer(t *testing.T) *liveServer {
 	t.Helper()
 	eng := newFakeEngine()
@@ -170,7 +184,9 @@ func decodeBodyMap(t *testing.T, resp *http.Response) map[string]any {
 // TestRESTParityLive drives the production REST server end-to-end and asserts
 // its emitted wire against the Wave-0 fixture oracle. It is the live half of the
 // parity lock: where TestRESTParityFixtures proves the fixtures self-consistent,
-// this proves the SERVER satisfies them across a real socket.
+// this proves the SERVER satisfies them across a real socket. "Live" = the HTTP
+// socket and the production router; the engine underneath is a fakeEngine, so
+// this is NOT a real object-store round-trip (see the file header).
 func TestRESTParityLive(t *testing.T) {
 	t.Run("unary/route-and-response-shapes", testLiveUnaryRoutesAndShapes)
 	t.Run("unary/request-carries-fsid-top-level", testLiveRequestEnvelope)
