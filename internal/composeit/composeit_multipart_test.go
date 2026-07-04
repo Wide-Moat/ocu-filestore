@@ -33,6 +33,18 @@ func TestComponentMultipartEdgeCasesAgainstMinIO(t *testing.T) {
 	cl := southClient(pool)
 	mc := minioClient()
 
+	// makeDirectory /pub — POSIX mkdir requires the parent to exist before a
+	// file is written into a sub-path.
+	mk := postJSON(t, cl, "makeDirectory", map[string]any{
+		"filesystem_id":          itScope,
+		"path":                   downloadablePrefix,
+		"authorization_metadata": authMeta("write"),
+	})
+	mk.Body.Close()
+	if mk.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory %s status = %d, want 200", downloadablePrefix, mk.StatusCode)
+	}
+
 	// --- 8. a larger payload exercising chunked streaming under the message
 	// ceiling. The upload streams the file part in 256-KiB chunks (well under the
 	// whole-object -broker-max-file-size ceiling), so a multi-chunk payload proves
