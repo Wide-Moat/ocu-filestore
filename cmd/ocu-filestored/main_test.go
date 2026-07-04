@@ -288,14 +288,25 @@ func TestComposeS3EngineRefusesPreBind(t *testing.T) {
 // TestComposeS3RealEngineServes pins the 13-16 composition end-to-end against
 // the live rig (gated): static env credentials compose the REAL s3 engine,
 // ProvisionScope runs against MinIO for real, the daemon serves on a real
-// south-face TLS listener, and Close tears the scope down.
+// south-face TLS listener, a real fileUpload -> fileDownload round-trip crosses
+// that listener (byte-exact) with the written object independently read back
+// from the real MinIO bucket, and Close tears the scope down.
+//
+// The round-trip is the load-bearing half: without it the daemon composes,
+// provisions, and Closes without ever serving a request — a bind-but-answer-
+// nothing Serve() would pass. Driving one real request through the composed
+// south face against the real engine, and asserting the bytes land in the real
+// bucket via an independent S3 client, makes neither a no-op transport nor a
+// mock backend able to pass.
 func TestComposeS3RealEngineServes(t *testing.T) {
 	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("OCU_S3_TEST_ENDPOINT not set - composed s3 engine live leg SKIPPED (boot deploy/docker-compose.test.yml)")
 	}
-	t.Setenv(objectstore.EnvS3AccessKeyID, os.Getenv("OCU_S3_TEST_ACCESS_KEY"))
-	t.Setenv(objectstore.EnvS3SecretAccessKey, os.Getenv("OCU_S3_TEST_SECRET_KEY"))
+	access := os.Getenv("OCU_S3_TEST_ACCESS_KEY")
+	secret := os.Getenv("OCU_S3_TEST_SECRET_KEY")
+	t.Setenv(objectstore.EnvS3AccessKeyID, access)
+	t.Setenv(objectstore.EnvS3SecretAccessKey, secret)
 	bucket := os.Getenv("OCU_S3_TEST_BUCKET")
 	if bucket == "" {
 		bucket = "ocu-conformance"
@@ -315,6 +326,15 @@ func TestComposeS3RealEngineServes(t *testing.T) {
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
+
+	// Drive a real south-face round-trip against the composed daemon while it is
+	// serving, THEN Close. The bytes must round-trip byte-exact through the
+	// engine AND land in the real MinIO bucket (independent S3 client).
+	cl := s3RTClient()
+	baseURL := "https://" + cfg.bindAddr
+	s3RTWaitReady(t, cl, baseURL)
+	s3RTRoundTrip(t, cl, baseURL, cfg.filesystemID, bucket, endpoint, access, secret)
+
 	if err := srv.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
