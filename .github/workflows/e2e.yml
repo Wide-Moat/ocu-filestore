@@ -180,15 +180,18 @@ jobs:
   # no manual compose up and no broker binary — just Docker (present on
   # ubuntu-latest), OCU_COMPOSE_IT=1, and the go test invocation.
   #
-  # ADVISORY (continue-on-error: true) for this cycle: the image build + stack
-  # boot is heavy and this is its first live run, so a failure annotates the run
-  # WITHOUT blocking (matching the deadcode/gremlins ratchet pattern). The
-  # advisory->required flip is a later, separate action once the job is proven
-  # green on a real Actions run — gating a check that never demonstrated it
-  # passes would itself be a fake-green.
+  # BLOCKING: a real composeit failure fails this job (no continue-on-error). It
+  # shipped advisory for one cycle and proved green on a real push-to-main Actions
+  # run (run 28690773106 on c0475816) plus three back-to-back local runs against
+  # the live stack (52-57s each, no flake) — so the gate reflects a real signal,
+  # not a check that never demonstrated it passes. The go test -timeout 1200s and
+  # the compose --wait against the services' healthchecks (minio: 30 retries,
+  # filestore: 10) already absorb cold-build and health-race variance, so no
+  # retry wrapper is added. Making it a required context is a separate protection
+  # toggle — but that toggle would be vacuous while continue-on-error masked every
+  # failure into success, so dropping continue-on-error is the prerequisite.
   component-it:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
