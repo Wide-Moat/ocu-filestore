@@ -141,20 +141,23 @@ jobs:
           OCU_S3_TEST_VERSIONED_BUCKET: ocu-conformance-versioned
           OCU_S3_TEST_ACCESS_KEY: ocu-test-root
           OCU_S3_TEST_SECRET_KEY: ocu-test-secret-key
-        # Capture -json and positively assert the S3-engine leg actually ran.
+        # Capture -json and positively assert every S3-engine leg actually ran.
         # The s3 live cases t.Skip when OCU_S3_TEST_ENDPOINT does not reach the
         # suite, and a skip counts as a pass — a var typo would otherwise report
-        # green while exercising no live S3. TestComposeS3RealEngineServes runs
-        # ONLY against the rig, so its real pass is the unique liveness signal.
+        # green while exercising no live S3. Each live target runs ONLY against
+        # the rig, so its real pass is a unique liveness signal:
+        # TestComposeS3RealEngineServes (cmd composed-daemon south round-trip)
+        # and TestFilesAPIRealS3EngineRoundTrip (filesapi north verbs against the
+        # REAL s3 engine — the engine-leg above the composed daemon).
         #
         # The liveness assertion lives in scripts/check-s3-leg-ran.sh (single
-        # source, red-probed below): it jq-selects the test's own pass object
+        # source, red-probed below): it jq-selects each test's own pass object
         # from the go-test-json stream — robust to JSON field order and line
         # buffering, unlike a two-stage grep pipe which false-reds a real green.
         run: |
           set -uo pipefail
           code=0
-          go test ./cmd/ocu-filestored/... ./internal/objectstore/... -json -timeout 600s \
+          go test ./cmd/ocu-filestored/... ./internal/objectstore/... ./internal/filesapi/... -json -timeout 600s \
             | tee /tmp/e2e-s3.json >/dev/null || code=$?
           grep -oE '"Output":"[^"]*"' /tmp/e2e-s3.json \
             | sed -E 's/^"Output":"//; s/"$//; s/\\n$//; s/\\t/\t/g' || true
