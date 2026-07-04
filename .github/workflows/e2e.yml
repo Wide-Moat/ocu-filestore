@@ -166,3 +166,57 @@ jobs:
       - name: tear the rig down
         if: always()
         run: docker compose -f deploy/docker-compose.test.yml down -v
+
+  # component-it runs internal/composeit: the ONLY full-stack REST->MinIO
+  # round-trip that stands up the broker's own TLS south face + real MinIO via
+  # the component compose (deploy/docker-compose.yml + the it overlay) and drives
+  # a real file-op through the south face, asserting the bytes land in the real
+  # bucket via an independent S3 client. Every case gates on OCU_COMPOSE_IT=1;
+  # before this job NO CI job set it, so the whole package skip-passed everywhere
+  # with no liveness anchor — the exact fake-green class this job closes.
+  #
+  # The composeit test SELF-manages the stack (composeUp builds the image and
+  # brings base+overlay up --wait, tearing down in t.Cleanup), so this job needs
+  # no manual compose up and no broker binary — just Docker (present on
+  # ubuntu-latest), OCU_COMPOSE_IT=1, and the go test invocation.
+  #
+  # ADVISORY (continue-on-error: true) for this cycle: the image build + stack
+  # boot is heavy and this is its first live run, so a failure annotates the run
+  # WITHOUT blocking (matching the deadcode/gremlins ratchet pattern). The
+  # advisory->required flip is a later, separate action once the job is proven
+  # green on a real Actions run — gating a check that never demonstrated it
+  # passes would itself be a fake-green.
+  component-it:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: red-probe the component-it liveness gate (two-sided, before the stack)
+        # Prove the liveness assertion does not lie in either direction BEFORE
+        # spending a ~10-minute image build + stack boot on it: a real pass ->
+        # exit 0, a skipped or absent target -> non-zero. Fails fast if the gate
+        # itself regresses.
+        run: bash scripts/check-composeit-ran-redprobe.sh
+      - name: run the component compose slice (full stack REST -> live MinIO)
+        env:
+          OCU_COMPOSE_IT: "1"
+        # Capture -json and positively assert the round-trip actually ran. The
+        # composeit cases t.Skip when OCU_COMPOSE_IT != 1 or docker is absent, and
+        # a skip counts as a pass — so a var typo would otherwise report green
+        # while standing up nothing. TestComponentRoundTripOverTLSToMinIO runs
+        # ONLY against the live stack, so its real pass is the unique liveness
+        # signal. The assertion lives in scripts/check-composeit-ran.sh (single
+        # source, red-probed above).
+        run: |
+          set -uo pipefail
+          code=0
+          go test ./internal/composeit/... -json -timeout 1200s \
+            | tee /tmp/component-it.json >/dev/null || code=$?
+          grep -oE '"Output":"[^"]*"' /tmp/component-it.json \
+            | sed -E 's/^"Output":"//; s/"$//; s/\\n$//; s/\\t/\t/g' || true
+          bash scripts/check-composeit-ran.sh /tmp/component-it.json
+          exit "$code"
