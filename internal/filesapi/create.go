@@ -363,6 +363,15 @@ var errCreateInternalPanic = errors.New("filesapi: engine WriteStream panicked")
 // overwrite_existing (defaults false when absent), media_type (the response
 // mime_type), and filename (the display name). Unknown fields are refused
 // (DisallowUnknownFields) so a caller cannot smuggle an unrecognised parameter.
+// createAuthorizationMetadata mirrors the contract AuthorizationMetadata
+// (files-api.openapi.yaml, additionalProperties:false): the create-time intent
+// and downloadable request. Scope still rides the attested header, never this
+// body; this is design-level create-meta.
+type createAuthorizationMetadata struct {
+	Intent       string `json:"intent"`
+	Downloadable bool   `json:"downloadable"`
+}
+
 type createUploadParams struct {
 	FilesystemID      string `json:"filesystem_id"`
 	Path              string `json:"path"`
@@ -370,6 +379,15 @@ type createUploadParams struct {
 	OverwriteExisting bool   `json:"overwrite_existing"`
 	MediaType         string `json:"media_type"`
 	Filename          string `json:"filename"`
+	// The struct MUST implement EVERY CreateFileParams property the frozen
+	// contract declares — DisallowUnknownFields rejects any contract-legal field
+	// this struct omits, 400ing a conforming client. authorization_metadata,
+	// metadata, tags, ttl_seconds are create-meta the write plane may ignore, but
+	// it MUST accept them or the upload fails at strict-decode.
+	AuthorizationMetadata *createAuthorizationMetadata `json:"authorization_metadata"`
+	Metadata              map[string]any               `json:"metadata"`
+	Tags                  []string                     `json:"tags"`
+	TTLSeconds            *int64                       `json:"ttl_seconds"`
 }
 
 // readCreateParams reads the FIRST multipart part, which MUST be the "params"

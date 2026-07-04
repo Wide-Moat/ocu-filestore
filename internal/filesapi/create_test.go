@@ -398,6 +398,37 @@ func TestCreateHappyPath(t *testing.T) {
 	}
 }
 
+// TestCreateAcceptsAllContractParams pins that the strict decoder accepts EVERY
+// property the frozen CreateFileParams schema (files-api.openapi.yaml) declares —
+// not just the subset the write plane happens to consume. A conforming client
+// (the webui BFF) sends authorization_metadata, metadata, tags, ttl_seconds; if
+// the server struct omits any, DisallowUnknownFields 400s the whole upload with
+// "malformed params JSON" and the pane can never upload. This test crosses the
+// client↔server boundary the isolated unit tests never joined: it reds if the
+// struct drops a contract field, greens once it implements the full schema.
+func TestCreateAcceptsAllContractParams(t *testing.T) {
+	h, _, _, _ := createSetup()
+	body := []byte("ABCDEFGH")
+	params := createParamsJSON(t, map[string]any{
+		"filesystem_id":       createTestScope,
+		"path":                "/dir/up.bin",
+		"declared_size_bytes": len(body),
+		"overwrite_existing":  false,
+		"media_type":          "application/octet-stream",
+		"filename":            "up.bin",
+		// The create-meta the write plane may ignore but MUST accept (the exact
+		// shape a conforming client sends — this is the field that 400'd live).
+		"authorization_metadata": map[string]any{"intent": "write", "downloadable": true},
+		"metadata":               map[string]any{"origin": "e2e"},
+		"tags":                   []string{"demo"},
+		"ttl_seconds":            3600,
+	})
+	w := doCreate(h, params, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 on a fully-populated contract params blob; body %s", w.Code, w.Body.String())
+	}
+}
+
 // TestCreateFilenameFallsBackToPathLeaf pins that an OMITTED filename resolves to
 // the leaf of the canonical path (createFilename), and an omitted media_type is
 // echoed as empty.
