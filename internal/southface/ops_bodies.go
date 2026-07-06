@@ -153,6 +153,30 @@ type readFileResponse struct {
 	File file `json:"file"`
 }
 
+// readMetadataRequest is the pinned readMetadata body: {filesystem_id, path}
+// plus the D3 authorization_metadata. It is the path-axis metadata resolve the
+// guest mount runs on every Open/stat (the rclone ocufs resolve() fallback) to
+// fetch the object's uuid handle and size BEFORE a read. The
+// authorization_metadata.downloadable flag is never trusted here; this is a
+// metadata resolve, not a content read, so it carries no downloadable gate.
+type readMetadataRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	Path                  string                `json:"path"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+}
+
+// readMetadataResponse is the arm-discriminated resolve body the guest reads:
+// exactly one of file or directory is set (omitempty drops the unset arm, so
+// the wire carries {"file":...} or {"directory":...}). The guest classifies by
+// arm — a file arm always carries an mtime and a uuid handle; a directory arm
+// carries path/mtime only. Both arms absent means not-found. The field names
+// match the listDirectory union (filesystemFile / directory) so both faces read
+// the same shapes.
+type readMetadataResponse struct {
+	File      *filesystemFile `json:"file,omitempty"`
+	Directory *directory      `json:"directory,omitempty"`
+}
+
 // uploadParamsFrame is the FIRST (and exactly one) frame of a fileUpload
 // stream (OPS-05, D5). It is strict-decoded (DisallowUnknownFields): every
 // field the guest may legitimately send is declared so a guest that carries

@@ -127,7 +127,7 @@ type dispatcher struct {
 	guard    Guard
 	ceilings CeilingsRegistry
 	registry map[Op]opHandler
-	// engine is the consumer-side storage seam the seven phase-9 handlers
+	// engine is the consumer-side storage seam the engine-plane handlers
 	// call; the wiring phase binds the real local-volume engine.
 	engine Engine
 	// logger is the structured logger for deny WARNs and other diagnostic
@@ -200,8 +200,8 @@ type dispatcher struct {
 	credExtractor CredentialScopeExtractor
 }
 
-// newDispatcher builds a dispatcher with the seven phase-9 handlers wired over
-// the injected engine seam (the other eleven ops stay unimplemented) and the
+// newDispatcher builds a dispatcher with the engine-plane handlers wired over
+// the injected engine seam (the remaining ops stay unimplemented) and the
 // injected authz/audit/ceilings seams. A nil engine leaves the registry
 // fully unimplemented (the phase-8 spine tests construct the dispatcher
 // without an engine).
@@ -211,8 +211,9 @@ func newDispatcher(resolver Resolver, guard Guard, ceilings CeilingsRegistry, si
 
 // newDispatcherWithEngine builds a dispatcher binding the storage engine seam
 // and a fresh session-scoped uuid store. When engine is non-nil it registers
-// the seven phase-9 handlers, replacing their unimplemented entries; the other
-// eleven ops stay unimplemented. The phase-8 spine ordering/registry tests use
+// the engine-plane handlers (the seven phase-9 verbs plus readFile and the
+// readMetadata resolve), replacing their unimplemented entries; the remaining
+// ops stay unimplemented. The phase-8 spine ordering/registry tests use
 // newDispatcher (engine nil) and continue to see every op unimplemented.
 func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRegistry, sizeCeiling int64, engine Engine) *dispatcher {
 	reg := newHandlerRegistry()
@@ -228,6 +229,10 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// (OPS-05) is REST-routed to serveUploadMultipart and never read from
 		// this registry, so its entry stays unimplemented (see handler_stub.go).
 		reg[OpReadFile] = handleReadFile
+		// readMetadata is the path-axis metadata resolve the guest mount runs on
+		// every Open/stat before a read (rclone ocufs resolve()); without it the
+		// read plane returns 501 and no object round-trips back through the mount.
+		reg[OpReadMetadata] = handleReadMetadata
 	}
 	return &dispatcher{
 		resolver:    resolver,
@@ -524,8 +529,8 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.String(observ.KeyOp, opStr),
 	)
 
-	// STAGE 4: the per-op handler. The seven phase-9 ops have real handlers;
-	// the other eleven stay unimplemented. A route op absent from the registry
+	// STAGE 4: the per-op handler. The engine-plane ops have real handlers; the
+	// remaining ops stay unimplemented. A route op absent from the registry
 	// is a wiring fault and fails closed.
 	h, ok := d.registry[op]
 	if !ok {
