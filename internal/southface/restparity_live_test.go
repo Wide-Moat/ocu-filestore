@@ -311,6 +311,8 @@ func liveBodyForSeeded(op Op) any {
 	switch op {
 	case OpListDirectory:
 		return pathReadReq{FilesystemID: liveFS, Path: "/d", AuthorizationMetadata: readMetaWire()}
+	case OpReadMetadata:
+		return pathReadReq{FilesystemID: liveFS, Path: "/p", AuthorizationMetadata: readMetaWire()}
 	case OpReadFile:
 		return readFileReq{FilesystemID: liveFS, Path: "/p", AuthorizationMetadata: readMetaWire()}
 	case OpMakeDirectory:
@@ -368,6 +370,13 @@ func assertLiveSuccessShape(t *testing.T, op Op, resp *http.Response) {
 		var got readFileRespFixture
 		if err := json.Unmarshal(body, &got); err != nil {
 			t.Fatalf("readFile body does not match the oracle metadata shape: %v (%q)", err, body)
+		}
+	case OpReadMetadata:
+		// The resolve success is the arm-discriminated {file, directory} union;
+		// the seeded /p target resolves to the file arm.
+		var got readMetadataRespFixture
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("readMetadata body does not match the oracle resolve shape: %v (%q)", err, body)
 		}
 	default:
 		t.Fatalf("op %s returned 200 but has no pinned success-shape assertion", op)
