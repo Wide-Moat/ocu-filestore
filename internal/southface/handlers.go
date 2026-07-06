@@ -603,3 +603,51 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	}})
 	return outcomeAllow()
 }
+
+// handleReadMetadata serves readMetadata: the path-axis metadata resolve the
+// guest mount runs on every Open/stat before a read (the rclone ocufs resolve()
+// fallback that fetches uuid+size). It Stats the object and returns the
+// arm-discriminated body — a directory arm for a directory, a file arm (with the
+// broker-minted uuid handle) for a file. Unlike readFile this is a metadata
+// resolve, not a content read: there is NO downloadable gate (the guest must be
+// able to resolve a handle it may not itself stream), and a directory target is
+// a first-class directory arm, not a not_found. A missing path surfaces the
+// engine's not_found through denyEngine (the anti-enumeration keystone: absent
+// and cross-scope are the same header-less 404). Stat reads zero content bytes,
+// O(1) regardless of object size.
+func handleReadMetadata(d *handlerDeps, hc handlerCtx) opOutcome {
+	var req readMetadataRequest
+	if !decodeOp(hc, &req) {
+		// decodeOp already emitted the deny audit event via mandateDeny, wrote
+		// the wire deny, and recorded the ops_total deny (southface-05).
+		return outcomeDenyRecorded()
+	}
+
+	ctx := hc.ctxOrBackground()
+	scope := hc.ps.FilesystemID
+	// Spine-canonicalized path (bypass-01/03), never the raw body path.
+	rel := enginePath(hc.canonPath)
+
+	info, err := d.engine.Stat(ctx, scope, rel)
+	if err != nil {
+		denyEngine(hc, err)
+		return outcomeDenyRecorded()
+	}
+
+	gp := guestPathFromRel(rel)
+	if info.IsDir {
+		writeJSON(hc.w, readMetadataResponse{Directory: &directory{
+			Path:  gp,
+			MTime: mtimeString(info.ModTime),
+		}})
+		return outcomeAllow()
+	}
+	writeJSON(hc.w, readMetadataResponse{File: &filesystemFile{
+		Path:  gp,
+		Size:  info.Size,
+		MTime: mtimeString(info.ModTime),
+		MIME:  mimeForPath(rel),
+		UUID:  d.ids.idFor(scope, gp),
+	}})
+	return outcomeAllow()
+}
