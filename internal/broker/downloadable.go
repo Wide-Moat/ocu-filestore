@@ -34,18 +34,38 @@ import (
 // structurally non-downloadable and never consults this func.
 //
 // The returned func is never nil (authz.New panics on nil — Pitfall 4).
+// downloadableMatchAll is the explicit whole-scope downloadable token. It is
+// DISTINCT from the bare root "/" (which stays a matches-nothing sentinel): a
+// deployment marks its entire scope downloadable by CONSCIOUSLY passing "*", not
+// by accidentally leaving a bare "/" in the prefix list. Canon-ruling (the
+// contracts/storage gatekeeper, reading NFR-SEC-73): "*" expresses the
+// PUBLIC-class posture the NFR provides for — for a single-tenant
+// trusted_operator agent output space, the whole fs-fleet scope is downloadable
+// by design (the agent writes outputs to be downloaded). It resolves ONLY the
+// downloadable axis: scope (filesystem_id) and intent are still checked, and
+// intent=preview stays structurally non-downloadable regardless of this token.
+const downloadableMatchAll = "*"
+
 func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 	// Normalize the configured prefixes once at construction.
 	norm := make([]string, 0, len(prefixes))
+	matchAll := false
 	for _, p := range prefixes {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
+		// "*" is the explicit whole-scope token — a conscious "this whole fs is
+		// downloadable", separate from the matches-nothing bare root. It is not a
+		// path prefix, so it never joins norm; it sets the match-all flag.
+		if p == downloadableMatchAll {
+			matchAll = true
+			continue
+		}
 		// Drop a trailing slash so "/pub/" and "/pub" behave identically;
 		// the root "/" is kept as a sentinel that matches nothing on its own
 		// (a deployment marking the entire scope downloadable configures the
-		// explicit prefixes it wants, not the bare root).
+		// explicit prefixes it wants — "*" — not the bare root).
 		if p != "/" {
 			p = strings.TrimRight(p, "/")
 		}
@@ -65,9 +85,18 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 		// to grant rather than match a traversal segment against a prefix. A
 		// path that still carries a ".." component or that does not equal its
 		// own filepath.Clean form is fail-closed to non-downloadable — the
-		// cleaned object it actually names may sit OUTSIDE the prefix.
+		// cleaned object it actually names may sit OUTSIDE the prefix. This guard
+		// runs BEFORE the match-all shortcut, so "*" never grants a traversal
+		// path (the whole-scope token widens the in-scope surface, never the
+		// containment boundary).
 		if filepath.Clean(path) != path || hasDotDotComponent(path) {
 			return false, nil
+		}
+		// The explicit whole-scope token: every canonical in-scope path is
+		// downloadable. Scope/intent/preview axes are enforced elsewhere and are
+		// unaffected.
+		if matchAll {
+			return true, nil
 		}
 		for _, prefix := range norm {
 			if pathUnderPrefix(path, prefix) {
