@@ -195,3 +195,52 @@ func TestPrefixPolicyFailClosedOnError(t *testing.T) {
 		t.Fatalf("empty path reported downloadable true, want false")
 	}
 }
+
+// TestPrefixPolicyMatchAllStar pins the explicit whole-scope token "*": every
+// canonical in-scope path is downloadable, WITHOUT weakening the containment
+// boundary (a traversal path is still refused) and WITHOUT the bare root "/"
+// gaining any match (it stays the matches-nothing sentinel). This is the
+// canon-ruled PUBLIC-class posture for a single-tenant trusted_operator output
+// space (NFR-SEC-73): the agent's whole fs is downloadable because it writes
+// outputs to be downloaded.
+func TestPrefixPolicyMatchAllStar(t *testing.T) {
+	star := NewPrefixDownloadablePolicy([]string{"*"})
+
+	// Every canonical in-scope path — including a root-level file with no
+	// sub-prefix (the fs-fleet outputs layout) — is downloadable under "*".
+	for _, path := range []string{"/p.txt", "/deep/nested/output.docx", "/pub/x", "/outputs/report.pdf"} {
+		dl, err := star(context.Background(), "fs1", path)
+		if err != nil {
+			t.Fatalf("star(%q): err %v", path, err)
+		}
+		if !dl {
+			t.Fatalf("star(%q): downloadable false, want true (whole-scope token)", path)
+		}
+	}
+
+	// Containment is preserved: "*" widens the in-scope surface, never the
+	// boundary. A traversal-bearing path is still fail-closed to non-downloadable
+	// (the bypass-01 guard runs before the match-all shortcut).
+	for _, bad := range []string{"/../escape", "/a/../../etc/passwd", "/dir/./x"} {
+		dl, err := star(context.Background(), "fs1", bad)
+		if err != nil {
+			t.Fatalf("star(%q): err %v", bad, err)
+		}
+		if dl {
+			t.Fatalf("star(%q): downloadable true, want false — the whole-scope token must not grant a non-canonical/traversal path", bad)
+		}
+	}
+
+	// Regression guard on the two-sided contract: WITHOUT the token, the same
+	// root-level path is NOT downloadable (a plain "/pub" prefix does not cover
+	// it), and a bare "/" is STILL the matches-nothing sentinel — "*" is the only
+	// way to express whole-scope, never the bare root.
+	noStar := NewPrefixDownloadablePolicy([]string{"/pub"})
+	if dl, _ := noStar(context.Background(), "fs1", "/p.txt"); dl {
+		t.Fatalf("without the token, /p.txt is downloadable; want false (only /pub covered)")
+	}
+	bareRoot := NewPrefixDownloadablePolicy([]string{"/"})
+	if dl, _ := bareRoot(context.Background(), "fs1", "/p.txt"); dl {
+		t.Fatalf("bare root '/' matched /p.txt; want false (bare root stays the matches-nothing sentinel, distinct from '*')")
+	}
+}
