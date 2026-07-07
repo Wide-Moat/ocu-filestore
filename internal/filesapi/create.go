@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
@@ -598,14 +599,20 @@ func denyClassForResolveErr(err error) string {
 
 // denyClassForEngineErr names the deny class for an engine WriteStream error on
 // the create path: an already-exists refusal (overwrite_existing=false against an
-// existing object) is the 409 already_exists class; a context cancellation is the
-// aborted class; anything else fails closed to internal. It mirrors the south
-// engine-error classifier for the subset a create WriteStream can surface (a
-// create does not read, so the read-side not_found/range rows do not apply).
+// existing object) is the 409 already_exists class; a missing-parent write (the
+// client named a path whose parent directory does not exist) is a
+// client-attributable 404 not_found, NOT an internal fault; anything else fails
+// closed to internal. It mirrors the south spine engine-error classifier
+// (internal/southface: fs.ErrNotExist -> not_found, fs.ErrExist -> already_exists)
+// for the subset a create WriteStream can surface. The engine surfaces a
+// missing-parent as a raw *fs.PathError wrapping fs.ErrNotExist, so the match is
+// on the standard-library sentinel, exactly as the south classifier does.
 func denyClassForEngineErr(err error) string {
 	switch {
-	case errors.Is(err, southface.ErrAlreadyExists):
+	case errors.Is(err, southface.ErrAlreadyExists), errors.Is(err, fs.ErrExist):
 		return denyclass.AlreadyExists
+	case errors.Is(err, fs.ErrNotExist):
+		return denyclass.NotFound
 	default:
 		return denyclass.Internal
 	}
