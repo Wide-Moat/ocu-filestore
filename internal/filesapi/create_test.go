@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -1046,6 +1047,33 @@ func TestCreateAlreadyExistsIs409(t *testing.T) {
 	}
 	if !sess.balanced() {
 		t.Fatalf("already-exists gauge unbalanced")
+	}
+}
+
+// TestCreateMissingParentIs404 pins the north create 4xx classifier: an engine
+// WriteStream that fails with fs.ErrNotExist (the client named a path whose
+// parent directory does not exist) is a client-attributable 404 not_found, NOT
+// an internal 500. Before the classifier fix this mis-mapped to Internal. It
+// mirrors the south spine (fs.ErrNotExist -> not_found). Keystone: neuter the
+// fs.ErrNotExist case in denyClassForEngineErr and this reds to 500.
+func TestCreateMissingParentIs404(t *testing.T) {
+	h, eng, store, sess := createSetup()
+	eng.writeErr = fs.ErrNotExist // engine refuses: parent directory missing
+	body := []byte("ABCD")
+	params := createParamsJSON(t, map[string]any{
+		"path": "/no-such-dir/child.bin", "declared_size_bytes": len(body),
+	})
+	w := doCreate(h, params, body)
+
+	assertCreateDenied(t, w, http.StatusNotFound)
+	if store.putCalls != 0 {
+		t.Fatalf("Put called on a missing-parent refusal; want 0")
+	}
+	if eng.committed != 0 {
+		t.Fatalf("engine committed on a missing-parent refusal; want 0")
+	}
+	if !sess.balanced() {
+		t.Fatalf("missing-parent gauge unbalanced")
 	}
 }
 
