@@ -372,20 +372,30 @@ func TestComponentRoundTripOverTLSToMinIO(t *testing.T) {
 
 	cl := southClient(pool)
 
-	// makeDirectory /pub — POSIX mkdir requires the parent to exist before a
-	// file is written into a sub-path.
+	mc := minioClient()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Under the ADR-0029 default join the write and read axes resolve to disjoint
+	// subtrees (write->outputs/, read->uploads/), so the object an agent writes is
+	// undownloadable back through the same mount: the session uuid is minted only
+	// by read-class ops (which resolve under uploads/), while the write lands under
+	// outputs/. The round-trip is TWO independent legs — that disjointness IS the
+	// NFR-SEC-73 split.
+
+	// WRITE LEG: makeDirectory /pub (write->outputs/pub, make_parents lays outputs/)
+	// then fileUpload /pub/golden.bin (write->outputs/pub/golden.bin). An
+	// independent MinIO GetObject proves it landed under outputs/ byte-exact.
 	mk := postJSON(t, cl, "makeDirectory", map[string]any{
 		"filesystem_id":          itScope,
 		"path":                   downloadablePrefix,
+		"make_parents":           true,
 		"authorization_metadata": authMeta("write"),
 	})
 	mk.Body.Close()
 	if mk.StatusCode != http.StatusOK {
 		t.Fatalf("makeDirectory %s status = %d, want 200", downloadablePrefix, mk.StatusCode)
 	}
-
-	// fileUpload /pub/golden.bin — a known binary-safe payload, streamed through
-	// the south face to the s3 engine, which writes it to the real MinIO bucket.
 	const guestPath = downloadablePrefix + "/golden.bin"
 	payload := []byte("ABCDEFGH\x00\x01\x02 binary-safe component-test payload")
 	up := uploadMultipart(t, cl, map[string]any{
@@ -398,53 +408,49 @@ func TestComponentRoundTripOverTLSToMinIO(t *testing.T) {
 	if up.StatusCode != http.StatusOK {
 		t.Fatalf("fileUpload %s status = %d, want 200", guestPath, up.StatusCode)
 	}
+	wantKey := itScope + "/outputs" + guestPath // "<itScope>/outputs/pub/golden.bin"
+	obj, err := mc.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(minioBucket), Key: aws.String(wantKey)})
+	if err != nil {
+		t.Fatalf("independent MinIO GetObject %q (write must land under outputs/): %v", wantKey, err)
+	}
+	inBucket, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if !bytes.Equal(inBucket, payload) {
+		t.Fatalf("MinIO object %q bytes = %q, want the uploaded payload %q", wantKey, inBucket, payload)
+	}
 
-	// fileDownload returns the EXACT uploaded bytes through the south face — the
-	// engine fetched them back from MinIO.
-	uuid := uuidFor(t, cl, downloadablePrefix, guestPath)
+	// READ/EGRESS LEG: seed an object DIRECTLY under uploads/ (the human->sandbox
+	// input) with the independent client, read-list finds it, and fileDownload is
+	// denied 403 not_downloadable — uploads/ is not a configured downloadable
+	// prefix, so a human input is readable-in-session but not egress-eligible (the
+	// exfil-bar). Non-vacuous: a broken split would 200.
+	if _, err := mc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(minioBucket), Key: aws.String(itScope + "/uploads/"), Body: bytes.NewReader(nil),
+	}); err != nil {
+		t.Fatalf("seed uploads dir marker: %v", err)
+	}
+	seedKey := itScope + "/uploads/seed.bin"
+	seed := []byte("human-supplied input, readable-in-session, NOT egress-eligible")
+	if _, err := mc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(minioBucket), Key: aws.String(seedKey), Body: bytes.NewReader(seed),
+	}); err != nil {
+		t.Fatalf("seed uploads object: %v", err)
+	}
+	// The read listing of "/" resolves under uploads/ and returns the entry at its
+	// SUBTREE-STRIPPED guest path "/seed.bin" (the emitter strips the active subtree
+	// so the guest can re-address); the uuid MUST come from that read-op listing.
+	uuid := uuidFor(t, cl, "/", "/seed.bin")
 	dl := postJSON(t, cl, "fileDownload", map[string]any{
 		"filesystem_id":          itScope,
 		"uuid":                   uuid,
 		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 	})
 	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusOK {
+	if dl.StatusCode != http.StatusForbidden {
 		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload status = %d, want 200; body %s", dl.StatusCode, b)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar); body %s", dl.StatusCode, b)
 	}
-	if ct := dl.Header.Get("Content-Type"); ct != contentTypeOctetStream {
-		t.Errorf("fileDownload Content-Type = %q, want %q", ct, contentTypeOctetStream)
-	}
-	got, err := io.ReadAll(dl.Body)
-	if err != nil {
-		t.Fatalf("read fileDownload body: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("fileDownload bytes = %q, want the uploaded payload %q", got, payload)
-	}
-
-	// INDEPENDENT backend assertion: read the SAME object straight from real
-	// MinIO via a second S3 client. The s3 engine keys objects under
-	// "<scope>/<path>"; the guest path is rooted at "/", so the key drops the
-	// leading slash: "<itScope>/pub/golden.bin".
-	wantKey := itScope + guestPath // itScope + "/pub/golden.bin"
-	mc := minioClient()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	obj, err := mc.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(minioBucket),
-		Key:    aws.String(wantKey),
-	})
-	if err != nil {
-		t.Fatalf("independent MinIO GetObject %q: %v", wantKey, err)
-	}
-	defer obj.Body.Close()
-	inBucket, err := io.ReadAll(obj.Body)
-	if err != nil {
-		t.Fatalf("read MinIO object %q: %v", wantKey, err)
-	}
-	if !bytes.Equal(inBucket, payload) {
-		t.Fatalf("MinIO object %q bytes = %q, want the uploaded payload %q (the broker write must land in the real bucket)",
-			wantKey, inBucket, payload)
+	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
+		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
 	}
 }

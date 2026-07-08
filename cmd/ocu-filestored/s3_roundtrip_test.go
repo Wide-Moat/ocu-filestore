@@ -273,9 +273,10 @@ func s3RTRoundTrip(t *testing.T, cl *http.Client, baseURL, scope, bucket, endpoi
 	}
 	// The uuid MUST come from a read-op listing (session-scoped, minted only on the
 	// read plane). The read listing of "/" resolves under uploads/ and returns the
-	// entry at its joined guest path "/uploads/seed.bin" — the subtree is visible in
-	// the guest path the read plane reports, so match on that.
-	uuid := s3RTUUIDFor(t, cl, baseURL, scope, "/", "/uploads/seed.bin")
+	// entry at its SUBTREE-STRIPPED guest path "/seed.bin" — the join is symmetric,
+	// the emitter strips the active subtree so the guest can re-address, so match
+	// on the stripped form.
+	uuid := s3RTUUIDFor(t, cl, baseURL, scope, "/", "/seed.bin")
 	dl := s3RTPostJSON(t, cl, baseURL, "fileDownload", map[string]any{
 		"filesystem_id":          scope,
 		"uuid":                   uuid,

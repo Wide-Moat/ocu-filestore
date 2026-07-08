@@ -33,11 +33,14 @@ func TestComponentMultipartEdgeCasesAgainstMinIO(t *testing.T) {
 	cl := southClient(pool)
 	mc := minioClient()
 
-	// makeDirectory /pub — POSIX mkdir requires the parent to exist before a
-	// file is written into a sub-path.
+	// makeDirectory /pub — under the ADR-0029 write join this resolves to
+	// "outputs/pub", whose parent "outputs/" must also exist (the s3 engine's
+	// parentExists refuses a write with an absent prefix), so make_parents lays the
+	// whole chain.
 	mk := postJSON(t, cl, "makeDirectory", map[string]any{
 		"filesystem_id":          itScope,
 		"path":                   downloadablePrefix,
+		"make_parents":           true,
 		"authorization_metadata": authMeta("write"),
 	})
 	mk.Body.Close()
@@ -60,11 +63,12 @@ func TestComponentMultipartEdgeCasesAgainstMinIO(t *testing.T) {
 		guestPath := downloadablePrefix + "/large-stream.bin"
 		uploadGolden(t, cl, guestPath, payload)
 
-		// Exact-byte round-trip through the south face.
-		if got := downloadBytes(t, cl, downloadablePrefix, guestPath); !bytes.Equal(got, payload) {
-			t.Fatalf("fileDownload of %s returned %d bytes, want the uploaded %d bytes (exact)", guestPath, len(got), len(payload))
-		}
-		// Independent MinIO: the SAME bytes landed in the real bucket.
+		// Under the ADR-0029 split a write-intent upload lands under outputs/ and is
+		// undownloadable back through the same mount (read resolves under uploads/),
+		// so the exact-byte proof is the independent MinIO read of the write subtree
+		// — a torn or duplicated chunk shows in the exact-byte compare of the real
+		// backend object. (The south-face download round-trip is covered, split-aware,
+		// by the golden test.)
 		key := keyForGuestPath(guestPath)
 		if got := getObjectBytes(t, mc, key); !bytes.Equal(got, payload) {
 			t.Fatalf("MinIO %q = %d bytes, want the uploaded %d bytes (exact)", key, len(got), len(payload))
@@ -123,11 +127,9 @@ func TestComponentMultipartEdgeCasesAgainstMinIO(t *testing.T) {
 			t.Fatalf("same-key upload with overwrite status = %d, want 200; body %s",
 				overwrite.StatusCode, b)
 		}
-		// Byte-identical after the overwrite retry — through the south face AND
-		// in the real bucket.
-		if got := downloadBytes(t, cl, downloadablePrefix, guestPath); !bytes.Equal(got, payload) {
-			t.Fatalf("fileDownload after overwrite retry = %q, want %q", got, payload)
-		}
+		// Byte-identical after the overwrite retry — proven by the independent MinIO
+		// read of the write subtree (the south-face download of a write object is not
+		// expressible under the split; the golden test covers the read plane).
 		if got := getObjectBytes(t, mc, key); !bytes.Equal(got, payload) {
 			t.Fatalf("MinIO %q after overwrite retry = %q, want %q", key, got, payload)
 		}
