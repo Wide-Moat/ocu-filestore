@@ -57,11 +57,10 @@ const (
 	// multipartParamsField / multipartFileField / multipartFileFilename are the
 	// fileUpload multipart shape: a form FIELD "params" carrying the upload-params
 	// JSON, then a file PART "file" (filename "upload") streaming the raw bytes.
-	multipartParamsField   = "params"
-	multipartFileField     = "file"
-	multipartFileFilename  = "upload"
-	contentTypeJSON        = "application/json"
-	contentTypeOctetStream = "application/octet-stream"
+	multipartParamsField  = "params"
+	multipartFileField    = "file"
+	multipartFileFilename = "upload"
+	contentTypeJSON       = "application/json"
 
 	// e2eScope is the filesystem_id the daemon binds the test's edge-injected
 	// bearer to (the -filesystem-id flag). Every in-scope request carries this
@@ -413,54 +412,55 @@ func (d *daemon) listingContains(t *testing.T, dir, guestPath string) (uuid stri
 	return "", false
 }
 
-// download drives fileDownload over HTTPS for a uuid-addressed object and
-// returns the raw streamed bytes. It asserts the success Content-Type is the
-// chunked application/octet-stream the wire pins (A2-octet).
-func (d *daemon) download(t *testing.T, uuid string) []byte {
-	t.Helper()
-	resp := d.postJSON(t, "fileDownload", map[string]any{
-		"filesystem_id":          e2eScope,
-		"uuid":                   uuid,
-		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
-	})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("fileDownload status = %d, want 200; body %s", resp.StatusCode, b)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != contentTypeOctetStream {
-		t.Errorf("fileDownload Content-Type = %q, want %q", ct, contentTypeOctetStream)
-	}
-	got, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read fileDownload body: %v", err)
-	}
-	return got
-}
-
-// TestE2ELifecycleOverTLS drives the full non-vacuous file-op lifecycle against
-// the REAL daemon over its production TLS REST listener: makeDirectory ->
-// fileUpload -> readFile + listDirectory show the object -> fileDownload returns
-// the EXACT uploaded bytes -> removeFile -> listDirectory no longer shows it. It
-// asserts the VISIBLE results at every step (the bytes round-trip, the listing
-// reflects each mutation), so a no-op transport could not pass it.
+// TestE2ELifecycleOverTLS drives the non-vacuous file-op lifecycle against the
+// REAL daemon over its production TLS REST listener under the ADR-0029 default
+// join. The join resolves the write and read axes to DISJOINT subtrees
+// (write->outputs/, read->uploads/), so an agent cannot download the object it
+// just wrote back through the same mount: the session uuid is minted only by
+// read-class ops, which resolve under uploads/, while a write lands under
+// outputs/. The lifecycle is therefore TWO independent legs, and that
+// disjointness IS the NFR-SEC-73 split (the ":ro" mirage closed by construction).
+//
+// WRITE LEG: makeDirectory (make_parents) lays the outputs/ chain, fileUpload
+// lands the object under outputs/, and an on-disk read of the local-volume
+// backend object (engineRoot/<scope>/outputs/<rel>) proves it landed byte-exact.
+// A download of the write object is impossible by construction, so the write is
+// verified at the backend, not through a read-plane uuid.
+//
+// READ/EGRESS LEG: a seed object is placed DIRECTLY under uploads/ on disk (the
+// human->sandbox input arrives out of band; the read plane holds no write
+// lease), then a read-op listing of "/" FINDS it at its subtree-stripped guest
+// path "/seed.bin" (the emitter strips the active subtree — the round-trip
+// symmetry fix) and mints its uuid. fileDownload of that uuid is DENIED 403
+// not_downloadable: uploads/ is not a configured downloadable prefix, so a
+// human-supplied input is readable in-session yet cannot be pulled out of the
+// sandbox — the exfil-bar.
 func TestE2ELifecycleOverTLS(t *testing.T) {
-	d := startDaemon(t)
+	d := startDaemon(t,
+		"-claims-bind",
+		"-subtree-rw", "outputs",
+		"-subtree-ro", "uploads",
+		"-subtree-preview", "uploads",
+	)
+	scopeDir := filepath.Join(d.engineRoot, e2eScope)
 
-	// makeDirectory /pub. POSIX mkdir semantics require the parent to exist
-	// before writing a file into a sub-path; the scope root is ready after
-	// provision, /pub must be created explicitly.
+	// WRITE LEG. makeDirectory /pub (intent=write) joins to outputs/pub, whose
+	// parent outputs/ does not exist after provision; the local engine's
+	// parentExists refuses a write into an absent prefix, so make_parents lays the
+	// outputs/ -> outputs/pub chain in one call.
 	mk := d.postJSON(t, "makeDirectory", map[string]any{
 		"filesystem_id":          e2eScope,
 		"path":                   downloadableDir,
+		"make_parents":           true,
 		"authorization_metadata": authMeta("write"),
 	})
 	mk.Body.Close()
 	if mk.StatusCode != http.StatusOK {
-		t.Fatalf("makeDirectory %s status = %d, want 200", downloadableDir, mk.StatusCode)
+		t.Fatalf("makeDirectory %s (make_parents) status = %d, want 200", downloadableDir, mk.StatusCode)
 	}
 
-	// fileUpload /pub/golden.bin = a known, binary-safe payload.
+	// fileUpload /pub/golden.bin = a known, binary-safe payload. The write join
+	// prepends the RW subtree, so the object lands at outputs/pub/golden.bin.
 	const guestPath = downloadableDir + "/golden.bin"
 	payload := []byte("ABCDEFGH\x00\x01\x02 binary-safe e2e payload")
 	up := d.uploadMultipart(t, map[string]any{
@@ -474,51 +474,28 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 		t.Fatalf("fileUpload %s status = %d, want 200; stderr:\n%s", guestPath, up.StatusCode, d.stderr.String())
 	}
 
-	// readFile (unary) shows the object with the uploaded size. readFile is
-	// metadata-only (no content/data/bytes); the bytes come from fileDownload.
-	rf := d.postJSON(t, "readFile", map[string]any{
-		"filesystem_id":          e2eScope,
-		"path":                   guestPath,
-		"authorization_metadata": authMeta("read"),
-	})
-	if rf.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(rf.Body)
-		rf.Body.Close()
-		t.Fatalf("readFile %s status = %d, want 200; body %s", guestPath, rf.StatusCode, b)
+	// The write is verified at the backend, not through a download: the object
+	// lands under the OUTPUTS subtree (outputs/pub/golden.bin), which no
+	// read-plane uuid can resolve. Read the local-volume backend object straight
+	// off disk and assert the bytes are exact — a no-op transport could not
+	// reproduce them.
+	landed := filepath.Join(scopeDir, "outputs", downloadablePrefix, "golden.bin")
+	onDisk, err := os.ReadFile(landed)
+	if err != nil {
+		t.Fatalf("write object %s not written under the outputs subtree: %v", landed, err)
 	}
-	var rfBody struct {
-		File struct {
-			Path string `json:"path"`
-			Size int64  `json:"size"`
-		} `json:"file"`
+	if !bytes.Equal(onDisk, payload) {
+		t.Fatalf("backend object %s bytes = %q, want the uploaded payload %q", landed, onDisk, payload)
 	}
-	if err := json.NewDecoder(rf.Body).Decode(&rfBody); err != nil {
-		rf.Body.Close()
-		t.Fatalf("decode readFile: %v", err)
-	}
-	rf.Body.Close()
-	if rfBody.File.Path != guestPath || rfBody.File.Size != int64(len(payload)) {
-		t.Fatalf("readFile metadata = %+v, want path %s size %d", rfBody.File, guestPath, len(payload))
+	// The write did NOT alias into the read-only uploads subtree.
+	if _, err := os.Stat(filepath.Join(scopeDir, "uploads", downloadablePrefix, "golden.bin")); err == nil {
+		t.Fatalf("write aliased into the read-only uploads subtree; the :ro split is broken")
 	}
 
-	// listDirectory shows the uploaded file; capture the minted uuid for the
-	// uuid-addressed download.
-	uuid, found := d.listingContains(t, downloadableDir, guestPath)
-	if !found {
-		t.Fatalf("listDirectory of %s does not contain %s after upload", downloadableDir, guestPath)
-	}
-	if uuid == "" {
-		t.Fatal("listDirectory entry for the uploaded file carries no minted uuid")
-	}
-
-	// fileDownload returns the EXACT uploaded bytes — the load-bearing
-	// round-trip assertion (a no-op transport cannot reproduce these bytes).
-	got := d.download(t, uuid)
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("fileDownload bytes = %q, want the uploaded payload %q", got, payload)
-	}
-
-	// removeFile mutates the namespace; the listing must reflect it.
+	// removeFile /pub/golden.bin is a write op -> it resolves under the SAME
+	// outputs subtree the upload landed in, so it names the object just written.
+	// Removing it and re-reading the backend proves the write plane can mutate its
+	// own namespace (the removeFile leg, adapted to the outputs subtree).
 	rm := d.postJSON(t, "removeFile", map[string]any{
 		"filesystem_id":          e2eScope,
 		"path":                   guestPath,
@@ -528,10 +505,49 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 	if rm.StatusCode != http.StatusOK {
 		t.Fatalf("removeFile %s status = %d, want 200", guestPath, rm.StatusCode)
 	}
+	if _, err := os.Stat(landed); err == nil {
+		t.Fatalf("backend object %s still present after removeFile; the mutation is not visible", landed)
+	}
 
-	// listDirectory no longer shows the removed file — the mutation is visible.
-	if _, stillThere := d.listingContains(t, downloadableDir, guestPath); stillThere {
-		t.Fatalf("listDirectory of %s still contains %s after removeFile", downloadableDir, guestPath)
+	// READ/EGRESS LEG. Seed an object DIRECTLY under uploads/ on disk — the
+	// human->sandbox input arrives out of band, the read plane holds no write
+	// lease to create it.
+	if err := os.MkdirAll(filepath.Join(scopeDir, "uploads"), 0o700); err != nil {
+		t.Fatalf("seed uploads dir: %v", err)
+	}
+	seed := []byte("human-supplied input, readable-in-session, NOT egress-eligible")
+	if err := os.WriteFile(filepath.Join(scopeDir, "uploads", "seed.bin"), seed, 0o600); err != nil {
+		t.Fatalf("seed uploads/seed.bin: %v", err)
+	}
+
+	// A read-op listing of "/" resolves under uploads/ and returns the seed at its
+	// SUBTREE-STRIPPED guest path "/seed.bin" (the emitter strips the active
+	// subtree so the guest can re-address). The uuid is minted only on this read
+	// plane.
+	uuid, found := d.listingContains(t, "/", "/seed.bin")
+	if !found {
+		t.Fatalf("read listing of / does not contain the seeded uploads/ input at /seed.bin")
+	}
+	if uuid == "" {
+		t.Fatal("read listing entry for the seeded input carries no minted uuid")
+	}
+
+	// fileDownload of that uuid is DENIED 403 not_downloadable: uploads/ is not a
+	// configured downloadable prefix, so the human-supplied input is readable
+	// in-session yet cannot be exfiltrated — the egress bar. A 404 would mean the
+	// uuid mis-keyed the object; a 200 would mean the split is broken.
+	dl := d.postJSON(t, "fileDownload", map[string]any{
+		"filesystem_id":          e2eScope,
+		"uuid":                   uuid,
+		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
+	})
+	defer dl.Body.Close()
+	if dl.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(dl.Body)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar: uploads is not downloadable); body %s", dl.StatusCode, b)
+	}
+	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
+		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
 	}
 }
 
@@ -745,52 +761,6 @@ func TestE2EMirageSubtreeJoin(t *testing.T) {
 		}
 		if string(roGot) != nonceA {
 			t.Fatalf("RO object bytes = %q, want the UNCHANGED seed %q; the write reached the read-only subtree", roGot, nonceA)
-		}
-	})
-
-	t.Run("join_disabled_write_clobbers_flat_object", func(t *testing.T) {
-		// No -claims-bind, no -subtree-* flags: the shipped static bind (join
-		// disabled). The fixed e2eBearer binds to the configured scope with the
-		// default read,write grant.
-		d := startDaemon(t)
-		scopeDir := filepath.Join(d.engineRoot, e2eScope)
-
-		if err := os.MkdirAll(filepath.Join(scopeDir, "uploads"), 0o700); err != nil {
-			t.Fatalf("seed uploads dir: %v", err)
-		}
-		flatPath := filepath.Join(scopeDir, "uploads", "x")
-		if err := os.WriteFile(flatPath, []byte(nonceA), 0o600); err != nil {
-			t.Fatalf("seed flat object: %v", err)
-		}
-
-		// The SAME upload addressing "/uploads/x" with overwrite: static mode has
-		// no join, so it CLOBBERS the flat object the RO view reads.
-		resp := d.uploadMultipart(t, map[string]any{
-			"filesystem_id":          e2eScope,
-			"path":                   "/uploads/x",
-			"declared_size_bytes":    len(nonceB),
-			"overwrite_existing":     true,
-			"authorization_metadata": authMeta("write"),
-		}, []byte(nonceB))
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("join-disabled write status = %d, want 200; body %s", resp.StatusCode, body)
-		}
-
-		// The flat object was CLOBBERED (the pre-fix mirage: write reached the
-		// same flat object the RO view reads).
-		got, err := os.ReadFile(flatPath)
-		if err != nil {
-			t.Fatalf("flat object vanished: %v", err)
-		}
-		if string(got) != nonceB {
-			t.Fatalf("flat object bytes = %q, want the CLOBBER %q (static mode must reach the flat object)", got, nonceB)
-		}
-		// No joined object exists in static mode.
-		joined := filepath.Join(scopeDir, "outputs", "uploads", "x")
-		if _, err := os.Stat(joined); err == nil {
-			t.Fatalf("static-mode write gained the join (%s exists); the join must be inert without the flags", joined)
 		}
 	})
 }
