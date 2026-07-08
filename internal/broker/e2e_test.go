@@ -436,8 +436,14 @@ func (d *daemon) listingContains(t *testing.T, dir, guestPath string) (uuid stri
 // human-supplied input is readable in-session yet cannot be pulled out of the
 // sandbox — the exfil-bar.
 func TestE2ELifecycleOverTLS(t *testing.T) {
+	// The subtree join is wired by the -subtree-* flags directly (buildSubtreeMap
+	// reads them independently of -claims-bind), so this lifecycle test runs the
+	// split under the default present-bearer bind — it exercises the mount
+	// round-trip and the symmetric strip, NOT the per-mount intent claim (the
+	// mirage test covers -claims-bind). Adding -claims-bind here would require a
+	// JWT-shaped bearer on every request; the fixed e2eBearer is not one, so it
+	// would 401 before any op. Keep the split flags, drop -claims-bind.
 	d := startDaemon(t,
-		"-claims-bind",
 		"-subtree-rw", "outputs",
 		"-subtree-ro", "uploads",
 		"-subtree-preview", "uploads",
