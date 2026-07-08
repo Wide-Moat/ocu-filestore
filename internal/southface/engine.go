@@ -316,6 +316,40 @@ func guestPathFromRel(rel string) string {
 	return "/" + strings.TrimPrefix(rel, "/")
 }
 
+// guestDisplayPath is the engine->guest emit-boundary counterpart to
+// canonicalizePath's guest->engine join (ADR-0029 round-trip symmetry): it strips
+// the active intent subtree from an engine-relative path and returns the guest
+// leading-slash form, so a path the read plane REPORTS is one the guest can
+// re-address without a double-join. The store, cursor, download re-canon, and
+// audit keep the JOINED engine form; ONLY the wire Path field a south response
+// echoes is stripped. subtree is engine-relative with no leading slash
+// ("uploads", "outputs"); "" (static-path mode) makes this identical to
+// guestPathFromRel.
+//
+// The strip is anchored and boundary-checked (strip only when rel equals the
+// subtree or lies beneath it on a "/" boundary — "uploads2/x" is NOT stripped)
+// and applied AT MOST ONCE, so the engine object "uploads/uploads/x" emits
+// "/uploads/x" and a guest re-address re-joins it back to "uploads/uploads/x".
+func guestDisplayPath(rel, subtree string) string {
+	if subtree == "" {
+		return guestPathFromRel(rel)
+	}
+	r := strings.TrimPrefix(rel, "/")
+	switch {
+	case r == subtree:
+		// The subtree root itself surfaces as the guest scope root.
+		return "/"
+	case strings.HasPrefix(r, subtree+"/"):
+		return guestPathFromRel(strings.TrimPrefix(r, subtree+"/"))
+	default:
+		// An engine-relative path outside the active subtree cannot occur under an
+		// intent-rooted walk (the walk is rooted at the subtree). Falling through to
+		// the joined form here would reopen the leak, so this branch is an internal
+		// inconsistency the round-trip keystone is built to catch.
+		return guestPathFromRel(rel)
+	}
+}
+
 // denyClassForEngineErr maps an engine error to a deny class in EXACTLY this
 // order (the order is load-bearing — see Pitfall 2):
 //

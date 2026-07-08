@@ -649,6 +649,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		op:          op,
 		body:        bodyBytes,
 		canonPath:   env.Path, // the spine-canonicalized primary path (bypass-01/03)
+		subtree:     subtree,  // the ADR-0029 join subtree, for symmetric strip on emit
 		canonSource: canonSrc, // the spine-canonicalized move/copy source leg (crutch-04)
 		canonDest:   canonDst, // the spine-canonicalized move/copy destination leg (crutch-04)
 		ps:          ps,

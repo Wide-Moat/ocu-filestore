@@ -47,6 +47,15 @@ type handlerCtx struct {
 	// decision can never disagree with the bytes touched. It is in the guest
 	// leading-slash convention; enginePath trims it for the engine call.
 	canonPath string
+	// subtree is the ADR-0029 intent-derived subtree the spine joined into
+	// canonPath (engine-relative, no leading slash — e.g. "uploads" for a read op,
+	// "outputs" for a write op; "" in static-path mode). A listing emitter strips
+	// this prefix from each entry's engine-relative path before reporting the guest
+	// path, so a guest re-addressing a listed path does not double-join it (the
+	// join is symmetric: canonicalizePath adds the subtree on the way in, the
+	// emitter removes it on the way out). Consumers other than the listing emitter
+	// do not need it — they address by canonPath (already joined) or by uuid.
+	subtree string
 	// canonSource and canonDest are the spine-canonicalized SECOND-LEG paths for
 	// the two-path namespace ops (moveDirectory, copyFile, moveFile). The spine
 	// cleans req.Source/req.Destination through the SAME canonicalizePath it

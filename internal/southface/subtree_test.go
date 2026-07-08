@@ -346,3 +346,106 @@ func TestDispatch_GrantedIntentsCeiling(t *testing.T) {
 		t.Fatalf("write op with write IN the ceiling status = %d, want 200 (the ceiling only narrows); body %s", w2.Code, w2.Body.String())
 	}
 }
+
+// TestDispatch_ListReAddressRoundTrip is the ADR-0029 emit-boundary keystone: a
+// path the read plane REPORTS must be one the guest can re-address without a
+// double-join. It closes the round-trip both ways in ONE test — by path
+// (readMetadata of a listed path) AND by uuid (fileDownload of the listed uuid)
+// — so a strip that fixes path-addressing cannot silently break uuid-addressing
+// (the download-immune uuid keys on the JOINED store form, Option A).
+//
+// The listing runs under READ, which joins to the "uploads" subtree, and the
+// wire Path is stripped so the guest sees the subtree-relative form. The nested
+// case (engine "uploads/uploads/deep.bin") proves the strip is anchored and
+// ONCE, not a loop: the display is "/uploads/deep.bin" (the inner "uploads" is a
+// legitimate segment), and re-addressing it re-joins to the original engine
+// object — a strip-loop would mangle it to "/deep.bin" and the round-trip would
+// break.
+func TestDispatch_ListReAddressRoundTrip(t *testing.T) {
+	const scope = "fs-roundtrip"
+
+	newDisp := func(eng *fakeEngine) *dispatcher {
+		return subtreeDispatcher(eng, &fakeGuard{}, &recordingCeilingsSession{}, 1<<20)
+	}
+
+	// (scope-relative engine path, expected stripped display path, bytes)
+	cases := []struct {
+		engineRel string
+		display   string
+		content   []byte
+	}{
+		{"uploads/seed.bin", "/seed.bin", []byte("read-plane input alpha")},
+		{"uploads/uploads/deep.bin", "/uploads/deep.bin", []byte("nested-uploads BETA — strip-once proof")},
+		{"uploads/a/b/c.txt", "/a/b/c.txt", []byte("deep tree gamma")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.engineRel, func(t *testing.T) {
+			eng := newFakeEngine()
+			eng.putBytes(scope, tc.engineRel, tc.content)
+			d := newDisp(eng)
+
+			// LIST "/" under READ (joins to uploads/): the entry's wire Path must be
+			// the STRIPPED display form, not the joined engine form.
+			ld := decodeList(t, serveOp(d, OpListDirectory, listBody(scope, "/", 0, "", true), scope, okIntents()))
+			var listedPath, listedUUID string
+			for _, e := range ld.Entries {
+				if e.File != nil && e.File.Path == tc.display {
+					listedPath, listedUUID = e.File.Path, e.File.UUID
+				}
+			}
+			if listedPath == "" {
+				t.Fatalf("listing of / did not emit the stripped display path %q; entries=%+v", tc.display, ld.Entries)
+			}
+			if listedUUID == "" {
+				t.Fatalf("listing entry for %q has no uuid", tc.display)
+			}
+
+			// LEG 1 (path re-address): readMetadata of the LISTED path re-joins to the
+			// same engine object -> 200, and mints the SAME uuid the listing reported.
+			// A double-join (strip-loop or unstripped emit) would 404 here.
+			rm := decodeReadMetadata(t, serveOp(d, OpReadMetadata, readMetadataBody(scope, listedPath), scope, okIntents()))
+			if rm.File == nil {
+				t.Fatalf("readMetadata(%q) returned no file (double-join?); resp=%+v", listedPath, rm)
+			}
+			if rm.File.Path != tc.display {
+				t.Fatalf("readMetadata(%q) Path = %q, want the stripped %q", listedPath, rm.File.Path, tc.display)
+			}
+			if rm.File.UUID != listedUUID {
+				t.Fatalf("uuid mismatch: listing %q vs readMetadata %q (idFor keyed on the wrong form?)", listedUUID, rm.File.UUID)
+			}
+
+			// LEG 2 (uuid re-address): fileDownload of the LISTED uuid resolves the
+			// JOINED store object (Option A: the uuid keys the joined form, so the
+			// download's empty-subtree re-canon reaches the real engine object at
+			// "uploads/..."). It is DENIED 403 not_downloadable because uploads/ is
+			// not a configured downloadable prefix — a human->sandbox input is
+			// readable-in-session but not egress-eligible (the exfil-bar). The
+			// load-bearing point HERE is that the uuid resolves to the RIGHT object:
+			// a mis-keyed uuid (stripped form) would 404 not_found — a different
+			// class — so a 403 not_downloadable proves the store keyed the joined form.
+			dl := serveDownload(t, d, scope, listedUUID, nil, scope, okIntents())
+			if dl.Code != 403 {
+				t.Fatalf("download of the listed uuid status = %d, want 403 not_downloadable (a 404 would mean the uuid mis-keyed the object); body %s", dl.Code, dl.Body.String())
+			}
+			if r := dl.Header().Get("x-deny-reason"); r != "not_downloadable" {
+				t.Fatalf("download deny reason = %q, want not_downloadable (a not_found reason would mean the uuid keyed the wrong object)", r)
+			}
+		})
+	}
+
+	// ALIAS NEGATIVE: the JOINED engine form is NOT guest-addressable once the
+	// strip is symmetric — readMetadata of "/uploads/seed.bin" under READ joins to
+	// "uploads/uploads/seed.bin" (double-join) and 404s. Pin it so nobody adds a
+	// try-both-forms fallback (two names for one object diverges every prefix
+	// policy check).
+	t.Run("alias_joined_form_is_not_addressable", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(scope, "uploads/seed.bin", []byte("x"))
+		d := newDisp(eng)
+		w := serveOp(d, OpReadMetadata, readMetadataBody(scope, "/uploads/seed.bin"), scope, okIntents())
+		if w.Code != 404 {
+			t.Fatalf("readMetadata of the joined alias status = %d, want 404 (the joined form must not be guest-addressable)", w.Code)
+		}
+	})
+}
