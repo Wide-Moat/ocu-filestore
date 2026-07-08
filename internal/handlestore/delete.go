@@ -62,7 +62,11 @@ func (s *DiskStore) Delete(ctx context.Context, fileID, attestedScope string) er
 	if err := s.durableAppend(delEnvelope{Op: opDel, FileID: fileID, Scope: rec.Scope}); err != nil {
 		return err
 	}
-	// Remove from the map only after the durable tombstone acked.
+	// Remove from the map AND the ref index, and mark the (scope, ref) tombstoned
+	// so EnsureObject will not re-mint it on the next north-list reconcile (a
+	// north-deleted object must not silently reappear). Only after the durable
+	// tombstone acked.
+	unindexRef(s.refIndex, s.tombstonedRefs, rec.Scope, rec.ObjectRef)
 	delete(s.recs, fileID)
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,6 +76,24 @@ type DiskStore struct {
 	// recs is the in-memory projection of the replayed log: file_id -> Record.
 	// Get and List read it; Put/Delete mutate it only AFTER the durable write.
 	recs map[string]Record
+	// refIndex is the (Scope, ObjectRef) -> file_id secondary index EnsureObject
+	// resolves put-if-absent against: scope -> normalizedObjectRef -> file_id. It
+	// is fully DERIVED from the existing opPut/opDelete log (no new log record
+	// shape) and rebuilt at replay — a Put indexes its (scope, ref); a Delete
+	// tombstone removes the entry. The ObjectRef key is normalised (a single
+	// leading slash stripped, normalizeRef) so a north-created engine-relative ref
+	// ("outputs/x") and the same object the engine namespace reports key
+	// identically (ADR-0029 inv-5), and one object never mints two handles.
+	refIndex map[string]map[string]string
+	// tombstonedRefs remembers every (Scope, ObjectRef) a Delete tombstoned so
+	// EnsureObject will NOT re-mint a handle for an ObjectRef the operator
+	// explicitly deleted (else a north-deleted object silently reappears on the
+	// next north-list reconcile). It is rebuilt at replay from opDelete records
+	// and set on every Delete. This preserves DELETE's meaning at the handle
+	// layer; whether a north delete should ALSO remove the engine bytes is a later
+	// ruling (this store carries no engine dependency — it masks the re-mint, it
+	// does not erase bytes).
+	tombstonedRefs map[string]map[string]bool
 	// failed latches true after any write or sync error; it never resets.
 	failed bool
 	// closed is set by Close after the descriptor is released; a mutation on a
@@ -120,6 +139,12 @@ func NewDiskStore(path string) (*DiskStore, error) {
 	}
 
 	recs := make(map[string]Record)
+	// refIndex and tombstonedRefs are DERIVED from the same opPut/opDelete log as
+	// recs (no new log shape): a Put indexes its (scope, ref); a Delete removes the
+	// index entry and records the tombstoned (scope, ref). Both are rebuilt here at
+	// replay so a restart resumes the exact idempotency/mask state.
+	refIndex := make(map[string]map[string]string)
+	tombstonedRefs := make(map[string]map[string]bool)
 	switch {
 	case isNew:
 		// Two-fsync creation: the file, then the parent directory so the new
@@ -139,7 +164,7 @@ func NewDiskStore(path string) (*DiskStore, error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("handlestore: open log for replay: %w", err)
 		}
-		torn, scanErr := replay(rf, recs)
+		torn, scanErr := replay(rf, recs, refIndex, tombstonedRefs)
 		_ = rf.Close()
 		if scanErr != nil {
 			_ = f.Close()
@@ -159,7 +184,58 @@ func NewDiskStore(path string) (*DiskStore, error) {
 		}
 	}
 
-	return &DiskStore{f: f, w: f, recs: recs, now: time.Now}, nil
+	return &DiskStore{
+		f:              f,
+		w:              f,
+		recs:           recs,
+		refIndex:       refIndex,
+		tombstonedRefs: tombstonedRefs,
+		now:            time.Now,
+	}, nil
+}
+
+// normalizeRef maps an ObjectRef to the key form the ref index and the tombstone
+// mask use: a single leading slash is stripped so a north-created engine-relative
+// ref ("outputs/x", stored with no leading slash by the create path) and the same
+// object the engine namespace reports key identically (ADR-0029 inv-5). It strips
+// AT MOST ONE leading slash (never path.Clean) — the store carries no engine
+// dependency and never dereferences the ref, so it must not rewrite the caller's
+// reference beyond the one-convention alignment the idempotency key needs.
+func normalizeRef(ref string) string {
+	return strings.TrimPrefix(ref, "/")
+}
+
+// indexRef records fileID as the handle for (scope, normalizeRef(ref)) in idx and
+// clears any tombstone mark on that (scope, ref): a fresh Put of a ref revives it
+// for EnsureObject (the operator re-created what they had deleted). It is the ONE
+// place a Put mutates the secondary index, shared by replay and the live Put path.
+func indexRef(idx map[string]map[string]string, tomb map[string]map[string]bool, scope, ref, fileID string) {
+	key := normalizeRef(ref)
+	byRef := idx[scope]
+	if byRef == nil {
+		byRef = make(map[string]string)
+		idx[scope] = byRef
+	}
+	byRef[key] = fileID
+	if ts := tomb[scope]; ts != nil {
+		delete(ts, key)
+	}
+}
+
+// unindexRef removes the (scope, normalizeRef(ref)) -> file_id entry and marks the
+// ref tombstoned so EnsureObject will not re-mint it. It is the ONE place a Delete
+// mutates the secondary index, shared by replay and the live Delete path.
+func unindexRef(idx map[string]map[string]string, tomb map[string]map[string]bool, scope, ref string) {
+	key := normalizeRef(ref)
+	if byRef := idx[scope]; byRef != nil {
+		delete(byRef, key)
+	}
+	ts := tomb[scope]
+	if ts == nil {
+		ts = make(map[string]bool)
+		tomb[scope] = ts
+	}
+	ts[key] = true
 }
 
 // syncDir fsyncs the directory at dir so a new entry inside it is durable.
@@ -183,20 +259,22 @@ func syncDir(dir string) error {
 	return nil
 }
 
-// replay folds a JSONL log stream into recs, last-write-wins. It returns the
-// byte length of a trailing partial line with no newline (0 when the stream
-// ends cleanly) and an error naming the first unparseable COMPLETE line — an
-// unparseable complete line is corruption the constructor must fail on, never a
-// torn tail. Each complete line is a put (insert/overwrite) or del (delete)
+// replay folds a JSONL log stream into recs, last-write-wins, and rebuilds the
+// two secondary indexes (refIndex, tombstonedRefs) from the SAME opPut/opDelete
+// log — no new record shape is read. It returns the byte length of a trailing
+// partial line with no newline (0 when the stream ends cleanly) and an error
+// naming the first unparseable COMPLETE line — an unparseable complete line is
+// corruption the constructor must fail on, never a torn tail. Each complete line
+// is a put (insert/overwrite + index) or del (delete + unindex + tombstone)
 // envelope; an unknown op or a put with an empty file_id is corruption.
-func replay(r io.Reader, recs map[string]Record) (torn int, err error) {
+func replay(r io.Reader, recs map[string]Record, refIndex map[string]map[string]string, tombstonedRefs map[string]map[string]bool) (torn int, err error) {
 	br := bufio.NewReader(r)
 	lineNum := 0
 	for {
 		chunk, readErr := br.ReadBytes('\n')
 		if len(chunk) > 0 && chunk[len(chunk)-1] == '\n' {
 			lineNum++
-			if aerr := applyLine(chunk, recs); aerr != nil {
+			if aerr := applyLine(chunk, recs, refIndex, tombstonedRefs); aerr != nil {
 				return 0, fmt.Errorf("handlestore: log line %d: %w", lineNum, aerr)
 			}
 		} else if len(chunk) > 0 {
@@ -212,10 +290,15 @@ func replay(r io.Reader, recs map[string]Record) (torn int, err error) {
 	}
 }
 
-// applyLine folds one complete JSONL line into recs. It peeks the op
-// discriminator, then unmarshals the matching envelope. An unparseable line, an
-// unknown op, or a put/del with an empty file_id is corruption (returned error).
-func applyLine(line []byte, recs map[string]Record) error {
+// applyLine folds one complete JSONL line into recs AND the two secondary
+// indexes. It peeks the op discriminator, then unmarshals the matching envelope.
+// A put indexes its (scope, ref) -> file_id; a del removes the index entry AND
+// records the tombstoned (scope, ref) so EnsureObject will not re-mint it. The
+// del envelope carries no ObjectRef, so the ref is read from the record the log
+// already put (recs[file_id]) BEFORE it is deleted — the log is self-describing.
+// An unparseable line, an unknown op, or a put/del with an empty file_id is
+// corruption (returned error).
+func applyLine(line []byte, recs map[string]Record, refIndex map[string]map[string]string, tombstonedRefs map[string]map[string]bool) error {
 	var head struct {
 		Op string `json:"op"`
 	}
@@ -232,6 +315,7 @@ func applyLine(line []byte, recs map[string]Record) error {
 			return errors.New("put record has empty file_id")
 		}
 		recs[env.Record.FileID] = env.Record
+		indexRef(refIndex, tombstonedRefs, env.Record.Scope, env.Record.ObjectRef, env.Record.FileID)
 		return nil
 	case opDel:
 		var env delEnvelope
@@ -240,6 +324,13 @@ func applyLine(line []byte, recs map[string]Record) error {
 		}
 		if env.FileID == "" {
 			return errors.New("del record has empty file_id")
+		}
+		// The del envelope names no ObjectRef; recover it from the record the log
+		// already put so the index/tombstone update keys on the same (scope, ref)
+		// the put indexed. The envelope's own Scope is the tombstone scope; the ref
+		// comes from the still-present record.
+		if rec, ok := recs[env.FileID]; ok {
+			unindexRef(refIndex, tombstonedRefs, rec.Scope, rec.ObjectRef)
 		}
 		delete(recs, env.FileID)
 		return nil
@@ -370,8 +461,86 @@ func (s *DiskStore) Put(ctx context.Context, in PutInput) (Record, error) {
 	if err := s.durableAppend(putEnvelope{Op: opPut, Record: rec}); err != nil {
 		return Record{}, err
 	}
-	// Insert into the map only after the durable write acked.
+	// Insert into the map AND the ref index only after the durable write acked. A
+	// fresh Put of a previously-deleted ref revives it for EnsureObject (indexRef
+	// clears the tombstone) — the operator re-created what they had deleted.
 	s.recs[rec.FileID] = rec
+	indexRef(s.refIndex, s.tombstonedRefs, rec.Scope, rec.ObjectRef, rec.FileID)
+	return rec, nil
+}
+
+// EnsureObject is put-if-absent keyed on (Scope, ObjectRef): if a NON-tombstoned
+// record already exists for that pair it is returned UNCHANGED (no new mint);
+// else a fresh record is durably Put (random FileID, store-stamped CreatedAt) and
+// returned. It is the north-list reconcile primitive (ADR-0029:46): the browser
+// File Pane lists via the north handle store, but a deliverable the agent wrote
+// through the south FUSE mount mints no north handle — so the list reconciles the
+// engine namespace by calling EnsureObject for every engine object, and the
+// (Scope, ObjectRef) key makes that reconcile IDEMPOTENT (the same object keeps
+// the same file_id across every list, the anti-dup invariant).
+//
+// The tombstone mask is load-bearing for DELETE correctness: an ObjectRef the
+// operator explicitly Deleted returns ErrNotFound here — it is NOT re-minted — so
+// a north-deleted object does not silently reappear on the next reconcile. This
+// preserves DELETE's meaning at the handle layer; whether a north delete should
+// ALSO remove the engine bytes is deferred to a later ruling (this store carries
+// no engine dependency and erases no bytes — it masks the re-mint only).
+//
+// It is a MUTATION and fails closed exactly like Put: an already-cancelled ctx,
+// a latched store, or a closed store returns ErrStoreUnavailable without writing.
+// The north caller (serveList) skips the reconcile when Store.Latched(), so this
+// path is not normally hit under a latch — but the guard here is the structural
+// one, not the caller's courtesy.
+func (s *DiskStore) EnsureObject(ctx context.Context, in EnsureInput) (Record, error) {
+	if err := ctx.Err(); err != nil {
+		return Record{}, ErrStoreUnavailable
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed || s.closed {
+		return Record{}, ErrStoreUnavailable
+	}
+
+	key := normalizeRef(in.ObjectRef)
+
+	// The tombstone mask FIRST: an ObjectRef the operator deleted must not be
+	// re-minted (else a north-deleted object reappears on the next north-list
+	// reconcile). Return the SAME ErrNotFound the resolution path uses so the
+	// caller (serveList) skips it exactly as it skips an absent ref — the sentinel
+	// is the "no handle for this ref, and do not mint one" signal.
+	if ts := s.tombstonedRefs[in.Scope]; ts != nil && ts[key] {
+		return Record{}, ErrNotFound
+	}
+
+	// Put-if-absent: a non-tombstoned record already indexed for (scope, ref) is
+	// returned UNCHANGED — no new mint, the anti-dup invariant. The existing
+	// file_id is stable across every list.
+	if byRef := s.refIndex[in.Scope]; byRef != nil {
+		if fileID, ok := byRef[key]; ok {
+			if rec, ok := s.recs[fileID]; ok {
+				return rec, nil
+			}
+		}
+	}
+
+	// Absent and not tombstoned: mint a fresh handle, durably. CreatedAt is
+	// store-clock-stamped (never the engine ModTime — "never the caller's value").
+	rec := Record{
+		FileID:                objectid.New(),
+		Scope:                 in.Scope,
+		ObjectRef:             in.ObjectRef,
+		Filename:              in.Filename,
+		Mime:                  in.Mime,
+		Size:                  in.Size,
+		CreatedAt:             s.now().UTC().Format(time.RFC3339),
+		DownloadablePolicyRef: in.DownloadablePolicyRef,
+	}
+	if err := s.durableAppend(putEnvelope{Op: opPut, Record: rec}); err != nil {
+		return Record{}, err
+	}
+	s.recs[rec.FileID] = rec
+	indexRef(s.refIndex, s.tombstonedRefs, rec.Scope, rec.ObjectRef, rec.FileID)
 	return rec, nil
 }
 

@@ -36,6 +36,7 @@ import (
 	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/Wide-Moat/ocu-filestore/internal/authz"
 	"github.com/Wide-Moat/ocu-filestore/internal/broker"
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 	"github.com/Wide-Moat/ocu-filestore/internal/objectstore"
@@ -383,4 +384,162 @@ func TestFilesAPIRealS3EngineEnsuresJoinSubtree(t *testing.T) {
 	if !bytes.Equal(gotContent, payload) {
 		t.Fatalf("content bytes = %q, want the uploaded payload %q", gotContent, payload)
 	}
+}
+
+// reHandlerWholeTree wires a real-engine, real-store handler with the REAL broker
+// prefix downloadable policy ("outputs" downloadable, "uploads" not) so the
+// whole-tree bridge's positive/negative download legs are decided by the same
+// resolver the daemon uses — not a fixed fake grant. It is the whole-tree analog
+// of reHandler.
+func reHandlerWholeTree(t *testing.T, engine southface.Engine) *Handler {
+	t.Helper()
+	store, err := handlestore.NewDiskStore(t.TempDir() + "/handles.jsonl")
+	if err != nil {
+		t.Fatalf("NewDiskStore: %v", err)
+	}
+	h, err := NewHandler(Deps{
+		Resolver:    broker.NewResolver(authz.New(broker.NewPrefixDownloadablePolicy([]string{"outputs"}))),
+		Guard:       &fakeGuard{},
+		Engine:      engine,
+		Ceilings:    newFakeCeilings(),
+		Store:       store,
+		Scope:       fakeScope{ps: southface.PeerScope{FilesystemID: reScope, GrantedIntents: []southface.Intent{southface.IntentRead}}, ok: true},
+		SizeCeiling: 1 << 20,
+		MaxFileSize: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h
+}
+
+// TestFilesAPIRealS3EngineWholeTreeBridge is the LIVE keystone for the whole-tree
+// bridge (ADR-0029:46). It seeds TWO engine objects DIRECTLY through the real s3
+// engine — bypassing the north create path, so NEITHER mints a north handle,
+// exactly like an agent deliverable written through the south FUSE mount:
+//
+//   - "outputs/report.pdf" (downloadable prefix)
+//   - "uploads/seed.bin"   (non-downloadable prefix)
+//
+// Then it asserts the north list SURFACES BOTH (the reconcile walked the real
+// engine namespace and minted handles), the outputs object DOWNLOADS 200 with the
+// real bytes, and the uploads object DOWNLOADS 403 not_downloadable — the bridge
+// surfaces the whole tree without reopening exfil. A second list returns the SAME
+// file_ids (the live anti-dup keystone). Gated on OCU_S3_TEST_ENDPOINT; the
+// dev-lead runs it against the composed MinIO rig.
+func TestFilesAPIRealS3EngineWholeTreeBridge(t *testing.T) {
+	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("OCU_S3_TEST_ENDPOINT not set - filesapi whole-tree bridge leg SKIPPED (boot deploy/docker-compose.test.yml)")
+	}
+	bucket := os.Getenv("OCU_S3_TEST_BUCKET")
+	if bucket == "" {
+		bucket = "ocu-conformance"
+	}
+	access := os.Getenv("OCU_S3_TEST_ACCESS_KEY")
+	secret := os.Getenv("OCU_S3_TEST_SECRET_KEY")
+
+	engine := reRealS3Engine(t, endpoint, bucket, access, secret)
+
+	// Seed both objects DIRECTLY through the engine (bypassing north create): ensure
+	// each parent marker, then WriteStream the bytes. No north handle is minted —
+	// this is the whole-tree scenario the reconcile must surface.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	reportBytes := []byte("WHOLE-TREE outputs report \x00\x01 bytes")
+	seedBytes := []byte("WHOLE-TREE uploads seed \x00\x02 bytes")
+	reSeedEngineObject(t, ctx, engine, "outputs", "outputs/report.pdf", reportBytes)
+	reSeedEngineObject(t, ctx, engine, "uploads", "uploads/seed.bin", seedBytes)
+
+	h := reHandlerWholeTree(t, engine)
+	srv := httptest.NewServer(http.HandlerFunc(h.ServeHTTP))
+	t.Cleanup(srv.Close)
+
+	// LIST: the reconcile surfaces BOTH engine objects with fresh handles.
+	list1 := reList(t, srv)
+	reportID := reFindByFilename(t, list1, "report.pdf")
+	seedID := reFindByFilename(t, list1, "seed.bin")
+	if reportID == "" {
+		t.Fatal("outputs/report.pdf did not surface in the north list — the whole-tree reconcile did not walk the real engine namespace")
+	}
+	if seedID == "" {
+		t.Fatal("uploads/seed.bin did not surface in the north list — the bridge must surface the whole tree")
+	}
+
+	// POSITIVE: the outputs object downloads 200 with the real bytes.
+	creport, err := srv.Client().Get(srv.URL + "/v1/files/" + reportID + "/content")
+	if err != nil {
+		t.Fatalf("outputs content GET: %v", err)
+	}
+	defer creport.Body.Close()
+	if creport.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(creport.Body)
+		t.Fatalf("outputs/report.pdf content = %d, want 200; body %s", creport.StatusCode, b)
+	}
+	gotReport, _ := io.ReadAll(creport.Body)
+	if !bytes.Equal(gotReport, reportBytes) {
+		t.Fatalf("outputs content = %q, want the seeded bytes", gotReport)
+	}
+
+	// NEGATIVE: the uploads object surfaced but downloads 403 not_downloadable.
+	cseed, err := srv.Client().Get(srv.URL + "/v1/files/" + seedID + "/content")
+	if err != nil {
+		t.Fatalf("uploads content GET: %v", err)
+	}
+	defer cseed.Body.Close()
+	if cseed.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(cseed.Body)
+		t.Fatalf("uploads/seed.bin content = %d, want 403 not_downloadable (the bridge must not reopen exfil); body %s", cseed.StatusCode, b)
+	}
+
+	// LIVE ANTI-DUP: a second list returns the SAME file_ids.
+	list2 := reList(t, srv)
+	if got := reFindByFilename(t, list2, "report.pdf"); got != reportID {
+		t.Fatalf("ANTI-DUP: outputs/report.pdf minted a new file_id on the second list (%q != %q)", got, reportID)
+	}
+	if len(list2) != len(list1) {
+		t.Fatalf("second list has %d entries, first had %d — a duplicate handle was minted", len(list2), len(list1))
+	}
+}
+
+// reSeedEngineObject ensures the parent marker for subtree then WriteStreams body
+// at engPath through the real engine — the "bypass north create" seed.
+func reSeedEngineObject(t *testing.T, ctx context.Context, engine southface.Engine, subtree, engPath string, body []byte) {
+	t.Helper()
+	if err := southface.EnsureDir(ctx, engine, reScope, subtree); err != nil {
+		t.Fatalf("EnsureDir(%s): %v", subtree, err)
+	}
+	if err := engine.WriteStream(ctx, reScope, engPath, bytes.NewReader(body), true); err != nil {
+		t.Fatalf("WriteStream(%s): %v", engPath, err)
+	}
+}
+
+// reList drives GET /v1/files against srv and returns the FileObjects.
+func reList(t *testing.T, srv *httptest.Server) []FileObject {
+	t.Helper()
+	resp, err := srv.Client().Get(srv.URL + "/v1/files")
+	if err != nil {
+		t.Fatalf("list GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("list status = %d, want 200; body %s", resp.StatusCode, b)
+	}
+	var env ListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	return env.Data
+}
+
+// reFindByFilename returns the id of the first FileObject with the given filename.
+func reFindByFilename(t *testing.T, list []FileObject, filename string) string {
+	t.Helper()
+	for _, fo := range list {
+		if fo.Filename == filename {
+			return fo.ID
+		}
+	}
+	return ""
 }
