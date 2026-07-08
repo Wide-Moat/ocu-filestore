@@ -1186,3 +1186,126 @@ func TestCreateExactByteContractTable(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0029:46 — NORTH LANDING JOIN (human->sandbox direction).
+// ---------------------------------------------------------------------------
+
+// createSetupSubtree wires a create handler exactly like createSetup but with a
+// configured Deps.CreateSubtree, so the north create joins every uploaded object
+// under that subtree (the deployment map's read entry). An empty subtree leaves
+// the create in static-path mode.
+func createSetupSubtree(subtree string) (*Handler, *createEngine, *createStore) {
+	eng := newCreateEngine()
+	store := newCreateStore()
+	h := newTestHandler(Deps{
+		Engine:        eng,
+		Store:         store,
+		Resolver:      &fakeResolver{grant: southface.Grant{Downloadable: true}},
+		Guard:         &fakeGuard{},
+		CreateSubtree: subtree,
+		Scope: fakeScope{ps: southface.PeerScope{
+			FilesystemID:   createTestScope,
+			GrantedIntents: []southface.Intent{southface.IntentRead},
+		}, ok: true},
+	})
+	return h, eng, store
+}
+
+// TestCreateJoinsReadSubtree pins the ADR-0029:46 north landing join: with a
+// configured CreateSubtree ("uploads", the deployment map's read entry), a wire
+// path "/report.txt" lands the JOINED engine object "uploads/report.txt" — the
+// SAME subtree the south read-mount joins under, so a browser File-Pane upload is
+// visible to the agent. The RED-probe branch (empty CreateSubtree, static mode)
+// keeps the path flat at "report.txt". Both branches assert the engine
+// WriteStream path arg (eng.lastPath — the single engineRef var the join sets)
+// AND the stored ObjectRef (store.lastPut.ObjectRef), so the one assignment is
+// proven to reach BOTH the byte write and the durable handle.
+func TestCreateJoinsReadSubtree(t *testing.T) {
+	body := []byte("REPORT-BYTES")
+
+	t.Run("join_enabled_lands_under_read_subtree", func(t *testing.T) {
+		h, eng, store := createSetupSubtree("uploads")
+		params := createParamsJSON(t, map[string]any{
+			"path": "/report.txt", "declared_size_bytes": len(body),
+		})
+		w := doCreate(h, params, body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body %s", w.Code, w.Body.String())
+		}
+		// The engine WriteStream saw the JOINED path (engineRef threaded through).
+		if eng.lastPath != "uploads/report.txt" {
+			t.Fatalf("engine WriteStream path = %q, want the joined uploads/report.txt", eng.lastPath)
+		}
+		// The joined bytes are durably linked at the joined path.
+		if got, ok := eng.committedBytes("uploads/report.txt"); !ok || !bytes.Equal(got, body) {
+			t.Fatalf("engine stored %q (%v) at uploads/report.txt, want %q", got, ok, body)
+		}
+		// The flat (unjoined) path must be empty — the join is not skipped.
+		if _, ok := eng.committedBytes("report.txt"); ok {
+			t.Fatalf("an object landed at the UNJOINED report.txt; the read-subtree join was skipped")
+		}
+		// The durable handle's ObjectRef is the SAME joined form (one engineRef var
+		// reaches authz, audit, the engine write, AND the stored ObjectRef).
+		if store.lastPut.ObjectRef != "uploads/report.txt" {
+			t.Fatalf("Put ObjectRef = %q, want the joined uploads/report.txt", store.lastPut.ObjectRef)
+		}
+	})
+
+	t.Run("join_disabled_stays_flat_static_mode", func(t *testing.T) {
+		h, eng, store := createSetupSubtree("") // empty CreateSubtree = static-path mode
+		params := createParamsJSON(t, map[string]any{
+			"path": "/report.txt", "declared_size_bytes": len(body),
+		})
+		w := doCreate(h, params, body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body %s", w.Code, w.Body.String())
+		}
+		// Static mode: the engine WriteStream saw the FLAT path, no join prepended.
+		if eng.lastPath != "report.txt" {
+			t.Fatalf("engine WriteStream path = %q, want the flat report.txt (static mode)", eng.lastPath)
+		}
+		if _, ok := eng.committedBytes("uploads/report.txt"); ok {
+			t.Fatalf("static-mode upload gained the join (uploads/report.txt); the empty subtree must stay flat")
+		}
+		if store.lastPut.ObjectRef != "report.txt" {
+			t.Fatalf("Put ObjectRef = %q, want the flat report.txt (static mode)", store.lastPut.ObjectRef)
+		}
+	})
+
+	// The join is applied AFTER canonicalizeCreatePath's traversal absorption, so a
+	// nested wire path joins cleanly under the subtree and a ".." over-climb is
+	// absorbed FIRST (never escapes via the join): "/a/../b.txt" cleans to "b.txt"
+	// then joins to "uploads/b.txt", and "/nested/deep.bin" joins to
+	// "uploads/nested/deep.bin". Neither leaves the subtree.
+	t.Run("join_applied_after_canonicalization", func(t *testing.T) {
+		for _, tc := range []struct {
+			wire    string
+			wantRef string
+		}{
+			{"/nested/deep.bin", "uploads/nested/deep.bin"},
+			{"/a/../b.txt", "uploads/b.txt"},         // interior traversal cleaned then joined
+			{"/../escape.txt", "uploads/escape.txt"}, // over-climb absorbed then joined (never escapes)
+		} {
+			t.Run(tc.wire, func(t *testing.T) {
+				h, eng, store := createSetupSubtree("uploads")
+				params := createParamsJSON(t, map[string]any{
+					"path": tc.wire, "declared_size_bytes": len(body),
+				})
+				w := doCreate(h, params, body)
+				if w.Code != http.StatusCreated {
+					t.Fatalf("wire=%q status = %d, want 201; body %s", tc.wire, w.Code, w.Body.String())
+				}
+				if eng.lastPath != tc.wantRef {
+					t.Fatalf("wire=%q engine path = %q, want %q", tc.wire, eng.lastPath, tc.wantRef)
+				}
+				if store.lastPut.ObjectRef != tc.wantRef {
+					t.Fatalf("wire=%q ObjectRef = %q, want %q", tc.wire, store.lastPut.ObjectRef, tc.wantRef)
+				}
+				if strings.Contains(store.lastPut.ObjectRef, "..") {
+					t.Fatalf("wire=%q ObjectRef %q carries a traversal segment (escaped the join)", tc.wire, store.lastPut.ObjectRef)
+				}
+			})
+		}
+	})
+}

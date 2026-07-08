@@ -1519,7 +1519,13 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 			// ceiling the south face's upload path reads (cfg.maxFileSize, bound from
 			// the broker-max-file-size flag): one ceiling, both planes.
 			MaxFileSize: cfg.maxFileSize,
-			Logger:      l,
+			// The north create joins every upload under the deployment map's READ
+			// subtree (ADR-0029:46, the human->sandbox direction), so a File-Pane
+			// upload lands where the south read-mount looks. This tracks the SAME
+			// resolved SubtreeMap the south dispatcher uses (cfg.subtrees); an empty
+			// read subtree (join-disabled map) leaves the create in static-path mode.
+			CreateSubtree: cfg.subtrees.ReadSubtree(),
+			Logger:        l,
 		})
 		if herr != nil {
 			_ = srv.Close()

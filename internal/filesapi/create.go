@@ -144,6 +144,23 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	}
 	engineRef = canonPath
 
+	// --- NORTH LANDING JOIN (ADR-0029:46, the human->sandbox direction). Join the
+	// canonical wire path under the deployment map's read subtree (h.deps.
+	// CreateSubtree, injected at construction) so a browser File-Pane upload lands
+	// where the agent's south read-mount looks — the default split joins reads
+	// under "uploads", so a root-landed upload would be INVISIBLE to the agent.
+	// This ONE assignment threads the joined path into authz Resolve, the audit
+	// createAllowEvent, Engine.WriteStream, AND the stored ObjectRef — engineRef is
+	// the single path var every downstream consumer reads. The join is applied
+	// AFTER canonicalizeCreatePath's NUL/URL/traversal/root-reject checks, so a
+	// hostile wire path can never escape via the join: canonPath is already clean
+	// and rootless, and path.Join(cleanSubtree, cleanRel) stays within the subtree.
+	// An empty CreateSubtree is static-path mode: the create writes at the scope
+	// root verbatim (path.Join skipped). ---
+	if h.deps.CreateSubtree != "" {
+		engineRef = path.Join(h.deps.CreateSubtree, canonPath)
+	}
+
 	// --- authz Resolve(intent=write) from the attested scope. The evidence
 	// grants BOTH read and write intents: the F9 host-attested scope is trusted
 	// for write on its OWN filesystem (component-08 has already done the upstream
@@ -506,7 +523,10 @@ func createFilename(params createUploadParams, engineRef string) string {
 // It is a north-local mirror rather than a call into the south-private helper:
 // the filesapi plane keeps the same consumer-seam isolation the south face keeps
 // (it does not import the south-private canonicalizer), exactly as content.go's
-// enginePath mirrors the read-side normalisation.
+// enginePath mirrors the read-side normalisation. The north landing subtree the
+// serveCreate join prepends to this canonical form is the deployment map's read
+// entry, injected at construction (Deps.CreateSubtree) — still no south
+// canonicalizer import.
 func canonicalizeCreatePath(wire string) (string, bool) {
 	if strings.ContainsRune(wire, '\x00') {
 		return "", false

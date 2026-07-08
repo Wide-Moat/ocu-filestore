@@ -47,6 +47,16 @@ func DefaultSubtreeMap() SubtreeMap {
 // canonicalizePath fall back to static-path mode for the request.
 func (s SubtreeMap) For(i Intent) string { return s.m[i] }
 
+// ReadSubtree returns the engine-relative read-intent subtree the north
+// human->sandbox create joins every uploaded object under (ADR-0029:46), or ""
+// when the join is disabled (static-path mode, an empty map). It is the SAME
+// value the south read-mount joins under, so a browser File-Pane upload lands
+// where the agent's read plane looks (the default map pins it to "uploads"). An
+// accessor on this documented config surface is public API, not a leaked
+// private helper: the composition root injects this value into the north create
+// at construction rather than the north hardcoding a landing const.
+func (s SubtreeMap) ReadSubtree() string { return s.m[IntentRead] }
+
 // enabled reports whether the map binds any subtree — a fully empty map means
 // the join is disabled deployment-wide (the shipped static bind), a non-empty
 // map means the join is active. Serve uses it to decide whether to wire the map
@@ -75,11 +85,56 @@ func NewSubtreeMap(write, read, preview string) (SubtreeMap, error) {
 	if err != nil {
 		return SubtreeMap{}, err
 	}
+	// Disjointness boot-guard (ADR-0029:53): the WRITE subtree — the RW sink and
+	// the downloadable-allow prefix — MUST be disjoint from both the READ and the
+	// PREVIEW subtrees. A perverse override (e.g. read -> "outputs") would land the
+	// north human->sandbox create (which joins the READ subtree, ADR-0029:46)
+	// inside the write/downloadable prefix, making a human input egress-eligible
+	// and reopening the NFR-SEC-73 exfil split. Read and preview MAY be equal (the
+	// pinned default has both at "uploads"), so the guard is WRITE-vs-{read,preview}
+	// only. It fails the BOOT loud, never the upload.
+	if subtreesOverlap(w, r) || subtreesOverlap(w, p) {
+		return SubtreeMap{}, ErrSubtreeOverlap
+	}
 	return SubtreeMap{m: map[Intent]string{
 		IntentWrite:   w,
 		IntentRead:    r,
 		IntentPreview: p,
 	}}, nil
+}
+
+// subtreesOverlap reports whether two engine-relative subtrees share a path
+// region: they are equal, or one is a path-prefix of the other on a "/"
+// component boundary. It mirrors the broker pathUnderPrefix semantics — "a"
+// overlaps "a/b" and "a" == "a", but "ab" does NOT overlap "a" (the boundary is
+// a whole component, never a raw byte prefix). Both inputs are already
+// normalised (no leading slash, no ".." segment) by normalizeSubtree, so the
+// comparison is on the clean engine-relative form. It compares "/"-delimited
+// components (via splitSlash) so subtree.go keeps its zero-import convention.
+func subtreesOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return hasPathPrefix(a, b) || hasPathPrefix(b, a)
+}
+
+// hasPathPrefix reports whether prefix is a strict path-prefix of path on a
+// component boundary: every component of prefix equals the leading component of
+// path AND path has at least one further component. Equal paths are NOT a strict
+// prefix (subtreesOverlap handles equality separately). "a" is a prefix of
+// "a/b"; "ab" is NOT a prefix of "a" (component-boundary, never a byte prefix).
+func hasPathPrefix(path, prefix string) bool {
+	ps := splitSlash(prefix)
+	ss := splitSlash(path)
+	if len(ss) <= len(ps) {
+		return false
+	}
+	for i := range ps {
+		if ps[i] != ss[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeSubtree trims a single leading slash and rejects an empty or
