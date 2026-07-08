@@ -197,6 +197,8 @@ func serveSouthface(t *testing.T, guard auditgate.Guard, reg *ceilings.Registry)
 		KeyFile:           keyFile,
 		SizeCeiling:       1 << 20,
 		BrokerMaxFileSize: 1 << 20,
+		// The join is mandatory (ADR-0029): Serve refuses an empty map.
+		Subtrees: southface.DefaultSubtreeMap(),
 	})
 	if err != nil {
 		t.Fatalf("southface.Serve: %v", err)

@@ -266,7 +266,17 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// maxFileSize is intentionally left 0 here: Serve sets it from the
 		// validated cfg.BrokerMaxFileSize. An unwired dispatcher therefore
 		// refuses any non-empty upload (fail-closed). See the field doc.
-		maxFileSize:       0,
+		maxFileSize: 0,
+		// maxFileSize is intentionally left 0 here: Serve sets it from the
+		// validated cfg.BrokerMaxFileSize. An unwired dispatcher therefore
+		// refuses any non-empty upload (fail-closed). See the field doc.
+		//
+		// subtrees is the zero-value (static-path mode) here: the internal unit
+		// constructors exercise dispatch logic that is orthogonal to the join, so
+		// they run flat. The join is mandatory on the SHIPPED path — Serve refuses
+		// an empty map at boot (ErrSubtreeDisabled) and the composition layer
+		// defaults to DefaultSubtreeMap() — so static mode is unreachable in
+		// production; only these in-package tests (and an explicit override) see it.
 		frameReadTimeout:  defaultFrameReadTimeout,
 		frameWriteTimeout: defaultFrameWriteTimeout,
 		logger:            slog.New(slog.DiscardHandler),
@@ -476,6 +486,19 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	subtree := d.subtrees.For(requiredIntent)
+	// Close the per-request residual bypass (ADR-0029 "never bypass it"): when the
+	// join is ENABLED (a populated map — the shipped posture, which Serve enforces
+	// at boot), an intent with no mapped subtree must DENY rather than degrade this
+	// one request to static-path mode. Without this, a future fourth intent or a
+	// zero-value Intent would fall through to the flat layout and coincide the write
+	// and downloadable axes for that request. When the map is disabled (empty),
+	// static mode is intended — the in-package unit path only; Serve refuses an
+	// empty map on the shipped path (ErrSubtreeDisabled), so this branch is never
+	// reached in production.
+	if d.subtrees.enabled() && subtree == "" {
+		denyOp(mapDeny(denyInternal), "no subtree bound to the operation's intent")
+		return
+	}
 
 	// STAGE 1b -> 2 BOUNDARY: canonicalize the decoded path ONCE (bypass-01/03),
 	// joined under the intent's subtree (ADR-0029 inv-10). Nothing trusts the body

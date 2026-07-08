@@ -972,7 +972,7 @@ func parseIntents(s string) ([]southface.Intent, error) {
 // errSubtreePartial rejects a half-set subtree override: setting ANY of the
 // three -subtree-* flags requires ALL three (the frozen 3-value intent axis).
 // Match it with errors.Is.
-var errSubtreePartial = errors.New("ocu-filestored: -subtree-rw, -subtree-ro and -subtree-preview must all be set together (or all empty for the static-path default)")
+var errSubtreePartial = errors.New("ocu-filestored: -subtree-rw, -subtree-ro and -subtree-preview must all be set together (or all empty for the pinned default map)")
 
 // errWildcardDownloadable rejects the whole-scope "*" downloadable token for the
 // fleet posture (ADR-0029 exfil-bar): "*" makes every human upload egress-eligible
@@ -988,7 +988,12 @@ var errWildcardDownloadable = errors.New("ocu-filestored: -downloadable-prefixes
 func buildSubtreeMap(rw, ro, preview string) (southface.SubtreeMap, error) {
 	anySet := rw != "" || ro != "" || preview != ""
 	if !anySet {
-		return southface.SubtreeMap{}, nil
+		// Zero override => the pinned default map (ADR-0029 Decision bullet 2:
+		// "ships pinned so the minimal shelf runs zero-config; a deployment may
+		// override the map, never bypass it"). The join is ON by default; a
+		// deployment supplying no subtree flags still runs the engine-enforced
+		// split, not the flat static-path layout.
+		return southface.DefaultSubtreeMap(), nil
 	}
 	if rw == "" || ro == "" || preview == "" {
 		return southface.SubtreeMap{}, errSubtreePartial

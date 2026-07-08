@@ -31,6 +31,14 @@ var ErrSeamMissing = errors.New("southface: a required seam is nil")
 // construction. Match it with errors.Is.
 var ErrInvalidSubtree = errors.New("southface: subtree override must be a non-empty engine-relative path with no traversal segment")
 
+// ErrSubtreeDisabled refuses an empty (disabled) intent->subtree join map at
+// Serve construction. The join is mandatory (ADR-0029 Decision bullet 2: "never
+// bypass it") — an empty map would coincide the write and downloadable axes on a
+// flat namespace and reopen the NFR-SEC-73 split. The composition layer defaults
+// to DefaultSubtreeMap(); a disabled map reaching the engine is a wiring fault.
+// Match it with errors.Is.
+var ErrSubtreeDisabled = errors.New("southface: the intent->subtree join map is disabled (empty); the join is mandatory (ADR-0029), a deployment defaults to the pinned map and can only override it, never bypass it")
+
 // Config is the frozen call site for the one exported south-face constructor.
 // The composition layer fills it with the broker-side adapters, the
 // flag-derived ceilings, and the TLS bind/cert/key; Serve validates it and
@@ -116,6 +124,15 @@ func Serve(cfg Config) (Server, error) {
 	if cfg.Resolver == nil || cfg.Guard == nil || cfg.Engine == nil ||
 		cfg.Ceilings == nil || cfg.CredExtractor == nil {
 		return nil, ErrSeamMissing
+	}
+	// The intent->subtree join is mandatory (ADR-0029 Decision bullet 2: "never
+	// bypass it"). An empty map would run canonicalizePath in static-path mode and
+	// coincide the write and downloadable axes on one flat namespace, reopening the
+	// NFR-SEC-73 split. A disabled map at engine boot is a wiring fault, refused
+	// loud — the composition layer defaults to DefaultSubtreeMap() and only an
+	// override (all three intents) is a legitimate populated map.
+	if !cfg.Subtrees.enabled() {
+		return nil, ErrSubtreeDisabled
 	}
 
 	logger := cfg.Logger

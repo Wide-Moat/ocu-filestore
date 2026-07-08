@@ -135,7 +135,7 @@ services:
       # must be engine-relative to match. downloadable resolves at read from this
       # prefix grant, never stamped at write (NFR-SEC-73).
       - -downloadable-prefixes
-      - ${OCU_DOWNLOADABLE_PREFIXES:-pub}
+      - ${OCU_DOWNLOADABLE_PREFIXES:-outputs}
       - -profile
       - trusted_operator
       - -tenancy
