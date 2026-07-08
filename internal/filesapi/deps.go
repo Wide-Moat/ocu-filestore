@@ -100,6 +100,17 @@ type Deps struct {
 	// from the same cfg.BrokerMaxFileSize the south face's whole-object ceiling
 	// reads.
 	MaxFileSize int64
+	// CreateSubtree is the engine-relative subtree the north create joins every
+	// uploaded object under (ADR-0029:46, the human->sandbox direction). Its value
+	// is the deployment map's READ entry, injected at construction (the composition
+	// root reads it off the resolved southface.SubtreeMap via ReadSubtree), so the
+	// north create joins the SAME subtree the south read-mount joins — a File-Pane
+	// upload lands where the agent's read plane looks. An EMPTY value disables the
+	// join (static-path mode): the create writes at the scope root verbatim. The
+	// default map is ON (read -> "uploads"), so an empty CreateSubtree is the rare
+	// static-mode case, not the norm. NewHandler does NOT reject an empty value —
+	// it is a valid static-mode configuration, not a missing seam.
+	CreateSubtree string
 	// Logger is the structured logger; a nil logger is normalised to a
 	// discard-all logger so a handler never panics on a nil log.
 	Logger *slog.Logger

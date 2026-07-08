@@ -31,6 +31,17 @@ var ErrSeamMissing = errors.New("southface: a required seam is nil")
 // construction. Match it with errors.Is.
 var ErrInvalidSubtree = errors.New("southface: subtree override must be a non-empty engine-relative path with no traversal segment")
 
+// ErrSubtreeOverlap — a deployment-supplied subtree override placed the WRITE
+// subtree in overlap with the READ or PREVIEW subtree (ADR-0029:53). The write
+// subtree is the RW sink; a read/preview subtree that shares or nests with it
+// would land north human->sandbox uploads (which join the read subtree,
+// ADR-0029:46) inside the downloadable-allow write prefix, making a human input
+// egress-eligible and reopening the NFR-SEC-73 exfil split. The write subtree
+// MUST be disjoint from BOTH the read and preview subtrees (read and preview MAY
+// be equal — the pinned default has both at "uploads"). This is a wiring fault
+// that fails loud at BOOT, never at the upload. Match it with errors.Is.
+var ErrSubtreeOverlap = errors.New("southface: the write subtree must be disjoint from the read and preview subtrees (ADR-0029); a write subtree that shares or nests with the read/preview subtree would make a human->sandbox upload egress-eligible")
+
 // ErrSubtreeDisabled refuses an empty (disabled) intent->subtree join map at
 // Serve construction. The join is mandatory (ADR-0029 Decision bullet 2: "never
 // bypass it") — an empty map would coincide the write and downloadable axes on a

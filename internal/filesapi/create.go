@@ -144,6 +144,23 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	}
 	engineRef = canonPath
 
+	// --- NORTH LANDING JOIN (ADR-0029:46, the human->sandbox direction). Join the
+	// canonical wire path under the deployment map's read subtree (h.deps.
+	// CreateSubtree, injected at construction) so a browser File-Pane upload lands
+	// where the agent's south read-mount looks — the default split joins reads
+	// under "uploads", so a root-landed upload would be INVISIBLE to the agent.
+	// This ONE assignment threads the joined path into authz Resolve, the audit
+	// createAllowEvent, Engine.WriteStream, AND the stored ObjectRef — engineRef is
+	// the single path var every downstream consumer reads. The join is applied
+	// AFTER canonicalizeCreatePath's NUL/URL/traversal/root-reject checks, so a
+	// hostile wire path can never escape via the join: canonPath is already clean
+	// and rootless, and path.Join(cleanSubtree, cleanRel) stays within the subtree.
+	// An empty CreateSubtree is static-path mode: the create writes at the scope
+	// root verbatim (path.Join skipped). ---
+	if h.deps.CreateSubtree != "" {
+		engineRef = path.Join(h.deps.CreateSubtree, canonPath)
+	}
+
 	// --- authz Resolve(intent=write) from the attested scope. The evidence
 	// grants BOTH read and write intents: the F9 host-attested scope is trusted
 	// for write on its OWN filesystem (component-08 has already done the upstream
@@ -193,6 +210,47 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 		return
 	}
 	defer sess.ReleaseFD()
+
+	// --- ENSURE THE JOIN-SUBTREE PARENT CHAIN (ADR-0029). The S3 engine's WriteStream
+	// refuses a write whose immediate parent directory marker is absent (parentExists ->
+	// *fs.PathError wrapping fs.ErrNotExist): before the north landing join, the object
+	// landed at the scope root whose parent is the always-present root, so no marker was
+	// needed; the join lands it under CreateSubtree ("uploads"), and a nested wire path
+	// lands it deeper still ("uploads/nested/..."), whose markers nothing else creates.
+	// Ensure the object's parent chain here, idempotently and engine-agnostically, via
+	// the shared southface.EnsureDir walker — the SAME dir-marker convention the south
+	// make_parents spine composes over.
+	//
+	// NFR-SEC-73: the ensure must materialise nothing OUTSIDE the join subtree. The
+	// argument is path.Dir(engineRef), and engineRef is the POST-canonicalize, POST-join
+	// path — CreateSubtree + a clean, traversal-free remainder — so path.Dir(engineRef)
+	// is closed under the subtree: it is CreateSubtree itself or a strict descendant,
+	// never a climb above the prefix. The containment guard asserts exactly that; in join
+	// mode a guard miss is impossible by construction, so it is an internal invariant
+	// violation (fail closed + audit), NEVER a silent unguarded ensure. Static-path mode
+	// (empty CreateSubtree) ensures NOTHING: the object lands at the scope root whose
+	// parent always exists, and any nested static path relies on the operator-provisioned
+	// tree plus the engine's own parentExists 404 (correct fail-closed). A marker failure
+	// is an internal fault, not client-attributable, so it denies denyclass.Internal
+	// WITHOUT reaching WriteStream. ---
+	if h.deps.CreateSubtree != "" {
+		ensureDir := path.Dir(engineRef)
+		if ensureDir != h.deps.CreateSubtree && !strings.HasPrefix(ensureDir, h.deps.CreateSubtree+"/") {
+			// Impossible under the join above (engineRef is subtree-prefixed and clean):
+			// a miss means the join invariant was broken upstream. Fail closed, never
+			// ensure outside the subtree.
+			reqLog.Error("files-api create: join-subtree containment invariant violated",
+				slog.String(observ.KeyReason, "ensure dir escaped the create subtree"))
+			denyCreate(denyclass.Internal, "internal error")
+			return
+		}
+		if eerr := southface.EnsureDir(r.Context(), h.deps.Engine, ps.FilesystemID, ensureDir); eerr != nil {
+			reqLog.Error("files-api create: ensure join-subtree parent failed",
+				slog.String(observ.KeyReason, eerr.Error()))
+			denyCreate(denyclass.Internal, "internal error")
+			return
+		}
+	}
 
 	// --- reassembly: single io.Pipe -> WriteStream(overwrite=OverwriteExisting).
 	// overwrite_existing defaults to false when absent (JSON zero value),
@@ -506,7 +564,10 @@ func createFilename(params createUploadParams, engineRef string) string {
 // It is a north-local mirror rather than a call into the south-private helper:
 // the filesapi plane keeps the same consumer-seam isolation the south face keeps
 // (it does not import the south-private canonicalizer), exactly as content.go's
-// enginePath mirrors the read-side normalisation.
+// enginePath mirrors the read-side normalisation. The north landing subtree the
+// serveCreate join prepends to this canonical form is the deployment map's read
+// entry, injected at construction (Deps.CreateSubtree) — still no south
+// canonicalizer import.
 func canonicalizeCreatePath(wire string) (string, bool) {
 	if strings.ContainsRune(wire, '\x00') {
 		return "", false

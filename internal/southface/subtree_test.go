@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -72,6 +73,76 @@ func TestNewSubtreeMap(t *testing.T) {
 			t.Fatalf("NewSubtreeMap(%q,%q,%q) = nil error, want ErrInvalidSubtree", c[0], c[1], c[2])
 		}
 	}
+}
+
+// TestNewSubtreeMap_RejectsWriteReadOverlap pins the ADR-0029:53 disjointness
+// boot-guard: the WRITE subtree (the RW sink and downloadable-allow prefix) must
+// be disjoint from BOTH the read and preview subtrees. A perverse override that
+// lands the read subtree inside the write prefix would make a north human upload
+// (which joins the read subtree, ADR-0029:46) egress-eligible — the exfil split.
+// The guard fails the BOOT (ErrSubtreeOverlap), never the upload. Read and
+// preview MAY be equal (the pinned default has both at "uploads"); the guard is
+// WRITE-vs-{read,preview} only, never read-vs-preview.
+func TestNewSubtreeMap_RejectsWriteReadOverlap(t *testing.T) {
+	rejects := []struct {
+		name              string
+		write, read, prev string
+	}{
+		{"write==read", "outputs", "outputs", "uploads"},
+		{"write==preview", "outputs", "uploads", "outputs"},
+		{"write prefix-of-read", "out", "out/nested", "uploads"},
+		{"read prefix-of-write", "out/nested", "out", "uploads"},
+		{"write prefix-of-preview", "out", "uploads", "out/deep"},
+		{"preview prefix-of-write", "out/deep", "uploads", "out"},
+	}
+	for _, c := range rejects {
+		t.Run("reject/"+c.name, func(t *testing.T) {
+			_, err := NewSubtreeMap(c.write, c.read, c.prev)
+			if err == nil {
+				t.Fatalf("NewSubtreeMap(%q,%q,%q) = nil error, want ErrSubtreeOverlap", c.write, c.read, c.prev)
+			}
+			if !errors.Is(err, ErrSubtreeOverlap) {
+				t.Fatalf("NewSubtreeMap(%q,%q,%q) error = %v, want ErrSubtreeOverlap", c.write, c.read, c.prev, err)
+			}
+		})
+	}
+
+	accepts := []struct {
+		name              string
+		write, read, prev string
+	}{
+		// The pinned default: write=outputs, read=preview=uploads. Disjoint write,
+		// and read==preview is ALLOWED.
+		{"pinned default (outputs/uploads/uploads)", "outputs", "uploads", "uploads"},
+		// read==preview accepted with a distinct write.
+		{"read==preview distinct", "rw", "ro", "ro"},
+		// A byte-prefix that is NOT a component-prefix must NOT trip the guard:
+		// "out" and "outX" share a byte prefix but are disjoint on the "/" boundary.
+		{"byte-prefix but component-disjoint", "out", "outX", "outY"},
+		// Fully distinct three-way.
+		{"fully distinct", "w", "r", "p"},
+	}
+	for _, c := range accepts {
+		t.Run("accept/"+c.name, func(t *testing.T) {
+			m, err := NewSubtreeMap(c.write, c.read, c.prev)
+			if err != nil {
+				t.Fatalf("NewSubtreeMap(%q,%q,%q) = %v, want a valid map (disjoint write)", c.write, c.read, c.prev, err)
+			}
+			if got := m.ReadSubtree(); got != normalized(c.read) {
+				t.Fatalf("ReadSubtree() = %q, want %q", got, normalized(c.read))
+			}
+		})
+	}
+}
+
+// normalized mirrors normalizeSubtree's leading-slash trim for the test's
+// ReadSubtree expectation (the accepted cases carry no leading slash, so it is a
+// pass-through, but it keeps the expectation honest against the production trim).
+func normalized(v string) string {
+	if len(v) > 0 && v[0] == '/' {
+		return v[1:]
+	}
+	return v
 }
 
 // TestIntersectIntents pins the -granted-intents ceiling semantics (ADR-0029
