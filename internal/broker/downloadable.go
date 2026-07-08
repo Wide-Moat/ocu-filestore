@@ -74,11 +74,15 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 		// matters only for the bare root "/", handled next.
 		p = strings.TrimRight(p, "/")
 		p = strings.TrimLeft(p, "/")
-		// The bare root "/" (now "") is the matches-nothing sentinel: a deployment
-		// marking the entire scope downloadable configures "*", never the bare
-		// root. Drop it AFTER the trims so it never lands in norm — an empty
-		// prefix would match every path (HasPrefix(path, "/")) and silently widen
-		// the allow set into the match-all the sentinel exists to withhold.
+		// The bare root "/" trims to "" and is dropped so it never lands in norm.
+		// Under the engine-relative convention this drop is defence-in-depth, not
+		// the load-bearing guard: an empty prefix would NOT widen to match-all,
+		// because pathUnderPrefix tests `HasPrefix(path, ""+"/")` = HasPrefix(path,
+		// "/"), and an engine-relative path carries no leading slash — so an empty
+		// prefix matches nothing (verified: bare "/" stays matches-nothing even
+		// with this drop removed). The drop keeps norm free of a dead entry and
+		// documents the "/"-vs-"*" distinction in one place: a deployment marks
+		// the whole scope downloadable with "*", never the bare root.
 		if p == "" {
 			continue
 		}
