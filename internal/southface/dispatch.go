@@ -186,7 +186,28 @@ type dispatcher struct {
 	// Defaulted in newDispatcherWithEngine; tests shrink it.
 	frameWriteTimeout time.Duration
 
+	// grantedIntentsCeiling is the static -granted-intents ceiling (ADR-0029
+	// Decision bullet 5): the intents the deployment serves. STAGE 0 intersects
+	// the credential's claim with this ceiling to derive the EFFECTIVE grant set
+	// the authz spine reads. The ceiling NEVER grants — an intent in the claim but
+	// outside the ceiling is dropped (that op then denies at the resolver), and a
+	// missing claim is never substituted by a ceiling value. A nil ceiling leaves
+	// the claim unnarrowed (the pre-ADR-0029 behaviour), so every existing test
+	// that builds the dispatcher without a ceiling is unaffected. Serve wires the
+	// real ceiling from Config.GrantedIntents.
+	grantedIntentsCeiling []Intent
+
+	// subtrees is the intent->subtree map (ADR-0029 inv-10): the dispatch spine
+
+	// and the two data-plane ops derive the join subtree from the ROUTE-OP-required
+	// intent (never the wire hint) and pass it into canonicalizePath. A zero-value
+	// (empty) map disables the join deployment-wide — the shipped static bind — so
+	// canonicalizePath runs its pre-ADR-0029 static-path behaviour and every
+	// existing caller is unaffected. Serve wires the real map from Config.Subtrees.
+	subtrees SubtreeMap
+
 	// credExtractor is the A5 credential-scope source for the UNARY REST path:
+
 	// when non-nil, STAGE-0 derives the request's host-attested PeerScope from
 	// the edge-injected Authorization: Bearer (deriveCredScope) rather than from
 	// the unix peer-cred stashed in the connection context. When nil the unary
@@ -352,7 +373,19 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			denyOp(v, "credential rejected")
 			return
 		}
+		// -granted-intents ceiling (ADR-0029 Decision bullet 5): narrow the
+		// credential's claim to the intents the deployment serves. The EFFECTIVE
+		// grant set the authz spine reads (CallerEvidence.GrantedIntents below) is
+		// claim ∩ ceiling — a claim intent outside the ceiling is dropped so that
+		// op denies at the resolver, and a missing claim is never substituted by a
+		// ceiling value (the intersection of an empty claim is empty, so every op
+		// denies). A nil ceiling leaves the claim unnarrowed. The ceiling never
+		// grants: it can only remove intents from the claim.
+		if d.grantedIntentsCeiling != nil {
+			ps.GrantedIntents = intersectIntents(ps.GrantedIntents, d.grantedIntentsCeiling)
+		}
 	} else {
+
 		var ok bool
 		ps, ok = peerScopeFromContext(r.Context())
 		if !ok {
@@ -431,18 +464,35 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// carries no op field in this build; the route op is authoritative and
 	// the body scope/intent are the only cross-checked fields.
 
-	// STAGE 1b -> 2 BOUNDARY: canonicalize the decoded path ONCE (bypass-01/03).
-	// Nothing trusts the body before STAGE 1b; now that the channel-scope
-	// cross-check has cleared, clean the path a SINGLE time so authz, the
-	// downloadable tag, the engine, the uuid store, and the audit record all
-	// see the SAME object. This is an additive step WITHIN the boundary — the
-	// LOCKED STAGE 0->4 order is unchanged — and it runs BEFORE STAGE 2 so a
-	// `<downloadable-prefix>/../<private>` wire path can never have its egress
-	// axis decided on the raw bytes while a different object is read. A path
-	// the canonicalizer rejects is invalid_argument at the boundary; the
-	// handler is never reached. From here, env.Path is the canonical form and
-	// every downstream consumer derives from it.
-	canonPath, perr := canonicalizePath(env.Path)
+	// STAGE 1b -> 2 BOUNDARY: derive the route-op required intent BEFORE the
+	// canonicalize so the join subtree is known when the path is cleaned. This is
+	// a pure closed-map lookup on the op (known since parseRoute); hoisting it
+	// above the canonicalize does NOT reorder the LOCKED STAGE 0->4 pipeline — the
+	// op/wire-intent cross-check below stays in its STAGE-2 position. An op absent
+	// from the closed map is a wiring fault and fails closed.
+	requiredIntent, ok := requiredIntentForOp(op)
+	if !ok {
+		denyOp(mapDeny(denyInternal), "no required intent bound to operation")
+		return
+	}
+	subtree := d.subtrees.For(requiredIntent)
+
+	// STAGE 1b -> 2 BOUNDARY: canonicalize the decoded path ONCE (bypass-01/03),
+	// joined under the intent's subtree (ADR-0029 inv-10). Nothing trusts the body
+	// before STAGE 1b; now that the channel-scope cross-check has cleared, clean
+	// the path a SINGLE time so authz, the downloadable tag, the engine, the uuid
+	// store, and the audit record all see the SAME object. The subtree is derived
+	// from the ROUTE-OP-required intent (never the wire), so a write op joins under
+	// the RW subtree and a read op under the RO subtree — the ":ro" posture is
+	// engine-enforced by the join, not a guest-mount artifact. This is an additive
+	// step WITHIN the boundary — the LOCKED STAGE 0->4 order is unchanged — and it
+	// runs BEFORE STAGE 2 so a `<downloadable-prefix>/../<private>` wire path can
+	// never have its egress axis decided on the raw bytes while a different object
+	// is read. A path the canonicalizer rejects (including one that escapes the
+	// join) is invalid_argument at the boundary; the handler is never reached. From
+	// here, env.Path is the canonical joined form and every downstream consumer
+	// derives from it.
+	canonPath, perr := canonicalizePath(env.Path, subtree)
 	if perr != nil {
 		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
 		return
@@ -462,7 +512,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// canonicalize error on either leg is denyMalformed HERE — symmetric with the
 	// primary path — and the handler is never reached. canonSrc/canonDst are
 	// empty for single-path ops, which never read them.
-	canonSrc, canonDst, perr := canonicalizeMoveCopyLegs(op, bodyBytes)
+	canonSrc, canonDst, perr := canonicalizeMoveCopyLegs(op, bodyBytes, subtree)
 	if perr != nil {
 		denyOp(mapDeny(denyMalformed), "invalid or unsafe path")
 		return
@@ -470,19 +520,14 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// STAGE 2: route-op -> required-intent binding (NFR-SEC-49, invariant 4).
 	// The route op is AUTHORITATIVE for what the request does; the wire
-	// authorization_metadata.intent is an untrusted hint. The authz intent
-	// passed to Resolve is DERIVED FROM THE ROUTE OP — never the wire — and a
-	// wire intent that disagrees with the op's required intent is refused
-	// (errRouteOpMismatch) before the resolver is consulted, so a read-only
-	// grant can never reach a mutation handler by declaring intent=read on a
-	// mutation route. An op absent from the closed map is a wiring fault and
-	// fails closed.
-	requiredIntent, ok := requiredIntentForOp(op)
-	if !ok {
-		denyOp(mapDeny(denyInternal), "no required intent bound to operation")
-		return
-	}
+	// authorization_metadata.intent is an untrusted hint. requiredIntent was
+	// derived at the STAGE 1b->2 boundary above (hoisted so the join subtree is
+	// known when the path is cleaned); the cross-check below refuses a wire intent
+	// that disagrees with the op's required intent BEFORE the resolver is
+	// consulted, so a read-only grant can never reach a mutation handler by
+	// declaring intent=read on a mutation route.
 	if env.AuthorizationMetadata.Intent != requiredIntent {
+
 		denyOp(mapDeny(denyClassForDecodeErr(errRouteOpMismatch)), "authorization intent does not match the operation")
 		return
 	}
@@ -497,7 +542,16 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Intent:     requiredIntent,
 	}
 	authzStart := time.Now()
-	grant, err := d.resolver.Resolve(r.Context(), evidence, req)
+	// The resolver (and its StoredTagFunc) keys on the ENGINE-RELATIVE path with
+	// NO leading slash — "outputs/uploads/x", never "/outputs/uploads/x"
+	// (ADR-0029 inv-5). The north Files-API plane already passes engine-relative,
+	// so normalising here gives both planes ONE convention at the tag boundary and
+	// settles the cross-plane mismatch that let the leading-slash south path miss
+	// the configured prefix. env.Path (leading-slash, the JOINED canonical form)
+	// stays authoritative for the audit ObjectHandle, the uuid store, and the
+	// engine handler; only the value the resolver sees is normalised, and it names
+	// the SAME joined object the bytes land in (authz-path == engine-path).
+	grant, err := d.resolver.Resolve(r.Context(), evidence, resolverRequest(req))
 	d.observeStage("authz", time.Since(authzStart).Seconds())
 	if err != nil {
 		denyOp(mapDeny(denyClassForErr(err)), "authorization denied")
@@ -637,7 +691,12 @@ func activityForOp(op Op) int {
 // Both returned legs are in the guest leading-slash convention; the handler
 // trims them through enginePath for the engine call. For a single-path op the
 // returned legs are empty and the handler never reads them.
-func canonicalizeMoveCopyLegs(op Op, body []byte) (src string, dst string, err error) {
+//
+// subtree is the SAME op-derived join subtree the primary path took (ADR-0029
+// inv-10): both legs of a move/copy carry the op's single intent, so both land
+// under the same subtree and no cross-subtree move is expressible. An empty
+// subtree disables the join (static-path mode) exactly as for the primary path.
+func canonicalizeMoveCopyLegs(op Op, body []byte, subtree string) (src string, dst string, err error) {
 	var rawSrc, rawDst string
 	switch op {
 	case OpMoveDirectory:
@@ -661,11 +720,11 @@ func canonicalizeMoveCopyLegs(op Op, body []byte) (src string, dst string, err e
 	default:
 		return "", "", nil
 	}
-	src, err = canonicalizePath(rawSrc)
+	src, err = canonicalizePath(rawSrc, subtree)
 	if err != nil {
 		return "", "", err
 	}
-	dst, err = canonicalizePath(rawDst)
+	dst, err = canonicalizePath(rawDst, subtree)
 	if err != nil {
 		return "", "", err
 	}

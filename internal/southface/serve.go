@@ -24,6 +24,13 @@ var ErrBrokerMaxFileSizeUnset = errors.New("southface: broker max file size must
 // Match it with errors.Is.
 var ErrSeamMissing = errors.New("southface: a required seam is nil")
 
+// ErrInvalidSubtree — a deployment-supplied subtree override was empty after
+// trimming or carried a ".." component (ADR-0029). A deployment may override the
+// intent->subtree join target but can never disable the join by setting it empty
+// or point it out of the scope tree; either is a wiring fault that fails loud at
+// construction. Match it with errors.Is.
+var ErrInvalidSubtree = errors.New("southface: subtree override must be a non-empty engine-relative path with no traversal segment")
+
 // Config is the frozen call site for the one exported south-face constructor.
 // The composition layer fills it with the broker-side adapters, the
 // flag-derived ceilings, and the TLS bind/cert/key; Serve validates it and
@@ -56,6 +63,19 @@ type Config struct {
 	// a wiring fault (an unwired credential source would fail closed on every
 	// request, so it is refused loud at construction).
 	CredExtractor CredentialScopeExtractor
+	// Subtrees is the intent->subtree join map (ADR-0029 inv-10). A zero-value
+	// (disabled) map runs canonicalizePath in static-path mode — the pre-ADR-0029
+	// behaviour — so a deployment that supplies no subtree overrides keeps the flat
+	// static-path layout. A populated map (DefaultSubtreeMap or a NewSubtreeMap
+	// override) engine-joins every file-op path under the intent's subtree before
+	// the invariant-1 traversal check.
+	Subtrees SubtreeMap
+	// GrantedIntents is the static -granted-intents ceiling (ADR-0029 Decision
+	// bullet 5): the intents the deployment serves. The dispatcher intersects the
+	// credential's claim with this ceiling to derive the effective grant set the
+	// authz spine reads. The ceiling never grants — it only narrows the claim. A
+	// nil value leaves the claim unnarrowed (the pre-ADR-0029 behaviour).
+	GrantedIntents []Intent
 	// BindAddr is the host:port the TLS south-face server binds (the service_url
 	// the guest dials outbound through the Egress edge).
 	BindAddr string
@@ -113,6 +133,12 @@ func Serve(cfg Config) (Server, error) {
 	// The credential-scope source: STAGE 0 of every op derives the
 	// host-attested PeerScope from the edge-injected Authorization: Bearer.
 	d.credExtractor = cfg.CredExtractor
+	// The ADR-0029 join map and -granted-intents ceiling. A disabled (zero-value)
+	// map keeps canonicalizePath in static-path mode; a nil ceiling leaves the
+	// credential claim unnarrowed — both preserve the pre-ADR-0029 behaviour when
+	// the composition layer supplies neither.
+	d.subtrees = cfg.Subtrees
+	d.grantedIntentsCeiling = cfg.GrantedIntents
 
 	router := newRESTRouter(d)
 

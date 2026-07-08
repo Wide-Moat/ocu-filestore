@@ -244,3 +244,54 @@ func TestPrefixPolicyMatchAllStar(t *testing.T) {
 		t.Fatalf("bare root '/' matched /p.txt; want false (bare root stays the matches-nothing sentinel, distinct from '*')")
 	}
 }
+
+// TestPrefixDownloadableCrossPlaneEngineRelative pins the ADR-0029 inv-5
+// stored-tag convention: the StoredTagFunc keys on the ENGINE-RELATIVE path with
+// NO leading slash ("outputs/report.pdf"), one convention across the south and
+// north planes. Before ADR-0029 the south plane passed the leading-slash form
+// ("/outputs/report.pdf") while the north Files-API plane passed engine-relative
+// ("outputs/report.pdf"), so a single configured prefix could never match both —
+// the observed F9 pane 403. With the convention unified, a prefix configured as
+// engine-relative "outputs" matches the engine-relative path both planes now
+// present, and does NOT match the stale leading-slash form.
+func TestPrefixDownloadableCrossPlaneEngineRelative(t *testing.T) {
+	// The fleet-shipped downloadable prefix is engine-relative, no leading slash.
+	tag := NewPrefixDownloadablePolicy([]string{"outputs"})
+
+	// Both planes now present the engine-relative path — the join makes the
+	// south path "outputs/uploads/x" and the north path "outputs/report.pdf",
+	// both without a leading slash. The tag must grant on both.
+	for _, p := range []string{"outputs/report.pdf", "outputs/uploads/x", "outputs"} {
+		dl, err := tag(context.Background(), "fs1", p)
+		if err != nil {
+			t.Fatalf("tag(%q): err %v, want nil", p, err)
+		}
+		if !dl {
+			t.Fatalf("tag(%q, prefix=outputs): downloadable false, want true (engine-relative convention)", p)
+		}
+	}
+
+	// The stale LEADING-SLASH form must NOT match the engine-relative prefix —
+	// this is the exact cross-plane mismatch ADR-0029 settles. A "/outputs/x"
+	// path does not lie under the engine-relative "outputs" prefix on a path
+	// boundary, so it is (correctly) non-downloadable; the fix is that the south
+	// plane no longer PRESENTS this stale form to the tag.
+	dl, err := tag(context.Background(), "fs1", "/outputs/report.pdf")
+	if err != nil {
+		t.Fatalf("tag(/outputs/report.pdf): err %v, want nil", err)
+	}
+	if dl {
+		t.Fatalf("tag(/outputs/report.pdf, prefix=outputs): downloadable true; the leading-slash form must NOT match the engine-relative prefix")
+	}
+
+	// The read-only "uploads" subtree is NEVER downloadable under an outputs-only
+	// prefix: a human upload landed under uploads/ is readable-in-session but not
+	// egress-eligible (the exfil-bar, NFR-SEC-73).
+	dl, err = tag(context.Background(), "fs1", "uploads/human-upload.bin")
+	if err != nil {
+		t.Fatalf("tag(uploads/...): err %v, want nil", err)
+	}
+	if dl {
+		t.Fatalf("tag(uploads/human-upload.bin, prefix=outputs): downloadable true; the read-only subtree must not be egress-eligible")
+	}
+}

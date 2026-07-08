@@ -208,8 +208,15 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// --- canonicalize the decoded path ONCE (bypass-01/03) ---
-	canonUpload, cerr := canonicalizePath(params.Path)
+	// --- canonicalize the decoded path ONCE, joined under the write subtree
+	// (bypass-01/03, ADR-0029 inv-10) ---
+	// fileUpload is a write op, so the intent is hardcoded IntentWrite; the join
+	// subtree is the RW sink ("outputs"). A write addressing "uploads/x" lands the
+	// distinct object "outputs/uploads/x" — the read-only subtree is unreachable
+	// for writing, so the ":ro" posture is engine-enforced by the join. An empty
+	// subtree (join disabled deployment-wide) preserves the pre-ADR-0029 behaviour.
+	writeSubtree := d.subtrees.For(IntentWrite)
+	canonUpload, cerr := canonicalizePath(params.Path, writeSubtree)
 	if cerr != nil {
 		denyUpload(denyMalformed, "invalid or unsafe path")
 		return
@@ -217,9 +224,14 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	params.Path = canonUpload
 
 	// --- authz Resolve(intent=write) from the channel scope ---
+	// The resolver (and its StoredTagFunc) keys on the engine-relative path with
+	// no leading slash (ADR-0029 inv-5); resolverRequest normalises the joined
+	// leading-slash params.Path to "outputs/uploads/x" so both planes evaluate the
+	// stored downloadable tag against the same string. The audit/engine keep the
+	// leading-slash params.Path.
 	req = ResolveRequest{Filesystem: ps.FilesystemID, Path: params.Path, Intent: IntentWrite}
 	evidence := CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
-	grant, err = d.resolver.Resolve(r.Context(), evidence, req)
+	grant, err = d.resolver.Resolve(r.Context(), evidence, resolverRequest(req))
 	if err != nil {
 		denyUpload(denyClassForErr(err), "authorization denied")
 		return

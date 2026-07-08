@@ -114,11 +114,13 @@ services:
       - ${OCU_BROKER_MAX_FILE_SIZE:-1073741824}
       - -granted-intents
       - ${OCU_GRANTED_INTENTS:-read,write}
-      # /pub is downloadable so the read path (readFile, fileDownload) reaches
-      # the engine; downloadable resolves at read from this prefix grant, never
+      # The downloadable prefix is ENGINE-RELATIVE with no leading slash
+      # (ADR-0029 inv-5): both planes present the engine-relative path to the
+      # stored-tag lookup, so the configured prefix must be engine-relative to
+      # match. downloadable resolves at read from this prefix grant, never
       # stamped at write (NFR-SEC-73).
       - -downloadable-prefixes
-      - ${OCU_DOWNLOADABLE_PREFIXES:-/pub}
+      - ${OCU_DOWNLOADABLE_PREFIXES:-pub}
       - -profile
       - trusted_operator
       - -tenancy

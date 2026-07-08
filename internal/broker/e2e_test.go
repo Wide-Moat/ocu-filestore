@@ -30,6 +30,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -74,8 +76,18 @@ const (
 
 	// downloadablePrefix is configured downloadable so the read path (readFile,
 	// fileDownload) reaches the engine: downloadable resolves at read from the
-	// broker-side prefix grant, never stamped at write (NFR-SEC-73).
-	downloadablePrefix = "/pub"
+	// broker-side prefix grant, never stamped at write (NFR-SEC-73). It is
+	// ENGINE-RELATIVE with no leading slash (ADR-0029 inv-5): both the south and
+	// north planes present the engine-relative path to the stored-tag lookup, so
+	// the configured prefix must be engine-relative to match.
+	downloadablePrefix = "pub"
+
+	// downloadableDir is the GUEST WIRE path form of the downloadable directory
+	// (leading slash), used for the makeDirectory/upload/list wire calls. The wire
+	// convention is guest leading-slash; the -downloadable-prefixes flag config
+	// (downloadablePrefix) is engine-relative — the two are distinct conventions
+	// that ADR-0029 reconciles at the stored-tag lookup, not on the wire.
+	downloadableDir = "/pub"
 )
 
 // brokerBin returns the daemon binary path from OCU_BROKER_BIN (default
@@ -180,7 +192,7 @@ func freeLoopbackAddr(t *testing.T) string {
 // and waits for the listener to answer before returning. The caller's t.Cleanup
 // stops the process. The returned daemon carries an http.Client that trusts the
 // daemon's own certificate and dials its bind address.
-func startDaemon(t *testing.T) *daemon {
+func startDaemon(t *testing.T, extraArgs ...string) *daemon {
 	t.Helper()
 	bin := brokerBin(t)
 
@@ -212,6 +224,10 @@ func startDaemon(t *testing.T) *daemon {
 		// concurrent live cases never collide on the default 127.0.0.1:9464.
 		"-ops-listen", "",
 	}
+	// Per-case extra flags (e.g. the ADR-0029 -subtree-rw/-subtree-ro overrides
+	// the mirage probe sets to enable the join). Appended AFTER the base args so a
+	// case can add flags the base set does not carry.
+	args = append(args, extraArgs...)
 
 	cmd := exec.Command(bin, args...)
 	var stderr bytes.Buffer
@@ -436,16 +452,16 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 	// provision, /pub must be created explicitly.
 	mk := d.postJSON(t, "makeDirectory", map[string]any{
 		"filesystem_id":          e2eScope,
-		"path":                   downloadablePrefix,
+		"path":                   downloadableDir,
 		"authorization_metadata": authMeta("write"),
 	})
 	mk.Body.Close()
 	if mk.StatusCode != http.StatusOK {
-		t.Fatalf("makeDirectory %s status = %d, want 200", downloadablePrefix, mk.StatusCode)
+		t.Fatalf("makeDirectory %s status = %d, want 200", downloadableDir, mk.StatusCode)
 	}
 
 	// fileUpload /pub/golden.bin = a known, binary-safe payload.
-	const guestPath = downloadablePrefix + "/golden.bin"
+	const guestPath = downloadableDir + "/golden.bin"
 	payload := []byte("ABCDEFGH\x00\x01\x02 binary-safe e2e payload")
 	up := d.uploadMultipart(t, map[string]any{
 		"filesystem_id":          e2eScope,
@@ -487,9 +503,9 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 
 	// listDirectory shows the uploaded file; capture the minted uuid for the
 	// uuid-addressed download.
-	uuid, found := d.listingContains(t, downloadablePrefix, guestPath)
+	uuid, found := d.listingContains(t, downloadableDir, guestPath)
 	if !found {
-		t.Fatalf("listDirectory of %s does not contain %s after upload", downloadablePrefix, guestPath)
+		t.Fatalf("listDirectory of %s does not contain %s after upload", downloadableDir, guestPath)
 	}
 	if uuid == "" {
 		t.Fatal("listDirectory entry for the uploaded file carries no minted uuid")
@@ -514,8 +530,8 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 	}
 
 	// listDirectory no longer shows the removed file — the mutation is visible.
-	if _, stillThere := d.listingContains(t, downloadablePrefix, guestPath); stillThere {
-		t.Fatalf("listDirectory of %s still contains %s after removeFile", downloadablePrefix, guestPath)
+	if _, stillThere := d.listingContains(t, downloadableDir, guestPath); stillThere {
+		t.Fatalf("listDirectory of %s still contains %s after removeFile", downloadableDir, guestPath)
 	}
 }
 
@@ -529,7 +545,7 @@ func TestE2EForeignScopeDeny(t *testing.T) {
 
 	resp := d.postJSON(t, "listDirectory", map[string]any{
 		"filesystem_id":          "fs-attacker",
-		"path":                   downloadablePrefix,
+		"path":                   downloadableDir,
 		"authorization_metadata": authMeta("read"),
 	})
 	defer resp.Body.Close()
@@ -558,7 +574,7 @@ func TestE2EMissingBearerDeny(t *testing.T) {
 
 	raw, _ := json.Marshal(map[string]any{
 		"filesystem_id":          e2eScope,
-		"path":                   downloadablePrefix,
+		"path":                   downloadableDir,
 		"authorization_metadata": authMeta("read"),
 	})
 	req, err := http.NewRequest(http.MethodPost, d.baseURL+restBase+"listDirectory", bytes.NewReader(raw))
@@ -576,4 +592,205 @@ func TestE2EMissingBearerDeny(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("missing-bearer status = %d, want 401; body %s", resp.StatusCode, b)
 	}
+}
+
+// mintUnsignedBearer builds an unsigned (alg=none) JWT carrying the given
+// filesystem_id and intent claim. Under -claims-bind the daemon's extractor
+// parses the edge-validated bearer's claims WITHOUT re-verifying the signature
+// (the edge owns weak-JWT validation; the service JWKS-verifies nothing —
+// inv3), so an unsigned token stands in for an edge-validated one. A random
+// nonce per call keeps two mints distinct.
+func mintUnsignedBearer(t *testing.T, fsid, intent, nonce string) string {
+	t.Helper()
+	b64 := func(v any) string {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal jwt part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	header := b64(map[string]any{"alg": "none", "typ": "JWT"})
+	payload := b64(map[string]any{
+		"filesystem_id": fsid,
+		"intent":        intent,
+		"nonce":         nonce,
+	})
+	// alg=none: an empty signature segment.
+	return header + "." + payload + "."
+}
+
+// randomNonce returns a short random hex nonce so two mints in one run differ.
+func randomNonce(t *testing.T) string {
+	t.Helper()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// uploadMultipartBearer is uploadMultipart with an explicit Authorization bearer
+// (the mirage probe mints an intent-bearing bearer per leg instead of the fixed
+// e2eBearer).
+func (d *daemon) uploadMultipartBearer(t *testing.T, bearer string, params map[string]any, payload []byte) *http.Response {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal upload params: %v", err)
+	}
+	if err := mw.WriteField(multipartParamsField, string(paramsJSON)); err != nil {
+		t.Fatalf("write params field: %v", err)
+	}
+	fw, err := mw.CreateFormFile(multipartFileField, multipartFileFilename)
+	if err != nil {
+		t.Fatalf("create file part: %v", err)
+	}
+	if _, err := fw.Write(payload); err != nil {
+		t.Fatalf("write file part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, d.baseURL+restBase+"fileUpload", bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("new fileUpload request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("fileUpload do: %v", err)
+	}
+	return resp
+}
+
+// TestE2EMirageSubtreeJoin pins the ADR-0029 inv-10 join LIVE, over the real
+// daemon and its on-disk local-volume layout (engineRoot/<scope>/<rel>), with
+// two PERMANENT subtests that differ only in whether the join is enabled. It is
+// non-vacuous by construction: the SAME write request lands a DISTINCT on-disk
+// object depending on the join, so a regression that silently stops (or wrongly
+// gains) the join reds one leg or the other.
+//
+//   - [join-enabled] a write-intent upload addressing "/uploads/x" lands the
+//     DISTINCT object "outputs/uploads/x" (the RW subtree is prepended); the RO
+//     "uploads/x" seeded out-of-band is byte-UNCHANGED — the read-only subtree is
+//     structurally unreachable for writing (the ":ro" mirage is closed by
+//     construction).
+//   - [join-disabled] the SAME upload CLOBBERS the flat "uploads/x" the RO view
+//     reads — the pre-fix mirage, pinned live so leg 1 can never be vacuous.
+func TestE2EMirageSubtreeJoin(t *testing.T) {
+	nonceA := randomNonce(t)
+	nonceB := randomNonce(t)
+	if nonceA == nonceB {
+		t.Fatal("nonces collided; the distinct-object witness would be vacuous")
+	}
+
+	t.Run("join_enabled_write_lands_under_outputs_ro_unreachable", func(t *testing.T) {
+		d := startDaemon(t,
+			"-claims-bind",
+			"-subtree-rw", "outputs",
+			"-subtree-ro", "uploads",
+			"-subtree-preview", "uploads",
+		)
+		scopeDir := filepath.Join(d.engineRoot, e2eScope)
+
+		// Seed the RO object out-of-band via the engine LAYOUT (stands in for a
+		// pane upload landed under uploads/, seeded through the layout not the
+		// credential under test).
+		if err := os.MkdirAll(filepath.Join(scopeDir, "uploads"), 0o700); err != nil {
+			t.Fatalf("seed uploads dir: %v", err)
+		}
+		roPath := filepath.Join(scopeDir, "uploads", "x")
+		if err := os.WriteFile(roPath, []byte(nonceA), 0o600); err != nil {
+			t.Fatalf("seed RO object: %v", err)
+		}
+		// Seed the write target's parent dir (the local engine refuses a missing
+		// parent on commit); the object itself is written by the request under test.
+		if err := os.MkdirAll(filepath.Join(scopeDir, "outputs", "uploads"), 0o700); err != nil {
+			t.Fatalf("seed outputs/uploads dir: %v", err)
+		}
+
+		// The write-intent upload addressing "/uploads/x".
+		writeBearer := mintUnsignedBearer(t, e2eScope, "write", nonceB)
+		resp := d.uploadMultipartBearer(t, writeBearer, map[string]any{
+			"filesystem_id":          e2eScope,
+			"path":                   "/uploads/x",
+			"declared_size_bytes":    len(nonceB),
+			"authorization_metadata": authMeta("write"),
+		}, []byte(nonceB))
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		// The write MUST land (a deny here would fake-green the next assert).
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("join-enabled write status = %d, want 200; body %s", resp.StatusCode, body)
+		}
+
+		// The DISTINCT joined object exists with the write bytes.
+		joined := filepath.Join(scopeDir, "outputs", "uploads", "x")
+		got, err := os.ReadFile(joined)
+		if err != nil {
+			t.Fatalf("joined object %s not written: %v", joined, err)
+		}
+		if string(got) != nonceB {
+			t.Fatalf("joined object bytes = %q, want the write payload %q", got, nonceB)
+		}
+
+		// The RO subtree object is byte-UNCHANGED: no write-intent path string can
+		// name it after the join (the ":ro" mirage is closed by construction).
+		roGot, err := os.ReadFile(roPath)
+		if err != nil {
+			t.Fatalf("RO object vanished: %v", err)
+		}
+		if string(roGot) != nonceA {
+			t.Fatalf("RO object bytes = %q, want the UNCHANGED seed %q; the write reached the read-only subtree", roGot, nonceA)
+		}
+	})
+
+	t.Run("join_disabled_write_clobbers_flat_object", func(t *testing.T) {
+		// No -claims-bind, no -subtree-* flags: the shipped static bind (join
+		// disabled). The fixed e2eBearer binds to the configured scope with the
+		// default read,write grant.
+		d := startDaemon(t)
+		scopeDir := filepath.Join(d.engineRoot, e2eScope)
+
+		if err := os.MkdirAll(filepath.Join(scopeDir, "uploads"), 0o700); err != nil {
+			t.Fatalf("seed uploads dir: %v", err)
+		}
+		flatPath := filepath.Join(scopeDir, "uploads", "x")
+		if err := os.WriteFile(flatPath, []byte(nonceA), 0o600); err != nil {
+			t.Fatalf("seed flat object: %v", err)
+		}
+
+		// The SAME upload addressing "/uploads/x" with overwrite: static mode has
+		// no join, so it CLOBBERS the flat object the RO view reads.
+		resp := d.uploadMultipart(t, map[string]any{
+			"filesystem_id":          e2eScope,
+			"path":                   "/uploads/x",
+			"declared_size_bytes":    len(nonceB),
+			"overwrite_existing":     true,
+			"authorization_metadata": authMeta("write"),
+		}, []byte(nonceB))
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("join-disabled write status = %d, want 200; body %s", resp.StatusCode, body)
+		}
+
+		// The flat object was CLOBBERED (the pre-fix mirage: write reached the
+		// same flat object the RO view reads).
+		got, err := os.ReadFile(flatPath)
+		if err != nil {
+			t.Fatalf("flat object vanished: %v", err)
+		}
+		if string(got) != nonceB {
+			t.Fatalf("flat object bytes = %q, want the CLOBBER %q (static mode must reach the flat object)", got, nonceB)
+		}
+		// No joined object exists in static mode.
+		joined := filepath.Join(scopeDir, "outputs", "uploads", "x")
+		if _, err := os.Stat(joined); err == nil {
+			t.Fatalf("static-mode write gained the join (%s exists); the join must be inert without the flags", joined)
+		}
+	})
 }

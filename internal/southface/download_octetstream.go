@@ -248,7 +248,14 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 	// all name the SAME object even for any record minted before this boundary
 	// existed. A non-canonical record is a not_found-class refusal — never an
 	// egress grant on a dirty path.
-	canonDownload, cerr := canonicalizePath(rec.path)
+	//
+	// The subtree is EMPTY here (static-mode re-canonicalize): rec.path is the
+	// uuid-store record minted by a prior listing/read, which ALREADY carries the
+	// join (the read subtree "uploads" the listing walked under). Re-joining it
+	// would double-prefix ("/uploads/uploads/x"); the static re-clean is
+	// idempotent on the already-joined form and preserves the ADR-0029 join the
+	// mint applied (inv-10).
+	canonDownload, cerr := canonicalizePath(rec.path, "")
 	if cerr != nil {
 		denyDownload(denyNotFound, "object not found")
 		return
@@ -258,10 +265,16 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 	req = ResolveRequest{Filesystem: ps.FilesystemID, Path: canonDownload, Intent: IntentRead}
 
 	// --- authz Resolve(intent=read) from the channel scope ---
+	// The resolver (and its StoredTagFunc) keys on the engine-relative path with
+	// no leading slash (ADR-0029 inv-5); resolverRequest normalises the joined
+	// leading-slash canonDownload to "uploads/x" so the south download plane and
+	// the north Files-API plane evaluate the stored downloadable tag against the
+	// same string. env.audit/ReadRange keep the leading-slash canonDownload.
 	evidence := CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
-	grant, err = d.resolver.Resolve(r.Context(), evidence, req)
+	grant, err = d.resolver.Resolve(r.Context(), evidence, resolverRequest(req))
 	if err != nil {
 		denyDownload(denyClassForErr(err), "authorization denied")
+
 		return
 	}
 
