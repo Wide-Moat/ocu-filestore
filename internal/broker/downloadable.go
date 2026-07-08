@@ -18,9 +18,12 @@ import (
 // broker-side at read from the deployment's configured prefix set.
 //
 // The returned func reports downloadable=true ONLY when the request path lies
-// under a configured downloadable prefix (a path-boundary match: "/pub"
-// matches "/pub" and "/pub/..." but not "/pubX"); everything else is false —
-// default false for any class above PUBLIC (SEC-73). An empty prefix set makes
+// under a configured downloadable prefix (a path-boundary match: "outputs"
+// matches "outputs" and "outputs/..." but not "outputsX"); everything else is
+// false — default false for any class above PUBLIC (SEC-73). Configured
+// prefixes are engine-relative with no leading slash (ADR-0029 inv-5, one
+// convention across the north and south planes); a deployment-facing "/pub" or
+// "pub" both normalise to "pub" at construction. An empty prefix set makes
 // every object non-downloadable, the fail-closed deployment default.
 //
 // It is fail-closed: it never reports downloadable=true for a path it cannot
@@ -62,12 +65,26 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 			matchAll = true
 			continue
 		}
-		// Drop a trailing slash so "/pub/" and "/pub" behave identically;
-		// the root "/" is kept as a sentinel that matches nothing on its own
-		// (a deployment marking the entire scope downloadable configures the
-		// explicit prefixes it wants — "*" — not the bare root).
-		if p != "/" {
-			p = strings.TrimRight(p, "/")
+		// Normalise to the engine-relative, no-leading-slash convention the
+		// StoredTagFunc input carries (ADR-0029 inv-5: one convention across the
+		// north and south planes). A deployment-facing prefix may be written with
+		// or without a leading slash ("/pub" or "pub") and with or without a
+		// trailing slash; all four normalise to the engine-relative "pub" the
+		// resolver evaluates against. Trailing slash first, then leading — order
+		// matters only for the bare root "/", handled next.
+		p = strings.TrimRight(p, "/")
+		p = strings.TrimLeft(p, "/")
+		// The bare root "/" trims to "" and is dropped so it never lands in norm.
+		// Under the engine-relative convention this drop is defence-in-depth, not
+		// the load-bearing guard: an empty prefix would NOT widen to match-all,
+		// because pathUnderPrefix tests `HasPrefix(path, ""+"/")` = HasPrefix(path,
+		// "/"), and an engine-relative path carries no leading slash — so an empty
+		// prefix matches nothing (verified: bare "/" stays matches-nothing even
+		// with this drop removed). The drop keeps norm free of a dead entry and
+		// documents the "/"-vs-"*" distinction in one place: a deployment marks
+		// the whole scope downloadable with "*", never the bare root.
+		if p == "" {
+			continue
 		}
 		norm = append(norm, p)
 	}

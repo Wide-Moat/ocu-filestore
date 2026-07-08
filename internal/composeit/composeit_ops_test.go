@@ -14,8 +14,12 @@ package composeit_test
 // and gates EVERY case on requireComposeIT (loud-skip without OCU_COMPOSE_IT=1).
 //
 // This file also hosts the shared helpers the sibling deny-path and multipart
-// slices reuse (keyForGuestPath/getObjectBytes/assertObjectAbsent/uploadGolden/
-// downloadBytes) — one rig, one set of helpers, three slices.
+// slices reuse (keyForGuestPath/getObjectBytes/assertObjectAbsent/uploadGolden)
+// — one rig, one set of helpers, three slices. Under the ADR-0029 disjoint-subtree
+// split a write object is undownloadable through the same mount (write->outputs/,
+// read->uploads/), so the golden test's read leg seeds uploads/ directly and
+// asserts the egress deny; write objects are verified by the independent MinIO
+// observer under the write subtree.
 //
 // No mocks (owner rule): the bytes are asserted in real MinIO, the mutations
 // are confirmed by an independent backend observer. Per-case keys/payloads keep
@@ -36,12 +40,15 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-// keyForGuestPath maps a guest path ("/pub/x.bin") to the real MinIO object key
-// the s3 engine writes it under: "<scope>/<path-without-leading-slash>". The
-// engine joins string(scope)+"/"+clean where clean drops the leading slash, so
-// the key is itScope + guestPath (guestPath already carries the leading slash).
+// keyForGuestPath maps a WRITE guest path ("/pub/x.bin") to the real MinIO
+// object key the s3 engine writes it under. Under the ADR-0029 default join a
+// write-intent op joins the guest path beneath the write subtree ("outputs/"),
+// so the backend key is "<scope>/outputs/<path-without-leading-slash>". Every
+// caller of this helper verifies a WRITE object (upload/copy/move sources and
+// destinations), so it keys on the write subtree. A read-plane object would key
+// under "uploads/" instead (see the seeded read leg).
 func keyForGuestPath(guestPath string) string {
-	return itScope + guestPath
+	return itScope + "/outputs" + guestPath
 }
 
 // getObjectBytes reads an object straight from real MinIO via the independent S3
@@ -102,9 +109,10 @@ func assertObjectAbsent(t *testing.T, mc *s3.Client, key string) {
 
 // uploadGolden uploads payload to guestPath under /pub through the live south
 // face and asserts the 200, leaving a real object in MinIO. It is the common
-// "arrange" step the mutation/multipart cases share. It does NOT makeDirectory:
-// the s3 engine keys flat under "<scope>/<path>" with no POSIX parent
-// requirement, so an upload to /pub/<leaf> lands without a prior mkdir.
+// "arrange" step the mutation/multipart cases share. The caller must have already
+// created the /pub working directory (which resolves to "outputs/pub" under the
+// ADR-0029 write join and needs its parent chain via make_parents) — the s3
+// engine's parentExists refuses a write whose prefix marker is absent.
 func uploadGolden(t *testing.T, cl *http.Client, guestPath string, payload []byte) {
 	t.Helper()
 	up := uploadMultipart(t, cl, map[string]any{
@@ -118,32 +126,6 @@ func uploadGolden(t *testing.T, cl *http.Client, guestPath string, payload []byt
 		b, _ := io.ReadAll(up.Body)
 		t.Fatalf("fileUpload %s status = %d, want 200; body %s", guestPath, up.StatusCode, b)
 	}
-}
-
-// downloadBytes downloads the object at guestPath (resolved to its minted uuid)
-// through the live south face and returns the exact bytes. It asserts the 200
-// and the octet-stream content type — the read leg of an exact-byte round-trip.
-func downloadBytes(t *testing.T, cl *http.Client, dir, guestPath string) []byte {
-	t.Helper()
-	uuid := uuidFor(t, cl, dir, guestPath)
-	dl := postJSON(t, cl, "fileDownload", map[string]any{
-		"filesystem_id":          itScope,
-		"uuid":                   uuid,
-		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
-	})
-	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload %s status = %d, want 200; body %s", guestPath, dl.StatusCode, b)
-	}
-	if ct := dl.Header.Get("Content-Type"); ct != contentTypeOctetStream {
-		t.Errorf("fileDownload %s Content-Type = %q, want %q", guestPath, ct, contentTypeOctetStream)
-	}
-	got, err := io.ReadAll(dl.Body)
-	if err != nil {
-		t.Fatalf("read fileDownload %s body: %v", guestPath, err)
-	}
-	return got
 }
 
 // TestComponentMutatingOpsAgainstMinIO drives the file-and-directory mutation
@@ -161,11 +143,14 @@ func TestComponentMutatingOpsAgainstMinIO(t *testing.T) {
 	cl := southClient(pool)
 	mc := minioClient()
 
-	// makeDirectory /pub once — the directory ops below operate under it, and the
-	// golden test established /pub as the downloadable working root.
+	// makeDirectory /pub once — the directory ops below operate under it. Under the
+	// ADR-0029 write join this resolves to "outputs/pub", whose parent "outputs/"
+	// must also exist (the s3 engine's parentExists refuses a write with an absent
+	// prefix), so make_parents lays down the whole chain.
 	mk := postJSON(t, cl, "makeDirectory", map[string]any{
 		"filesystem_id":          itScope,
 		"path":                   downloadablePrefix,
+		"make_parents":           true,
 		"authorization_metadata": authMeta("write"),
 	})
 	mk.Body.Close()

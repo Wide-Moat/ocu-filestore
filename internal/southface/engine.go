@@ -162,12 +162,13 @@ func isPathEscape(err error) bool {
 }
 
 // canonicalizePath returns the single canonical in-scope form of a
-// guest-supplied wire path, or errInvalidPath. It is the wire-boundary
-// obligation the dispatch spine discharges ONCE after STAGE 1b and before
-// STAGE 2 authz (bypass-01/03): the cleaned form it returns is what authz, the
-// downloadable tag, the engine read/write, the uuid store, and the audit
-// record ALL see, so the layer that decides downloadable can never disagree
-// with the layer that reads the bytes.
+// guest-supplied wire path, joined under the credential-intent's subtree, or
+// errInvalidPath. It is the wire-boundary obligation the dispatch spine
+// discharges ONCE after STAGE 1b and before STAGE 2 authz (bypass-01/03,
+// ADR-0029 inv-10): the cleaned form it returns is what authz, the downloadable
+// tag, the engine read/write, the uuid store, and the audit record ALL see, so
+// the layer that decides downloadable can never disagree with the layer that
+// reads the bytes.
 //
 // Its job is precisely to make authz-path == engine-path: it rejects the
 // unsafe lexical classes objectstore.ValidatePath rejects that can change which
@@ -178,6 +179,23 @@ func isPathEscape(err error) bool {
 // "/a/b" canonicalizes to "/a/b" and trims through enginePath to the engine
 // "a/b" that objectstore.ValidatePath cleans to the identical "a/b".
 //
+// subtree is the engine-relative form of the intent-derived subtree with NO
+// leading slash (e.g. "outputs" for write, "uploads" for read); an empty
+// subtree disables the join (static-path mode) and preserves the pre-ADR-0029
+// behaviour verbatim. When a subtree is supplied it is prepended BEFORE the
+// path.Clean and the escape check becomes a subtree-containment check: the
+// cleaned result must be the subtree root ("/outputs") or lie beneath it
+// ("/outputs/..."). This ordering is load-bearing (ADR-0029 inv-10): the join
+// happens before Clean, so "uploads/../x" cleans to "/x", which fails the
+// "/uploads/" containment prefix and is refused — the exact hole a bare "/.."
+// reject leaves open once a subtree is prepended. The returned canonical form
+// carries the subtree ("/outputs/uploads/x"); enginePath trims it to the
+// engine-relative "outputs/uploads/x" the backend object lands at.
+//
+// The two lexical rejects (NUL byte, URL scheme) run on the RAW guest input
+// BEFORE the join, so a smuggled "s3://..." or NUL-bearing leg dies before it
+// can be prefixed with a subtree.
+//
 // Unlike the engine-side ValidatePath it does NOT reject the scope root itself
 // (canonical "/") or enforce the per-path component cap: those are OP-specific
 // concerns the handlers and the engine already enforce with their own wire
@@ -187,25 +205,44 @@ func isPathEscape(err error) bool {
 // authz==engine path identity. southface declares its own mirror so the
 // consumer-seam isolation (no objectstore import) is preserved, exactly as it
 // mirrors errInvalidPath and the other engine sentinels.
-func canonicalizePath(guest string) (string, error) {
+func canonicalizePath(guest, subtree string) (string, error) {
+	// The lexical rejects run on the RAW guest input BEFORE the join: a NUL
+	// byte or a URL-shaped handle must die before it can be prefixed with the
+	// subtree (a "s3://bucket/key" leg smuggled through the path field would
+	// otherwise become "/outputs/s3://bucket/key" and lose its scheme shape to
+	// path.Clean's "//"-deduplication).
 	if strings.ContainsRune(guest, '\x00') {
 		return "", errInvalidPath
 	}
 	if hasURLScheme(guest) {
 		return "", errInvalidPath
 	}
-	// path.Clean operates on the slash convention directly. Anchor at the scope
-	// root so a leading-slash path and a relative path clean identically:
-	// "/a/b" and "a/b" both clean to "/a/b". A ".." that climbs above the root
-	// surfaces as a residual leading "/.." (path.Clean keeps a leading ".."
-	// after the anchor), caught below.
+	// Prepend the intent-derived subtree (if any) BEFORE path.Clean, then anchor
+	// at the scope root so a leading-slash path and a relative path clean
+	// identically. With subtree "outputs" the guest "/x" and "x" both become the
+	// pre-clean "outputs/x"; a residual ".." surfaces as a segment path.Clean
+	// keeps, caught by the containment check below.
 	rel := strings.TrimPrefix(guest, "/")
+	if subtree != "" {
+		rel = subtree + "/" + rel
+	}
 	clean := path.Clean("/" + rel)
-	// A residual ".." component after Clean means the path tried to escape the
-	// scope root — the bypass-01 class. Refuse it (the engine would also reject
-	// it, but the egress axis must be decided on the CLEANED in-scope form, so
-	// the boundary refuses an escape outright rather than pass it downstream).
-	if clean == "/.." || strings.HasPrefix(clean, "/../") {
+	if subtree != "" {
+		// Subtree-containment check (ADR-0029 inv-10): the cleaned result must be
+		// the subtree root or lie beneath it on a path boundary. This SUBSUMES the
+		// bare "/.." reject: "uploads/../x" cleans to "/x", which is neither
+		// "/uploads" nor under "/uploads/", so it is refused — the escape a bare
+		// "/.." check would miss once the subtree is prepended.
+		base := "/" + subtree
+		if clean != base && !strings.HasPrefix(clean, base+"/") {
+			return "", errInvalidPath
+		}
+	} else if clean == "/.." || strings.HasPrefix(clean, "/../") {
+		// Static-path mode (join disabled): the unchanged pre-ADR-0029 behaviour.
+		// A residual ".." component after Clean means the path tried to escape the
+		// scope root — the bypass-01 class. Refuse it (the engine would also reject
+		// it, but the egress axis must be decided on the CLEANED in-scope form, so
+		// the boundary refuses an escape outright rather than pass it downstream).
 		return "", errInvalidPath
 	}
 	return clean, nil
@@ -247,7 +284,24 @@ func enginePath(guestPath string) string {
 	return p
 }
 
+// resolverRequest returns a copy of req with Path normalised to the
+// engine-relative convention (no leading slash) for the resolver and its
+// StoredTagFunc (ADR-0029 inv-5). The stored downloadable tag is a raw string
+// prefix match, so the leading-slash convention is load-bearing: the south face
+// carries the guest leading-slash form ("/outputs/x") through env.Path for the
+// audit ObjectHandle and the uuid store, while the north Files-API plane passes
+// engine-relative ("outputs/x"); normalising the resolver's view to
+// engine-relative gives BOTH planes one convention at the tag boundary, so a
+// single configured downloadable prefix ("outputs") matches identically on both.
+// The normalised path names the SAME object env.Path names — enginePath only
+// strips the leading slash — so authz-path == engine-path is preserved.
+func resolverRequest(req ResolveRequest) ResolveRequest {
+	req.Path = enginePath(req.Path)
+	return req
+}
+
 // guestPathFromRel is the inverse of enginePath for emitting listing responses
+
 // and for keying the uuid store off an engine-relative path: it stamps the
 // guest's leading-slash convention back onto an engine-relative path. The scope
 // root "." becomes "/"; any other relative path gains a single leading "/".
@@ -260,6 +314,40 @@ func guestPathFromRel(rel string) string {
 		return "/"
 	}
 	return "/" + strings.TrimPrefix(rel, "/")
+}
+
+// guestDisplayPath is the engine->guest emit-boundary counterpart to
+// canonicalizePath's guest->engine join (ADR-0029 round-trip symmetry): it strips
+// the active intent subtree from an engine-relative path and returns the guest
+// leading-slash form, so a path the read plane REPORTS is one the guest can
+// re-address without a double-join. The store, cursor, download re-canon, and
+// audit keep the JOINED engine form; ONLY the wire Path field a south response
+// echoes is stripped. subtree is engine-relative with no leading slash
+// ("uploads", "outputs"); "" (static-path mode) makes this identical to
+// guestPathFromRel.
+//
+// The strip is anchored and boundary-checked (strip only when rel equals the
+// subtree or lies beneath it on a "/" boundary — "uploads2/x" is NOT stripped)
+// and applied AT MOST ONCE, so the engine object "uploads/uploads/x" emits
+// "/uploads/x" and a guest re-address re-joins it back to "uploads/uploads/x".
+func guestDisplayPath(rel, subtree string) string {
+	if subtree == "" {
+		return guestPathFromRel(rel)
+	}
+	r := strings.TrimPrefix(rel, "/")
+	switch {
+	case r == subtree:
+		// The subtree root itself surfaces as the guest scope root.
+		return "/"
+	case strings.HasPrefix(r, subtree+"/"):
+		return guestPathFromRel(strings.TrimPrefix(r, subtree+"/"))
+	default:
+		// An engine-relative path outside the active subtree cannot occur under an
+		// intent-rooted walk (the walk is rooted at the subtree). Falling through to
+		// the joined form here would reopen the leak, so this branch is an internal
+		// inconsistency the round-trip keystone is built to catch.
+		return guestPathFromRel(rel)
+	}
 }
 
 // denyClassForEngineErr maps an engine error to a deny class in EXACTLY this

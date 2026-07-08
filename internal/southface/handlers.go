@@ -311,15 +311,19 @@ func handleListDirectory(d *handlerDeps, hc handlerCtx) opOutcome {
 			resp.Cursor = encodeCursor(lastEmitted)
 			return false
 		}
+		// gp is the JOINED guest form — the uuid store key (download-immune, ADR-0029
+		// Option A). dp is the subtree-stripped DISPLAY form the guest can re-address
+		// without a double-join (the emit-boundary counterpart to the spine join).
 		gp := guestPathFromRel(wr.rel)
+		dp := guestDisplayPath(wr.rel, hc.subtree)
 		if wr.info.IsDir {
 			resp.Entries = append(resp.Entries, entry{Directory: &directory{
-				Path:  gp,
+				Path:  dp,
 				MTime: mtimeString(wr.info.ModTime),
 			}})
 		} else {
 			resp.Entries = append(resp.Entries, entry{File: &filesystemFile{
-				Path:  gp,
+				Path:  dp,
 				Size:  wr.info.Size,
 				MTime: mtimeString(wr.info.ModTime),
 				MIME:  mimeForPath(wr.rel),
@@ -593,9 +597,10 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 		hc.mandateDeny(denyNotFound, denyNotFound, "object is not a file")
 		return outcomeDenyRecorded()
 	}
-	gp := guestPathFromRel(rel)
+	gp := guestPathFromRel(rel)             // JOINED — uuid store key (Option A)
+	dp := guestDisplayPath(rel, hc.subtree) // stripped DISPLAY form for the wire
 	writeJSON(hc.w, readFileResponse{File: file{
-		Path:  gp,
+		Path:  dp,
 		Size:  info.Size,
 		MTime: mtimeString(info.ModTime),
 		MIME:  mimeForPath(rel),
@@ -634,16 +639,17 @@ func handleReadMetadata(d *handlerDeps, hc handlerCtx) opOutcome {
 		return outcomeDenyRecorded()
 	}
 
-	gp := guestPathFromRel(rel)
+	gp := guestPathFromRel(rel)             // JOINED — uuid store key (Option A)
+	dp := guestDisplayPath(rel, hc.subtree) // stripped DISPLAY form for the wire
 	if info.IsDir {
 		writeJSON(hc.w, readMetadataResponse{Directory: &directory{
-			Path:  gp,
+			Path:  dp,
 			MTime: mtimeString(info.ModTime),
 		}})
 		return outcomeAllow()
 	}
 	writeJSON(hc.w, readMetadataResponse{File: &filesystemFile{
-		Path:  gp,
+		Path:  dp,
 		Size:  info.Size,
 		MTime: mtimeString(info.ModTime),
 		MIME:  mimeForPath(rel),

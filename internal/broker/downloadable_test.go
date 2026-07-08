@@ -41,13 +41,15 @@ func TestPrefixDownloadablePolicyMatchesPrefix(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/pub/report.pdf", true},
-		{"/pub", true},
-		{"/share/out/a/b.txt", true},
-		{"/private/x", false},
-		{"/pubX/y", false}, // string prefix but not a path-boundary match
-		{"/share/outsider", false},
-		{"/", false},
+		// Paths are engine-relative with no leading slash (ADR-0029 inv-5) — the
+		// StoredTagFunc input the resolver delivers on both planes.
+		{"pub/report.pdf", true},
+		{"pub", true},
+		{"share/out/a/b.txt", true},
+		{"private/x", false},
+		{"pubX/y", false}, // string prefix but not a path-boundary match
+		{"share/outsider", false},
+		{"", false},
 	} {
 		dl, err := tag(context.Background(), "fs1", tc.path)
 		if err != nil {
@@ -80,19 +82,20 @@ func TestPrefixPolicyFeedsResolverReadEgressBit(t *testing.T) {
 	ev := authz.CallerEvidence{Scope: "fs1", GrantedIntents: []authz.Intent{authz.IntentRead}}
 
 	// Under the downloadable prefix: read allowed, egress artifact grantable.
+	// Paths are engine-relative with no leading slash (ADR-0029 inv-5).
 	g, err := res.Resolve(context.Background(), ev, authz.Request{
-		Filesystem: "fs1", Path: "/pub/report.pdf", Intent: authz.IntentRead,
+		Filesystem: "fs1", Path: "pub/report.pdf", Intent: authz.IntentRead,
 	})
 	if err != nil {
-		t.Fatalf("read under /pub: err %v, want a grant", err)
+		t.Fatalf("read under pub: err %v, want a grant", err)
 	}
 	if !g.Downloadable {
-		t.Fatalf("read under /pub: Downloadable false, want true")
+		t.Fatalf("read under pub: Downloadable false, want true")
 	}
 
 	// Outside any prefix: read is ALLOWED in-session, egress artifact withheld.
 	g, err = res.Resolve(context.Background(), ev, authz.Request{
-		Filesystem: "fs1", Path: "/private/secret.bin", Intent: authz.IntentRead,
+		Filesystem: "fs1", Path: "private/secret.bin", Intent: authz.IntentRead,
 	})
 	if err != nil {
 		t.Fatalf("read outside prefix: got %v, want nil (readable in-session, invariant 5)", err)
@@ -138,17 +141,20 @@ func TestPreviewStaysNonDownloadable(t *testing.T) {
 // able configures explicit prefixes, never the bare root). These rows exercise
 // the trailing-slash-trim and root-sentinel branches the earlier tests skip.
 func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
-	// Whitespace-only and empty entries are dropped; "/pub/" trims to "/pub".
+	// Whitespace-only and empty entries are dropped; a leading and/or trailing
+	// slash on a configured prefix is tolerated and trimmed to the engine-relative
+	// convention (ADR-0029 inv-5): "/pub/" and "  /share/out/  " normalise to
+	// "pub" and "share/out". Query paths are engine-relative with no leading slash.
 	tag := NewPrefixDownloadablePolicy([]string{"  ", "", "/pub/", "  /share/out/  "})
 	for _, tc := range []struct {
 		path string
 		want bool
 	}{
-		{"/pub/report.pdf", true}, // trailing slash on the prefix was trimmed
-		{"/pub", true},
-		{"/share/out/a.txt", true}, // surrounding whitespace was trimmed
-		{"/share/out", true},
-		{"/private/x", false}, // the dropped empty/whitespace entries grant nothing
+		{"pub/report.pdf", true}, // leading + trailing slash on the prefix were trimmed
+		{"pub", true},
+		{"share/out/a.txt", true}, // surrounding whitespace was trimmed
+		{"share/out", true},
+		{"private/x", false}, // the dropped empty/whitespace entries grant nothing
 	} {
 		dl, err := tag(context.Background(), "fs1", tc.path)
 		if err != nil {
@@ -159,19 +165,23 @@ func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
 		}
 	}
 
-	// A bare root "/" is kept verbatim (the trailing-slash trim is skipped for
-	// it): it never expands to cover the whole tree on a path-boundary match —
-	// "/anything" is NOT beneath it ("//"-joined prefix never matches), so a
-	// deployment that wants the whole scope egress-able must configure explicit
-	// prefixes, not the bare root.
+	// A bare root "/" stays the matches-nothing sentinel, DISTINCT from "*": a
+	// deployment that wants the whole scope egress-able configures "*", never the
+	// bare root. Under the engine-relative convention this holds two ways over —
+	// "/" trims to "" and is dropped, AND even an empty prefix reaching
+	// pathUnderPrefix would match nothing (HasPrefix(engine-relative-path, "/") is
+	// false). This asserts the sentinel BEHAVIOUR, not the empty-drop mechanism;
+	// the mechanism is defence-in-depth (see downloadable.go), so this leg passes
+	// whether or not the drop is present — the load-bearing guarantee is the
+	// no-leading-slash convention, covered by TestPrefixDownloadableCrossPlaneEngineRelative.
 	rootTag := NewPrefixDownloadablePolicy([]string{"/"})
-	for _, path := range []string{"/anything", "/deep/nested/file.bin", "/pub/x"} {
+	for _, path := range []string{"anything", "deep/nested/file.bin", "pub/x"} {
 		dl, err := rootTag(context.Background(), "fs1", path)
 		if err != nil {
 			t.Fatalf("rootTag(%q): err %v", path, err)
 		}
 		if dl {
-			t.Fatalf("rootTag(%q): downloadable true, want false (bare root does not cover the tree)", path)
+			t.Fatalf("rootTag(%q): downloadable true, want false (bare root is a matches-nothing sentinel, not match-all)", path)
 		}
 	}
 }
@@ -242,5 +252,56 @@ func TestPrefixPolicyMatchAllStar(t *testing.T) {
 	bareRoot := NewPrefixDownloadablePolicy([]string{"/"})
 	if dl, _ := bareRoot(context.Background(), "fs1", "/p.txt"); dl {
 		t.Fatalf("bare root '/' matched /p.txt; want false (bare root stays the matches-nothing sentinel, distinct from '*')")
+	}
+}
+
+// TestPrefixDownloadableCrossPlaneEngineRelative pins the ADR-0029 inv-5
+// stored-tag convention: the StoredTagFunc keys on the ENGINE-RELATIVE path with
+// NO leading slash ("outputs/report.pdf"), one convention across the south and
+// north planes. Before ADR-0029 the south plane passed the leading-slash form
+// ("/outputs/report.pdf") while the north Files-API plane passed engine-relative
+// ("outputs/report.pdf"), so a single configured prefix could never match both —
+// the observed F9 pane 403. With the convention unified, a prefix configured as
+// engine-relative "outputs" matches the engine-relative path both planes now
+// present, and does NOT match the stale leading-slash form.
+func TestPrefixDownloadableCrossPlaneEngineRelative(t *testing.T) {
+	// The fleet-shipped downloadable prefix is engine-relative, no leading slash.
+	tag := NewPrefixDownloadablePolicy([]string{"outputs"})
+
+	// Both planes now present the engine-relative path — the join makes the
+	// south path "outputs/uploads/x" and the north path "outputs/report.pdf",
+	// both without a leading slash. The tag must grant on both.
+	for _, p := range []string{"outputs/report.pdf", "outputs/uploads/x", "outputs"} {
+		dl, err := tag(context.Background(), "fs1", p)
+		if err != nil {
+			t.Fatalf("tag(%q): err %v, want nil", p, err)
+		}
+		if !dl {
+			t.Fatalf("tag(%q, prefix=outputs): downloadable false, want true (engine-relative convention)", p)
+		}
+	}
+
+	// The stale LEADING-SLASH form must NOT match the engine-relative prefix —
+	// this is the exact cross-plane mismatch ADR-0029 settles. A "/outputs/x"
+	// path does not lie under the engine-relative "outputs" prefix on a path
+	// boundary, so it is (correctly) non-downloadable; the fix is that the south
+	// plane no longer PRESENTS this stale form to the tag.
+	dl, err := tag(context.Background(), "fs1", "/outputs/report.pdf")
+	if err != nil {
+		t.Fatalf("tag(/outputs/report.pdf): err %v, want nil", err)
+	}
+	if dl {
+		t.Fatalf("tag(/outputs/report.pdf, prefix=outputs): downloadable true; the leading-slash form must NOT match the engine-relative prefix")
+	}
+
+	// The read-only "uploads" subtree is NEVER downloadable under an outputs-only
+	// prefix: a human upload landed under uploads/ is readable-in-session but not
+	// egress-eligible (the exfil-bar, NFR-SEC-73).
+	dl, err = tag(context.Background(), "fs1", "uploads/human-upload.bin")
+	if err != nil {
+		t.Fatalf("tag(uploads/...): err %v, want nil", err)
+	}
+	if dl {
+		t.Fatalf("tag(uploads/human-upload.bin, prefix=outputs): downloadable true; the read-only subtree must not be egress-eligible")
 	}
 }

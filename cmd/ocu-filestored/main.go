@@ -29,6 +29,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -257,8 +259,16 @@ type brokerConfig struct {
 	opsBurst       float64
 	grantedIntents []southface.Intent
 	dlPrefixes     []string
-	profile        admission.WorkloadTrustProfile
-	tenancy        admission.Tenancy
+	// subtrees is the ADR-0029 intent->subtree join map. It is the zero-value
+	// (join disabled, static-path mode) unless a deployment sets the -subtree-*
+	// override flags; validate builds it from those flags fail-closed.
+	subtrees southface.SubtreeMap
+	// claimsBind, when true, makes the credential extractor parse the
+	// edge-validated bearer's filesystem_id/intent claims (ADR-0029 interim seam)
+	// instead of binding every present bearer to the static configured scope.
+	claimsBind bool
+	profile    admission.WorkloadTrustProfile
+	tenancy    admission.Tenancy
 	// logLevel is the validated slog.Level for the daemon's JSON logger.
 	logLevel slog.Level
 	// opsListen is the bind address for the loopback-only ops listener
@@ -349,11 +359,32 @@ func runCtx(ctx context.Context, args []string) error {
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
-		"comma-separated broker-side downloadable prefixes (NFR-SEC-73); empty = nothing downloadable")
+		"comma-separated broker-side downloadable prefixes, engine-relative no leading slash e.g. outputs (ADR-0029 inv-5; a leading slash is tolerated and trimmed); empty = nothing downloadable")
+	// ADR-0029 intent->subtree join overrides. All empty (the default) keeps the
+	// static-path layout (join disabled). Setting ANY of the three requires ALL
+	// three to be a non-empty engine-relative path (no leading slash, no ".."):
+	// the join is engine-enforced and a deployment can override the target but
+	// never disable it by setting an empty value (validate fails closed).
+	subtreeRW := fs.String("subtree-rw", "",
+		"ADR-0029 write-intent subtree (engine-relative, no leading slash), e.g. outputs; requires -subtree-ro/-subtree-preview when set")
+	subtreeRO := fs.String("subtree-ro", "",
+		"ADR-0029 read-intent subtree (engine-relative, no leading slash), e.g. uploads; requires -subtree-rw/-subtree-preview when set")
+	subtreePreview := fs.String("subtree-preview", "",
+		"ADR-0029 preview-intent subtree (engine-relative, no leading slash), e.g. uploads; requires -subtree-rw/-subtree-ro when set")
 	opsPerSecond := fs.Float64("ops-per-second", defaultOpsPerSecond,
 		"per-session file-ops token-bucket refill rate in ops/s (>0); the throttle ceiling (NFR-SEC-46)")
 	opsBurst := fs.Float64("ops-burst", defaultOpsBurst,
 		"per-session file-ops token-bucket capacity in tokens (>=1); a session starts with a full bucket")
+	// -claims-bind (ADR-0029, PR-B test seam): when set, the credential extractor
+	// parses the EDGE-VALIDATED bearer's filesystem_id and intent CLAIMS instead of
+	// binding every present bearer to the static configured scope. It JWKS-verifies
+	// NOTHING (the edge owns weak-JWT validation; the service mints/signs nothing —
+	// inv3). This is the interim seam that lets the per-mount intent claim reach the
+	// engine before the PR-C control mint + ADR-0019 intent-keyed exchange land; the
+	// per-request filesystem_id cross-check still rejects a claim that disagrees with
+	// -filesystem-id.
+	claimsBind := fs.Bool("claims-bind", false,
+		"parse the edge-validated bearer's filesystem_id/intent claims (ADR-0029 interim seam); JWKS-verifies nothing")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -418,6 +449,9 @@ func runCtx(ctx context.Context, args []string) error {
 		tenancy:              *tenancy,
 		grantedIntents:       *grantedIntents,
 		downloadablePrefixes: *downloadablePrefixes,
+		subtreeRW:            *subtreeRW,
+		subtreeRO:            *subtreeRO,
+		subtreePreview:       *subtreePreview,
 		maxFileSize:          *maxFileSize,
 		maxRequestBytes:      *maxRequestBytes,
 		opsPerSecond:         *opsPerSecond,
@@ -433,6 +467,9 @@ func runCtx(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// -claims-bind is a pass-through bool (no validation): set it on the config
+	// after validate so the credential extractor picks the claims-parsing mode.
+	cfg.claimsBind = *claimsBind
 
 	// Build the structured logger AFTER validate (which refused bad flags)
 	// and BEFORE compose (which binds sockets). The logger is the first
@@ -714,6 +751,9 @@ type rawFlags struct {
 	tenancy              string
 	grantedIntents       string
 	downloadablePrefixes string
+	subtreeRW            string
+	subtreeRO            string
+	subtreePreview       string
 	maxFileSize          int64
 	maxRequestBytes      int64
 	opsPerSecond         float64
@@ -863,6 +903,27 @@ func validate(r rawFlags) (brokerConfig, error) {
 		return cfg, err
 	}
 
+	// ADR-0029 intent->subtree join map. All three overrides empty (the default)
+	// keeps the static-path layout (join disabled). Setting ANY of the three
+	// requires ALL three — southface.NewSubtreeMap validates each is a non-empty
+	// engine-relative path with no traversal segment and fails closed otherwise, so
+	// a deployment can override the join target but never disable it by half-setting
+	// or emptying a value.
+	subtrees, err := buildSubtreeMap(r.subtreeRW, r.subtreeRO, r.subtreePreview)
+	if err != nil {
+		return cfg, err
+	}
+
+	// EXFIL-BAR (ADR-0029 Alternatives bullet 3): the whole-scope "*" downloadable
+	// token holds both directions of the scope tree, making every human upload
+	// egress-eligible and reopening the read-vs-remove split NFR-SEC-73 holds. It
+	// is refused for the fleet posture (single-tenant trusted_operator): the
+	// downloadable allow rule keys on the "outputs" subtree prefix, which the join
+	// makes expressible, so "*" is never needed and never accepted here.
+	if err := rejectWildcardDownloadable(downloadablePrefixes, prof, ten); err != nil {
+		return cfg, err
+	}
+
 	cfg = brokerConfig{
 		engineKind:       kind,
 		engineRoot:       engineRoot,
@@ -884,6 +945,7 @@ func validate(r rawFlags) (brokerConfig, error) {
 		opsBurst:         opsBurst,
 		grantedIntents:   intents,
 		dlPrefixes:       splitNonEmpty(downloadablePrefixes),
+		subtrees:         subtrees,
 		profile:          prof,
 		tenancy:          ten,
 		logLevel:         level,
@@ -905,6 +967,57 @@ func parseIntents(s string) ([]southface.Intent, error) {
 		out = append(out, intent)
 	}
 	return out, nil
+}
+
+// errSubtreePartial rejects a half-set subtree override: setting ANY of the
+// three -subtree-* flags requires ALL three (the frozen 3-value intent axis).
+// Match it with errors.Is.
+var errSubtreePartial = errors.New("ocu-filestored: -subtree-rw, -subtree-ro and -subtree-preview must all be set together (or all empty for the pinned default map)")
+
+// errWildcardDownloadable rejects the whole-scope "*" downloadable token for the
+// fleet posture (ADR-0029 exfil-bar): "*" makes every human upload egress-eligible
+// and reopens the read-vs-remove split NFR-SEC-73 holds. Match it with errors.Is.
+var errWildcardDownloadable = errors.New("ocu-filestored: -downloadable-prefixes \"*\" (whole-scope downloadable) is refused for the single-tenant trusted_operator fleet posture; key the allow rule on the outputs subtree instead (ADR-0029)")
+
+// buildSubtreeMap constructs the ADR-0029 intent->subtree join map from the
+// three -subtree-* override flags. All three empty (the default) returns the
+// zero-value map (join disabled, static-path mode). Setting ANY of the three
+// requires ALL three — a half-set is errSubtreePartial — and each is validated by
+// southface.NewSubtreeMap (non-empty, engine-relative, no ".."). A deployment can
+// override the join target but never disable it by emptying one value.
+func buildSubtreeMap(rw, ro, preview string) (southface.SubtreeMap, error) {
+	anySet := rw != "" || ro != "" || preview != ""
+	if !anySet {
+		// Zero override => the pinned default map (ADR-0029 Decision bullet 2:
+		// "ships pinned so the minimal shelf runs zero-config; a deployment may
+		// override the map, never bypass it"). The join is ON by default; a
+		// deployment supplying no subtree flags still runs the engine-enforced
+		// split, not the flat static-path layout.
+		return southface.DefaultSubtreeMap(), nil
+	}
+	if rw == "" || ro == "" || preview == "" {
+		return southface.SubtreeMap{}, errSubtreePartial
+	}
+	return southface.NewSubtreeMap(rw, ro, preview)
+}
+
+// rejectWildcardDownloadable enforces the ADR-0029 exfil-bar: the whole-scope
+// "*" downloadable token is refused for the single-tenant trusted_operator fleet
+// posture. A "*" token anywhere in the comma-separated -downloadable-prefixes
+// value fails closed. Other postures (internal_workforce, untrusted, or a
+// non-single-tenant tenancy) are unconstrained here — the guard targets the fleet
+// cell the split protects. The raw flag string is inspected (before splitNonEmpty
+// drops it) so a "*" token is caught verbatim.
+func rejectWildcardDownloadable(prefixes string, prof admission.WorkloadTrustProfile, ten admission.Tenancy) error {
+	if prof != admission.ProfileTrustedOperator || ten != admission.TenancySingleTenant {
+		return nil
+	}
+	for _, tok := range splitNonEmpty(prefixes) {
+		if tok == "*" {
+			return errWildcardDownloadable
+		}
+	}
+	return nil
 }
 
 // splitNonEmpty splits a comma-separated list, trimming spaces and dropping
@@ -986,6 +1099,10 @@ var envFallbackMap = func() map[string]string {
 		"filesystem-id",
 		"granted-intents",
 		"downloadable-prefixes",
+		"subtree-rw",
+		"subtree-ro",
+		"subtree-preview",
+		"claims-bind",
 		"ops-per-second",
 		"ops-burst",
 	}
@@ -1083,19 +1200,64 @@ const (
 func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtractor {
 	fsid := cfg.filesystemID
 	intents := cfg.grantedIntents
+	claimsBind := cfg.claimsBind
 	return southface.NewCredentialScopeExtractor(func(bearer string) (southface.CredentialScope, error) {
 		// A present-but-empty token is rejected before this bind by
 		// bearerFromRequest; an empty bound FilesystemID is treated as a
-		// rejection by the extractor. The interim bind binds a present bearer to
-		// the single-tenant configured scope.
+		// rejection by the extractor.
 		if bearer == "" {
 			return southface.CredentialScope{}, nil
 		}
+		if claimsBind {
+			// ADR-0029 interim seam: parse the edge-validated bearer's
+			// filesystem_id/intent CLAIMS. The service JWKS-verifies NOTHING (the
+			// edge owns weak-JWT validation; the service mints/signs nothing —
+			// inv3). A claim carrying no filesystem_id is a rejection (empty
+			// FilesystemID); an unparseable token is a rejection too.
+			return bearerClaimsScope(bearer)
+		}
+		// Default interim bind: bind a present bearer to the single-tenant
+		// configured scope (filesystem-id + granted-intents).
 		return southface.CredentialScope{
 			FilesystemID:   fsid,
 			GrantedIntents: intents,
 		}, nil
 	})
+}
+
+// bearerClaimsScope parses the CLAIMS of an edge-validated bearer (a JWT-shaped
+// token) into a CredentialScope WITHOUT verifying the signature. It reads the
+// payload's filesystem_id and intent claims: filesystem_id binds the scope, and
+// a present intent claim maps to the single-element GrantedIntents grant set the
+// per-mount credential carries (ADR-0029 — the edge exchanges per {filesystem_id,
+// intent}). A token that is not three dot-separated segments, an undecodable
+// payload, or a claim carrying no filesystem_id is a rejection (empty
+// FilesystemID -> the extractor rejects). The service verifies no signature and
+// mints nothing (inv3).
+func bearerClaimsScope(bearer string) (southface.CredentialScope, error) {
+	parts := strings.Split(bearer, ".")
+	if len(parts) != 3 {
+		return southface.CredentialScope{}, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return southface.CredentialScope{}, nil
+	}
+	var claims struct {
+		FilesystemID string `json:"filesystem_id"`
+		Intent       string `json:"intent"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return southface.CredentialScope{}, nil
+	}
+	var grants []southface.Intent
+	if intent, ok := intentVocabulary[claims.Intent]; ok {
+		grants = []southface.Intent{intent}
+	}
+	return southface.CredentialScope{
+		FilesystemID:   claims.FilesystemID,
+		GrantedIntents: grants,
+	}, nil
 }
 
 // newBackendTLSClient builds the s3 engine's backend HTTP client: a strict
@@ -1314,6 +1476,8 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		Ceilings:          ceilingsSeam,
 		Engine:            engineSeam,
 		CredExtractor:     newCredentialScopeExtractor(cfg),
+		Subtrees:          cfg.subtrees,
+		GrantedIntents:    cfg.grantedIntents,
 		BindAddr:          cfg.bindAddr,
 		CertFile:          cfg.certFile,
 		KeyFile:           cfg.keyFile,

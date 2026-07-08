@@ -146,6 +146,9 @@ func serveValidConfig(t *testing.T) Config {
 		KeyFile:           keyFile,
 		SizeCeiling:       4 << 20,
 		BrokerMaxFileSize: 1 << 30,
+		// The join is mandatory (ADR-0029): Serve refuses an empty map, so the
+		// valid Config carries the pinned default the composition layer supplies.
+		Subtrees: DefaultSubtreeMap(),
 	}
 }
 
@@ -202,6 +205,27 @@ func TestServeRejectsNilSeams(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServeRejectsDisabledSubtree pins the ADR-0029 "never bypass it" boot
+// invariant: an empty (disabled) subtree map refuses startup with
+// ErrSubtreeDisabled, so a deployment can never ship the flat static-path layout
+// that coincides the write and downloadable axes and reopens the NFR-SEC-73
+// split. The valid config (which carries DefaultSubtreeMap) serves; zeroing the
+// map is the only mutation, so the reject is attributable to it and non-vacuous.
+func TestServeRejectsDisabledSubtree(t *testing.T) {
+	cfg := serveValidConfig(t)
+	cfg.Subtrees = SubtreeMap{} // disable the join
+	if _, err := Serve(cfg); !errors.Is(err, ErrSubtreeDisabled) {
+		t.Fatalf("Serve(empty subtree map): got %v, want ErrSubtreeDisabled", err)
+	}
+	// Positive control: the same config WITH the pinned default serves clean.
+	ok := serveValidConfig(t)
+	srv, err := Serve(ok)
+	if err != nil {
+		t.Fatalf("Serve(default subtree map): got %v, want nil", err)
+	}
+	_ = srv.Close()
 }
 
 // TestServeRejectsMissingTLSMaterial pins that a missing bind address or an
@@ -275,6 +299,8 @@ func TestServeServesAndCloses(t *testing.T) {
 		KeyFile:           keyFile,
 		SizeCeiling:       4 << 20,
 		BrokerMaxFileSize: 1 << 30,
+		// The join is mandatory (ADR-0029): Serve refuses an empty map.
+		Subtrees: DefaultSubtreeMap(),
 	}
 	srv, err := Serve(cfg)
 	if err != nil {
