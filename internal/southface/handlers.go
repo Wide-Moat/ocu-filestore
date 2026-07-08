@@ -597,8 +597,8 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 		hc.mandateDeny(denyNotFound, denyNotFound, "object is not a file")
 		return outcomeDenyRecorded()
 	}
-	gp := guestPathFromRel(rel)                 // JOINED — uuid store key (Option A)
-	dp := guestDisplayPath(rel, hc.subtree)     // stripped DISPLAY form for the wire
+	gp := guestPathFromRel(rel)             // JOINED — uuid store key (Option A)
+	dp := guestDisplayPath(rel, hc.subtree) // stripped DISPLAY form for the wire
 	writeJSON(hc.w, readFileResponse{File: file{
 		Path:  dp,
 		Size:  info.Size,
