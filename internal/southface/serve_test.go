@@ -299,6 +299,8 @@ func TestServeServesAndCloses(t *testing.T) {
 		KeyFile:           keyFile,
 		SizeCeiling:       4 << 20,
 		BrokerMaxFileSize: 1 << 30,
+		// The join is mandatory (ADR-0029): Serve refuses an empty map.
+		Subtrees: DefaultSubtreeMap(),
 	}
 	srv, err := Serve(cfg)
 	if err != nil {

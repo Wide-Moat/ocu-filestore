@@ -124,9 +124,17 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 		opsPerSecond:   defaultOpsPerSecond,
 		opsBurst:       defaultOpsBurst,
 		grantedIntents: []southface.Intent{southface.IntentRead, southface.IntentWrite},
-		dlPrefixes:     []string{"/pub"},
-		profile:        admission.ProfileTrustedOperator,
-		tenancy:        admission.TenancySingleTenant,
+		// The downloadable prefix is the write subtree (ADR-0029): a trusted-producer
+		// artifact written under intent=write lands at outputs/... and is the only
+		// egress-eligible surface. Under the default join a write to "x" resolves to
+		// "outputs/x", so the prefix keys on "outputs".
+		dlPrefixes: []string{"outputs"},
+		// The join is mandatory (ADR-0029): the composition layer defaults to the
+		// pinned map, so the test config carries it too — a zero-value map would be
+		// refused at Serve construction (ErrSubtreeDisabled).
+		subtrees: southface.DefaultSubtreeMap(),
+		profile:  admission.ProfileTrustedOperator,
+		tenancy:  admission.TenancySingleTenant,
 	}
 }
 

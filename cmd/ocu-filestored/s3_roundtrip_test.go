@@ -192,77 +192,101 @@ func s3RTMinioClient(endpoint, access, secret string) *s3.Client {
 func s3RTRoundTrip(t *testing.T, cl *http.Client, baseURL, scope, bucket, endpoint, access, secret string) {
 	t.Helper()
 
-	// makeDirectory /pub — the parent must exist before a file is written into it.
-	mk := s3RTPostJSON(t, cl, baseURL, "makeDirectory", map[string]any{
+	// Under the ADR-0029 default join the write and read axes resolve to DISJOINT
+	// subtrees (write->outputs/, read->uploads/), so an agent cannot download the
+	// object it just wrote back through the same mount: the session uuid is minted
+	// only by read-class ops, which resolve under uploads/, while a write lands
+	// under outputs/. The round-trip is therefore TWO independent legs, and that
+	// disjointness IS the NFR-SEC-73 split (":ro"-mirage closed by construction).
+	mc := s3RTMinioClient(endpoint, access, secret)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// WRITE LEG: fileUpload (intent=write) lands under outputs/. The s3 engine
+	// refuses a write whose parent prefix is absent (parentExists -> ErrNotExist),
+	// so create the write-subtree root first: makeDirectory "/" (intent=write)
+	// joins to "outputs/" and lays down the parent marker. Then upload targets
+	// "/golden.bin", which the join prepends to "outputs/golden.bin". The real
+	// backend key is "<scope>/outputs/golden.bin"; an independent MinIO GetObject
+	// proves the write landed there byte-exact — and NOT under uploads/, so the
+	// write axis cannot reach the read-only input.
+	mkRoot := s3RTPostJSON(t, cl, baseURL, "makeDirectory", map[string]any{
 		"filesystem_id":          scope,
-		"path":                   s3RTDownloadDir,
+		"path":                   "/",
 		"authorization_metadata": map[string]any{"intent": "write", "downloadable": false},
 	})
-	mk.Body.Close()
-	if mk.StatusCode != http.StatusOK {
-		t.Fatalf("makeDirectory %s status = %d, want 200", s3RTDownloadDir, mk.StatusCode)
+	mkRoot.Body.Close()
+	if mkRoot.StatusCode != http.StatusOK {
+		t.Fatalf("makeDirectory / (write->outputs root) status = %d, want 200", mkRoot.StatusCode)
 	}
-
-	// fileUpload /pub/golden.bin — a binary-safe payload streamed through the
-	// south face to the s3 engine, which writes it to the real MinIO bucket.
-	const guestPath = s3RTDownloadDir + "/golden.bin"
+	const uploadGuestPath = "/golden.bin"
 	payload := []byte("ABCDEFGH\x00\x01\x02 binary-safe composed-daemon live payload")
 	up := s3RTUpload(t, cl, baseURL, map[string]any{
 		"filesystem_id":          scope,
-		"path":                   guestPath,
+		"path":                   uploadGuestPath,
 		"declared_size_bytes":    len(payload),
 		"authorization_metadata": map[string]any{"intent": "write", "downloadable": false},
 	}, payload)
 	up.Body.Close()
 	if up.StatusCode != http.StatusOK {
-		t.Fatalf("fileUpload %s status = %d, want 200", guestPath, up.StatusCode)
+		t.Fatalf("fileUpload %s status = %d, want 200", uploadGuestPath, up.StatusCode)
+	}
+	outputsKey := scope + "/outputs/golden.bin"
+	obj, err := mc.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(outputsKey)})
+	if err != nil {
+		t.Fatalf("independent MinIO GetObject %q (write must land under outputs/): %v", outputsKey, err)
+	}
+	inBucket, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if !bytes.Equal(inBucket, payload) {
+		t.Fatalf("MinIO object %q bytes = %q, want the uploaded payload %q", outputsKey, inBucket, payload)
+	}
+	// The write did NOT alias into the read-only uploads subtree.
+	uploadsAlias := scope + "/uploads/golden.bin"
+	if _, err := mc.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(uploadsAlias)}); err == nil {
+		t.Fatalf("write aliased into the read-only subtree %q; the :ro split is broken", uploadsAlias)
 	}
 
-	// fileDownload returns the EXACT uploaded bytes — the engine fetched them
-	// back from MinIO through the composed daemon's south face.
-	uuid := s3RTUUIDFor(t, cl, baseURL, scope, s3RTDownloadDir, guestPath)
+	// READ/EGRESS LEG: seed an object DIRECTLY under uploads/ with the independent
+	// client (the human->sandbox input direction), then drive a read through the
+	// composed daemon. The read plane resolves under uploads/ and FINDS it, but the
+	// egress gate denies download (403 not_downloadable): uploads/ is not a
+	// configured downloadable prefix (dlPrefixes={outputs}), so a human-supplied
+	// input is readable in-session yet cannot be pulled out of the sandbox — the
+	// exfil-bar. If the split were broken (uploads egress-eligible) this would 200.
+	// The s3 engine represents a directory with a 0-byte marker key ("uploads/"),
+	// which a read listing checks for existence before walking. Seed both the marker
+	// and the object with the independent client (the human->sandbox input arrives
+	// out of band; the read plane holds no write lease to create either).
+	uploadsMarker := scope + "/uploads/"
+	if _, err := mc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(uploadsMarker), Body: bytes.NewReader(nil),
+	}); err != nil {
+		t.Fatalf("independent MinIO PutObject %q (uploads dir marker): %v", uploadsMarker, err)
+	}
+	seedKey := scope + "/uploads/seed.bin"
+	seed := []byte("human-supplied input, readable-in-session, NOT egress-eligible")
+	if _, err := mc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(seedKey), Body: bytes.NewReader(seed),
+	}); err != nil {
+		t.Fatalf("independent MinIO PutObject %q (seed uploads/): %v", seedKey, err)
+	}
+	// The uuid MUST come from a read-op listing (session-scoped, minted only on the
+	// read plane). The read listing of "/" resolves under uploads/ and returns the
+	// entry at its joined guest path "/uploads/seed.bin" — the subtree is visible in
+	// the guest path the read plane reports, so match on that.
+	uuid := s3RTUUIDFor(t, cl, baseURL, scope, "/", "/uploads/seed.bin")
 	dl := s3RTPostJSON(t, cl, baseURL, "fileDownload", map[string]any{
 		"filesystem_id":          scope,
 		"uuid":                   uuid,
 		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 	})
 	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusOK {
+	if dl.StatusCode != http.StatusForbidden {
 		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload status = %d, want 200; body %s", dl.StatusCode, b)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar: uploads is not downloadable); body %s", dl.StatusCode, b)
 	}
-	if ct := dl.Header.Get("Content-Type"); ct != s3RTContentOctet {
-		t.Errorf("fileDownload Content-Type = %q, want %q", ct, s3RTContentOctet)
-	}
-	got, err := io.ReadAll(dl.Body)
-	if err != nil {
-		t.Fatalf("read fileDownload body: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("fileDownload bytes = %q, want the uploaded payload %q", got, payload)
-	}
-
-	// INDEPENDENT backend assertion: read the SAME object straight from real
-	// MinIO. The s3 engine keys objects under "<scope>/<path>"; the guest path is
-	// rooted at "/", so the key drops the leading slash: "<scope>/pub/golden.bin".
-	wantKey := scope + guestPath
-	mc := s3RTMinioClient(endpoint, access, secret)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	obj, err := mc.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(wantKey),
-	})
-	if err != nil {
-		t.Fatalf("independent MinIO GetObject %q: %v", wantKey, err)
-	}
-	defer obj.Body.Close()
-	inBucket, err := io.ReadAll(obj.Body)
-	if err != nil {
-		t.Fatalf("read MinIO object %q: %v", wantKey, err)
-	}
-	if !bytes.Equal(inBucket, payload) {
-		t.Fatalf("MinIO object %q bytes = %q, want the uploaded payload %q (the broker write must land in the real bucket)",
-			wantKey, inBucket, payload)
+	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
+		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
 	}
 }
