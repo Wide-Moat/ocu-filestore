@@ -41,13 +41,15 @@ func TestPrefixDownloadablePolicyMatchesPrefix(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/pub/report.pdf", true},
-		{"/pub", true},
-		{"/share/out/a/b.txt", true},
-		{"/private/x", false},
-		{"/pubX/y", false}, // string prefix but not a path-boundary match
-		{"/share/outsider", false},
-		{"/", false},
+		// Paths are engine-relative with no leading slash (ADR-0029 inv-5) — the
+		// StoredTagFunc input the resolver delivers on both planes.
+		{"pub/report.pdf", true},
+		{"pub", true},
+		{"share/out/a/b.txt", true},
+		{"private/x", false},
+		{"pubX/y", false}, // string prefix but not a path-boundary match
+		{"share/outsider", false},
+		{"", false},
 	} {
 		dl, err := tag(context.Background(), "fs1", tc.path)
 		if err != nil {
@@ -80,19 +82,20 @@ func TestPrefixPolicyFeedsResolverReadEgressBit(t *testing.T) {
 	ev := authz.CallerEvidence{Scope: "fs1", GrantedIntents: []authz.Intent{authz.IntentRead}}
 
 	// Under the downloadable prefix: read allowed, egress artifact grantable.
+	// Paths are engine-relative with no leading slash (ADR-0029 inv-5).
 	g, err := res.Resolve(context.Background(), ev, authz.Request{
-		Filesystem: "fs1", Path: "/pub/report.pdf", Intent: authz.IntentRead,
+		Filesystem: "fs1", Path: "pub/report.pdf", Intent: authz.IntentRead,
 	})
 	if err != nil {
-		t.Fatalf("read under /pub: err %v, want a grant", err)
+		t.Fatalf("read under pub: err %v, want a grant", err)
 	}
 	if !g.Downloadable {
-		t.Fatalf("read under /pub: Downloadable false, want true")
+		t.Fatalf("read under pub: Downloadable false, want true")
 	}
 
 	// Outside any prefix: read is ALLOWED in-session, egress artifact withheld.
 	g, err = res.Resolve(context.Background(), ev, authz.Request{
-		Filesystem: "fs1", Path: "/private/secret.bin", Intent: authz.IntentRead,
+		Filesystem: "fs1", Path: "private/secret.bin", Intent: authz.IntentRead,
 	})
 	if err != nil {
 		t.Fatalf("read outside prefix: got %v, want nil (readable in-session, invariant 5)", err)
@@ -138,17 +141,20 @@ func TestPreviewStaysNonDownloadable(t *testing.T) {
 // able configures explicit prefixes, never the bare root). These rows exercise
 // the trailing-slash-trim and root-sentinel branches the earlier tests skip.
 func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
-	// Whitespace-only and empty entries are dropped; "/pub/" trims to "/pub".
+	// Whitespace-only and empty entries are dropped; a leading and/or trailing
+	// slash on a configured prefix is tolerated and trimmed to the engine-relative
+	// convention (ADR-0029 inv-5): "/pub/" and "  /share/out/  " normalise to
+	// "pub" and "share/out". Query paths are engine-relative with no leading slash.
 	tag := NewPrefixDownloadablePolicy([]string{"  ", "", "/pub/", "  /share/out/  "})
 	for _, tc := range []struct {
 		path string
 		want bool
 	}{
-		{"/pub/report.pdf", true}, // trailing slash on the prefix was trimmed
-		{"/pub", true},
-		{"/share/out/a.txt", true}, // surrounding whitespace was trimmed
-		{"/share/out", true},
-		{"/private/x", false}, // the dropped empty/whitespace entries grant nothing
+		{"pub/report.pdf", true}, // leading + trailing slash on the prefix were trimmed
+		{"pub", true},
+		{"share/out/a.txt", true}, // surrounding whitespace was trimmed
+		{"share/out", true},
+		{"private/x", false}, // the dropped empty/whitespace entries grant nothing
 	} {
 		dl, err := tag(context.Background(), "fs1", tc.path)
 		if err != nil {
@@ -159,19 +165,19 @@ func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
 		}
 	}
 
-	// A bare root "/" is kept verbatim (the trailing-slash trim is skipped for
-	// it): it never expands to cover the whole tree on a path-boundary match —
-	// "/anything" is NOT beneath it ("//"-joined prefix never matches), so a
-	// deployment that wants the whole scope egress-able must configure explicit
-	// prefixes, not the bare root.
+	// A bare root "/" trims to the empty string and is DROPPED (ADR-0029 inv-5:
+	// after the leading-slash trim it is empty, and an empty prefix is never
+	// appended — it would match every path). It stays the matches-nothing
+	// sentinel, DISTINCT from "*": a deployment that wants the whole scope
+	// egress-able configures "*", never the bare root.
 	rootTag := NewPrefixDownloadablePolicy([]string{"/"})
-	for _, path := range []string{"/anything", "/deep/nested/file.bin", "/pub/x"} {
+	for _, path := range []string{"anything", "deep/nested/file.bin", "pub/x"} {
 		dl, err := rootTag(context.Background(), "fs1", path)
 		if err != nil {
 			t.Fatalf("rootTag(%q): err %v", path, err)
 		}
 		if dl {
-			t.Fatalf("rootTag(%q): downloadable true, want false (bare root does not cover the tree)", path)
+			t.Fatalf("rootTag(%q): downloadable true, want false (bare root is a matches-nothing sentinel, not match-all)", path)
 		}
 	}
 }

@@ -359,7 +359,7 @@ func runCtx(ctx context.Context, args []string) error {
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
-		"comma-separated broker-side downloadable prefixes (NFR-SEC-73); empty = nothing downloadable")
+		"comma-separated broker-side downloadable prefixes, engine-relative no leading slash e.g. outputs (ADR-0029 inv-5; a leading slash is tolerated and trimmed); empty = nothing downloadable")
 	// ADR-0029 intent->subtree join overrides. All empty (the default) keeps the
 	// static-path layout (join disabled). Setting ANY of the three requires ALL
 	// three to be a non-empty engine-relative path (no leading slash, no ".."):
