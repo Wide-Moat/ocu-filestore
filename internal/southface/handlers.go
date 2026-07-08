@@ -131,38 +131,33 @@ func auditTruthForEngineErr(err error) string {
 
 // makeDirs composes per-component MakeDir over the engine's single-level verb
 // (Pattern 3). With parents false it calls MakeDir once on the full relative
-// path (a missing parent then surfaces ENOENT). With parents true it creates
-// each prefix in turn, tolerating an intermediate EEXIST as success and
-// surfacing only the FINAL component's EEXIST as the caller-visible
-// already_exists. The component count is capped at maxWalkDepth BEFORE any
-// engine call (NFR-SEC-46): a body-ceiling-sized path of millions of
-// components must not drive a per-component engine-call loop or build a tree
-// no later walk can traverse; the real engine's ValidatePath enforces its own
-// component cap, this guard keeps the spine safe independent of the bound
-// engine.
+// path (a missing parent then surfaces ENOENT). With parents true it ensures
+// the PARENT chain via the shared EnsureDir walker (tolerating an intermediate
+// EEXIST as success) and then makes the FINAL component directly so its EEXIST
+// surfaces as the caller-visible already_exists — the makeDirectory op reports
+// a re-created leaf, unlike the internal ensure EnsureDir performs. The full
+// component count is capped at maxWalkDepth BEFORE any engine call (NFR-SEC-46):
+// a body-ceiling-sized path of millions of components must not drive a
+// per-component engine-call loop or build a tree no later walk can traverse.
+// The level-walking convention lives once in EnsureDir; makeDirs keeps only the
+// leaf-visible wrapping this op needs.
 func (d *handlerDeps) makeDirs(ctx context.Context, scope, rel string, parents bool) error {
 	if !parents {
 		return d.engine.MakeDir(ctx, scope, rel)
 	}
-	parts := strings.Split(rel, "/")
-	if len(parts) > maxWalkDepth {
+	if len(strings.Split(rel, "/")) > maxWalkDepth {
 		return errInvalidPath
 	}
-	for i := range parts {
-		prefix := strings.Join(parts[:i+1], "/")
-		err := d.engine.MakeDir(ctx, scope, prefix)
-		if err == nil {
-			continue
+	// Ensure the parent chain (all levels before the leaf) idempotently, then make
+	// the leaf directly so a final-component EEXIST is caller-visible. A rel with a
+	// single component (no "/") has no parent to ensure: parent is "" and EnsureDir
+	// no-ops, then the leaf MakeDir runs against the scope root.
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		if err := EnsureDir(ctx, d.engine, scope, rel[:i]); err != nil {
+			return err
 		}
-		if errors.Is(err, fs.ErrExist) {
-			if i < len(parts)-1 {
-				continue // intermediate already exists: ok
-			}
-			return err // final component already exists: caller-visible
-		}
-		return err
 	}
-	return nil
+	return d.engine.MakeDir(ctx, scope, rel)
 }
 
 // listOneLevel returns the engine entries under rel, sorted by Name ascending

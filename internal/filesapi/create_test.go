@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
 	"sync"
 	"testing"
@@ -52,17 +53,66 @@ type createEngine struct {
 	writeErr     error  // when non-nil, fail the write after consuming r (fault inject)
 	bytesRead    int    // total bytes read off r across all WriteStream calls (incl. aborted ones)
 	trace        *[]string
+	// dirs records the directory markers MakeDir created, so WriteStream can enforce
+	// the real S3 engine's parent-must-exist precondition (engine_s3.go parentExists):
+	// a write whose parent dir was never MakeDir'd 404s exactly as the live engine does.
+	dirs map[string]bool
+	// callLog is an ordered trace of MakeDir/WriteStream calls (keyed op:path) so an
+	// order test can prove EnsureDir's MakeDir precedes WriteStream (load-bearing, not
+	// vacuous). Distinct from trace (which records only the write phase for
+	// audit-before-ack).
+	callLog []string
+	// refuseMakeDir, when true, makes MakeDir a no-op that records NOTHING (neither the
+	// marker nor the callLog) — a NEUTERED EnsureDir. It proves the ensure-parent is
+	// load-bearing: with it set, the join-subtree marker is never created, so WriteStream
+	// 404s and the create denies not_found, exactly as the live parentExists path did.
+	refuseMakeDir bool
 }
 
 func newCreateEngine() *createEngine {
-	return &createEngine{fakeEngine: newFakeEngine()}
+	return &createEngine{fakeEngine: newFakeEngine(), dirs: map[string]bool{}}
+}
+
+// MakeDir records the created directory marker (unless neutered) so WriteStream's
+// parent-must-exist check is satisfied for a subsequent write beneath it. It mirrors
+// the real engine's idempotent MakeDir: an already-recorded dir converges (no error).
+func (e *createEngine) MakeDir(_ context.Context, _ string, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.refuseMakeDir {
+		return nil // neutered: record nothing, so no parent marker is ever created
+	}
+	e.callLog = append(e.callLog, "makedir:"+path)
+	e.dirs[path] = true
+	return nil
+}
+
+// parentExists mirrors the real S3 engine: the scope root (a key with no "/"
+// separator, i.e. a leaf directly under the scope) always has a present parent;
+// any deeper key requires its parent dir to have been MakeDir'd. Caller holds e.mu.
+func (e *createEngine) parentExists(key string) bool {
+	i := strings.LastIndexByte(key, '/')
+	if i < 0 {
+		return true // "<leaf>" — the parent is the scope root, always present
+	}
+	return e.dirs[key[:i]]
 }
 
 func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, overwrite bool) error {
 	e.mu.Lock()
 	e.writeCalls++
+	e.callLog = append(e.callLog, "write:"+path)
 	if e.trace != nil {
 		*e.trace = append(*e.trace, "engine:write")
+	}
+	// parent-must-exist: the real S3 engine's WriteStream calls parentExists FIRST and
+	// returns *fs.PathError{fs.ErrNotExist} when the parent dir marker is absent
+	// (engine_s3.go:1457). Enforce it here so the fake catches a missing-parent write
+	// the live leg would 404 — the previously-vacuous no-op WriteStream let a joined
+	// upload succeed without its subtree marker.
+	if !e.parentExists(path) {
+		e.mu.Unlock()
+		return &fs.PathError{Op: "write", Path: path, Err: fs.ErrNotExist}
 	}
 	// already-exists: refuse WITHOUT consuming r, exactly as the real engine does
 	// on a create-new against an existing object.
@@ -98,12 +148,37 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	return nil
 }
 
+// seedDir marks a directory (and every ancestor level) as pre-existing, standing
+// in for an operator-provisioned tree or a prior makeDirectory op. A static-mode
+// nested create (no CreateSubtree join to ensure the parent) needs its parent dir
+// present, since BOTH real engines require the immediate parent marker to exist
+// for a nested write (S3 parentExists; local rename into a missing parent ENOENTs).
+func (e *createEngine) seedDir(dir string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	parts := strings.Split(dir, "/")
+	for i := range parts {
+		e.dirs[strings.Join(parts[:i+1], "/")] = true
+	}
+}
+
 // committedBytes returns the bytes durably linked at path (nil if none).
 func (e *createEngine) committedBytes(path string) ([]byte, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	b, ok := e.bytesByPath[path]
 	return b, ok
+}
+
+// calls returns a copy of the ordered MakeDir/WriteStream call log ("makedir:<p>"
+// / "write:<p>"), so an order test can prove EnsureDir's MakeDir precedes the
+// WriteStream under the joined subtree.
+func (e *createEngine) calls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.callLog))
+	copy(out, e.callLog)
+	return out
 }
 
 // createStore's Put succeeds, minting a record from the PutInput (stamping a
@@ -334,6 +409,7 @@ func assertCreateDenied(t *testing.T, w *httptest.ResponseRecorder, wantStatus i
 // ObjectRef, and the engine actually streamed the body bytes.
 func TestCreateHappyPath(t *testing.T) {
 	h, eng, store, sess := createSetup()
+	eng.seedDir("dir") // static mode: the nested parent must pre-exist (both engines require it)
 	body := []byte("ABCDEFGH")
 	params := createParamsJSON(t, map[string]any{
 		"path":                "/dir/up.bin",
@@ -408,7 +484,8 @@ func TestCreateHappyPath(t *testing.T) {
 // client↔server boundary the isolated unit tests never joined: it reds if the
 // struct drops a contract field, greens once it implements the full schema.
 func TestCreateAcceptsAllContractParams(t *testing.T) {
-	h, _, _, _ := createSetup()
+	h, eng, _, _ := createSetup()
+	eng.seedDir("dir") // static mode: the nested parent must pre-exist
 	body := []byte("ABCDEFGH")
 	params := createParamsJSON(t, map[string]any{
 		"filesystem_id":       createTestScope,
@@ -434,7 +511,8 @@ func TestCreateAcceptsAllContractParams(t *testing.T) {
 // the leaf of the canonical path (createFilename), and an omitted media_type is
 // echoed as empty.
 func TestCreateFilenameFallsBackToPathLeaf(t *testing.T) {
-	h, _, store, _ := createSetup()
+	h, eng, store, _ := createSetup()
+	eng.seedDir("nested") // static mode: the nested parent must pre-exist
 	body := []byte("xyz")
 	params := createParamsJSON(t, map[string]any{
 		"path":                "/nested/leaf.txt",
@@ -949,7 +1027,13 @@ func TestCreateTraversalAbsorbed(t *testing.T) {
 		{"/dir/../x/y.bin", "x/y.bin"}, // interior traversal cleaned in-scope
 	} {
 		t.Run(tc.wire, func(t *testing.T) {
-			h, _, store, _ := createSetup()
+			h, eng, store, _ := createSetup()
+			// Static mode: a nested absorbed target ("x/y.bin") needs its parent dir
+			// pre-seeded (both engines require the immediate parent to exist). A flat
+			// absorbed target ("escape") lands at the root, whose parent always exists.
+			if parent := path.Dir(tc.wantRef); parent != "." {
+				eng.seedDir(parent)
+			}
 			params := createParamsJSON(t, map[string]any{"path": tc.wire, "declared_size_bytes": 4})
 			w := doCreate(h, params, []byte("ABCD"))
 			if w.Code != http.StatusCreated {
@@ -1308,4 +1392,112 @@ func TestCreateJoinsReadSubtree(t *testing.T) {
 			})
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0029 — ENSURE THE JOIN-SUBTREE PARENT BEFORE THE WRITE.
+//
+// The S3 engine's WriteStream calls parentExists FIRST and 404s a write whose
+// parent dir marker is absent. The north create joins the object under
+// CreateSubtree ("uploads"), whose marker nothing else creates — so the create
+// must EnsureDir the parent chain before WriteStream. The createEngine fake now
+// enforces the SAME parent-must-exist precondition (its WriteStream 404s an
+// unparented key), so these tests fail if the ensure is dropped or reordered.
+// ---------------------------------------------------------------------------
+
+// TestCreateEnsuresParentBeforeWrite is the ORDER keystone: with the join
+// enabled, the create must MakeDir the subtree parent BEFORE it WriteStreams the
+// joined object, so the s3 parentExists precondition is satisfied. The engine's
+// ordered call log must show makedir:uploads STRICTLY BEFORE write:uploads/report.txt.
+// A nested wire path proves the WHOLE parent chain is walked root->leaf.
+func TestCreateEnsuresParentBeforeWrite(t *testing.T) {
+	t.Run("flat_join_makedir_precedes_write", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		body := []byte("REPORT-BYTES")
+		params := createParamsJSON(t, map[string]any{
+			"path": "/report.txt", "declared_size_bytes": len(body),
+		})
+		if w := doCreate(h, params, body); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body %s", w.Code, w.Body.String())
+		}
+		calls := eng.calls()
+		mkIdx, wrIdx := indexOf(calls, "makedir:uploads"), indexOf(calls, "write:uploads/report.txt")
+		if mkIdx < 0 {
+			t.Fatalf("engine never saw MakeDir(uploads); calls=%v", calls)
+		}
+		if wrIdx < 0 {
+			t.Fatalf("engine never saw WriteStream(uploads/report.txt); calls=%v", calls)
+		}
+		if mkIdx >= wrIdx {
+			t.Fatalf("MakeDir(uploads)@%d did not precede WriteStream@%d; calls=%v", mkIdx, wrIdx, calls)
+		}
+	})
+
+	t.Run("nested_join_walks_full_parent_chain", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		body := []byte("DEEP")
+		params := createParamsJSON(t, map[string]any{
+			"path": "/nested/deep.bin", "declared_size_bytes": len(body),
+		})
+		if w := doCreate(h, params, body); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body %s", w.Code, w.Body.String())
+		}
+		calls := eng.calls()
+		// The chain root->leaf: uploads, then uploads/nested, then the write.
+		mk1, mk2 := indexOf(calls, "makedir:uploads"), indexOf(calls, "makedir:uploads/nested")
+		wr := indexOf(calls, "write:uploads/nested/deep.bin")
+		if mk1 < 0 || mk2 < 0 || wr < 0 {
+			t.Fatalf("chain incomplete: makedir:uploads=%d makedir:uploads/nested=%d write=%d; calls=%v", mk1, mk2, wr, calls)
+		}
+		if !(mk1 < mk2 && mk2 < wr) {
+			t.Fatalf("parent chain not walked root->leaf-before-write: %d,%d,%d; calls=%v", mk1, mk2, wr, calls)
+		}
+	})
+}
+
+// TestCreateParentEnsureIsLoadBearing is the RED-PROBE: it neuters the ensure
+// (the fake MakeDir records NOTHING, standing in for a missing/failed EnsureDir)
+// and proves the create then DENIES not_found — exactly the live-MinIO 404 this
+// fix closes. With the ensure ACTIVE (the sibling case) the same upload 201s. If
+// a future change drops the EnsureDir call, the ACTIVE case reds; if the fake's
+// parent-check is vacuous, the NEUTERED case reds. Both halves are required to
+// prove the ensure-parent is load-bearing, not decorative.
+func TestCreateParentEnsureIsLoadBearing(t *testing.T) {
+	body := []byte("REPORT-BYTES")
+	params := createParamsJSON(t, map[string]any{
+		"path": "/report.txt", "declared_size_bytes": len(body),
+	})
+
+	t.Run("ensure_active_join_succeeds", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		w := doCreate(h, params, body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (ensure created the subtree marker); body %s", w.Code, w.Body.String())
+		}
+		if _, ok := eng.committedBytes("uploads/report.txt"); !ok {
+			t.Fatal("bytes not committed under uploads/report.txt despite 201")
+		}
+	})
+
+	t.Run("ensure_neutered_write_404s_not_found", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.refuseMakeDir = true // NEUTER: no marker is ever created -> parentExists false
+		w := doCreate(h, params, body)
+		// The write's parent (uploads) is absent -> WriteStream returns fs.ErrNotExist
+		// -> the create denies not_found, exactly the pre-fix live behaviour.
+		assertCreateDenied(t, w, http.StatusNotFound)
+		if _, ok := eng.committedBytes("uploads/report.txt"); ok {
+			t.Fatal("bytes committed despite the missing parent marker; the parent-check is vacuous")
+		}
+	})
+}
+
+// indexOf returns the index of s in xs, or -1.
+func indexOf(xs []string, s string) int {
+	for i, x := range xs {
+		if x == s {
+			return i
+		}
+	}
+	return -1
 }

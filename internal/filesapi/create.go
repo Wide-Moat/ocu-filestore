@@ -211,6 +211,47 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	}
 	defer sess.ReleaseFD()
 
+	// --- ENSURE THE JOIN-SUBTREE PARENT CHAIN (ADR-0029). The S3 engine's WriteStream
+	// refuses a write whose immediate parent directory marker is absent (parentExists ->
+	// *fs.PathError wrapping fs.ErrNotExist): before the north landing join, the object
+	// landed at the scope root whose parent is the always-present root, so no marker was
+	// needed; the join lands it under CreateSubtree ("uploads"), and a nested wire path
+	// lands it deeper still ("uploads/nested/..."), whose markers nothing else creates.
+	// Ensure the object's parent chain here, idempotently and engine-agnostically, via
+	// the shared southface.EnsureDir walker — the SAME dir-marker convention the south
+	// make_parents spine composes over.
+	//
+	// NFR-SEC-73: the ensure must materialise nothing OUTSIDE the join subtree. The
+	// argument is path.Dir(engineRef), and engineRef is the POST-canonicalize, POST-join
+	// path — CreateSubtree + a clean, traversal-free remainder — so path.Dir(engineRef)
+	// is closed under the subtree: it is CreateSubtree itself or a strict descendant,
+	// never a climb above the prefix. The containment guard asserts exactly that; in join
+	// mode a guard miss is impossible by construction, so it is an internal invariant
+	// violation (fail closed + audit), NEVER a silent unguarded ensure. Static-path mode
+	// (empty CreateSubtree) ensures NOTHING: the object lands at the scope root whose
+	// parent always exists, and any nested static path relies on the operator-provisioned
+	// tree plus the engine's own parentExists 404 (correct fail-closed). A marker failure
+	// is an internal fault, not client-attributable, so it denies denyclass.Internal
+	// WITHOUT reaching WriteStream. ---
+	if h.deps.CreateSubtree != "" {
+		ensureDir := path.Dir(engineRef)
+		if ensureDir != h.deps.CreateSubtree && !strings.HasPrefix(ensureDir, h.deps.CreateSubtree+"/") {
+			// Impossible under the join above (engineRef is subtree-prefixed and clean):
+			// a miss means the join invariant was broken upstream. Fail closed, never
+			// ensure outside the subtree.
+			reqLog.Error("files-api create: join-subtree containment invariant violated",
+				slog.String(observ.KeyReason, "ensure dir escaped the create subtree"))
+			denyCreate(denyclass.Internal, "internal error")
+			return
+		}
+		if eerr := southface.EnsureDir(r.Context(), h.deps.Engine, ps.FilesystemID, ensureDir); eerr != nil {
+			reqLog.Error("files-api create: ensure join-subtree parent failed",
+				slog.String(observ.KeyReason, eerr.Error()))
+			denyCreate(denyclass.Internal, "internal error")
+			return
+		}
+	}
+
 	// --- reassembly: single io.Pipe -> WriteStream(overwrite=OverwriteExisting).
 	// overwrite_existing defaults to false when absent (JSON zero value),
 	// preserving create-new behaviour for any sender that omits it. ---

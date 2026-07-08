@@ -281,3 +281,106 @@ func TestFilesAPIRealS3EngineRoundTrip(t *testing.T) {
 		t.Fatalf("archive entry bytes = %q, want the uploaded payload %q", entryBytes, payload)
 	}
 }
+
+// reHandlerSubtree is reHandler with a configured CreateSubtree — the north
+// landing join (ADR-0029). It proves the create ensures the join-subtree parent
+// marker before the write, so the real s3 engine's parentExists precondition is
+// satisfied and the object lands under the subtree instead of 404ing.
+func reHandlerSubtree(t *testing.T, engine southface.Engine, subtree string) *Handler {
+	t.Helper()
+	store, err := handlestore.NewDiskStore(t.TempDir() + "/handles.jsonl")
+	if err != nil {
+		t.Fatalf("NewDiskStore: %v", err)
+	}
+	h, err := NewHandler(Deps{
+		Resolver:      &fakeResolver{grant: southface.Grant{Downloadable: true}},
+		Guard:         &fakeGuard{},
+		Engine:        engine,
+		Ceilings:      newFakeCeilings(),
+		Store:         store,
+		CreateSubtree: subtree,
+		Scope:         fakeScope{ps: southface.PeerScope{FilesystemID: reScope, GrantedIntents: []southface.Intent{southface.IntentRead}}, ok: true},
+		SizeCeiling:   1 << 20,
+		MaxFileSize:   1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h
+}
+
+// TestFilesAPIRealS3EngineEnsuresJoinSubtree is the LIVE keystone for the
+// ADR-0029 fix: with CreateSubtree="uploads", a flat File-Pane upload
+// ("/report.txt") joins to the engine key "uploads/report.txt". The real s3
+// engine's WriteStream refuses a write whose parent dir marker is absent
+// (parentExists -> fs.ErrNotExist), so WITHOUT the create's EnsureDir this 404s
+// — the exact live-MinIO bug. The 201 plus the independent MinIO read of
+// "<scope>/uploads/report.txt" proves the parent marker was materialised before
+// the write against the REAL engine (the in-memory fakes cannot). Gated on
+// OCU_S3_TEST_ENDPOINT exactly as the round-trip leg; the dev-lead runs it
+// against the composed MinIO rig.
+func TestFilesAPIRealS3EngineEnsuresJoinSubtree(t *testing.T) {
+	endpoint := os.Getenv("OCU_S3_TEST_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("OCU_S3_TEST_ENDPOINT not set - filesapi real-engine join-subtree leg SKIPPED (boot deploy/docker-compose.test.yml)")
+	}
+	bucket := os.Getenv("OCU_S3_TEST_BUCKET")
+	if bucket == "" {
+		bucket = "ocu-conformance"
+	}
+	access := os.Getenv("OCU_S3_TEST_ACCESS_KEY")
+	secret := os.Getenv("OCU_S3_TEST_SECRET_KEY")
+
+	engine := reRealS3Engine(t, endpoint, bucket, access, secret)
+	h := reHandlerSubtree(t, engine, "uploads")
+	srv := httptest.NewServer(http.HandlerFunc(h.ServeHTTP))
+	t.Cleanup(srv.Close)
+
+	payload := []byte("JOIN-SUBTREE binary-safe \x00\x01\x02 payload")
+
+	// CREATE — flat wire path; the join lands it under "uploads/". A 201 proves the
+	// EnsureDir materialised the "uploads/" marker before the real engine WriteStream
+	// (which would otherwise 404 on the absent parent).
+	fileID := reCreate(t, srv, "/report.txt", payload)
+
+	// INDEPENDENT backend assertion: the object lands at "<scope>/uploads/report.txt"
+	// in the REAL bucket, not at the scope root — the join reached the engine and the
+	// parent marker let the write commit.
+	wantKey := reScope + "/uploads/report.txt"
+	mc := reMinioClient(endpoint, access, secret)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	obj, err := mc.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(wantKey),
+	})
+	if err != nil {
+		t.Fatalf("independent MinIO GetObject %q: %v (the join-subtree parent was not ensured before the write)", wantKey, err)
+	}
+	defer obj.Body.Close()
+	inBucket, err := io.ReadAll(obj.Body)
+	if err != nil {
+		t.Fatalf("read MinIO object %q: %v", wantKey, err)
+	}
+	if !bytes.Equal(inBucket, payload) {
+		t.Fatalf("MinIO object %q bytes = %q, want %q", wantKey, inBucket, payload)
+	}
+
+	// The content read round-trips the same bytes through the joined handle.
+	cresp, err := srv.Client().Get(srv.URL + "/v1/files/" + fileID + "/content")
+	if err != nil {
+		t.Fatalf("content GET: %v", err)
+	}
+	defer cresp.Body.Close()
+	if cresp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(cresp.Body)
+		t.Fatalf("content status = %d, want 200; body %s", cresp.StatusCode, b)
+	}
+	gotContent, err := io.ReadAll(cresp.Body)
+	if err != nil {
+		t.Fatalf("read content body: %v", err)
+	}
+	if !bytes.Equal(gotContent, payload) {
+		t.Fatalf("content bytes = %q, want the uploaded payload %q", gotContent, payload)
+	}
+}
