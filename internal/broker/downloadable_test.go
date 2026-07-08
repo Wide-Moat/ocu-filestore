@@ -165,11 +165,15 @@ func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
 		}
 	}
 
-	// A bare root "/" trims to the empty string and is DROPPED (ADR-0029 inv-5:
-	// after the leading-slash trim it is empty, and an empty prefix is never
-	// appended — it would match every path). It stays the matches-nothing
-	// sentinel, DISTINCT from "*": a deployment that wants the whole scope
-	// egress-able configures "*", never the bare root.
+	// A bare root "/" stays the matches-nothing sentinel, DISTINCT from "*": a
+	// deployment that wants the whole scope egress-able configures "*", never the
+	// bare root. Under the engine-relative convention this holds two ways over —
+	// "/" trims to "" and is dropped, AND even an empty prefix reaching
+	// pathUnderPrefix would match nothing (HasPrefix(engine-relative-path, "/") is
+	// false). This asserts the sentinel BEHAVIOUR, not the empty-drop mechanism;
+	// the mechanism is defence-in-depth (see downloadable.go), so this leg passes
+	// whether or not the drop is present — the load-bearing guarantee is the
+	// no-leading-slash convention, covered by TestPrefixDownloadableCrossPlaneEngineRelative.
 	rootTag := NewPrefixDownloadablePolicy([]string{"/"})
 	for _, path := range []string{"anything", "deep/nested/file.bin", "pub/x"} {
 		dl, err := rootTag(context.Background(), "fs1", path)
