@@ -102,6 +102,35 @@ type PutInput struct {
 	DownloadablePolicyRef string
 }
 
+// EnsureInput is the caller-supplied content of a mint-on-first-sight put. It
+// carries the same metadata as PutInput plus the ObjectRef the ensure is keyed
+// on: EnsureObject mints a handle for an engine object the north list found in
+// the engine namespace that carries no handle yet (a deliverable the agent
+// wrote through the SOUTH FUSE mount mints no north file_id — ADR-0029:46 "the
+// scope's owner sees the whole tree"). Like PutInput it names neither FileID nor
+// CreatedAt: the store mints and stamps those itself.
+type EnsureInput struct {
+	// Scope is the attested filesystem scope the ensured record is bound to. It
+	// is the first half of the (Scope, ObjectRef) idempotency key.
+	Scope string
+	// ObjectRef is the engine object reference the ensure is keyed on (the second
+	// half of the idempotency key). It is normalised (a single leading slash
+	// stripped) before it keys the ref index — the create path stores
+	// engine-relative refs with NO leading slash (ADR-0029 inv-5), so the ensure
+	// key must match that convention or a north-created object and its
+	// engine-visible twin would mint two handles.
+	ObjectRef string
+	// Filename is the display name for the ensured object.
+	Filename string
+	// Mime is the content type.
+	Mime string
+	// Size is the object's byte length.
+	Size int64
+	// DownloadablePolicyRef is the opaque downloadable-policy reference (Q2
+	// deferred — not a boolean; see Record.DownloadablePolicyRef).
+	DownloadablePolicyRef string
+}
+
 // ListInput parameterizes a scope-bound page of records. The fields are the
 // minimal cursor surface the List wave (TASK 6, a LATER wave) fills in; they
 // are declared now so the Store interface is stable.
@@ -154,6 +183,20 @@ type Store interface {
 	// store is latched or the durable write/sync fails (the record is NOT
 	// acked).
 	Put(ctx context.Context, in PutInput) (Record, error)
+	// EnsureObject is put-if-absent keyed on (Scope, ObjectRef): if a
+	// NON-tombstoned record already exists for that pair it is returned UNCHANGED
+	// (no new mint); otherwise a fresh record is Put (random FileID, store-stamped
+	// CreatedAt) and returned. It is idempotent — a second call for the same
+	// (Scope, ObjectRef) returns the SAME FileID — so the north list can reconcile
+	// the engine namespace on every request without minting a duplicate handle per
+	// list (the anti-dup invariant, ADR-0029:46).
+	//
+	// An ObjectRef the operator explicitly Deleted (tombstoned) is NOT re-minted:
+	// EnsureObject returns ErrNotFound for it so a north-deleted object does not
+	// silently reappear on the next reconcile (the tombstone mask). It respects
+	// the mutation fail-closed contract: on a latched store it returns
+	// ErrStoreUnavailable without writing (it is a mutation, like Put).
+	EnsureObject(ctx context.Context, in EnsureInput) (Record, error)
 	// Get resolves a file_id to its record IFF the attested scope byte-matches
 	// the record's scope. An absent OR cross-scope file_id returns ErrNotFound
 	// (the SAME sentinel — anti-enumeration).

@@ -5,9 +5,12 @@ package filesapi
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
@@ -50,20 +53,72 @@ func (g *fakeGuard) Mandate(_ context.Context, event any) error {
 // fakeEngine serves Stat and ReadRange from in-memory bytes keyed by engine path.
 // readRangeCalls counts ReadRange invocations so a test can prove the engine was
 // (or was NOT) reached. statErr/readErr inject faults.
+//
+// List serves a one-level directory listing DERIVED from the keys in bytesByPath
+// (the engine-relative, no-leading-slash object paths), so a test seeds objects
+// with seedObject and the north-list reconcile walks the SAME namespace a real
+// engine would report. listErr injects a walk fault; listCalls counts the
+// per-level List invocations. Directories are synthesized from the key path
+// segments (an object "outputs/report.pdf" implies a directory "outputs").
 type fakeEngine struct {
 	bytesByPath    map[string][]byte
 	statErr        error
 	readErr        error
+	listErr        error
 	readRangeCalls int
 	statCalls      int
+	listCalls      int
 }
 
 func newFakeEngine() *fakeEngine {
 	return &fakeEngine{bytesByPath: map[string][]byte{}}
 }
 
-func (e *fakeEngine) List(context.Context, string, string) ([]southface.FileInfo, error) {
-	return nil, nil
+// seedObject registers an engine object at the engine-relative path (no leading
+// slash) so both List (namespace) and Stat/ReadRange (bytes) see it.
+func (e *fakeEngine) seedObject(engPath string, body []byte) {
+	e.bytesByPath[engPath] = body
+}
+
+// List returns the one-level entries under dir ("." = scope root) synthesized
+// from the object keys: the direct file children and the immediate sub-directory
+// names implied by deeper keys. It mirrors the real engine's one-level List
+// contract (the walk recurses per level), so the reconcile's bounded tree walk is
+// exercised against a real multi-level namespace.
+func (e *fakeEngine) List(_ context.Context, _ string, dir string) ([]southface.FileInfo, error) {
+	e.listCalls++
+	if e.listErr != nil {
+		return nil, e.listErr
+	}
+	prefix := ""
+	if dir != "." && dir != "" && dir != "/" {
+		prefix = strings.TrimSuffix(strings.TrimPrefix(dir, "/"), "/") + "/"
+	}
+	files := map[string]int64{}
+	dirs := map[string]bool{}
+	for key, body := range e.bytesByPath {
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(key, prefix)
+		if rest == "" {
+			continue
+		}
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			dirs[rest[:i]] = true // an immediate sub-directory
+			continue
+		}
+		files[rest] = int64(len(body)) // a direct file child
+	}
+	out := make([]southface.FileInfo, 0, len(files)+len(dirs))
+	for name, size := range files {
+		out = append(out, southface.FileInfo{Name: name, Size: size, IsDir: false})
+	}
+	for name := range dirs {
+		out = append(out, southface.FileInfo{Name: name, IsDir: true})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func (e *fakeEngine) Stat(_ context.Context, _ string, path string) (southface.FileInfo, error) {
@@ -147,27 +202,105 @@ func (c *fakeCeilings) Release(string)                           {}
 // fakeStore is an in-memory handlestore.Store keyed by file_id, scope-bound on
 // Get/Delete (absent OR cross-scope -> ErrNotFound, the keystone). getErr, when
 // set, overrides Get for fault injection; deleteErr overrides Delete.
+//
+// EnsureObject is a REAL put-if-absent keyed on (scope, normalizeRef(ObjectRef))
+// with the tombstone mask — not a stub — so the north-list reconcile it drives
+// exercises the actual anti-dup and delete-mask semantics through the handler
+// (the keystone tests are non-vacuous). ensureCalls counts the mints so a test
+// can prove a second list did NOT re-mint.
 type fakeStore struct {
 	recs      map[string]handlestore.Record
+	refIndex  map[string]map[string]string // scope -> normalizedRef -> file_id
+	tombRefs  map[string]map[string]bool   // scope -> normalizedRef -> tombstoned
 	getErr    error
 	deleteErr error
+	ensureErr error
+	latched   bool
 	listPage  handlestore.ListPage
 	listErr   error
 	// deleted records the file_ids passed to Delete (ordering proof).
 	deleted []string
+	// ensureCalls counts the number of EnsureObject calls that MINTED a fresh
+	// record (an already-existing ref returns without minting).
+	ensureMints int
+	// mintSeq mints deterministic, unique file_ids for the fake ensure/put.
+	mintSeq int
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{recs: map[string]handlestore.Record{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		recs:     map[string]handlestore.Record{},
+		refIndex: map[string]map[string]string{},
+		tombRefs: map[string]map[string]bool{},
+	}
+}
 
-// put seeds a record bound to scope.
+// normRef mirrors handlestore.normalizeRef (unexported there): strip a single
+// leading slash so the fake keys on the same engine-relative convention.
+func normRef(ref string) string { return strings.TrimPrefix(ref, "/") }
+
+// put seeds a record bound to scope and indexes it by (scope, ref) so the fake's
+// EnsureObject dedup sees a pre-seeded handle.
 func (s *fakeStore) put(fileID, scope string, rec handlestore.Record) {
 	rec.FileID = fileID
 	rec.Scope = scope
 	s.recs[fileID] = rec
+	s.indexRef(scope, rec.ObjectRef, fileID)
+}
+
+func (s *fakeStore) indexRef(scope, ref, fileID string) {
+	byRef := s.refIndex[scope]
+	if byRef == nil {
+		byRef = map[string]string{}
+		s.refIndex[scope] = byRef
+	}
+	byRef[normRef(ref)] = fileID
+	if ts := s.tombRefs[scope]; ts != nil {
+		delete(ts, normRef(ref))
+	}
 }
 
 func (s *fakeStore) Put(context.Context, handlestore.PutInput) (handlestore.Record, error) {
 	return handlestore.Record{}, handlestore.ErrStoreUnavailable
+}
+
+// EnsureObject is the real put-if-absent + tombstone-mask the north-list
+// reconcile drives. A tombstoned ref returns ErrNotFound (not re-minted); an
+// existing ref returns its record UNCHANGED; else a fresh record is minted.
+func (s *fakeStore) EnsureObject(_ context.Context, in handlestore.EnsureInput) (handlestore.Record, error) {
+	if s.ensureErr != nil {
+		return handlestore.Record{}, s.ensureErr
+	}
+	if s.latched {
+		return handlestore.Record{}, handlestore.ErrStoreUnavailable
+	}
+	key := normRef(in.ObjectRef)
+	if ts := s.tombRefs[in.Scope]; ts != nil && ts[key] {
+		return handlestore.Record{}, handlestore.ErrNotFound
+	}
+	if byRef := s.refIndex[in.Scope]; byRef != nil {
+		if fid, ok := byRef[key]; ok {
+			if rec, ok := s.recs[fid]; ok {
+				return rec, nil
+			}
+		}
+	}
+	s.mintSeq++
+	s.ensureMints++
+	fid := fmt.Sprintf("ensured-%d", s.mintSeq)
+	rec := handlestore.Record{
+		FileID:                fid,
+		Scope:                 in.Scope,
+		ObjectRef:             in.ObjectRef,
+		Filename:              in.Filename,
+		Mime:                  in.Mime,
+		Size:                  in.Size,
+		CreatedAt:             "2026-01-01T00:00:00Z",
+		DownloadablePolicyRef: in.DownloadablePolicyRef,
+	}
+	s.recs[fid] = rec
+	s.indexRef(in.Scope, in.ObjectRef, fid)
+	return rec, nil
 }
 
 func (s *fakeStore) Get(_ context.Context, fileID, attestedScope string) (handlestore.Record, error) {
@@ -191,19 +324,56 @@ func (s *fakeStore) Delete(_ context.Context, fileID, attestedScope string) erro
 	if !ok || rec.Scope != attestedScope {
 		return handlestore.ErrNotFound
 	}
+	// Unindex + tombstone the (scope, ref) so EnsureObject will not re-mint it —
+	// the real store's delete-mask, so the handler-driven reconcile tests are
+	// non-vacuous.
+	if byRef := s.refIndex[rec.Scope]; byRef != nil {
+		delete(byRef, normRef(rec.ObjectRef))
+	}
+	ts := s.tombRefs[rec.Scope]
+	if ts == nil {
+		ts = map[string]bool{}
+		s.tombRefs[rec.Scope] = ts
+	}
+	ts[normRef(rec.ObjectRef)] = true
 	delete(s.recs, fileID)
 	return nil
 }
 
-func (s *fakeStore) List(_ context.Context, _ handlestore.ListInput) (handlestore.ListPage, error) {
+// List returns the fixed listPage when a test set one; otherwise it synthesizes
+// a scope-bound, (CreatedAt, FileID)-sorted page from s.recs so a handler that
+// reconciled the engine namespace into the store (EnsureObject) sees the ensured
+// records in the list. This makes the whole-tree bridge test drive real list
+// output, not a pre-canned page.
+func (s *fakeStore) List(_ context.Context, in handlestore.ListInput) (handlestore.ListPage, error) {
 	if s.listErr != nil {
 		return handlestore.ListPage{}, s.listErr
 	}
-	return s.listPage, nil
+	if s.listPage.Records != nil || s.listPage.HasMore || s.listPage.FirstID != "" {
+		return s.listPage, nil
+	}
+	matched := make([]handlestore.Record, 0, len(s.recs))
+	for _, rec := range s.recs {
+		if rec.Scope == in.Scope {
+			matched = append(matched, rec)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].CreatedAt != matched[j].CreatedAt {
+			return matched[i].CreatedAt < matched[j].CreatedAt
+		}
+		return matched[i].FileID < matched[j].FileID
+	})
+	page := handlestore.ListPage{Records: matched}
+	if len(matched) > 0 {
+		page.FirstID = matched[0].FileID
+		page.LastID = matched[len(matched)-1].FileID
+	}
+	return page, nil
 }
 
 func (s *fakeStore) Close() error  { return nil }
-func (s *fakeStore) Latched() bool { return false }
+func (s *fakeStore) Latched() bool { return s.latched }
 
 // fakeScope is a programmable ScopeSource: it returns the fixed PeerScope and
 // ok flag regardless of the request, so a test can drive the fail-closed
