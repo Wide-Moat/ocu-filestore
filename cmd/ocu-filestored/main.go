@@ -1461,11 +1461,13 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	}
 
 	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
-	// post-provision step fails before ownership passes to teardownServer
-	// (whose Close runs TeardownScope), compose returns nil,err WITHOUT a
-	// closer for that scope — the dirty scope persists meanwhile. This deferred
-	// rollback releases resources on every post-provision error path, bounded by
-	// teardownTimeout, and is disarmed (committed = true) only once the
+	// post-provision step fails before ownership passes to teardownServer,
+	// compose returns nil,err WITHOUT a closer for that scope. This deferred
+	// rollback releases the durable handle-store fd on every post-provision
+	// error path so a failed compose never leaks an open log fd. It does NOT
+	// erase the scope — a composition failure is not an owner-change event;
+	// erase-before-reuse is TeardownScope's responsibility, called only on an
+	// explicit owner-change grant. Disarmed (committed = true) once the
 	// teardownServer takes ownership.
 	committed := false
 	defer func() {
@@ -1477,13 +1479,6 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		// passed to teardownServer).
 		if hStore != nil {
 			_ = hStore.Close()
-		}
-		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
-		defer cancelTeardown()
-		if err := eng.TeardownScope(teardownCtx, scope); err != nil {
-			l.Error("rolling back a provisioned scope after a failed compose",
-				slog.String(observ.KeyReason, "compose_rollback"),
-				slog.String("error", err.Error()))
 		}
 	}()
 
