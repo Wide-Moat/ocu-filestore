@@ -538,22 +538,28 @@ func TestE2ELifecycleOverTLS(t *testing.T) {
 		t.Fatal("read listing entry for the seeded input carries no minted uuid")
 	}
 
-	// fileDownload of that uuid is DENIED 403 not_downloadable: uploads/ is not a
-	// configured downloadable prefix, so the human-supplied input is readable
-	// in-session yet cannot be exfiltrated — the egress bar. A 404 would mean the
-	// uuid mis-keyed the object; a 200 would mean the split is broken.
+	// fileDownload of that uuid returns 200 + the raw input bytes: the SOUTH
+	// byte-stream is an in-session read (NFR-SEC-73: a non-downloadable object MAY
+	// be read into the sandbox), so the agent reads its own human-supplied input.
+	// The south plane is NOT the egress boundary — the north /content endpoint
+	// (filesapi) is the sole exfil-bar, covered by the filesapi content tests. A
+	// 404 would mean the uuid mis-keyed the object.
 	dl := d.postJSON(t, "fileDownload", map[string]any{
 		"filesystem_id":          e2eScope,
 		"uuid":                   uuid,
 		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 	})
 	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusForbidden {
+	if dl.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar: uploads is not downloadable); body %s", dl.StatusCode, b)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 200 (in-session read); body %s", dl.StatusCode, b)
 	}
-	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
-		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
+	gotSeed, rerr := io.ReadAll(dl.Body)
+	if rerr != nil {
+		t.Fatalf("read fileDownload body: %v", rerr)
+	}
+	if !bytes.Equal(gotSeed, seed) {
+		t.Fatalf("fileDownload body = %q, want the seeded uploads input %q", gotSeed, seed)
 	}
 }
 
