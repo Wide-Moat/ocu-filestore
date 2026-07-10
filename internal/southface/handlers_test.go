@@ -741,6 +741,52 @@ func TestReadFileNonDownloadableIsReadable(t *testing.T) {
 	}
 }
 
+// TestNonDownloadableObjectSouthReadSplit pins the invariant the fix restores:
+// a non-downloadable object (Grant{Downloadable:false}) is south-readable
+// in-session on both the metadata and the byte-stream plane, but NOT eligible
+// for north egress (the north /content tests are the authority for that half).
+//
+// (a) OpReadFile → 200 + metadata body (path/size/uuid present, no content).
+// (b) OpFileDownload (south byte-stream) → 200 + exact raw bytes.
+//
+// The north egress half is covered by the untouched filesapi content/archive
+// tests; this test does NOT duplicate north assertions.
+func TestNonDownloadableObjectSouthReadSplit(t *testing.T) {
+	const scope = "fs-split"
+	content := []byte("in-session payload delta")
+
+	// (a) South readFile — metadata-only, no content bytes.
+	t.Run("readFile_200_metadata", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(scope, "secret.bin", content)
+		d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: false}}, &fakeGuard{}, okCeilings(), eng)
+
+		w := serveOp(d, OpReadFile, readBodyNoRange(scope, "/secret.bin", false), scope, okIntents())
+		resp := decodeReadFile(t, w)
+		if resp.File.Path == "" || resp.File.Size == 0 || resp.File.UUID == "" {
+			t.Fatalf("readFile metadata incomplete for non-downloadable object: %+v", resp.File)
+		}
+		if calls := eng.readRangeCalls(); len(calls) != 0 {
+			t.Fatalf("readFile called ReadRange on a metadata-only op: %v", calls)
+		}
+	})
+
+	// (b) South fileDownload byte-stream — exact bytes, in-session.
+	t.Run("fileDownload_200_bytes", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(scope, "secret.bin", content)
+		sess := &recordingCeilingsSession{}
+		d := newDownloadDispatcher(eng, &fakeGuard{}, sess, false)
+		uuid := d.ids.idFor(scope, "/secret.bin")
+
+		w := serveDownload(t, d, scope, uuid, nil, scope, okIntents())
+		assertDownloadOK(t, w, content)
+		if len(eng.readRangeCalls()) == 0 {
+			t.Fatalf("fileDownload never called ReadRange for a non-downloadable in-session read")
+		}
+	})
+}
+
 // TestReadFileNoContentRead pins CONC-01 (NFR-SEC-46/78): readFile validates
 // through engine.Stat ONLY — the engine's ReadRange is NEVER called, so no
 // content byte is read or buffered regardless of object size or the guest
