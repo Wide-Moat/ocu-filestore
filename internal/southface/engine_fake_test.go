@@ -458,8 +458,9 @@ func (e *fakeEngine) removeDirCalls() []string {
 }
 
 // readRangeCalls returns the ReadRange target paths recorded — the witness
-// that a not_downloadable readFile deny precedes (and never reaches) the
-// engine read (SEC-73/A2).
+// that a south readFile (which is Stat-only, NFR-SEC-46/78) never calls
+// ReadRange, and that intent_denied/traversal/not_found denies do not reach
+// the engine read plane.
 func (e *fakeEngine) readRangeCalls() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -468,10 +469,10 @@ func (e *fakeEngine) readRangeCalls() []string {
 	return out
 }
 
-// statCalls returns the Stat target paths recorded — the witness that a
-// traversal/non-downloadable readFile deny precedes (and never reaches) the
-// engine Stat, and that the path the engine sees is the canonical one
-// (bypass-01/03).
+// statCalls returns the Stat target paths recorded — the witness that the
+// path the engine sees is the canonical spine-cleaned form (bypass-01/03),
+// and that intent_denied or traversal denies do not leak path information
+// through the engine.
 func (e *fakeEngine) statCalls() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()

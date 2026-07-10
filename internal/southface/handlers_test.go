@@ -699,37 +699,43 @@ func TestReadFileMetadataOnly(t *testing.T) {
 	}
 }
 
-// TestReadFileNotDownloadable pins SEC-73/A2: a non-downloadable read denies
-// permission_denied/403 with x-deny-reason: not_downloadable from the
-// broker-resolved GRANT — regardless of the wire downloadable flag value or
-// any would-be stored tag — and engine.ReadRange is NOT called (the deny
-// precedes the read).
-func TestReadFileNotDownloadable(t *testing.T) {
+// TestReadFileNonDownloadableIsReadable pins the corrected SEC-73 scope: the
+// downloadable axis is a NORTH egress control (the /content egress endpoint).
+// The SOUTH readFile is an in-session metadata read — it is governed by
+// intent/subtree (read-intent → uploads RO, ADR-0029), NOT the egress axis.
+// A non-downloadable object MUST be accessible to the south readFile plane so
+// the guest cat path (ocufs resolve → readFile → fileDownload) can service
+// in-session reads regardless of north egress eligibility.
+//
+// Asserts: Grant{Downloadable:false} + read-intent + existing object →
+//   - 200 with metadata body (path, size, uuid present)
+//   - ReadRange call count is 0 (Stat-only; readFile emits NO content bytes)
+//   - engine.Stat WAS called (the object was looked up)
+func TestReadFileNonDownloadableIsReadable(t *testing.T) {
 	for _, wireFlag := range []bool{false, true} {
 		t.Run(fmt.Sprintf("wire_downloadable_%t", wireFlag), func(t *testing.T) {
 			eng := newFakeEngine()
 			eng.putBytes(opScope, "golden.bin", []byte("ABCDEFGH"))
 			g := &fakeGuard{}
-			// The resolved grant denies downloadable; the wire flag is flipped
-			// to prove the verdict follows the grant, not the flag.
+			// Grant marks not-downloadable (north egress axis). South readFile
+			// must serve the metadata regardless.
 			d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: false}}, g, okCeilings(), eng)
 			w := serveOp(d, OpReadFile, readBody(opScope, "/golden.bin", 0, 4, wireFlag), opScope, okIntents())
 
-			if w.Code != http.StatusForbidden {
-				t.Fatalf("status = %d, want 403 (not_downloadable); body %s", w.Code, w.Body.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (non-downloadable south read must succeed); body %s", w.Code, w.Body.String())
 			}
-			if h := w.Header().Get("x-deny-reason"); h != denyNotDownloadable {
-				t.Fatalf("x-deny-reason = %q, want %q", h, denyNotDownloadable)
+			resp := decodeReadFile(t, w)
+			if resp.File.Path == "" || resp.File.Size == 0 || resp.File.UUID == "" {
+				t.Fatalf("readFile metadata incomplete: %+v", resp.File)
 			}
-			if ce := decodeErrBody(t, w); ce.Code != wireCodePermissionDenied {
-				t.Fatalf("code = %q, want permission_denied", ce.Code)
-			}
+			// ReadRange must NOT be called — readFile is Stat-only (NFR-SEC-46/78).
 			if calls := eng.readRangeCalls(); len(calls) != 0 {
-				t.Fatalf("ReadRange was called on a denied read: %v (deny must precede the read)", calls)
+				t.Fatalf("ReadRange was called on a metadata-only south read: %v", calls)
 			}
-			// A deny audit event was emitted (the handler-stage deny Mandate).
-			if len(g.events) == 0 {
-				t.Fatalf("no deny audit event emitted on not_downloadable")
+			// engine.Stat must have been called (the path was resolved).
+			if len(eng.statCalls()) == 0 {
+				t.Fatalf("engine.Stat was never called for the south readFile")
 			}
 		})
 	}

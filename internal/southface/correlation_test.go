@@ -15,6 +15,7 @@ package southface
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"regexp"
@@ -179,25 +180,34 @@ func TestRequestIDInLogAndAuditRecord(t *testing.T) {
 // TestRequestIDUnifiedDenyAudit asserts (d): a deny's audit record carries
 // the same CorrelationUID as the x-request-id header — one id, not two. This
 // subsumes the previous D8 per-deny correlation id mechanism (T2-18). It uses
-// a HANDLER-STAGE deny (a non-downloadable readFile), which — unlike a
-// pre-handler scope/route refusal — unconditionally mandates a deny audit
-// event before the REST deny response.
+// a HANDLER-STAGE intent_denied deny, which — unlike a pre-handler scope/route
+// refusal — unconditionally mandates a deny audit event before the REST deny
+// response.
+//
+// Vehicle: OpRemoveFile with a session that grants only IntentRead (no
+// IntentWrite). assertWriteGrant is the handler-stage defense-in-depth check
+// (NFR-SEC-49, invariant 4): it fires mandateDeny(intent_denied) before any
+// engine touch, so the deny audit event carries the request_id correlation.
 func TestRequestIDUnifiedDenyAudit(t *testing.T) {
 	g := &fakeGuard{}
-	// A non-downloadable grant: readFile resolves the egress axis to false and
-	// the handler emits a deny audit event before the 403.
 	eng := newFakeEngine()
 	eng.putBytes(boundScope, "secret.bin", []byte("S"))
-	d := newDispatcherWithEngine(&fakeResolver{grant: Grant{Downloadable: false}}, g, okCeilings(), 1<<20, eng)
+	// fakeResolver returns a grant without error regardless of intent; the
+	// handler-stage assertWriteGrant catches the missing IntentWrite.
+	d := newDispatcherWithEngine(&fakeResolver{}, g, okCeilings(), 1<<20, eng)
 	d.maxFileSize = 1 << 20
 	var logBuf bytes.Buffer
 	d.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
+	// Session holds only IntentRead; assertWriteGrant in OpRemoveFile fires the
+	// handler-stage intent_denied deny and mandates an audit event before the 403.
+	readOnly := []Intent{IntentRead}
+	removeBody := fmt.Sprintf(`{"filesystem_id":%q,"path":"/secret.bin","authorization_metadata":{"intent":"write","downloadable":false}}`, boundScope)
 	w := httptest.NewRecorder()
-	d.ServeHTTP(w, scopedRequest(OpReadFile, readBodyNoRange(boundScope, "/secret.bin", false), boundScope, []Intent{IntentRead}))
+	d.ServeHTTP(w, scopedRequest(OpRemoveFile, removeBody, boundScope, readOnly))
 
 	if w.Code != 403 {
-		t.Fatalf("status = %d, want 403 (not_downloadable deny); body %s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 403 (intent_denied handler-stage deny); body %s", w.Code, w.Body.String())
 	}
 	reqID := w.Header().Get(requestIDHeader)
 	if !reqIDRe.MatchString(reqID) {

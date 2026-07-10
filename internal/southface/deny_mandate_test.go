@@ -61,19 +61,25 @@ func TestUnaryDenyMandateFailureDegradesToAuditDown(t *testing.T) {
 	})
 
 	t.Run("header_bearing_deny_loses_header", func(t *testing.T) {
-		// not_downloadable normally carries x-deny-reason; with the deny
-		// Mandate down, the header must vanish along with the original code.
+		// intent_denied normally carries x-deny-reason; with the deny Mandate
+		// down, the header must vanish along with the original code.
+		// Vehicle: OpRemoveFile with a read-only session (no IntentWrite) so the
+		// handler-stage assertWriteGrant calls mandateDeny(intent_denied). The
+		// failAfterGuard lets the STAGE-3 allow Mandate land (call index 0) and
+		// fails the handler-stage deny Mandate (call index 1) → 503 with no header.
 		eng := newFakeEngine()
 		eng.putBytes(opScope, "secret.bin", []byte("S"))
 		g := &failAfterGuard{failFrom: 1}
-		d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: false}}, g, okCeilings(), eng)
+		d := newEngineDispatcher(&fakeResolver{}, g, okCeilings(), eng)
 
-		w := serveOp(d, OpReadFile, readBodyNoRange(opScope, "/secret.bin", false), opScope, okIntents())
+		readOnly := []Intent{IntentRead}
+		body := fmt.Sprintf(`{"filesystem_id":%q,"path":"/secret.bin","authorization_metadata":{"intent":"write","downloadable":false}}`, opScope)
+		w := serveOp(d, OpRemoveFile, body, opScope, readOnly)
 		if w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503; body %s", w.Code, w.Body.String())
 		}
 		if h := w.Header().Get("x-deny-reason"); h != "" {
-			t.Fatalf("x-deny-reason = %q, want none (the not_downloadable truth was never recorded)", h)
+			t.Fatalf("x-deny-reason = %q, want none (the intent_denied truth was never recorded)", h)
 		}
 	})
 
