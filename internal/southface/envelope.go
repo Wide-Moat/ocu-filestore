@@ -274,3 +274,19 @@ func denyClassForDecodeErr(err error) string {
 		return denyInternal
 	}
 }
+
+// joinIntentFor resolves the subtree-join intent (ADR-0029: "the join input is
+// the credential's claim, never per-request caller metadata"). A single-intent
+// grant - the per-mount credential the intent-keyed exchange yields - keys the
+// join for EVERY op of the request, so a write credential's read-class ops
+// resolve under its own outputs/ subtree (the writer sees its own files, the
+// PoC outputs-rw contract). A grant naming several intents is the interim
+// static single-tenant bind (deployment config, not per-request metadata) and
+// keeps the route-op derivation, today's shipped behavior for that mode. The
+// wire hint never participates in either mode.
+func joinIntentFor(grants []Intent, required Intent) Intent {
+	if len(grants) == 1 {
+		return grants[0]
+	}
+	return required
+}

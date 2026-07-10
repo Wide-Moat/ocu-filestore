@@ -521,3 +521,75 @@ func TestDispatch_ListReAddressRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// TestDispatch_CredentialClaimJoin is the two-mount keystone (ADR-0029: "the
+// join input is the credential's claim"): a WRITE-credential request (grant set
+// {write}) joins EVERY op under its own outputs/ subtree, reads included, so
+// the writer lists and reads its own files. This is the list-own-writes leg the
+// flat/route-op era broke - a read-class op used to resolve to uploads/,
+// hiding the writer's outputs. A READ-credential (grant {read}) keeps joining
+// under uploads/. The wire hint is never the join key in either case.
+func TestDispatch_CredentialClaimJoin(t *testing.T) {
+	const scope = "fs-claimjoin"
+
+	t.Run("write_credential_reads_its_own_outputs_subtree", func(t *testing.T) {
+		eng := newFakeEngine()
+		// Seed a file the WRITER produced: it lives under outputs/ engine-relative.
+		eng.putBytes(scope, "outputs/report.pdf", []byte("WRITER-DELIVERABLE"))
+		// Seed a DIFFERENT file under uploads/ so the assertion is non-vacuous:
+		// a route-op join (read->uploads/) would have listed THIS one, not the
+		// writer's outputs file.
+		eng.putBytes(scope, "uploads/attachment.txt", []byte("USER-UPLOAD"))
+		d := subtreeDispatcher(eng, &fakeGuard{}, &recordingCeilingsSession{}, 1<<20)
+
+		// LIST "/" with a WRITE-only credential grant. The credential claim keys
+		// the join, so listing resolves under outputs/ - the writer sees report.pdf.
+		ld := decodeList(t, serveOp(d, OpListDirectory, listBody(scope, "/", 0, "", true), scope, []Intent{IntentWrite}))
+		var sawReport, sawAttachment bool
+		for _, e := range ld.Entries {
+			if e.File == nil {
+				continue
+			}
+			if e.File.Path == "/report.pdf" {
+				sawReport = true
+			}
+			if e.File.Path == "/attachment.txt" {
+				sawAttachment = true
+			}
+		}
+		if !sawReport {
+			t.Fatalf("write-credential list did not surface its own outputs/report.pdf; entries=%+v", ld.Entries)
+		}
+		if sawAttachment {
+			t.Fatalf("write-credential list surfaced the uploads-subtree file; the join keyed the route op (read->uploads/), not the credential claim")
+		}
+	})
+
+	t.Run("read_credential_joins_uploads_subtree", func(t *testing.T) {
+		eng := newFakeEngine()
+		eng.putBytes(scope, "uploads/attachment.txt", []byte("USER-UPLOAD"))
+		eng.putBytes(scope, "outputs/report.pdf", []byte("WRITER-DELIVERABLE"))
+		d := subtreeDispatcher(eng, &fakeGuard{}, &recordingCeilingsSession{}, 1<<20)
+
+		// LIST "/" with a READ-only credential grant joins under uploads/.
+		ld := decodeList(t, serveOp(d, OpListDirectory, listBody(scope, "/", 0, "", true), scope, []Intent{IntentRead}))
+		var sawAttachment, sawReport bool
+		for _, e := range ld.Entries {
+			if e.File == nil {
+				continue
+			}
+			if e.File.Path == "/attachment.txt" {
+				sawAttachment = true
+			}
+			if e.File.Path == "/report.pdf" {
+				sawReport = true
+			}
+		}
+		if !sawAttachment {
+			t.Fatalf("read-credential list did not surface uploads/attachment.txt; entries=%+v", ld.Entries)
+		}
+		if sawReport {
+			t.Fatalf("read-credential list surfaced the outputs-subtree file; the RO uploads view leaked outputs")
+		}
+	})
+}

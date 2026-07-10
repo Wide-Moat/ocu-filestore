@@ -116,7 +116,7 @@ func TestIntentDenied(t *testing.T) {
 		{"empty grant set", []Intent{}, IntentWrite},
 		{"preview-only caller requests write", []Intent{IntentPreview}, IntentWrite},
 		{"preview-only caller requests read", []Intent{IntentPreview}, IntentRead},
-		{"write-only caller requests read", []Intent{IntentWrite}, IntentRead},
+		{"read-only caller requests write", []Intent{IntentRead}, IntentWrite},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := CallerEvidence{Scope: "fs1", GrantedIntents: tc.grants}
@@ -274,5 +274,23 @@ func TestDownloadableFromTag(t *testing.T) {
 	}
 	if !g.Downloadable {
 		t.Fatal("read with stored tag true did not yield Downloadable=true")
+	}
+}
+
+// TestWriteGrantSubsumesRead pins the class-admission rule (ADR-0029 + the PoC
+// outputs-rw contract): a write-only grant ADMITS read-class requests - an RW
+// mount must stat, list, and read the subtree it writes, and the dispatch join
+// confines those reads to the write subtree itself. The reverse direction
+// (read grant requesting write) stays denied in TestIntentDenied - read carries
+// no write lease (NFR-SEC-49).
+func TestWriteGrantSubsumesRead(t *testing.T) {
+	r := New(tagReturning(true, nil))
+	ev := CallerEvidence{Scope: "fs1", GrantedIntents: []Intent{IntentWrite}}
+	if _, err := r.Resolve(context.Background(), ev, Request{
+		Filesystem: "fs1",
+		Path:       "outputs/a.txt",
+		Intent:     IntentRead,
+	}); err != nil {
+		t.Fatalf("a write-only grant must admit a read-class request, got %v", err)
 	}
 }
