@@ -257,9 +257,15 @@ func TestDownloadOctetStream(t *testing.T) {
 		}
 	})
 
-	t.Run("not_downloadable_403", func(t *testing.T) {
-		// The resolver grants Downloadable=false: the wire flag (sent false anyway)
-		// is irrelevant; the broker-resolved grant denies (403). No engine read.
+	t.Run("non_downloadable_is_readable_in_session", func(t *testing.T) {
+		// The south byte-stream (fileDownload) is an in-session read, NOT a north
+		// egress operation. A Grant{Downloadable:false} means the object may not be
+		// exported via the north /content egress; it does NOT block the guest from
+		// streaming the object in-session. The south byte-stream MUST return 200
+		// with the raw object bytes regardless of the downloadable flag.
+		//
+		// Assert: Grant{Downloadable:false} + existing uuid → 200 + exact bytes,
+		// engine ReadRange WAS called (bytes actually streamed), gauge balanced.
 		eng := newFakeEngine()
 		eng.putBytes(downloadScope, "dl.bin", content)
 		sess := &recordingCeilingsSession{}
@@ -268,16 +274,13 @@ func TestDownloadOctetStream(t *testing.T) {
 
 		w := serveDownload(t, d, downloadScope, uuid, nil, downloadScope, okIntents())
 
-		assertDownloadDenied(t, w, http.StatusForbidden)
-		if w.Header().Get(denyReasonHeader) != denyNotDownloadable {
-			t.Fatalf("not-downloadable x-deny-reason = %q, want %q", w.Header().Get(denyReasonHeader), denyNotDownloadable)
-		}
-		// downloadable resolves at read BEFORE the engine: no read, no stat.
-		if len(eng.readRangeCalls()) != 0 {
-			t.Fatalf("not-downloadable deny reached the engine read: %v", eng.readRangeCalls())
+		assertDownloadOK(t, w, content)
+		// Engine ReadRange was called — bytes were actually streamed in-session.
+		if len(eng.readRangeCalls()) == 0 {
+			t.Fatalf("engine ReadRange was never called on a non-downloadable in-session read")
 		}
 		if !sess.balanced() {
-			t.Fatalf("not-downloadable gauge unbalanced")
+			t.Fatalf("non-downloadable in-session read gauge unbalanced")
 		}
 	})
 

@@ -265,13 +265,16 @@ func s3RTRoundTrip(t *testing.T, cl *http.Client, baseURL, scope, bucket, endpoi
 		t.Fatalf("write aliased into the read-only subtree %q; the :ro split is broken", uploadsAlias)
 	}
 
-	// READ/EGRESS LEG: seed an object DIRECTLY under uploads/ with the independent
+	// READ/IN-SESSION LEG: seed an object DIRECTLY under uploads/ with the independent
 	// client (the human->sandbox input direction), then drive a read through the
-	// composed daemon. The read plane resolves under uploads/ and FINDS it, but the
-	// egress gate denies download (403 not_downloadable): uploads/ is not a
-	// configured downloadable prefix (dlPrefixes={outputs}), so a human-supplied
-	// input is readable in-session yet cannot be pulled out of the sandbox — the
-	// exfil-bar. If the split were broken (uploads egress-eligible) this would 200.
+	// composed daemon. The read plane resolves under uploads/ and FINDS it, and the
+	// SOUTH fileDownload streams the raw bytes 200 — uploads/ is a read-plane
+	// (in-session) subtree, so a human-supplied input is readable in-session by the
+	// agent. The south byte-stream is NOT the egress boundary (NFR-SEC-73: a
+	// non-downloadable object MAY be read into the sandbox); the north /content
+	// endpoint (filesapi) is the sole exfil-bar, covered by the filesapi content
+	// tests. The write-leg disjointness above (write->outputs/, read->uploads/) is
+	// the ADR-0029 isolation the split preserves.
 	// The s3 engine represents a directory with a 0-byte marker key ("uploads/"),
 	// which a read listing checks for existence before walking. Seed both the marker
 	// and the object with the independent client (the human->sandbox input arrives
@@ -301,11 +304,18 @@ func s3RTRoundTrip(t *testing.T, cl *http.Client, baseURL, scope, bucket, endpoi
 		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 	})
 	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusForbidden {
+	if dl.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar: uploads is not downloadable); body %s", dl.StatusCode, b)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 200 (in-session read); body %s", dl.StatusCode, b)
 	}
-	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
-		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
+	// The south byte-stream returns the raw human-supplied input bytes: the agent
+	// reads its own input in-session. The wire downloadable hint is irrelevant
+	// (broker-resolved grant governs); the north /content endpoint is the exfil-bar.
+	gotSeed, rerr := io.ReadAll(dl.Body)
+	if rerr != nil {
+		t.Fatalf("read fileDownload body: %v", rerr)
+	}
+	if !bytes.Equal(gotSeed, seed) {
+		t.Fatalf("fileDownload body = %q, want the seeded uploads input %q", gotSeed, seed)
 	}
 }

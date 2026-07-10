@@ -542,11 +542,18 @@ func handleRemoveFile(d *handlerDeps, hc handlerCtx) opOutcome {
 }
 
 // handleReadFile implements OPS-04 readFile: a UNARY op on the existing
-// dispatch pipeline. It strict-decodes {filesystem_id, path, range}, enforces
-// downloadable AT READ from the broker-resolved grant FIRST (A2/SEC-73),
-// validates the target through engine.Stat WITHOUT reading any content
-// (readFile emits NO content; D6 TBD content body stays TBD), and emits the
-// metadata-only {file: File} body.
+// dispatch pipeline. It strict-decodes {filesystem_id, path, range}, validates
+// the target through engine.Stat WITHOUT reading any content (readFile emits
+// NO content; D6 TBD content body stays TBD), and emits the metadata-only
+// {file: File} body.
+//
+// SOUTH READ IS NOT AN EGRESS OPERATION. The downloadable axis (NFR-SEC-73) is
+// a NORTH egress control: it gates minting an egress artifact on the north
+// /content endpoint (internal/filesapi). The south readFile is an in-session
+// metadata read governed by intent/subtree (read-intent → uploads RO,
+// ADR-0029). A non-downloadable object is fully accessible to the south read
+// plane so the guest can stat and stream it in-session. The downloadable gate
+// lives exclusively on the north egress listener.
 //
 // NO CONTENT IS READ (NFR-SEC-46/78): an earlier build validated the window
 // by copying it into an in-memory buffer with the guest-supplied length —
@@ -561,16 +568,6 @@ func handleReadFile(d *handlerDeps, hc handlerCtx) opOutcome {
 	if !decodeOp(hc, &req) {
 		// decodeOp already emitted the deny audit event via mandateDeny, wrote
 		// the wire deny, and recorded the ops_total deny (southface-05).
-		return outcomeDenyRecorded()
-	}
-
-	// DOWNLOADABLE@READ, FIRST (SEC-73 wire half, A2). The spine's STAGE-2
-	// Resolve(intent=read) already produced the authoritative grant; a
-	// non-downloadable read denies BEFORE any engine touch, regardless of the
-	// wire authorization_metadata.downloadable flag or any write-time stored
-	// tag. The handler reads ONLY hc.grant.Downloadable — never the wire flag.
-	if !hc.grant.Downloadable {
-		hc.mandateDeny(denyNotDownloadable, denyNotDownloadable, "object not downloadable")
 		return outcomeDenyRecorded()
 	}
 

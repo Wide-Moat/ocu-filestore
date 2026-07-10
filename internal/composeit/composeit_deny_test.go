@@ -102,16 +102,14 @@ func TestComponentDenyPathsOverTLS(t *testing.T) {
 		}
 	})
 
-	// --- 7. unknown path under a read-only (uploads) subtree -> 403 not_downloadable,
-	// the STRONGEST anti-enumeration degrade. readFile addresses by PATH; a read-intent
-	// op joins under the "uploads" subtree (ADR-0029), which is NOT a configured
-	// downloadable prefix, so the downloadable-AT-READ gate denies BEFORE any engine
-	// touch (handleReadFile checks hc.grant.Downloadable first, SEC-73). The engine
-	// Stat that would report not_found is never reached, so the response is
-	// path-existence-INDEPENDENT: an unknown path and a real-but-non-downloadable
-	// object return the same 403, leaking nothing about existence. (The not_found 404
-	// degrade still applies where the object IS downloadable — the write outputs/
-	// subtree; a read of the RO uploads plane is denied for egress before it enumerates.)
+	// --- 7. unknown path under a read-only (uploads) subtree -> 404 not_found,
+	// header-less. readFile addresses by PATH; after the south-read-gate removal,
+	// the downloadable axis is a NORTH egress control only. A read-intent op
+	// joins under the "uploads" subtree (ADR-0029); an unknown path reaches the
+	// engine (Stat), which returns not_found (404) — the same anti-enumeration
+	// degrade as the unknown-uuid fileDownload (subtest 7b). No x-deny-reason
+	// header on a not_found deny (the anti-enumeration degrade must not leak path
+	// existence truth).
 	t.Run("unknown_path_readFile_denied_before_enumeration", func(t *testing.T) {
 		resp := postJSON(t, cl, "readFile", map[string]any{
 			"filesystem_id":          itScope,
@@ -119,12 +117,12 @@ func TestComponentDenyPathsOverTLS(t *testing.T) {
 			"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 		})
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
+		if resp.StatusCode != http.StatusNotFound {
 			b, _ := io.ReadAll(resp.Body)
-			t.Fatalf("unknown-path readFile status = %d, want 403 (downloadable gate denies before engine enumeration under the RO read subtree); body %s", resp.StatusCode, b)
+			t.Fatalf("unknown-path readFile status = %d, want 404 not_found (engine Stat reaches here now; path does not exist); body %s", resp.StatusCode, b)
 		}
-		if hdr := resp.Header.Get("x-deny-reason"); hdr != "not_downloadable" {
-			t.Fatalf("readFile deny reason = %q, want not_downloadable (a not_found reason would mean the engine was reached and existence leaked)", hdr)
+		if hdr := resp.Header.Get("x-deny-reason"); hdr != "" {
+			t.Fatalf("readFile not_found leaked x-deny-reason = %q, want NO truth header (anti-enumeration)", hdr)
 		}
 	})
 

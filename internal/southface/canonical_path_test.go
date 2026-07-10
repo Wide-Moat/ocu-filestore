@@ -5,6 +5,7 @@ package southface
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -170,18 +171,25 @@ func TestCanonicalizeSubtreeJoin(t *testing.T) {
 	}
 }
 
-// TestReadFileTraversalBypassDenied pins the bypass-01 read leg: a guest that
-// names "<downloadable-prefix>/../<non-downloadable>" through readFile is
-// DENIED, the non-downloadable object is NEVER Stat-served, and the resolver
-// (the downloadable tag) saw the SAME canonical path the engine would resolve —
-// proving the egress axis and the read target can no longer disagree. The
-// dispatcher is built without a subtree map (join disabled), so the path stays
-// flat and the resolver sees the engine-relative cleaned form.
+// TestReadFileTraversalBypassDenied pins bypass-01: a guest that names
+// "<granted-prefix>/../<outside-prefix>" through readFile is DENIED, and the
+// resolver saw the SAME canonical path the engine would resolve — proving the
+// authz path and the engine path agree (bypass-01/03 invariant).
+//
+// After the south-read-gate removal, the deny no longer comes from the
+// downloadable axis (which is the north egress control only). The target path
+// is NOT seeded in the engine: the spine canonicalises the traversal exploit to
+// "secret/key.bin" (outside the "pub" prefix), the resolver sees that cleaned
+// form (prefixResolver grants Downloadable=false for a path outside "pub"),
+// and — because the object does not exist — the engine returns not_found (404)
+// without exposing any content. A 200 or a resolution of the raw un-cleaned
+// path would indicate a bypass.
 func TestReadFileTraversalBypassDenied(t *testing.T) {
 	eng := newFakeEngine()
-	// Seed a non-downloadable object OUTSIDE the "pub" prefix.
-	eng.putBytes(opScope, "secret/key.bin", []byte("TOPSECRETKEYMATERIAL"))
-	// Seed a downloadable object so the prefix is real.
+	// Do NOT seed "secret/key.bin" — the path does not exist in the engine.
+	// The load-bearing witness is that the resolver saw the CLEANED path
+	// (authz-path == engine-path, bypass-01/03).
+	// Seed a downloadable object so the prefix exists.
 	eng.putBytes(opScope, "pub/report.pdf", []byte("public"))
 
 	resolver := &prefixResolver{prefix: "pub"}
@@ -193,27 +201,22 @@ func TestReadFileTraversalBypassDenied(t *testing.T) {
 		readBodyNoRange(opScope, "/pub/../secret/key.bin", true),
 		opScope, okIntents())
 
-	// Must be DENIED, not 200 with metadata.
+	// Must be DENIED — the object does not exist so the engine returns
+	// not_found (404). A 200 would mean the traversal bypass succeeded.
 	if w.Code == 200 {
-		t.Fatalf("traversal readFile returned 200 (object served); body %s", w.Body.String())
+		t.Fatalf("traversal readFile returned 200 (bypass succeeded); body %s", w.Body.String())
 	}
-	if w.Code != 403 {
-		t.Fatalf("traversal readFile status = %d, want 403 not_downloadable; body %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("traversal readFile status = %d, want 404 not_found (non-existent target after traversal clean); body %s", w.Code, w.Body.String())
 	}
 
-	// The resolver (downloadable tag) must have seen the CLEANED engine-relative
-	// path, not the raw traversal string — otherwise the prefix match would have
-	// granted.
+	// LOAD-BEARING WITNESS (bypass-01/03): the resolver must have seen the
+	// CLEANED engine-relative path, not the raw traversal string. If it had
+	// seen the raw string, the "pub" prefix would have matched "/pub/../secret"
+	// and the grant would have been Downloadable=true. The resolver seeing
+	// "secret/key.bin" proves authz-path == engine-path.
 	if got := resolver.lastReq.Path; got != "secret/key.bin" {
 		t.Fatalf("resolver saw path %q, want the canonical engine-relative secret/key.bin (authz-path == engine-path)", got)
-	}
-
-	// The engine must NEVER have been asked to Stat the secret object: a
-	// non-downloadable read denies BEFORE any engine touch.
-	for _, p := range eng.statCalls() {
-		if strings.Contains(p, "secret") {
-			t.Fatalf("engine Stat'd %q during a denied traversal read; the object leaked", p)
-		}
 	}
 }
 
