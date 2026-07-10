@@ -351,7 +351,7 @@ func TestComponentScaffoldWriteSucceedsWithNoManualSeeding(t *testing.T) {
 	defer up.Body.Close()
 	if up.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(up.Body)
-		t.Fatalf("fileUpload (no manual seeding) status = %d, want 200 — " +
+		t.Fatalf("fileUpload (no manual seeding) status = %d, want 200 — "+
 			"scaffold loop did NOT seed outputs/ marker; body: %s", up.StatusCode, b)
 	}
 	// Confirm the object landed in MinIO under the write subtree.
