@@ -14,12 +14,13 @@ import (
 	"testing"
 )
 
-// TestLocalEngine_CrashRestartEraseAtProvision pins the SEC-54 crash path
-// (T1-10): a daemon that crashed mid-session never ran TeardownScope, so the
-// scope directory is dirty when the restarted daemon provisions it again.
-// ProvisionScope on an existing scope ERASES it first — the prior session's
-// bytes read fs.ErrNotExist after the re-provision, never re-served.
-func TestLocalEngine_CrashRestartEraseAtProvision(t *testing.T) {
+// TestLocalEngine_CrashRestartPreservesOwnerData pins the create-if-absent
+// crash path (T1-10): a daemon that crashed mid-session never ran
+// TeardownScope, so the scope directory is dirty when the restarted daemon
+// provisions it again. ProvisionScope on an existing scope PRESERVES owner
+// data — the prior session's bytes must still Stat OK and be readable after
+// re-provision, so the owner is never evicted by a process restart.
+func TestLocalEngine_CrashRestartPreservesOwnerData(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	scope := ScopeID("fs-crash-01")
@@ -45,19 +46,13 @@ func TestLocalEngine_CrashRestartEraseAtProvision(t *testing.T) {
 		t.Fatalf("ProvisionScope (restart): %v", err)
 	}
 
+	// Owner data SURVIVES re-provision — a process restart must not evict data.
 	for _, p := range []string{"secret.bin", "d", "d/deep.bin"} {
-		if _, err := restarted.Stat(ctx, scope, p); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("Stat(%q after crash re-provision) = %v, want fs.ErrNotExist (SEC-54)", p, err)
+		if _, err := restarted.Stat(ctx, scope, p); err != nil {
+			t.Fatalf("Stat(%q after crash re-provision) = %v, want still present (owner data must survive)", p, err)
 		}
 	}
-	entries, err := restarted.List(ctx, scope, ".")
-	if err != nil {
-		t.Fatalf("List(. after crash re-provision): %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("List(. after crash re-provision) = %+v, want empty", entries)
-	}
-	// The re-provisioned scope serves fresh writes.
+	// The re-provisioned scope also serves fresh writes.
 	if err := restarted.WriteStream(ctx, scope, "fresh.bin", bytes.NewReader([]byte("FRESH")), false); err != nil {
 		t.Fatalf("WriteStream after re-provision: %v", err)
 	}

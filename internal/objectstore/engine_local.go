@@ -150,15 +150,19 @@ func toFileInfo(fi os.FileInfo) FileInfo {
 	}
 }
 
-// ProvisionScope prepares baseDir/<scope> at session grant — ERASE-AT-
-// PROVISION (SEC-54 crash path, mirroring the s3 engine): a scope directory
-// left behind by a daemon that crashed mid-session (its TeardownScope never
-// ran) is erased before serving, so a restart never re-serves prior-session
-// bytes. The same sweep removes any orphaned partial write in the staging
-// area, which is then recreated empty. A symlinked or non-directory scope
-// entry refuses BEFORE any removal, exactly as in TeardownScope (T-03-05).
-// OpenScopeRoot refuses an absent directory, so this must run before any
-// data verb on a fresh scope.
+// ProvisionScope prepares baseDir/<scope> at session grant: it creates the
+// scope directory if absent (create-if-absent, idempotent) and sweeps only
+// the staging sub-directory so any orphaned partial write left by a crashed
+// daemon is removed without touching owner data. A symlinked or non-directory
+// scope entry refuses BEFORE any modification, exactly as in TeardownScope
+// (T-03-05). OpenScopeRoot refuses an absent directory, so this must run
+// before any data verb on a fresh scope.
+//
+// Owner data already in the scope is never erased here. Erase-before-reuse
+// is the responsibility of the caller that holds an explicit owner-change
+// grant (TeardownScope, called on an owner-change signal, never on process
+// lifecycle). Sweeping only staging preserves the SEC-54 orphan-clearance
+// invariant without evicting a live owner on restart.
 func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -177,8 +181,11 @@ func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) e
 		if !info.IsDir() {
 			return fmt.Errorf("%w: scope %q", ErrNotADirectory, scope)
 		}
-		if err := removeAllCtx(ctx, scopePath); err != nil {
-			return fmt.Errorf("objectstore: erase scope %q at provision: %w", scope, err)
+		// Scope exists: sweep ONLY the staging area (orphaned partial writes
+		// from a crashed daemon). Owner data at the scope root is untouched.
+		stagingPath := filepath.Join(scopePath, stagingDirName)
+		if err := removeAllCtx(ctx, stagingPath); err != nil {
+			return fmt.Errorf("objectstore: sweep staging area for %q at provision: %w", scope, err)
 		}
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("objectstore: lstat scope %q: %w", scope, err)
