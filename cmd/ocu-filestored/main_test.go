@@ -180,11 +180,12 @@ func TestComposeTinyOpsBucketServes(t *testing.T) {
 	}
 }
 
-// TestComposeCrashRestartErasesScope pins the T1-10/SEC-54 crash path at the
+// TestComposeCrashRestartPreservesOwnerData pins the T1-10 crash path at the
 // composition level: a daemon that crashed mid-session (no Close, so no
 // TeardownScope) leaves a dirty scope; the NEXT composition's ProvisionScope
-// erases it, so the restarted daemon never re-serves prior-session bytes.
-func TestComposeCrashRestartErasesScope(t *testing.T) {
+// must NOT erase it — owner data survives a process restart. Erase-before-reuse
+// is owner-change-driven (TeardownScope), never process-lifecycle-driven.
+func TestComposeCrashRestartPreservesOwnerData(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	srv1, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
 	if err != nil {
@@ -204,8 +205,9 @@ func TestComposeCrashRestartErasesScope(t *testing.T) {
 		t.Fatalf("compose (restart): %v", err)
 	}
 	defer srv2.Close()
-	if _, err := os.Stat(prior); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("prior-session file after restart provision: stat err = %v, want erased (SEC-54)", err)
+	// Owner data SURVIVES the crash-restart re-provision.
+	if _, err := os.Stat(prior); err != nil {
+		t.Fatalf("prior-session file after restart provision: stat err = %v, want still present (owner data must survive)", err)
 	}
 }
 

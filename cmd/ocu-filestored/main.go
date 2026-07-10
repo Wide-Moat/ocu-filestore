@@ -34,6 +34,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1421,9 +1422,8 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		Clock:                time.Now,
 	})
 
-	// Erase-before-reuse: provision the scope's storage at grant on the real
-	// engine directly (lifecycle is not a consumer-seam verb). TeardownScope
-	// runs on Close (NFR-SEC-54).
+	// Provision = ensure-scaffold-if-absent, idempotent, does NOT erase;
+	// erase is owner-change-driven (TeardownScope), never boot-driven.
 	scope := objectstore.ScopeID(cfg.filesystemID)
 	provisionCtx, cancelProvision := context.WithTimeout(context.Background(), provisionTimeout)
 	defer cancelProvision()
@@ -1431,14 +1431,42 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		return nil, err
 	}
 
+	// Seed subtree dir-markers after provision (idempotent scaffold). The engine
+	// stays subtree-agnostic; compose supplies the list via the SubtreeMap. The
+	// loop collects the distinct non-empty For() values across the three intent
+	// axes, then calls MakeDir for each, treating ErrExist as success (idempotent:
+	// a restart re-provisions without erasing and this loop is a no-op).
+	// Approach (a): engine.MakeDir is the tested path; no engine-interface change.
+	{
+		// Collect distinct non-empty subtree values from the three intent axes and
+		// seed a dir-marker for each (idempotent: ErrExist is treated as success).
+		// A zero-value SubtreeMap has no non-empty For() values and the loop is a
+		// no-op; a configured map yields at most two distinct subtrees (read and
+		// preview share "uploads" under the default). The engine stays subtree-
+		// agnostic; compose supplies the subtree list via the SubtreeMap (approach a).
+		seen := make(map[string]struct{})
+		for _, intent := range []southface.Intent{southface.IntentWrite, southface.IntentRead, southface.IntentPreview} {
+			sub := cfg.subtrees.For(intent)
+			if sub == "" {
+				continue
+			}
+			if _, dup := seen[sub]; dup {
+				continue
+			}
+			seen[sub] = struct{}{}
+			if err := eng.MakeDir(provisionCtx, scope, sub); err != nil && !errors.Is(err, fs.ErrExist) {
+				return nil, fmt.Errorf("scaffold subtree %q: %w", sub, err)
+			}
+		}
+	}
+
 	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
 	// post-provision step fails before ownership passes to teardownServer
 	// (whose Close runs TeardownScope), compose returns nil,err WITHOUT a
-	// closer for that scope — the erase-before-reuse contract would be left
-	// to the next ProvisionScope, but the dirty scope persists meanwhile.
-	// This deferred rollback erases the just-provisioned scope on every
-	// post-provision error path, bounded by teardownTimeout, and is disarmed
-	// (committed = true) only once the teardownServer takes ownership.
+	// closer for that scope — the dirty scope persists meanwhile. This deferred
+	// rollback releases resources on every post-provision error path, bounded by
+	// teardownTimeout, and is disarmed (committed = true) only once the
+	// teardownServer takes ownership.
 	committed := false
 	defer func() {
 		if committed {

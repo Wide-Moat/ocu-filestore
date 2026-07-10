@@ -424,6 +424,36 @@ func TestS3Live_ProvisionScaffold_ParentExists(t *testing.T) {
 	}
 }
 
+// TestS3Live_OwnerDataPreservedOnReProvision (N2-s3) pins that ProvisionScope
+// is safe to call on an already-provisioned, live scope: owner bytes written
+// via the engine API survive a second ProvisionScope call and remain readable.
+// S3 prefixes are virtual so ProvisionScope is always a no-op; this test
+// documents the contract and would catch any regression that re-introduces an
+// erase on the provision path.
+func TestS3Live_OwnerDataPreservedOnReProvision(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	if err := e.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (first): %v", err)
+	}
+	if err := e.WriteStream(ctx, scope, "owner.bin", bytes.NewReader([]byte("OWNER")), false); err != nil {
+		t.Fatalf("WriteStream (owner): %v", err)
+	}
+
+	// Re-provision must not touch owner data.
+	if err := e.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (second): %v", err)
+	}
+	fi, err := e.Stat(ctx, scope, "owner.bin")
+	if err != nil {
+		t.Fatalf("Stat(owner.bin) after re-provision = %v, want still present", err)
+	}
+	if fi.Size != int64(len("OWNER")) {
+		t.Fatalf("owner.bin size after re-provision = %d, want %d", fi.Size, len("OWNER"))
+	}
+}
+
 // TestS3Live_EraseScope_PlainBucket drives the shared erase sweep on the plain
 // (non-versioned) bucket directly: keys and an in-progress MPU under the scope
 // are both gone after eraseScope, exercising the non-versioned branch

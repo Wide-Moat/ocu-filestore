@@ -318,3 +318,45 @@ func TestComponentMutatingOpsAgainstMinIO(t *testing.T) {
 		assertObjectAbsent(t, mc, fileKey)
 	})
 }
+
+// TestComponentScaffoldWriteSucceedsWithNoManualSeeding (N5) pins the compose
+// scaffold guarantee: after a cold boot against a FRESH empty bucket, a
+// write-intent mount write to the outputs/ subtree MUST succeed WITHOUT any
+// prior manual makeDirectory call. The compose boot must seed the outputs/ and
+// uploads/ dir-markers via the idempotent scaffold loop so the s3 engine's
+// parentExists passes on the first real write.
+//
+// Without the scaffold loop the s3 engine refuses the write (parentExists on
+// the outputs/ marker returns false), so this test is RED on the pre-fix
+// binary. After the scaffold loop lands it turns GREEN.
+func TestComponentScaffoldWriteSucceedsWithNoManualSeeding(t *testing.T) {
+	requireComposeIT(t)
+
+	certDir := t.TempDir()
+	pool := generateSouthCert(t, certDir)
+	composeUp(t, certDir)
+
+	cl := southClient(pool)
+	mc := minioClient()
+
+	// Write-intent upload into the outputs/ subtree, NO prior makeDirectory.
+	// The broker's scaffold loop must have already seeded the outputs/ marker.
+	payload := []byte("scaffold-probe")
+	up := uploadMultipart(t, cl, map[string]any{
+		"filesystem_id":          itScope,
+		"path":                   "/scaffold-probe.bin",
+		"declared_size_bytes":    len(payload),
+		"authorization_metadata": authMeta("write"),
+	}, payload)
+	defer up.Body.Close()
+	if up.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(up.Body)
+		t.Fatalf("fileUpload (no manual seeding) status = %d, want 200 — " +
+			"scaffold loop did NOT seed outputs/ marker; body: %s", up.StatusCode, b)
+	}
+	// Confirm the object landed in MinIO under the write subtree.
+	key := itScope + "/outputs/scaffold-probe.bin"
+	if got := getObjectBytes(t, mc, key); !bytes.Equal(got, payload) {
+		t.Fatalf("MinIO %q = %q, want %q", key, got, payload)
+	}
+}

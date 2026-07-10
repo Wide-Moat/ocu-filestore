@@ -45,6 +45,45 @@ func TestProvisionScope_DirtyScopePreserved(t *testing.T) {
 	}
 }
 
+// TestProvisionScope_OwnerDataPreservedOnReProvision (N2-local) pins that
+// ProvisionScope is safe to call on an already-provisioned, live scope:
+// owner bytes written via the engine API survive a second ProvisionScope call
+// and remain readable. Only the staging area is swept; the owner's files are
+// never touched.
+func TestProvisionScope_OwnerDataPreservedOnReProvision(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	eng := NewLocalVolumeEngine(base)
+	scope := ScopeID("reprovision")
+
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (first): %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
+		t.Fatalf("WriteStream (owner): %v", err)
+	}
+	if err := eng.MakeDir(ctx, scope, "subdir"); err != nil {
+		t.Fatalf("MakeDir (subdir): %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "subdir/deep.bin", strings.NewReader("DEEP"), false); err != nil {
+		t.Fatalf("WriteStream (deep): %v", err)
+	}
+
+	// Re-provision: must be idempotent, never evict owner data.
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (second): %v", err)
+	}
+	for _, p := range []string{"owner.bin", "subdir", "subdir/deep.bin"} {
+		if _, err := eng.Stat(ctx, scope, p); err != nil {
+			t.Fatalf("Stat(%q) after re-provision = %v, want still present", p, err)
+		}
+	}
+	var b strings.Builder
+	if err := eng.ReadRange(ctx, scope, "owner.bin", 0, 16, &b); err != nil || b.String() != "OWNER" {
+		t.Fatalf("ReadRange(owner.bin) = %q, %v; want OWNER", b.String(), err)
+	}
+}
+
 // TestProvisionScope_SymlinkRefused pins the T-03-05 guard on the PROVISION
 // path (the teardown twin is already pinned): a symlinked scope entry is
 // refused with ErrInvalidPath before any RemoveAll, and the link target's
