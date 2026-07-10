@@ -1762,36 +1762,34 @@ func TestS3Live_Teardown_BatchOver1000(t *testing.T) {
 	}
 }
 
-// TestS3Live_ProvisionErasesDirty pins erase-at-provision: a dirty prefix
-// left by a crashed prior session is erased before serving, and the freshly
-// provisioned scope then serves normally.
-func TestS3Live_ProvisionErasesDirty(t *testing.T) {
+// TestS3Live_ProvisionPreservesDirtyPrefix pins create-if-absent semantics:
+// a dirty prefix left by a crashed prior session is NOT erased by ProvisionScope
+// — its keys survive. The provisioned scope still serves fresh writes normally.
+// Erase-before-reuse belongs to TeardownScope (owner-change verb only).
+func TestS3Live_ProvisionPreservesDirtyPrefix(t *testing.T) {
 	e, scope := liveS3Engine(t)
 	ctx := context.Background()
 	prefix := string(scope) + "/"
 
-	// A crashed prior session's leavings: stray keys AND an orphaned MPU.
+	// A crashed prior session's leavings: stray keys.
 	liveSeed(t, e, prefix+"stale.bin", []byte("stale bytes"))
 	liveSeed(t, e, prefix+"stale-dir/", nil)
 	liveSeed(t, e, prefix+"stale-dir/child.txt", []byte("child"))
-	if _, err := e.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(e.bucket), Key: aws.String(prefix + "stale-mpu.bin"),
-	}); err != nil {
-		t.Fatalf("CreateMultipartUpload(stale): %v", err)
+	priorCount := liveKeyCount(t, e, scope)
+	if priorCount == 0 {
+		t.Fatal("seed failed: no keys present before ProvisionScope")
 	}
 
 	if err := e.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
 
-	if got := liveKeyCount(t, e, scope); got != 0 {
-		t.Fatalf("raw key count after provision = %d, want 0 (dirty prefix served)", got)
-	}
-	if got := liveMPUCount(t, e, scope); got != 0 {
-		t.Fatalf("MPU count after provision = %d, want 0", got)
+	// Owner keys SURVIVE — provision must not erase the prefix.
+	if got := liveKeyCount(t, e, scope); got < priorCount {
+		t.Fatalf("raw key count after provision = %d, want >= %d (owner data must survive)", got, priorCount)
 	}
 
-	// The provisioned scope serves: write -> read round-trip.
+	// The provisioned scope also serves fresh writes.
 	if err := e.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("fresh")), false); err != nil {
 		t.Fatalf("WriteStream(fresh after provision): %v", err)
 	}

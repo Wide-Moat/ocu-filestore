@@ -167,12 +167,14 @@ type Engine interface {
 	// Kind names the engine.
 	Kind() EngineKind
 
-	// ProvisionScope creates the scope's storage at session grant; it must
-	// run before any data verb on a fresh scope.
+	// ProvisionScope ensures the scope's storage scaffold exists at session
+	// grant (create-if-absent, idempotent). It does NOT erase owner data; it
+	// must run before any data verb on a fresh scope.
 	ProvisionScope(ctx context.Context, scope ScopeID) error
-	// TeardownScope erases ALL contents of the named scope before re-grant
-	// — erase-before-reuse (NFR-SEC-54). After it returns, no path written
-	// in the prior session is readable.
+	// TeardownScope erases ALL contents of the named scope — erase-before-reuse
+	// (NFR-SEC-54). After it returns, no path written in the prior session is
+	// readable. Callers: explicit owner-change grant only, never process
+	// lifecycle (shutdown, restart, or composition failure).
 	TeardownScope(ctx context.Context, scope ScopeID) error
 
 	// List returns the entries of the named directory, ONE level only

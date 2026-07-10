@@ -14,11 +14,11 @@ import (
 	"testing"
 )
 
-// TestProvisionScope_DirtyScopeErased pins the erase-before-reuse branch of
+// TestProvisionScope_DirtyScopePreserved pins the create-if-absent branch of
 // ProvisionScope: an existing scope directory left dirty by a prior session is
-// fully erased and recreated empty before the engine serves it, and the
-// freshly provisioned scope serves a normal write.
-func TestProvisionScope_DirtyScopeErased(t *testing.T) {
+// NOT erased — its contents survive re-provision. ProvisionScope only ensures
+// the directory exists and the staging area is reset; it never touches owner data.
+func TestProvisionScope_DirtyScopePreserved(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	eng := NewLocalVolumeEngine(base)
@@ -35,13 +35,52 @@ func TestProvisionScope_DirtyScopeErased(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope over dirty: %v", err)
 	}
-	// The prior tree is gone.
-	if _, err := os.Stat(filepath.Join(scopeDir, "old")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("stale subtree after provision = %v, want gone (erase-before-reuse)", err)
+	// The prior tree SURVIVES — owner data is never erased at provision.
+	if _, err := os.Stat(filepath.Join(scopeDir, "old", "stale.txt")); err != nil {
+		t.Fatalf("stale.txt after provision = %v, want still present (owner data must survive)", err)
 	}
-	// The freshly provisioned scope serves a normal write.
+	// The provisioned scope still serves a normal write.
 	if err := eng.WriteStream(ctx, scope, "fresh.txt", strings.NewReader("fresh"), false); err != nil {
 		t.Fatalf("WriteStream after provision: %v", err)
+	}
+}
+
+// TestProvisionScope_OwnerDataPreservedOnReProvision (N2-local) pins that
+// ProvisionScope is safe to call on an already-provisioned, live scope:
+// owner bytes written via the engine API survive a second ProvisionScope call
+// and remain readable. Only the staging area is swept; the owner's files are
+// never touched.
+func TestProvisionScope_OwnerDataPreservedOnReProvision(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	eng := NewLocalVolumeEngine(base)
+	scope := ScopeID("reprovision")
+
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (first): %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
+		t.Fatalf("WriteStream (owner): %v", err)
+	}
+	if err := eng.MakeDir(ctx, scope, "subdir"); err != nil {
+		t.Fatalf("MakeDir (subdir): %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "subdir/deep.bin", strings.NewReader("DEEP"), false); err != nil {
+		t.Fatalf("WriteStream (deep): %v", err)
+	}
+
+	// Re-provision: must be idempotent, never evict owner data.
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (second): %v", err)
+	}
+	for _, p := range []string{"owner.bin", "subdir", "subdir/deep.bin"} {
+		if _, err := eng.Stat(ctx, scope, p); err != nil {
+			t.Fatalf("Stat(%q) after re-provision = %v, want still present", p, err)
+		}
+	}
+	var b strings.Builder
+	if err := eng.ReadRange(ctx, scope, "owner.bin", 0, 16, &b); err != nil || b.String() != "OWNER" {
+		t.Fatalf("ReadRange(owner.bin) = %q, %v; want OWNER", b.String(), err)
 	}
 }
 
