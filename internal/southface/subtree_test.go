@@ -4,6 +4,7 @@
 package southface
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -489,18 +490,18 @@ func TestDispatch_ListReAddressRoundTrip(t *testing.T) {
 			// LEG 2 (uuid re-address): fileDownload of the LISTED uuid resolves the
 			// JOINED store object (Option A: the uuid keys the joined form, so the
 			// download's empty-subtree re-canon reaches the real engine object at
-			// "uploads/..."). It is DENIED 403 not_downloadable because uploads/ is
-			// not a configured downloadable prefix — a human->sandbox input is
-			// readable-in-session but not egress-eligible (the exfil-bar). The
-			// load-bearing point HERE is that the uuid resolves to the RIGHT object:
-			// a mis-keyed uuid (stripped form) would 404 not_found — a different
-			// class — so a 403 not_downloadable proves the store keyed the joined form.
+			// "uploads/..."). After the south-gate removal, the south byte-stream is
+			// an in-session read and streams ANY object regardless of the downloadable
+			// flag — so the download returns 200 + the raw bytes. The load-bearing
+			// point is that the uuid resolves to the RIGHT object and the bytes match:
+			// a mis-keyed uuid (stripped form) would 404 not_found; a correct key
+			// returns 200 + exact content, proving the store keyed the joined form.
 			dl := serveDownload(t, d, scope, listedUUID, nil, scope, okIntents())
-			if dl.Code != 403 {
-				t.Fatalf("download of the listed uuid status = %d, want 403 not_downloadable (a 404 would mean the uuid mis-keyed the object); body %s", dl.Code, dl.Body.String())
+			if dl.Code != http.StatusOK {
+				t.Fatalf("download of the listed uuid status = %d, want 200 in-session read (a 404 would mean the uuid mis-keyed the object); body %s", dl.Code, dl.Body.String())
 			}
-			if r := dl.Header().Get("x-deny-reason"); r != "not_downloadable" {
-				t.Fatalf("download deny reason = %q, want not_downloadable (a not_found reason would mean the uuid keyed the wrong object)", r)
+			if !bytes.Equal(dl.Body.Bytes(), tc.content) {
+				t.Fatalf("download of listed uuid returned wrong bytes: got %q, want %q (uuid keyed the wrong object?)", dl.Body.Bytes(), tc.content)
 			}
 		})
 	}

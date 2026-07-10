@@ -33,7 +33,6 @@ import (
 // session-scoped objectIDStore, the CROSS-SCOPE degrade (a uuid that resolves to
 // a foreign scope -> 404 on the wire (anti-enumeration) but scope_mismatch as the
 // AUDIT truth), canonicalizePath, the Resolve(read-intent) authz, the
-// downloadable-at-read check from the broker-resolved grant (NFR-SEC-73), the
 // nil-range -> engine.Stat whole-object size probe, the negative-offset/length
 // reject, audit-before-ack via Guard.Mandate (audit-down denies before any byte),
 // and the fd ceiling (acquire/release on every exit). Only the TRANSPORT edges
@@ -43,6 +42,14 @@ import (
 // ResponseWriter (flushed as it goes; NO base64, NO framing). A mid-stream engine
 // error after the 200 header just terminates the stream (logged; the status
 // cannot be changed).
+//
+// SOUTH BYTE-STREAM IS NOT AN EGRESS OPERATION. The downloadable axis
+// (NFR-SEC-73) is a NORTH egress control that gates minting an egress artifact
+// on the north /content endpoint (internal/filesapi). The south fileDownload is
+// an in-session byte-stream read: a non-downloadable object MUST be streamable
+// in-session so the guest (e.g., ocufs cat) can read any object regardless of
+// its north egress eligibility. The downloadable gate lives exclusively on the
+// north egress listener.
 //
 // Unlike the retired Connect path, NO HTTP 200 is committed until the read
 // window is resolved, the grant cleared, and the ALLOW Mandate landed: every
@@ -275,13 +282,6 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		denyDownload(denyClassForErr(err), "authorization denied")
 
-		return
-	}
-
-	// --- DOWNLOADABLE@READ, broker-side (NFR-SEC-73, A2) ---
-	// The grant is the broker-resolved truth; the wire flag is never consulted.
-	if !grant.Downloadable {
-		denyDownload(denyNotDownloadable, "object not downloadable")
 		return
 	}
 
