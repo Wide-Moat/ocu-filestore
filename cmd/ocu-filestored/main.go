@@ -1608,8 +1608,9 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	}
 
 	// Ownership of the provisioned scope now passes to teardownServer. Disarm
-	// the rollback latch (FILESTORED-11) so the deferred TeardownScope above
-	// does not erase a live scope on the error path.
+	// the rollback latch (FILESTORED-11) so the deferred handle-store fd-release
+	// above does not run on the live path. The rollback is release-only and never
+	// erases the scope — erase is the owner-change verb, not a lifecycle action.
 	committed = true
 
 	// Fan the south listener and the optional north Files-API listener into one
