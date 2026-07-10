@@ -419,11 +419,13 @@ func TestComponentRoundTripOverTLSToMinIO(t *testing.T) {
 		t.Fatalf("MinIO object %q bytes = %q, want the uploaded payload %q", wantKey, inBucket, payload)
 	}
 
-	// READ/EGRESS LEG: seed an object DIRECTLY under uploads/ (the human->sandbox
-	// input) with the independent client, read-list finds it, and fileDownload is
-	// denied 403 not_downloadable — uploads/ is not a configured downloadable
-	// prefix, so a human input is readable-in-session but not egress-eligible (the
-	// exfil-bar). Non-vacuous: a broken split would 200.
+	// READ/IN-SESSION LEG: seed an object DIRECTLY under uploads/ (a human->sandbox
+	// input) with the independent client. Read-list finds it; south fileDownload
+	// returns 200 + the raw bytes — uploads/ is a read-plane (in-session) subtree
+	// so the bytes are streamable in-session. The south byte-stream is NOT the
+	// egress boundary: the north /content endpoint (filesapi) is the sole exfil-bar
+	// (NFR-SEC-73). The write-leg disjointness (write->outputs/, read->uploads/)
+	// keeps ADR-0029 isolated; the north egress tests cover the downloadable gate.
 	if _, err := mc.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(minioBucket), Key: aws.String(itScope + "/uploads/"), Body: bytes.NewReader(nil),
 	}); err != nil {
@@ -446,11 +448,15 @@ func TestComponentRoundTripOverTLSToMinIO(t *testing.T) {
 		"authorization_metadata": map[string]any{"intent": "read", "downloadable": true},
 	})
 	defer dl.Body.Close()
-	if dl.StatusCode != http.StatusForbidden {
+	if dl.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(dl.Body)
-		t.Fatalf("fileDownload of an uploads/ input status = %d, want 403 (exfil-bar); body %s", dl.StatusCode, b)
+		t.Fatalf("fileDownload of an uploads/ input status = %d, want 200 (in-session read); body %s", dl.StatusCode, b)
 	}
-	if r := dl.Header.Get("x-deny-reason"); r != "not_downloadable" {
-		t.Fatalf("fileDownload 403 x-deny-reason = %q, want not_downloadable", r)
+	got, err := io.ReadAll(dl.Body)
+	if err != nil {
+		t.Fatalf("read fileDownload body: %v", err)
+	}
+	if !bytes.Equal(got, seed) {
+		t.Fatalf("fileDownload body = %q, want seeded bytes %q", got, seed)
 	}
 }
