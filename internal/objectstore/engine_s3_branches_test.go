@@ -382,6 +382,48 @@ func TestS3Live_KeyAndDirExists(t *testing.T) {
 	}
 }
 
+// TestS3Live_ProvisionScaffold_ParentExists verifies that ProvisionScope is
+// idempotent and does NOT erase existing dir-markers: after seeding subtree
+// markers via MakeDir and then calling ProvisionScope a second time, the
+// markers must still be visible via parentExists and WriteStream into the
+// subtree must succeed. This pins the create-if-absent guarantee — a second
+// provision must never wipe markers seeded by the first pass.
+func TestS3Live_ProvisionScaffold_ParentExists(t *testing.T) {
+	e, scope := liveS3Engine(t)
+	ctx := context.Background()
+
+	// First provision: ensures the scope's virtual prefix exists.
+	if err := e.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (first): %v", err)
+	}
+	// Seed the subtree dir-markers (the compose scaffold step plants these).
+	if err := e.MakeDir(ctx, scope, "outputs"); err != nil {
+		t.Fatalf("MakeDir(outputs): %v", err)
+	}
+	if err := e.MakeDir(ctx, scope, "uploads"); err != nil {
+		t.Fatalf("MakeDir(uploads): %v", err)
+	}
+
+	// Second provision (restart simulation): MUST NOT erase the markers.
+	if err := e.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope (second): %v", err)
+	}
+
+	// Markers must survive: parentExists returns true for children of each subtree.
+	pfx := string(scope) + "/"
+	if ok, err := e.parentExists(ctx, pfx+"outputs/x"); err != nil || !ok {
+		t.Fatalf("parentExists(outputs/x) after re-provision = %v, %v; want true (marker survived)", ok, err)
+	}
+	if ok, err := e.parentExists(ctx, pfx+"uploads/x"); err != nil || !ok {
+		t.Fatalf("parentExists(uploads/x) after re-provision = %v, %v; want true (marker survived)", ok, err)
+	}
+
+	// WriteStream into the outputs subtree must succeed without manual re-seeding.
+	if err := e.WriteStream(ctx, scope, "outputs/probe.bin", bytes.NewReader([]byte("probe")), false); err != nil {
+		t.Fatalf("WriteStream(outputs/probe.bin) after re-provision: %v", err)
+	}
+}
+
 // TestS3Live_EraseScope_PlainBucket drives the shared erase sweep on the plain
 // (non-versioned) bucket directly: keys and an in-progress MPU under the scope
 // are both gone after eraseScope, exercising the non-versioned branch

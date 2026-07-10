@@ -374,12 +374,18 @@ func mapS3Err(verb string, err error) error {
 
 func (e *s3Engine) Kind() EngineKind { return S3 }
 
-// ProvisionScope is erase-at-provision: a dirty prefix left by a crashed
-// prior session is erased before serving (the provision-side analogue of
-// erase-before-reuse, SEC-54). Prefixes are virtual — after the sweep there
-// is nothing to create.
+// ProvisionScope is create-if-absent for the S3 engine: S3 prefixes are
+// virtual (no directory object to create), so provision validates the scope
+// ID and returns nil. Callers: compose scaffold loop seeds subtree dir-markers
+// after provision via MakeDir (approach a); the engine stays subtree-agnostic.
+// Erase-before-reuse is the responsibility of TeardownScope, called only on an
+// explicit owner-change grant — never on process lifecycle.
 func (e *s3Engine) ProvisionScope(ctx context.Context, scope ScopeID) error {
-	return e.eraseScope(ctx, scope)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := e.scopePrefix(scope)
+	return err
 }
 
 // TeardownScope erases EVERY byte under the scope prefix (SEC-54): on a
