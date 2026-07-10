@@ -202,22 +202,40 @@ func s3RTRoundTrip(t *testing.T, cl *http.Client, baseURL, scope, bucket, endpoi
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Scope objects now PERSIST across composes (owner data survives every process
+	// lifecycle — erase is owner-change-only), so this round-trip must clean its own
+	// MUTABLE objects up front to stay idempotent instead of relying on a boot erase.
+	// Only the golden.bin object this test writes is removed; the scaffold-seeded
+	// outputs/ and uploads/ dir-markers are left intact (they are the boot invariant
+	// this test asserts, not test-created state). Delete-before is best-effort: a
+	// missing key is not an error.
+	for _, mutable := range []string{scope + "/outputs/golden.bin", scope + "/uploads/seed.bin"} {
+		_, _ = mc.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(mutable)})
+	}
+
 	// WRITE LEG: fileUpload (intent=write) lands under outputs/. The s3 engine
 	// refuses a write whose parent prefix is absent (parentExists -> ErrNotExist),
-	// so create the write-subtree root first: makeDirectory "/" (intent=write)
-	// joins to "outputs/" and lays down the parent marker. Then upload targets
-	// "/golden.bin", which the join prepends to "outputs/golden.bin". The real
-	// backend key is "<scope>/outputs/golden.bin"; an independent MinIO GetObject
-	// proves the write landed there byte-exact — and NOT under uploads/, so the
-	// write axis cannot reach the read-only input.
+	// so the write-subtree root must already exist. Under the boot scaffold the
+	// compose layer seeds the outputs/ (and uploads/) dir-markers at provision, so
+	// makeDirectory "/" (intent=write, joins to "outputs/") finds the marker
+	// ALREADY present and denies already_exists (409). Asserting 409 here — not
+	// "200 or 409" — is the scaffold invariant made observable: on the retired
+	// erase-at-provision semantics the scope booted empty, this makeDirectory would
+	// have CREATED the marker and returned 200, so a 409 assertion would be RED.
+	// The upload that follows targeting "/golden.bin" (join -> "outputs/golden.bin")
+	// then landing 200 is the paired non-vacuous half: it only succeeds because the
+	// outputs/ parent the scaffold seeded truly exists (parentExists passes). The
+	// real backend key is "<scope>/outputs/golden.bin"; an independent MinIO
+	// GetObject proves the write landed there byte-exact — and NOT under uploads/,
+	// so the write axis cannot reach the read-only input.
 	mkRoot := s3RTPostJSON(t, cl, baseURL, "makeDirectory", map[string]any{
 		"filesystem_id":          scope,
 		"path":                   "/",
 		"authorization_metadata": map[string]any{"intent": "write", "downloadable": false},
 	})
 	mkRoot.Body.Close()
-	if mkRoot.StatusCode != http.StatusOK {
-		t.Fatalf("makeDirectory / (write->outputs root) status = %d, want 200", mkRoot.StatusCode)
+	if mkRoot.StatusCode != http.StatusConflict {
+		t.Fatalf("makeDirectory / (write->outputs root, scaffold-seeded) status = %d, want 409 already_exists", mkRoot.StatusCode)
 	}
 	const uploadGuestPath = "/golden.bin"
 	payload := []byte("ABCDEFGH\x00\x01\x02 binary-safe composed-daemon live payload")
