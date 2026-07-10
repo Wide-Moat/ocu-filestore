@@ -485,7 +485,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		denyOp(mapDeny(denyInternal), "no required intent bound to operation")
 		return
 	}
-	subtree := d.subtrees.For(requiredIntent)
+	subtree := d.subtrees.For(joinIntentFor(ps.GrantedIntents, requiredIntent))
 	// Close the per-request residual bypass (ADR-0029 "never bypass it"): when the
 	// join is ENABLED (a populated map — the shipped posture, which Serve enforces
 	// at boot), an intent with no mapped subtree must DENY rather than degrade this
@@ -496,7 +496,7 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// empty map on the shipped path (ErrSubtreeDisabled), so this branch is never
 	// reached in production.
 	if d.subtrees.enabled() && subtree == "" {
-		denyOp(mapDeny(denyInternal), "no subtree bound to the operation's intent")
+		denyOp(mapDeny(denyInternal), "no subtree bound to the join intent")
 		return
 	}
 
@@ -504,10 +504,16 @@ func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// joined under the intent's subtree (ADR-0029 inv-10). Nothing trusts the body
 	// before STAGE 1b; now that the channel-scope cross-check has cleared, clean
 	// the path a SINGLE time so authz, the downloadable tag, the engine, the uuid
-	// store, and the audit record all see the SAME object. The subtree is derived
-	// from the ROUTE-OP-required intent (never the wire), so a write op joins under
-	// the RW subtree and a read op under the RO subtree — the ":ro" posture is
-	// engine-enforced by the join, not a guest-mount artifact. This is an additive
+	// store, and the audit record all see the SAME object. The subtree is keyed on the
+	// CREDENTIAL's claim when the grant names exactly one intent (ADR-0029: "the
+	// join input is the credential's claim") - the per-mount credential the
+	// intent-keyed exchange yields - so EVERY op of a write-credential request,
+	// reads included, resolves under its own outputs/ subtree and the writer
+	// lists its own files. A multi-intent grant (the interim static single-tenant
+	// bind, deployment config rather than per-request metadata) keeps the
+	// route-op derivation. Never the wire hint in either mode; the ":ro" posture
+	// is engine-enforced by the read-credential's uploads/ join plus the
+	// resolver's no-write-lease rule (NFR-SEC-49), not a guest-mount artifact. This is an additive
 	// step WITHIN the boundary — the LOCKED STAGE 0->4 order is unchanged — and it
 	// runs BEFORE STAGE 2 so a `<downloadable-prefix>/../<private>` wire path can
 	// never have its egress axis decided on the raw bytes while a different object

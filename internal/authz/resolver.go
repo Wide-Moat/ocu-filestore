@@ -118,6 +118,14 @@ func intentGranted(grants []Intent, intent Intent) bool {
 		if g == intent {
 			return true
 		}
+		// A write grant subsumes read-class ops: an RW mount must stat, list,
+		// and read the subtree it writes, and the credential-claim join confines
+		// every such read to the write subtree itself. The reverse never holds -
+		// read and preview carry no write lease (NFR-SEC-49) - and no grant
+		// subsumes preview (the render axis stays explicitly granted).
+		if g == IntentWrite && intent == IntentRead {
+			return true
+		}
 	}
 	return false
 }
