@@ -661,11 +661,11 @@ func runCtx(ctx context.Context, args []string) error {
 // serveUntilSignal serves srv until either Serve returns on its own (a
 // listener fault), SIGTERM/SIGINT arrives, or parent is cancelled. On a signal
 // or a parent cancellation the session begins its bounded drain (southface
-// force-closes stragglers past the bound) and teardown ALWAYS runs —
-// TeardownScope erase-before-reuse plus socket removal (NFR-SEC-54): a clean
-// stop must never skip the erase. Every exit path combines the serve and close
-// results with errors.Join, so a teardown error is never silently dropped
-// behind a serve error (or vice versa).
+// force-closes stragglers past the bound) then Close drains, releases ceilings,
+// and closes the handle-store fd. Close does NOT erase the scope — shutdown is
+// not an owner-change event. Every exit path combines the serve and close
+// results with errors.Join, so a close error is never silently dropped behind
+// a serve error (or vice versa).
 //
 // parent is the caller's stop context. The signal context is derived from it,
 // so cancelling parent drives the same clean-drain path as an OS signal. In
@@ -1612,9 +1612,9 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		telemetry.RegisterOpsListenerHealthHandlers(opsListener, probes)
 	}
 
-	// Ownership of the provisioned scope now passes to teardownServer, whose
-	// Close runs TeardownScope. Disarm the rollback latch (FILESTORED-11) so
-	// the deferred erase above does not double-tear-down a live scope.
+	// Ownership of the provisioned scope now passes to teardownServer. Disarm
+	// the rollback latch (FILESTORED-11) so the deferred TeardownScope above
+	// does not erase a live scope on the error path.
 	committed = true
 
 	// Fan the south listener and the optional north Files-API listener into one
@@ -1622,27 +1622,27 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// A nil north degrades the dualServer to south-only.
 	fanned := newDualServer(srv, north)
 
-	// Wrap the server so Close also tears down the scope (erase-before-reuse)
-	// and releases the per-session ceilings (NFR-SEC-54).
+	// Wrap the server so Close drains the session, releases the per-session
+	// ceilings, and closes the handle-store fd — all without touching the scope
+	// on disk. TeardownScope is the owner-change verb (callers: explicit grant
+	// only, never process lifecycle); Close does NOT call it.
 	return &teardownServer{
 		Server:      fanned,
-		engine:      eng,
 		ceiling:     reg,
-		scope:       scope,
 		fsid:        cfg.filesystemID,
 		handleStore: hStore,
 	}, nil
 }
 
-// teardownServer wraps the per-session south-face Server so Close also runs
-// the scope erase-before-reuse (engine.TeardownScope, NFR-SEC-54) and releases
-// the per-session ceilings entry. The southface session's own Close already
-// releases the registry binding and unlinks the socket.
+// teardownServer wraps the per-session south-face Server so Close also drains
+// in-flight requests, releases the per-session ceilings entry, and closes the
+// durable handle-store descriptor. It does NOT erase the scope on Close —
+// erase-before-reuse (TeardownScope) is owner-change-driven, never triggered
+// by process shutdown. The southface session's own Close releases the registry
+// binding and unlinks the socket.
 type teardownServer struct {
 	southface.Server
-	engine  objectstore.Engine
 	ceiling *ceilings.Registry
-	scope   objectstore.ScopeID
 	fsid    string
 	// handleStore is the durable file_id handle store opened in compose, or nil
 	// when --handle-store was empty. Close releases its descriptor; every acked
@@ -1650,16 +1650,13 @@ type teardownServer struct {
 	handleStore *handlestore.DiskStore
 }
 
-// Close shuts the session down, erases the scope (erase-before-reuse), and
-// releases the per-session ceilings. TeardownScope runs UNCONDITIONALLY —
-// a session-close failure never skips the erase — and both errors surface
-// via errors.Join: a teardown error is never silently dropped behind a
-// session-close error (NFR-SEC-54).
+// Close drains in-flight requests, releases the per-session ceilings, and
+// closes the durable handle-store fd. It does NOT call TeardownScope — process
+// shutdown is not an owner-change event; a clean stop must not evict the
+// owner's data. All errors surface via errors.Join so no failure is silently
+// dropped behind another.
 func (t *teardownServer) Close() error {
 	closeErr := t.Server.Close()
-	teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), teardownTimeout)
-	defer cancelTeardown()
-	teardownErr := t.engine.TeardownScope(teardownCtx, t.scope)
 	t.ceiling.Release(ceilings.SessionKey(t.fsid))
 	// Release the durable handle-store descriptor (no-op when unconfigured).
 	// Every acked record is already fsynced, so closing loses no durable data;
@@ -1668,5 +1665,5 @@ func (t *teardownServer) Close() error {
 	if t.handleStore != nil {
 		handleStoreErr = t.handleStore.Close()
 	}
-	return errors.Join(closeErr, teardownErr, handleStoreErr)
+	return errors.Join(closeErr, handleStoreErr)
 }
