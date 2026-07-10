@@ -205,8 +205,8 @@ func (s stubEngine) RemoveFile(context.Context, objectstore.ScopeID, string) err
 func (s stubEngine) ReadRange(context.Context, objectstore.ScopeID, string, int64, int64, io.Writer) error {
 	return s.err
 }
-func (s stubEngine) WriteStream(context.Context, objectstore.ScopeID, string, io.Reader, bool) error {
-	return s.err
+func (s stubEngine) WriteStream(context.Context, objectstore.ScopeID, string, io.Reader, bool) (string, error) {
+	return "", s.err
 }
 
 // TestEngineAdapterRemapsTypedSentinels feeds each engine error class through
@@ -407,7 +407,7 @@ func TestEngineAdapterRealLocalVerbs(t *testing.T) {
 
 	// --- WriteStream + Stat --------------------------------------------------
 	content := []byte("hello delegation")
-	if err := a.WriteStream(ctx, scope, "greet.txt", strings.NewReader(string(content)), false); err != nil {
+	if _, err := a.WriteStream(ctx, scope, "greet.txt", strings.NewReader(string(content)), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	fi, err := a.Stat(ctx, scope, "greet.txt")

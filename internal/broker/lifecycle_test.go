@@ -6,6 +6,8 @@ package broker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"os"
@@ -39,7 +41,7 @@ func TestE2EEraseBeforeReuse(t *testing.T) {
 		t.Fatalf("ProvisionScope A: %v", err)
 	}
 	payload := []byte("TOPSECRET")
-	if err := eng.WriteStream(ctx, scope, path, bytes.NewReader(payload), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, path, bytes.NewReader(payload), false); err != nil {
 		t.Fatalf("WriteStream A: %v", err)
 	}
 	// Confirm it is readable in session A.
@@ -92,8 +94,16 @@ func TestE2EEraseThroughEngineAdapter(t *testing.T) {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
 	adapter := NewEngine(realEng)
-	if err := adapter.WriteStream(ctx, scope, path, strings.NewReader("DATA"), false); err != nil {
+	digest, err := adapter.WriteStream(ctx, scope, path, strings.NewReader("DATA"), false)
+	if err != nil {
 		t.Fatalf("adapter.WriteStream: %v", err)
+	}
+	// The adapter threads the real local engine's single-pass content digest (D6)
+	// through unchanged - assert it equals the precomputed hex SHA-256 of "DATA"
+	// (a live-engine leg, not a stub echo).
+	sum := sha256.Sum256([]byte("DATA"))
+	if want := hex.EncodeToString(sum[:]); digest != want {
+		t.Fatalf("adapter.WriteStream digest = %q, want the content sha256 %q", digest, want)
 	}
 	if err := realEng.TeardownScope(ctx, sid); err != nil {
 		t.Fatalf("TeardownScope: %v", err)

@@ -21,6 +21,8 @@ package filesapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -202,6 +204,22 @@ func TestFilesAPIRealS3EngineRoundTrip(t *testing.T) {
 
 	// CREATE — north multipart upload through the real engine into MinIO.
 	fileID := reCreate(t, srv, guestPath, payload)
+
+	// D6 CONTENT-HASH - the north list surfaces the engine-computed content
+	// SHA-256 as the FileObject sha256, read from the durable record (no per-object
+	// backend HEAD/tag lookup at list time). It equals the precomputed hex digest of
+	// the exact uploaded bytes - the live-S3 leg of the content-hash keystone.
+	wantSha := hex.EncodeToString(func() []byte { s := sha256.Sum256(payload); return s[:] }())
+	reList1 := reList(t, srv)
+	var gotSha string
+	for _, fo := range reList1 {
+		if fo.ID == fileID {
+			gotSha = fo.Sha256
+		}
+	}
+	if gotSha != wantSha {
+		t.Fatalf("list FileObject sha256 = %q, want the content hash %q of the uploaded bytes", gotSha, wantSha)
+	}
 
 	// CONTENT — north read returns the EXACT bytes back through the real engine.
 	cresp, err := srv.Client().Get(srv.URL + "/v1/files/" + fileID + "/content")
@@ -509,7 +527,7 @@ func reSeedEngineObject(t *testing.T, ctx context.Context, engine southface.Engi
 	if err := southface.EnsureDir(ctx, engine, reScope, subtree); err != nil {
 		t.Fatalf("EnsureDir(%s): %v", subtree, err)
 	}
-	if err := engine.WriteStream(ctx, reScope, engPath, bytes.NewReader(body), true); err != nil {
+	if _, err := engine.WriteStream(ctx, reScope, engPath, bytes.NewReader(body), true); err != nil {
 		t.Fatalf("WriteStream(%s): %v", engPath, err)
 	}
 }

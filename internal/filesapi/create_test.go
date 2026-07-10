@@ -6,6 +6,8 @@ package filesapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -98,7 +100,7 @@ func (e *createEngine) parentExists(key string) bool {
 	return e.dirs[key[:i]]
 }
 
-func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, overwrite bool) error {
+func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, overwrite bool) (string, error) {
 	e.mu.Lock()
 	e.writeCalls++
 	e.callLog = append(e.callLog, "write:"+path)
@@ -112,13 +114,13 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	// upload succeed without its subtree marker.
 	if !e.parentExists(path) {
 		e.mu.Unlock()
-		return &fs.PathError{Op: "write", Path: path, Err: fs.ErrNotExist}
+		return "", &fs.PathError{Op: "write", Path: path, Err: fs.ErrNotExist}
 	}
 	// already-exists: refuse WITHOUT consuming r, exactly as the real engine does
 	// on a create-new against an existing object.
 	if e.alreadyExist && !overwrite {
 		e.mu.Unlock()
-		return southface.ErrAlreadyExists
+		return "", southface.ErrAlreadyExists
 	}
 	e.mu.Unlock()
 
@@ -134,10 +136,10 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	e.bytesRead += len(buf)
 	e.mu.Unlock()
 	if rerr != nil {
-		return rerr
+		return "", rerr
 	}
 	if e.writeErr != nil {
-		return e.writeErr
+		return "", e.writeErr
 	}
 
 	e.mu.Lock()
@@ -145,7 +147,10 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	e.committed++
 	e.lastPath = path
 	e.bytesByPath[path] = buf
-	return nil
+	// Return the single-pass content digest the real engines compute (D6): only on
+	// a SUCCESSFUL commit, so an aborted write returns "" alongside its error.
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // seedDir marks a directory (and every ancestor level) as pre-existing, standing
@@ -214,6 +219,9 @@ func (s *createStore) Put(_ context.Context, in handlestore.PutInput) (handlesto
 		Mime:      in.Mime,
 		Size:      in.Size,
 		CreatedAt: "2026-01-01T00:00:00Z",
+		// Mirror the real DiskStore.Put: the record carries the create-time content
+		// digest so the response/list FileObject surfaces it (D6).
+		Sha256: in.Sha256,
 	}, nil
 }
 

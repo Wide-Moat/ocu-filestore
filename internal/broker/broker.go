@@ -253,8 +253,9 @@ func (a engineAdapter) ReadRange(ctx context.Context, scope, path string, offset
 	return mapEngineErr(a.e.ReadRange(ctx, objectstore.ScopeID(scope), path, offset, length, w))
 }
 
-func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) error {
-	return mapEngineErr(a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite))
+func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) (string, error) {
+	digest, err := a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite)
+	return digest, mapEngineErr(err)
 }
 
 func toSouthfaceFileInfo(fi objectstore.FileInfo) southface.FileInfo {

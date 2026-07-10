@@ -300,7 +300,11 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 		// and sends on writeErrCh. The engine's temp+rename atomicity guarantees
 		// no torn object is visible.
 		defer recoverWriteStream(pr, writeErrCh)
-		werr := d.engine.WriteStream(r.Context(), ps.FilesystemID, enginePath(params.Path), pr, params.OverwriteExisting)
+		// The south upload writes bytes into the guest's mount but mints NO north
+		// file_id (no handle record), so the engine's content digest (D6) has no
+		// record to land on here - discard it. The north Files-API create path is
+		// the leg that threads the digest into a durable handle.
+		_, werr := d.engine.WriteStream(r.Context(), ps.FilesystemID, enginePath(params.Path), pr, params.OverwriteExisting)
 		// Close the read end with the engine's error so a producer pw.Write
 		// blocked on a reader that returned early (e.g. WriteStream refused
 		// already_exists WITHOUT consuming r) unblocks immediately with that error

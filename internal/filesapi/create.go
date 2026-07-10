@@ -256,20 +256,25 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// overwrite_existing defaults to false when absent (JSON zero value),
 	// preserving create-new behaviour for any sender that omits it. ---
 	pr, pw := io.Pipe()
-	writeErrCh := make(chan error, 1)
+	// writeErrCh carries the engine's WriteStream outcome: the error AND, on
+	// success, the content SHA-256 the engine computed in its single write pass
+	// (D6, PARITY-LEDGER-147). The digest is read ONLY on the success path (after
+	// the half-close), so the abort receives discard it; the record Put threads it
+	// northward.
+	writeErrCh := make(chan writeResult, 1)
 	go func() {
 		// Panic containment: on a panic in WriteStream, recoverCreateWriteStream
 		// closes pr with the internal sentinel (unblocking any producer pw.Write)
 		// and sends on writeErrCh. The engine's temp+rename atomicity guarantees no
 		// torn object is visible.
 		defer recoverCreateWriteStream(pr, writeErrCh)
-		werr := h.deps.Engine.WriteStream(r.Context(), ps.FilesystemID, engineRef, pr, params.OverwriteExisting)
+		digest, werr := h.deps.Engine.WriteStream(r.Context(), ps.FilesystemID, engineRef, pr, params.OverwriteExisting)
 		// Close the read end with the engine's error so a producer pw.Write blocked
 		// on a reader that returned early (e.g. WriteStream refused already_exists
 		// WITHOUT consuming r) unblocks immediately with that error instead of
 		// deadlocking on the unread pipe.
 		pr.CloseWithError(werr)
-		writeErrCh <- werr
+		writeErrCh <- writeResult{digest: digest, err: werr}
 	}()
 
 	// Stream the raw file part into the engine pipe in ceiling-bounded reads,
@@ -303,8 +308,8 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 			if _, werr := pw.Write(chunk); werr != nil {
 				// The pipe write failed: the engine rejected (e.g. already_exists)
 				// WITHOUT consuming r. Drain the engine error and map it.
-				engErr := <-writeErrCh
-				denyCreate(denyClassForEngineErr(engErr), "upload refused")
+				engRes := <-writeErrCh
+				denyCreate(denyClassForEngineErr(engRes.err), "upload refused")
 				return
 			}
 		}
@@ -335,9 +340,9 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// Commit: closing the pipe writer signals EOF; WriteStream's temp+rename makes
 	// the object visible only now.
 	pw.Close()
-	werr := <-writeErrCh
-	if werr != nil {
-		denyCreate(denyClassForEngineErr(werr), "upload refused")
+	writeRes := <-writeErrCh
+	if writeRes.err != nil {
+		denyCreate(denyClassForEngineErr(writeRes.err), "upload refused")
 		return
 	}
 
@@ -360,6 +365,10 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 		Filename:  createFilename(params, engineRef),
 		Mime:      params.MediaType,
 		Size:      declared,
+		// Sha256 is the engine's single-pass content digest (D6): the record
+		// carries it so the north list surfaces it for upload-client content
+		// dedup. Empty when the engine returned no digest - the compat window.
+		Sha256: writeRes.digest,
 	})
 	if perr != nil {
 		// The bytes are durable but the handle did not land. A latched store is a
@@ -618,18 +627,29 @@ func hasURLScheme(s string) bool {
 	return i+2 < len(s) && s[i] == ':' && s[i+1] == '/' && s[i+2] == '/'
 }
 
+// writeResult is the outcome the WriteStream pipe goroutine sends on writeErrCh:
+// the engine error and, on success, the content SHA-256 the engine computed in
+// its single write pass (D6, PARITY-LEDGER-147). On any error path (engine
+// refusal, abort, panic) the digest is empty and only err is consumed; the
+// success path threads the digest into the durable handle record.
+type writeResult struct {
+	digest string
+	err    error
+}
+
 // recoverCreateWriteStream is the panic-containment wrapper for the WriteStream
 // pipe goroutine. On a panic it closes the pipe reader with the internal
 // sentinel (unblocking a producer pw.Write blocked on the reader) and sends the
 // sentinel on writeErrCh so the handler drains and aborts. The engine's
 // temp+rename atomicity guarantees an aborted WriteStream writes nothing to the
-// namespace. It is a north-local mirror of the south recoverWriteStream.
-func recoverCreateWriteStream(pr *io.PipeReader, writeErrCh chan<- error) {
+// namespace. It is a north-local mirror of the south recoverWriteStream. The
+// digest is empty on a panic (no successful write occurred).
+func recoverCreateWriteStream(pr *io.PipeReader, writeErrCh chan<- writeResult) {
 	if v := recover(); v == nil {
 		return
 	}
 	pr.CloseWithError(errCreateInternalPanic)
-	writeErrCh <- errCreateInternalPanic
+	writeErrCh <- writeResult{err: errCreateInternalPanic}
 }
 
 // denyClassForResolveErr names the deny class for a Resolver seam sentinel,

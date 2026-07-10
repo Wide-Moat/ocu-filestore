@@ -163,8 +163,12 @@ func (e *fakeEngine) ReadRange(_ context.Context, _ string, path string, offset,
 	return err
 }
 
-func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) error {
-	return nil
+func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) (string, error) {
+	// The base fake is a read/delete-plane double: its WriteStream is a no-op that
+	// ignores the reader, so it computes no content digest (D6). The create-plane
+	// doubles (createEngine / recordingEngine) that consume the reader return a
+	// real single-pass digest.
+	return "", nil
 }
 
 // fakeSession is a programmable ceilings session: each Try* call consults its

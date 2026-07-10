@@ -72,6 +72,15 @@ type Record struct {
 	// Its concrete meaning is deferred (Q2) — this phase stores and replays it
 	// verbatim without interpreting it.
 	DownloadablePolicyRef string `json:"downloadable_policy_ref"`
+	// Sha256 is the lowercase-hex SHA-256 of the stored object's content
+	// (D6, PARITY-LEDGER-147). The storage engine computes it in the single
+	// write pass and the create path records it here; the north list surfaces
+	// it so an upload client dedups by content - an edited same-size file has a
+	// new digest and is re-uploaded. It is APPEND-ONLY at the tail of this
+	// record (never reordered) so replay of a pre-D6 log still unmarshals: a
+	// record written before this field existed replays with Sha256 == "" and
+	// stays valid.
+	Sha256 string `json:"sha256"`
 }
 
 // AuditObjectHandle returns the value that populates OCSF
@@ -100,6 +109,10 @@ type PutInput struct {
 	// DownloadablePolicyRef is the opaque downloadable-policy reference (Q2
 	// deferred — not a boolean; see Record.DownloadablePolicyRef).
 	DownloadablePolicyRef string
+	// Sha256 is the lowercase-hex SHA-256 the engine computed for the written
+	// bytes (D6). Empty when the caller has no digest to record; the store
+	// replays an empty digest verbatim (the compat window).
+	Sha256 string
 }
 
 // EnsureInput is the caller-supplied content of a mint-on-first-sight put. It

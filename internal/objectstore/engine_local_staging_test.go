@@ -30,13 +30,13 @@ func TestLocalEngine_CrashRestartPreservesOwnerData(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope (session one): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "secret.bin", bytes.NewReader([]byte("PRIORSESSION")), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "secret.bin", bytes.NewReader([]byte("PRIORSESSION")), false); err != nil {
 		t.Fatalf("WriteStream (session one): %v", err)
 	}
 	if err := eng.MakeDir(ctx, scope, "d"); err != nil {
 		t.Fatalf("MakeDir (session one): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "d/deep.bin", bytes.NewReader([]byte("DEEP")), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "d/deep.bin", bytes.NewReader([]byte("DEEP")), false); err != nil {
 		t.Fatalf("WriteStream deep (session one): %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestLocalEngine_CrashRestartPreservesOwnerData(t *testing.T) {
 		}
 	}
 	// The re-provisioned scope also serves fresh writes.
-	if err := restarted.WriteStream(ctx, scope, "fresh.bin", bytes.NewReader([]byte("FRESH")), false); err != nil {
+	if _, err := restarted.WriteStream(ctx, scope, "fresh.bin", bytes.NewReader([]byte("FRESH")), false); err != nil {
 		t.Fatalf("WriteStream after re-provision: %v", err)
 	}
 }
@@ -102,7 +102,7 @@ func TestLocalEngine_StagingInvisibleToGuest(t *testing.T) {
 	eng, base, scope := newLocalEngine(t)
 
 	// A write exercises the staging area for real.
-	if err := eng.WriteStream(ctx, scope, "visible.txt", strings.NewReader("guest bytes"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "visible.txt", strings.NewReader("guest bytes"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 
@@ -136,7 +136,8 @@ func TestLocalEngine_StagingInvisibleToGuest(t *testing.T) {
 		{"StatChild", func() error { _, err := eng.Stat(ctx, scope, stagedPath); return err }},
 		{"MakeDir", func() error { return eng.MakeDir(ctx, scope, stagingDirName+"/evil") }},
 		{"WriteStream", func() error {
-			return eng.WriteStream(ctx, scope, stagedPath, strings.NewReader("x"), true)
+			_, err := eng.WriteStream(ctx, scope, stagedPath, strings.NewReader("x"), true)
+			return err
 		}},
 		{"ReadRange", func() error { return eng.ReadRange(ctx, scope, stagedPath, 0, 1, &sink) }},
 		{"RemoveFile", func() error { return eng.RemoveFile(ctx, scope, stagedPath) }},
@@ -164,7 +165,7 @@ func TestLocalEngine_StagingInvisibleToGuest(t *testing.T) {
 	if err := eng.MakeDir(ctx, scope, nested); err != nil {
 		t.Fatalf("MakeDir(%q) = %v, want nil (only the root name is reserved)", nested, err)
 	}
-	if err := eng.WriteStream(ctx, scope, nested+"/f.txt", strings.NewReader("ok"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, nested+"/f.txt", strings.NewReader("ok"), false); err != nil {
 		t.Fatalf("WriteStream(%q/f.txt) = %v, want nil", nested, err)
 	}
 }
@@ -183,13 +184,13 @@ func TestLocalEngine_TeardownScope_SweepsPopulatedScope(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("A")), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("A")), false); err != nil {
 		t.Fatalf("WriteStream(a.txt): %v", err)
 	}
 	if err := eng.MakeDir(ctx, scope, "sub"); err != nil {
 		t.Fatalf("MakeDir(sub): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "sub/b.txt", bytes.NewReader([]byte("B")), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "sub/b.txt", bytes.NewReader([]byte("B")), false); err != nil {
 		t.Fatalf("WriteStream(sub/b.txt): %v", err)
 	}
 
@@ -215,7 +216,7 @@ func TestLocalEngine_TeardownScope_SweepsPopulatedScope(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope after teardown: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("FRESH")), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("FRESH")), false); err != nil {
 		t.Fatalf("WriteStream after re-provision: %v", err)
 	}
 	// Confirm scope root sees exactly the one fresh file.
@@ -237,7 +238,7 @@ func TestLocalEngine_TeardownLeavesScopeFullyEmpty(t *testing.T) {
 	ctx := context.Background()
 	eng, base, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "f.txt", strings.NewReader("x"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "f.txt", strings.NewReader("x"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.TeardownScope(ctx, scope); err != nil {
@@ -257,7 +258,7 @@ func TestLocalEngine_TeardownLeavesScopeFullyEmpty(t *testing.T) {
 
 	// Defensive on-demand restore: a write straight after teardown (no
 	// re-provision) recreates the staging area and succeeds.
-	if err := eng.WriteStream(ctx, scope, "g.txt", strings.NewReader("y"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "g.txt", strings.NewReader("y"), false); err != nil {
 		t.Fatalf("WriteStream after teardown (on-demand staging) = %v, want nil", err)
 	}
 }
