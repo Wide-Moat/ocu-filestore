@@ -169,6 +169,66 @@ func TestLocalEngine_StagingInvisibleToGuest(t *testing.T) {
 	}
 }
 
+// TestLocalEngine_TeardownScope_SweepsPopulatedScope (N1) is the local-engine
+// parity of TestS3Live_EraseScope_PlainBucket: provision, write files and a
+// subdir, call TeardownScope directly, assert the scope is empty (List(".")
+// len 0, prior paths fs.ErrNotExist), then re-provision and confirm a fresh
+// write succeeds. This pins TeardownScope as the owner-change erase verb.
+func TestLocalEngine_TeardownScope_SweepsPopulatedScope(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	eng := NewLocalVolumeEngine(base)
+	scope := ScopeID("teardown-sweep")
+
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope: %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("A")), false); err != nil {
+		t.Fatalf("WriteStream(a.txt): %v", err)
+	}
+	if err := eng.MakeDir(ctx, scope, "sub"); err != nil {
+		t.Fatalf("MakeDir(sub): %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "sub/b.txt", bytes.NewReader([]byte("B")), false); err != nil {
+		t.Fatalf("WriteStream(sub/b.txt): %v", err)
+	}
+
+	if err := eng.TeardownScope(ctx, scope); err != nil {
+		t.Fatalf("TeardownScope: %v", err)
+	}
+
+	// Scope is empty — all prior paths ErrNotExist.
+	for _, p := range []string{"a.txt", "sub", "sub/b.txt"} {
+		if _, err := eng.Stat(ctx, scope, p); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Stat(%q) after TeardownScope = %v, want fs.ErrNotExist", p, err)
+		}
+	}
+	entries, err := eng.List(ctx, scope, ".")
+	if err != nil {
+		t.Fatalf("List(.) after TeardownScope: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("List(.) after TeardownScope = %+v, want empty", entries)
+	}
+
+	// Re-provision and a fresh write succeed.
+	if err := eng.ProvisionScope(ctx, scope); err != nil {
+		t.Fatalf("ProvisionScope after teardown: %v", err)
+	}
+	if err := eng.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("FRESH")), false); err != nil {
+		t.Fatalf("WriteStream after re-provision: %v", err)
+	}
+	// Confirm scope root sees exactly the one fresh file.
+	entries, err = eng.List(ctx, scope, ".")
+	if err != nil {
+		t.Fatalf("List(.) after re-provision: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "fresh.txt" {
+		t.Fatalf("List(.) after re-provision = %+v, want [fresh.txt]", entries)
+	}
+
+}
+
 // TestLocalEngine_TeardownLeavesScopeFullyEmpty pins the stop-path shape the
 // live e2e asserts: after TeardownScope the scope directory exists and holds
 // NOTHING — not even the staging area (it is restored on demand by the next

@@ -396,6 +396,7 @@ func (e *s3Engine) ProvisionScope(ctx context.Context, scope ScopeID) error {
 // aborts every orphaned in-progress multipart upload under the prefix. A
 // versioned bucket whose version listing is denied REFUSES with a typed
 // error — never a clean report while bytes remain.
+// Callers: explicit owner-change grant only, never process lifecycle.
 func (e *s3Engine) TeardownScope(ctx context.Context, scope ScopeID) error {
 	return e.eraseScope(ctx, scope)
 }

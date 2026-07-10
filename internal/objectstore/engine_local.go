@@ -203,6 +203,7 @@ func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) e
 // TeardownScope erases ALL contents of the scope directory and recreates it
 // empty — erase-before-reuse (NFR-SEC-54): after it returns, a re-grant of
 // the same filesystem_id reads fs.ErrNotExist for every prior path.
+// Callers: explicit owner-change grant only, never process lifecycle.
 //
 // SEC-54 boundary: this is an OS-level remove+recreate, NOT a cryptographic
 // erase — the substrate is operator disk and freed blocks may persist until
