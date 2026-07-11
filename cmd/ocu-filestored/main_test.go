@@ -649,6 +649,72 @@ func TestRunMissingRequiredFlags(t *testing.T) {
 	}
 }
 
+// TestRunVerifyStorageJWTGate pins the GA Wave 1 fail-closed gate: setting
+// -verify-storage-jwt REQUIRES -storage-jwks-path/-storage-jwt-issuer/
+// -storage-jwt-audience and a readable non-empty JWKS file; any absent companion
+// or unreadable JWKS refuses at run BEFORE any socket is bound. A complete set
+// with a real JWKS is accepted through the gate (it fails later on the fake TLS
+// cert, NOT on the gate: proving the gate itself admits a well-formed config).
+func TestRunVerifyStorageJWTGate(t *testing.T) {
+	root := shortDir(t)
+	certFile, keyFile := testTLSCertPaths(t)
+	base := []string{
+		"--engine-root", root,
+		"--audit-sink", filepath.Join(root, "audit.jsonl"),
+		"--south-bind", freeLoopbackAddr(t),
+		"--tls-cert", certFile,
+		"--tls-key", keyFile,
+		"--filesystem-id", "fs1",
+		"--broker-max-file-size", "1024",
+	}
+	jwksPath := filepath.Join(root, "jwks.json")
+	if err := os.WriteFile(jwksPath, []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","use":"sig","alg":"EdDSA","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}`), 0o600); err != nil {
+		t.Fatalf("write jwks: %v", err)
+	}
+	emptyJWKS := filepath.Join(root, "empty.json")
+	if err := os.WriteFile(emptyJWKS, nil, 0o600); err != nil {
+		t.Fatalf("write empty jwks: %v", err)
+	}
+	full := []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"missing_jwks_path", []string{"--verify-storage-jwt", "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
+		{"missing_issuer", []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-audience", "aud"}},
+		{"missing_audience", []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss"}},
+		{"unreadable_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", filepath.Join(root, "nope.json"), "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
+		{"empty_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", emptyJWKS, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := run(append(append([]string{}, base...), tc.args...))
+			if !errors.Is(err, errMissingRequiredFlag) {
+				t.Fatalf("run(%s): got %v, want errMissingRequiredFlag", tc.name, err)
+			}
+		})
+	}
+
+	// A complete, well-formed set passes the gate: run under a context cancelled
+	// immediately so the serve loop drains at once. The returned error must NOT be
+	// the missing-flag gate, proving the gate admitted the well-formed config and
+	// the daemon proceeded to compose/serve.
+	t.Run("complete_set_passes_gate", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		runErr := make(chan error, 1)
+		go func() { runErr <- runCtx(ctx, append(append([]string{}, base...), full...)) }()
+		cancel()
+		select {
+		case err := <-runErr:
+			if errors.Is(err, errMissingRequiredFlag) {
+				t.Fatalf("gate refused a well-formed verify config: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("runCtx did not return within 10s of context cancellation")
+		}
+	})
+}
+
 // TestValidateOpsCeilingPlumbing pins the operator-tunable throttle plumbing:
 // the ops token-bucket values land in brokerConfig unchanged, and omitting
 // the flags yields the shelf defaults (100 ops/s, 200-token burst) with no
