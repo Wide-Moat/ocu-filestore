@@ -122,6 +122,8 @@ func auditTruthForEngineErr(err error) string {
 		// The client supplied a negative read range — request fault; audited
 		// as malformed (matches the wire class: no truth/wire split needed).
 		return denyMalformed
+	case errors.Is(err, errForeignScope):
+		return denyScopeMismatch // engine confinement: a scope with no title
 	case errors.Is(err, errInvalidPath), isPathEscape(err):
 		return denyScopeMismatch // escape truth: a path leaving the bound scope
 	default:
