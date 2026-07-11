@@ -44,15 +44,25 @@ type lazyProvisionEngine struct {
 	// marker MakeDir loop). It is the SAME helper the boot path calls, bound
 	// to the wrapped engine and the boot marker list by the compose site.
 	scaffold func(ctx context.Context, scope ScopeID) error
-	// done records scopes already scaffolded so the scaffold runs at most once
-	// per scope; a sync.Once per scope makes concurrent first-touches converge
-	// on a single scaffold call.
-	mu   sync.Mutex
-	once map[ScopeID]*sync.Once
-	// scaffoldErr records the (terminal) error of a scope's single scaffold
-	// attempt so a later touch surfaces the same failure instead of silently
-	// delegating to a wrapped verb that would fault again.
-	scaffoldErr map[ScopeID]error
+	// state tracks per-scope scaffold progress. Only SUCCESS is memoized: a
+	// failed attempt (a transient backend refusal such as a storage-full 5xx
+	// mapped to ErrTransient, or a canceled caller context) fails THAT
+	// caller's verb and leaves the scope un-scaffolded, so the next touch
+	// retries. Memoizing a failure would wedge the scope until process
+	// restart while the backend condition it names is recoverable. The
+	// per-scope mutex serializes attempts, so concurrent first-touches
+	// converge on a single scaffold call and a retry can never stampede: at
+	// most one attempt is in flight per scope, and attempts are paced by the
+	// data-verb rate.
+	mu    sync.Mutex
+	state map[ScopeID]*scaffoldState
+}
+
+// scaffoldState is one scope's scaffold progress: attempt serializes
+// attempts, done latches on the first success.
+type scaffoldState struct {
+	attempt sync.Mutex
+	done    bool
 }
 
 // NewLazyProvisionEngine wraps eng so the FIRST data verb per UNSEEN,
@@ -63,12 +73,11 @@ type lazyProvisionEngine struct {
 // straight through (fail-closed: the wrapped engine refuses it as today).
 func NewLazyProvisionEngine(eng Engine, bootBase string, scaffold func(ctx context.Context, scope ScopeID) error) Engine {
 	return &lazyProvisionEngine{
-		Engine:      eng,
-		shapeRe:     regexp.MustCompile("^" + regexp.QuoteMeta(bootBase) + "-[0-9a-f]{16}$"),
-		bootBase:    bootBase,
-		scaffold:    scaffold,
-		once:        make(map[ScopeID]*sync.Once),
-		scaffoldErr: make(map[ScopeID]error),
+		Engine:   eng,
+		shapeRe:  regexp.MustCompile("^" + regexp.QuoteMeta(bootBase) + "-[0-9a-f]{16}$"),
+		bootBase: bootBase,
+		scaffold: scaffold,
+		state:    make(map[ScopeID]*scaffoldState),
 	}
 }
 
@@ -80,34 +89,36 @@ func (e *lazyProvisionEngine) derivedLegal(scope ScopeID) bool {
 	return s == e.bootBase || e.shapeRe.MatchString(s)
 }
 
-// ensureScaffold scaffolds a derived-legal scope's markers at most once. It is
-// a no-op for a scope that is not derived-legal (fail-closed: the caller then
-// delegates to the wrapped engine, which refuses the scope as today). Under
-// concurrent first-touches the sync.Once converges on a single scaffold call;
-// every caller observes that call's terminal error.
+// ensureScaffold scaffolds a derived-legal scope's markers, memoizing SUCCESS
+// only. It is a no-op for a scope that is not derived-legal (fail-closed: the
+// caller then delegates to the wrapped engine, which refuses the scope as
+// today). Under concurrent first-touches the per-scope mutex serializes
+// attempts: the winner scaffolds, the waiters observe its success without a
+// second call. A failed attempt is returned to its caller and NOT recorded,
+// so the next touch retries — a transient backend refusal or a canceled
+// caller context never poisons the scope until restart.
 func (e *lazyProvisionEngine) ensureScaffold(ctx context.Context, scope ScopeID) error {
 	if !e.derivedLegal(scope) {
 		return nil
 	}
 	e.mu.Lock()
-	o, ok := e.once[scope]
+	st, ok := e.state[scope]
 	if !ok {
-		o = new(sync.Once)
-		e.once[scope] = o
+		st = new(scaffoldState)
+		e.state[scope] = st
 	}
 	e.mu.Unlock()
 
-	o.Do(func() {
-		err := e.scaffold(ctx, scope)
-		e.mu.Lock()
-		e.scaffoldErr[scope] = err
-		e.mu.Unlock()
-	})
-
-	e.mu.Lock()
-	err := e.scaffoldErr[scope]
-	e.mu.Unlock()
-	return err
+	st.attempt.Lock()
+	defer st.attempt.Unlock()
+	if st.done {
+		return nil
+	}
+	if err := e.scaffold(ctx, scope); err != nil {
+		return err
+	}
+	st.done = true
+	return nil
 }
 
 // The data verbs each ensure the scope is scaffolded (for a derived-legal

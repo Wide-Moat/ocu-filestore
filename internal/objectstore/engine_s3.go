@@ -309,7 +309,11 @@ func parentKey(key string) string {
 // the package sentinels; transport-level timeouts and connection failures
 // are transient; authorization and clock-skew refusals are terminal typed
 // errors that are never retried. No credential material ever appears in the
-// returned error.
+// returned error. The retryable classes keep the backend's error CODE and
+// HTTP status in the message (never the backend message body): a bare
+// sentinel in the daemon log names the class but not the condition, and an
+// operator acting on "transient backend failure" cannot tell a storage-full
+// refusal from a flapping transport.
 func mapS3Err(verb string, err error) error {
 	if err == nil {
 		return nil
@@ -319,16 +323,17 @@ func mapS3Err(verb string, err error) error {
 	}
 
 	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
+	apiMatched := errors.As(err, &apiErr)
+	if apiMatched {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NoSuchBucket", "NotFound", "404":
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, fs.ErrNotExist)
 		case "PreconditionFailed":
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrAlreadyExists)
 		case "SlowDown", "ServiceUnavailable", "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequests":
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrThrottled)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend code %s)", verb, ErrThrottled, apiErr.ErrorCode())
 		case "RequestTimeout", "InternalError":
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrTransient)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend code %s)", verb, ErrTransient, apiErr.ErrorCode())
 		case "AccessDenied":
 			return fmt.Errorf("s3 %s: %w", verb, errS3AccessDenied)
 		case "RequestTimeTooSkewed":
@@ -338,6 +343,13 @@ func mapS3Err(verb string, err error) error {
 
 	var respErr *awshttp.ResponseError
 	if errors.As(err, &respErr) {
+		// An unmodeled backend code (e.g. a storage-full refusal) reaches this
+		// branch with the API error still attached; carry its code alongside
+		// the status so the log names the refusal.
+		code := ""
+		if apiMatched {
+			code = ", code " + apiErr.ErrorCode()
+		}
 		switch sc := respErr.HTTPStatusCode(); {
 		case sc == http.StatusNotFound:
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, fs.ErrNotExist)
@@ -346,9 +358,9 @@ func mapS3Err(verb string, err error) error {
 		case sc == http.StatusForbidden:
 			return fmt.Errorf("s3 %s: %w", verb, errS3AccessDenied)
 		case sc == http.StatusServiceUnavailable, sc == http.StatusTooManyRequests:
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrThrottled)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend status %d%s)", verb, ErrThrottled, sc, code)
 		case sc >= 500:
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrTransient)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend status %d%s)", verb, ErrTransient, sc, code)
 		}
 	}
 

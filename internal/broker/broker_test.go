@@ -536,3 +536,20 @@ func TestMapEngineErr_TransientThrottled(t *testing.T) {
 		}
 	}
 }
+
+// TestEngineAdapterKeepsBackendDetailOnTransient pins that the adapter's
+// sentinel remap WRAPS the engine error instead of replacing it: the
+// southface mirror stays errors.Is-matchable (the spine's classification
+// contract) while the message keeps the engine's verb and backend detail —
+// the daemon log line for a backend refusal must name what was refused, not
+// just the class.
+func TestEngineAdapterKeepsBackendDetailOnTransient(t *testing.T) {
+	in := fmt.Errorf("objectstore: s3 mkdir: %w (backend status 507, code XMinioStorageFull)", objectstore.ErrTransient)
+	got := mapEngineErr(in)
+	if !errors.Is(got, southface.ErrBackendTransient) {
+		t.Fatalf("mapEngineErr = %v, want errors.Is(ErrBackendTransient)", got)
+	}
+	if !strings.Contains(got.Error(), "XMinioStorageFull") {
+		t.Fatalf("mapEngineErr message %q dropped the backend detail", got.Error())
+	}
+}

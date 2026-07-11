@@ -1986,3 +1986,90 @@ func TestS3_CompleteMultipart_HeadTransientClassification(t *testing.T) {
 		})
 	}
 }
+
+// TestS3_MapS3ErrPreservesBackendDetail pins operator-actionability on the
+// retryable classes: a 5xx refusal whose code the taxonomy does not model
+// (e.g. XMinioStorageFull from a full backend, HTTP 507) maps to ErrTransient
+// AND the message carries the backend status and code. Without them the
+// daemon log shows only the bare sentinel and the operator cannot see WHAT
+// the backend refused. Only the code and status are included — never the
+// backend message body (no credential byte, decision 7).
+func TestS3_MapS3ErrPreservesBackendDetail(t *testing.T) {
+	in := opErr(&awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 507}},
+			Err:      &smithy.GenericAPIError{Code: "XMinioStorageFull", Message: "backend full"},
+		},
+	})
+	got := mapS3Err("mkdir", in)
+	if !errors.Is(got, ErrTransient) {
+		t.Fatalf("mapS3Err(507) = %v, want ErrTransient", got)
+	}
+	for _, want := range []string{"507", "XMinioStorageFull"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Fatalf("mapS3Err(507) message %q lacks %q (a bare sentinel is not actionable)", got.Error(), want)
+		}
+	}
+}
+
+// TestS3Live_LazyScaffoldDerivedScopeFirstTouch drives the D5 lazy-provision
+// chain against the real backend (gated like every live S3 leg): a FRESH
+// derived scope "<base>-<16hex>" whose first touches are exactly the two
+// production shapes — the north create's ensure-parent (MakeDir tolerating
+// EEXIST, then the joined uploads/ write) and the south agent write under
+// outputs/ — both through ONE decorator over the s3 engine, with the SAME
+// scaffold verbs the daemon boot path composes. It pins on real S3 what the
+// local-engine units pin hermetically: the scaffold seeds BOTH subtree
+// markers (not just the scope root), the joined write lands, and the
+// listing reports it.
+func TestS3Live_LazyScaffoldDerivedScopeFirstTouch(t *testing.T) {
+	eng, base := liveS3Engine(t)
+	derived := ScopeID(string(base) + "-a1b2c3d4e5f60718")
+	t.Cleanup(func() { liveSweepScope(t, eng, derived) })
+
+	scaffold := func(ctx context.Context, scope ScopeID) error {
+		return scaffoldMarkers(ctx, eng, scope, lazyMarkers)
+	}
+	wrapped := NewLazyProvisionEngine(eng, string(base), scaffold)
+	ctx := context.Background()
+
+	// North create shape: EnsureDir's MakeDir (EEXIST tolerated — the lazy
+	// scaffold has just seeded the marker), then the joined object write.
+	if err := wrapped.MakeDir(ctx, derived, "uploads"); err != nil && !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("MakeDir(uploads) on fresh derived scope: %v", err)
+	}
+	if _, err := wrapped.WriteStream(ctx, derived, "uploads/probe.bin", bytes.NewReader([]byte("north")), false); err != nil {
+		t.Fatalf("north-shaped first write to fresh derived scope: %v", err)
+	}
+
+	// South shape through the SAME decorator: the agent writes an output.
+	if _, err := wrapped.WriteStream(ctx, derived, "outputs/result.txt", bytes.NewReader([]byte("south")), false); err != nil {
+		t.Fatalf("south-shaped write: %v", err)
+	}
+
+	// Both subtree markers exist as directories on the backend.
+	for _, sub := range lazyMarkers {
+		fi, serr := wrapped.Stat(ctx, derived, sub)
+		if serr != nil {
+			t.Fatalf("Stat(%q): %v (subtree marker not scaffolded)", sub, serr)
+		}
+		if !fi.IsDir {
+			t.Fatalf("Stat(%q) = %+v, want a directory marker", sub, fi)
+		}
+	}
+
+	// The joined object is listable under the derived scope's uploads/.
+	entries, lerr := wrapped.List(ctx, derived, "uploads")
+	if lerr != nil {
+		t.Fatalf("List(uploads): %v", lerr)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name == "probe.bin" && !e.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("uploads/probe.bin not in listing; entries=%v", entries)
+	}
+}

@@ -245,9 +245,22 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 			return
 		}
 		if eerr := southface.EnsureDir(r.Context(), h.deps.Engine, ps.FilesystemID, ensureDir); eerr != nil {
+			// A backend refusal on the marker write is the BACKEND's condition,
+			// not this service's fault: transient (e.g. a full backend refusing
+			// the PUT with a 5xx) is backend_unavailable, load-shed is throttle.
+			// Anything else stays the fail-closed internal.
+			class := denyclass.Internal
+			reason := "internal error"
+			switch {
+			case errors.Is(eerr, southface.ErrBackendTransient):
+				class, reason = denyclass.BackendUnavailable, "storage backend unavailable"
+			case errors.Is(eerr, southface.ErrBackendThrottled):
+				class, reason = denyclass.Throttle, "storage backend throttled"
+			}
 			reqLog.Error("files-api create: ensure join-subtree parent failed",
-				slog.String(observ.KeyReason, eerr.Error()))
-			denyCreate(denyclass.Internal, "internal error")
+				slog.String(observ.KeyReason, eerr.Error()),
+				slog.String(observ.KeyDenyClass, class))
+			denyCreate(class, reason)
 			return
 		}
 	}
@@ -682,9 +695,12 @@ func denyClassForResolveErr(err error) string {
 // the create path: an already-exists refusal (overwrite_existing=false against an
 // existing object) is the 409 already_exists class; a missing-parent write (the
 // client named a path whose parent directory does not exist) is a
-// client-attributable 404 not_found, NOT an internal fault; anything else fails
-// closed to internal. It mirrors the south spine engine-error classifier
-// (internal/southface: fs.ErrNotExist -> not_found, fs.ErrExist -> already_exists)
+// client-attributable 404 not_found, NOT an internal fault; a throttled or
+// transient backend refusal is the backend's condition (429 throttle / 503
+// backend_unavailable), matching the south spine's rows for the same mirrors;
+// anything else fails closed to internal. It mirrors the south spine
+// engine-error classifier (internal/southface: fs.ErrNotExist -> not_found,
+// fs.ErrExist -> already_exists, throttled/transient -> throttle/unavailable)
 // for the subset a create WriteStream can surface. The engine surfaces a
 // missing-parent as a raw *fs.PathError wrapping fs.ErrNotExist, so the match is
 // on the standard-library sentinel, exactly as the south classifier does.
@@ -694,6 +710,10 @@ func denyClassForEngineErr(err error) string {
 		return denyclass.AlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyclass.NotFound
+	case errors.Is(err, southface.ErrBackendThrottled):
+		return denyclass.Throttle
+	case errors.Is(err, southface.ErrBackendTransient):
+		return denyclass.BackendUnavailable
 	default:
 		return denyclass.Internal
 	}

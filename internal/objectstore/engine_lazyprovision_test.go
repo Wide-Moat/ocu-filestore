@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"sync"
 	"testing"
@@ -197,5 +198,92 @@ func TestLazyScaffoldConcurrentFirstTouchScaffoldsOnce(t *testing.T) {
 	mu.Unlock()
 	if got != 1 {
 		t.Fatalf("scaffold ran %d times under %d concurrent first-touches, want exactly 1", got, n)
+	}
+}
+
+// TestLazyScaffoldTransientFailureIsRetriedOnNextTouch pins the recovery
+// contract: a scaffold attempt that fails with a TRANSIENT backend refusal
+// (e.g. an S3 storage-full 5xx mapped to ErrTransient) fails THAT caller's
+// verb but is NOT memoized — the next touch of the same scope re-runs the
+// scaffold and, with the backend healthy again, succeeds. Success IS
+// memoized: a third touch runs no further scaffold.
+//
+// Red-probe: memoizing the first attempt's error (the terminal-cache
+// behaviour) leaves the second write failing forever and this test RED.
+func TestLazyScaffoldTransientFailureIsRetriedOnNextTouch(t *testing.T) {
+	ctx := context.Background()
+	const bootBase = "fs-fleet"
+	derived := ScopeID(bootBase + "-00ff00ff00ff00ff")
+
+	bare := NewLocalVolumeEngine(t.TempDir())
+	var mu sync.Mutex
+	var calls int
+	scaffold := func(ctx context.Context, scope ScopeID) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			// The backend refuses the marker write transiently (the live class:
+			// a 5xx storage refusal surfaces wrapped around ErrTransient).
+			return fmt.Errorf("scaffold subtree %q: objectstore: s3 mkdir: %w", "uploads", ErrTransient)
+		}
+		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
+	}
+	wrapped := NewLazyProvisionEngine(bare, bootBase, scaffold)
+
+	// First touch: the scaffold fails; the verb surfaces the transient error.
+	if _, err := wrapped.WriteStream(ctx, derived, "outputs/f.txt", bytes.NewReader([]byte("x")), false); !errors.Is(err, ErrTransient) {
+		t.Fatalf("first touch during backend refusal: err = %v, want ErrTransient", err)
+	}
+
+	// Second touch after the backend recovered: the scaffold MUST re-run and
+	// the verb MUST succeed. A terminal error cache leaves this failing until
+	// process restart — the defect this test pins closed.
+	if _, err := wrapped.WriteStream(ctx, derived, "outputs/f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+		t.Fatalf("second touch after backend recovery: err = %v, want success (scaffold retried)", err)
+	}
+
+	// Third touch: success is memoized; no further scaffold runs.
+	if _, err := wrapped.WriteStream(ctx, derived, "outputs/g.txt", bytesReader("y"), false); err != nil {
+		t.Fatalf("third touch: %v", err)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("scaffold ran %d times, want exactly 2 (fail, retry-success, then memoized)", got)
+	}
+}
+
+// bytesReader is a tiny helper so the third-touch line stays readable.
+func bytesReader(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) }
+
+// TestLazyScaffoldCanceledFirstTouchDoesNotPoison pins the same recovery
+// contract for the caller-context class: a first touch whose request context
+// is already canceled fails THAT verb with the ctx error, and a later touch
+// with a live context scaffolds and succeeds. The first toucher's canceled
+// request must never wedge the scope for every subsequent caller.
+func TestLazyScaffoldCanceledFirstTouchDoesNotPoison(t *testing.T) {
+	const bootBase = "fs-fleet"
+	derived := ScopeID(bootBase + "-11aa11aa11aa11aa")
+
+	bare := NewLocalVolumeEngine(t.TempDir())
+	scaffold := func(ctx context.Context, scope ScopeID) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
+	}
+	wrapped := NewLazyProvisionEngine(bare, bootBase, scaffold)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := wrapped.WriteStream(canceled, derived, "outputs/f.txt", bytes.NewReader([]byte("x")), false); err == nil {
+		t.Fatal("first touch with canceled ctx: got success, want the ctx error")
+	}
+
+	if _, err := wrapped.WriteStream(context.Background(), derived, "outputs/f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+		t.Fatalf("second touch with live ctx: err = %v, want success (canceled first touch must not poison)", err)
 	}
 }
