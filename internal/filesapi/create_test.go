@@ -6,6 +6,8 @@ package filesapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"io/fs"
@@ -67,6 +69,11 @@ type createEngine struct {
 	// load-bearing: with it set, the join-subtree marker is never created, so WriteStream
 	// 404s and the create denies not_found, exactly as the live parentExists path did.
 	refuseMakeDir bool
+	// makeDirErr, when non-nil, fails every MakeDir with it (fault inject): the
+	// backend refused the marker write. It stands in for the adapter-mapped S3
+	// refusals (e.g. a 5xx storage refusal -> ErrBackendTransient), so a test
+	// can pin the deny class the ensure-parent arm reports for a backend fault.
+	makeDirErr error
 }
 
 func newCreateEngine() *createEngine {
@@ -79,6 +86,9 @@ func newCreateEngine() *createEngine {
 func (e *createEngine) MakeDir(_ context.Context, _ string, path string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.makeDirErr != nil {
+		return e.makeDirErr
+	}
 	if e.refuseMakeDir {
 		return nil // neutered: record nothing, so no parent marker is ever created
 	}
@@ -98,7 +108,7 @@ func (e *createEngine) parentExists(key string) bool {
 	return e.dirs[key[:i]]
 }
 
-func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, overwrite bool) error {
+func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, overwrite bool) (string, error) {
 	e.mu.Lock()
 	e.writeCalls++
 	e.callLog = append(e.callLog, "write:"+path)
@@ -112,13 +122,13 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	// upload succeed without its subtree marker.
 	if !e.parentExists(path) {
 		e.mu.Unlock()
-		return &fs.PathError{Op: "write", Path: path, Err: fs.ErrNotExist}
+		return "", &fs.PathError{Op: "write", Path: path, Err: fs.ErrNotExist}
 	}
 	// already-exists: refuse WITHOUT consuming r, exactly as the real engine does
 	// on a create-new against an existing object.
 	if e.alreadyExist && !overwrite {
 		e.mu.Unlock()
-		return southface.ErrAlreadyExists
+		return "", southface.ErrAlreadyExists
 	}
 	e.mu.Unlock()
 
@@ -134,10 +144,10 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	e.bytesRead += len(buf)
 	e.mu.Unlock()
 	if rerr != nil {
-		return rerr
+		return "", rerr
 	}
 	if e.writeErr != nil {
-		return e.writeErr
+		return "", e.writeErr
 	}
 
 	e.mu.Lock()
@@ -145,7 +155,10 @@ func (e *createEngine) WriteStream(_ context.Context, _ string, path string, r i
 	e.committed++
 	e.lastPath = path
 	e.bytesByPath[path] = buf
-	return nil
+	// Return the single-pass content digest the real engines compute (D6): only on
+	// a SUCCESSFUL commit, so an aborted write returns "" alongside its error.
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // seedDir marks a directory (and every ancestor level) as pre-existing, standing
@@ -214,6 +227,9 @@ func (s *createStore) Put(_ context.Context, in handlestore.PutInput) (handlesto
 		Mime:      in.Mime,
 		Size:      in.Size,
 		CreatedAt: "2026-01-01T00:00:00Z",
+		// Mirror the real DiskStore.Put: the record carries the create-time content
+		// digest so the response/list FileObject surfaces it (D6).
+		Sha256: in.Sha256,
 	}, nil
 }
 
@@ -1500,4 +1516,47 @@ func indexOf(xs []string, s string) int {
 		}
 	}
 	return -1
+}
+
+// TestCreateBackendFailureDenyClasses pins the wire class for a BACKEND
+// refusal on the create path: transient (a 5xx storage refusal, e.g. a full
+// backend refusing the derived-scope marker PUT) denies backend_unavailable
+// (503) and throttled denies throttle (429) — never internal (500). Internal
+// mislabels a recoverable operational condition as a service bug and hides
+// the actionable truth from the operator and the audit chain. Both arms that
+// touch the backend are covered: the ensure-parent MakeDir (the first
+// backend write a joined create performs) and the WriteStream itself.
+func TestCreateBackendFailureDenyClasses(t *testing.T) {
+	body := []byte("REPORT-BYTES")
+	params := createParamsJSON(t, map[string]any{
+		"path": "/report.txt", "declared_size_bytes": len(body),
+	})
+
+	t.Run("ensure_parent_transient_denies_unavailable", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.makeDirErr = southface.ErrBackendTransient
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusServiceUnavailable)
+	})
+
+	t.Run("ensure_parent_throttled_denies_throttle", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.makeDirErr = southface.ErrBackendThrottled
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusTooManyRequests)
+	})
+
+	t.Run("write_transient_denies_unavailable", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.writeErr = southface.ErrBackendTransient
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusServiceUnavailable)
+	})
+
+	t.Run("write_throttled_denies_throttle", func(t *testing.T) {
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.writeErr = southface.ErrBackendThrottled
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusTooManyRequests)
+	})
 }

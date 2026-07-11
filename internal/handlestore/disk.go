@@ -456,6 +456,7 @@ func (s *DiskStore) Put(ctx context.Context, in PutInput) (Record, error) {
 		Size:                  in.Size,
 		CreatedAt:             s.now().UTC().Format(time.RFC3339),
 		DownloadablePolicyRef: in.DownloadablePolicyRef,
+		Sha256:                in.Sha256,
 	}
 
 	if err := s.durableAppend(putEnvelope{Op: opPut, Record: rec}); err != nil {

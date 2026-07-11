@@ -4,7 +4,10 @@
 package filesapi
 
 import (
+	"fmt"
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
@@ -68,6 +71,33 @@ const fencedScopeHeader = "X-OCU-Filesystem-Id"
 // never the decision itself.
 var fencedGrantedIntents = []southface.Intent{southface.IntentRead}
 
+// validateScopeShape refuses a filesystem_id whose bytes are not a single,
+// clean path element. It is the north face of ADR-0030 (open question #348): a
+// COOPERATIVE shape + traversal guard, not a per-chat authorization point. The
+// filesystem_id is entirely caller-supplied on this leg, so this check cannot
+// (and does not) enforce which chat a caller may reach - the real per-chat
+// isolation lives on the credential/south path. What it DOES enforce is that the
+// value is a legal single directory element, so a scope id can never change which
+// directory a downstream baseDir join resolves to.
+//
+// The rules mirror the storage engine's own scope-id validation (a defense in
+// depth guard at the north edge, refusing a malformed scope BEFORE it reaches the
+// engine): reject empty, "." / "..", any path separator or NUL, and any
+// non-clean form. A shape-legal id is "<base>" or "<base>-<hex>" or any other
+// single clean element; the guard does not require the chat suffix, so a plain
+// scope stays backward compatible.
+func validateScopeShape(id string) error {
+	switch {
+	case id == "" || id == "." || id == "..":
+		return fmt.Errorf("filesapi: invalid scope shape: %q", id)
+	case strings.ContainsAny(id, "/\\\x00"):
+		return fmt.Errorf("filesapi: invalid scope shape: %q", id)
+	case filepath.Clean(id) != id:
+		return fmt.Errorf("filesapi: invalid scope shape: %q", id)
+	}
+	return nil
+}
+
 // headerScopeSource is the ScopeSource that reads the ADR-0025 scope-field
 // transport: it reads the host-attested filesystem_id from the fencedScopeHeader
 // request header and, if present and non-empty, returns a PeerScope bound to it
@@ -93,6 +123,13 @@ func NewFencedScopeSource() ScopeSource { return headerScopeSource{} }
 func (headerScopeSource) Scope(r *http.Request) (southface.PeerScope, bool) {
 	fsid := r.Header.Get(fencedScopeHeader)
 	if fsid == "" {
+		return southface.PeerScope{}, false
+	}
+	// Shape-guard the resolved scope (ADR-0030 north face, open question #348): a
+	// filesystem_id that is not a single, clean path element is refused
+	// fail-closed (ok=false), so the route's existing 503 deny refuses it without
+	// a scope-distinction leak. This is a cooperative shape guard, not authz.
+	if validateScopeShape(fsid) != nil {
 		return southface.PeerScope{}, false
 	}
 	return southface.PeerScope{

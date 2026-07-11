@@ -49,7 +49,7 @@ func (panicEngine) RemoveFile(_ context.Context, _, _ string) error {
 func (panicEngine) ReadRange(_ context.Context, _, _ string, _, _ int64, _ io.Writer) error {
 	panic("panicEngine: ReadRange panicked")
 }
-func (panicEngine) WriteStream(_ context.Context, _, _ string, r io.Reader, _ bool) error {
+func (panicEngine) WriteStream(_ context.Context, _, _ string, r io.Reader, _ bool) (string, error) {
 	panic("panicEngine: WriteStream panicked")
 }
 

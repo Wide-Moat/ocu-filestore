@@ -78,19 +78,19 @@ func TestLocalEngine_WriteStream(t *testing.T) {
 	eng, base, scope := newLocalEngine(t)
 
 	data := []byte("the first object body")
-	if err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data), false); err != nil {
 		t.Fatalf("WriteStream new: %v", err)
 	}
 	if got := readBack(t, eng, scope, "f.txt", int64(len(data))+8); !bytes.Equal(got, data) {
 		t.Fatalf("readback: got %q, want %q", got, data)
 	}
 
-	if err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data), false); !errors.Is(err, ErrAlreadyExists) {
+	if _, err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data), false); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("WriteStream overwrite=false on existing: got %v, want ErrAlreadyExists", err)
 	}
 
 	data2 := []byte("replaced")
-	if err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data2), true); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "f.txt", bytes.NewReader(data2), true); err != nil {
 		t.Fatalf("WriteStream overwrite=true: %v", err)
 	}
 	if got := readBack(t, eng, scope, "f.txt", 64); !bytes.Equal(got, data2) {
@@ -107,7 +107,7 @@ func TestLocalEngine_WriteStreamCleanup(t *testing.T) {
 	ctx := context.Background()
 	eng, base, scope := newLocalEngine(t)
 
-	err := eng.WriteStream(ctx, scope, "broken.txt", &failingReader{}, false)
+	_, err := eng.WriteStream(ctx, scope, "broken.txt", &failingReader{}, false)
 	if err == nil {
 		t.Fatal("WriteStream with failing reader: got nil error")
 	}
@@ -169,7 +169,7 @@ func TestLocalEngine_WriteStreamCancelCtx(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err := eng.WriteStream(ctx, scope, "cancelled.txt", &cancellingReader{cancel: cancel}, false)
+	_, err := eng.WriteStream(ctx, scope, "cancelled.txt", &cancellingReader{cancel: cancel}, false)
 	if err == nil {
 		t.Fatal("WriteStream under mid-stream cancel: got nil error")
 	}
@@ -187,7 +187,7 @@ func TestLocalEngine_ReadRange(t *testing.T) {
 	ctx := context.Background()
 	eng, _, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "r.bin", strings.NewReader("abcdefghij"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "r.bin", strings.NewReader("abcdefghij"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 
@@ -221,13 +221,13 @@ func TestLocalEngine_List(t *testing.T) {
 	ctx := context.Background()
 	eng, _, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "f1", strings.NewReader("abc"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "f1", strings.NewReader("abc"), false); err != nil {
 		t.Fatalf("WriteStream f1: %v", err)
 	}
 	if err := eng.MakeDir(ctx, scope, "d"); err != nil {
 		t.Fatalf("MakeDir d: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "d/f2", strings.NewReader("12345"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "d/f2", strings.NewReader("12345"), false); err != nil {
 		t.Fatalf("WriteStream d/f2: %v", err)
 	}
 
@@ -264,7 +264,7 @@ func TestLocalEngine_Stat(t *testing.T) {
 	ctx := context.Background()
 	eng, _, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "s.txt", strings.NewReader("123456"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "s.txt", strings.NewReader("123456"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.MakeDir(ctx, scope, "dir"); err != nil {
@@ -317,7 +317,7 @@ func TestLocalEngine_Remove(t *testing.T) {
 	ctx := context.Background()
 	eng, _, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "victim", strings.NewReader("x"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "victim", strings.NewReader("x"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.RemoveFile(ctx, scope, "victim"); err != nil {
@@ -330,7 +330,7 @@ func TestLocalEngine_Remove(t *testing.T) {
 	if err := eng.MakeDir(ctx, scope, "tree"); err != nil {
 		t.Fatalf("MakeDir: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "tree/leaf", strings.NewReader("y"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "tree/leaf", strings.NewReader("y"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.RemoveDir(ctx, scope, "tree"); err != nil {
@@ -347,7 +347,7 @@ func TestLocalEngine_Move(t *testing.T) {
 	ctx := context.Background()
 	eng, _, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "a.txt", strings.NewReader("alpha"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "a.txt", strings.NewReader("alpha"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.MoveFile(ctx, scope, "a.txt", "b.txt", false); err != nil {
@@ -360,7 +360,7 @@ func TestLocalEngine_Move(t *testing.T) {
 		t.Fatalf("readback after move: got %q, want alpha", got)
 	}
 
-	if err := eng.WriteStream(ctx, scope, "c.txt", strings.NewReader("gamma"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "c.txt", strings.NewReader("gamma"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.MoveFile(ctx, scope, "c.txt", "b.txt", false); !errors.Is(err, ErrAlreadyExists) {
@@ -376,7 +376,7 @@ func TestLocalEngine_Move(t *testing.T) {
 	if err := eng.MakeDir(ctx, scope, "src_dir"); err != nil {
 		t.Fatalf("MakeDir: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "src_dir/inner", strings.NewReader("z"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "src_dir/inner", strings.NewReader("z"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.MoveDir(ctx, scope, "src_dir", "dst_dir", false); err != nil {
@@ -396,7 +396,7 @@ func TestLocalEngine_Copy(t *testing.T) {
 	ctx := context.Background()
 	eng, base, scope := newLocalEngine(t)
 
-	if err := eng.WriteStream(ctx, scope, "orig", strings.NewReader("copy me"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "orig", strings.NewReader("copy me"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.CopyFile(ctx, scope, "orig", "dup", false); err != nil {
@@ -412,7 +412,7 @@ func TestLocalEngine_Copy(t *testing.T) {
 	if err := eng.CopyFile(ctx, scope, "orig", "dup", false); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("CopyFile overwrite=false onto existing: got %v, want ErrAlreadyExists", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "orig2", strings.NewReader("v2"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "orig2", strings.NewReader("v2"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := eng.CopyFile(ctx, scope, "orig2", "dup", true); err != nil {
@@ -443,7 +443,7 @@ func TestLocalEngine_EscapeRejected(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(base, string(scope), "esc")); err != nil {
 		t.Fatalf("plant symlink: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "f.txt", strings.NewReader("in"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "f.txt", strings.NewReader("in"), false); err != nil {
 		t.Fatalf("WriteStream seed: %v", err)
 	}
 
@@ -468,7 +468,8 @@ func TestLocalEngine_EscapeRejected(t *testing.T) {
 		call func() error
 	}{
 		{"write_through_symlink", func() error {
-			return eng.WriteStream(ctx, scope, "esc/w.txt", strings.NewReader("x"), false)
+			_, err := eng.WriteStream(ctx, scope, "esc/w.txt", strings.NewReader("x"), false)
+			return err
 		}},
 		{"copy_src_through_symlink", func() error {
 			return eng.CopyFile(ctx, scope, "esc/secret", "in.txt", false)
@@ -546,10 +547,10 @@ func TestProvisionTeardownCycle(t *testing.T) {
 		t.Fatalf("scope dir after provision: fi=%v err=%v", fi, err)
 	}
 
-	if err := eng.WriteStream(ctx, scope, "session1/marker", strings.NewReader("prior bytes"), false); err == nil {
+	if _, err := eng.WriteStream(ctx, scope, "session1/marker", strings.NewReader("prior bytes"), false); err == nil {
 		t.Log("nested write succeeded unexpectedly without parent dir")
 	}
-	if err := eng.WriteStream(ctx, scope, "marker", strings.NewReader("prior bytes"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "marker", strings.NewReader("prior bytes"), false); err != nil {
 		t.Fatalf("WriteStream marker: %v", err)
 	}
 
@@ -645,7 +646,7 @@ func TestScopeIDGuard(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, legit); err != nil {
 		t.Fatalf("ProvisionScope legit: %v", err)
 	}
-	if err := eng.WriteStream(ctx, legit, "ok.txt", strings.NewReader("fine"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, legit, "ok.txt", strings.NewReader("fine"), false); err != nil {
 		t.Fatalf("WriteStream legit: %v", err)
 	}
 	if got := readBack(t, eng, legit, "ok.txt", 16); string(got) != "fine" {
@@ -686,7 +687,7 @@ func TestLexicalStagePinnedPerVerb(t *testing.T) {
 		{"CopyFile_src", func() error { return eng.CopyFile(ctx, scope, bad, "ok", false) }},
 		{"CopyFile_dst", func() error { return eng.CopyFile(ctx, scope, "ok", bad, false) }},
 		{"ReadRange", func() error { return eng.ReadRange(ctx, scope, bad, 0, 1, &sink) }},
-		{"WriteStream", func() error { return eng.WriteStream(ctx, scope, bad, strings.NewReader("x"), false) }},
+		{"WriteStream", func() error { _, err := eng.WriteStream(ctx, scope, bad, strings.NewReader("x"), false); return err }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.call(); !errors.Is(err, ErrInvalidPath) {

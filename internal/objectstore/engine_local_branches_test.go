@@ -40,7 +40,7 @@ func TestProvisionScope_DirtyScopePreserved(t *testing.T) {
 		t.Fatalf("stale.txt after provision = %v, want still present (owner data must survive)", err)
 	}
 	// The provisioned scope still serves a normal write.
-	if err := eng.WriteStream(ctx, scope, "fresh.txt", strings.NewReader("fresh"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "fresh.txt", strings.NewReader("fresh"), false); err != nil {
 		t.Fatalf("WriteStream after provision: %v", err)
 	}
 }
@@ -59,13 +59,13 @@ func TestProvisionScope_OwnerDataPreservedOnReProvision(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope (first): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
 		t.Fatalf("WriteStream (owner): %v", err)
 	}
 	if err := eng.MakeDir(ctx, scope, "subdir"); err != nil {
 		t.Fatalf("MakeDir (subdir): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "subdir/deep.bin", strings.NewReader("DEEP"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "subdir/deep.bin", strings.NewReader("DEEP"), false); err != nil {
 		t.Fatalf("WriteStream (deep): %v", err)
 	}
 
@@ -145,10 +145,10 @@ func TestRenameWithin_FileDestExistsNoReplace(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "src.txt", strings.NewReader("source"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "src.txt", strings.NewReader("source"), false); err != nil {
 		t.Fatalf("WriteStream src: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "dst.txt", strings.NewReader("existing"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "dst.txt", strings.NewReader("existing"), false); err != nil {
 		t.Fatalf("WriteStream dst: %v", err)
 	}
 
@@ -192,7 +192,7 @@ func TestRenameWithin_LinkRollback(t *testing.T) {
 	if err := eng.MakeDir(ctx, scope, "src"); err != nil {
 		t.Fatalf("MakeDir(src): %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "src/f.txt", strings.NewReader("payload"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "src/f.txt", strings.NewReader("payload"), false); err != nil {
 		t.Fatalf("WriteStream(src/f.txt): %v", err)
 	}
 
@@ -268,7 +268,7 @@ func TestWriteTempAndCommit_RecreatesStagingAfterTeardown(t *testing.T) {
 	}
 
 	// The next write recreates the staging area on demand and commits.
-	if err := eng.WriteStream(ctx, scope, "after.txt", strings.NewReader("after teardown"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "after.txt", strings.NewReader("after teardown"), false); err != nil {
 		t.Fatalf("WriteStream after teardown: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(scopeDir, stagingDirName)); err != nil {

@@ -1002,6 +1002,28 @@ func buildSubtreeMap(rw, ro, preview string) (southface.SubtreeMap, error) {
 	return southface.NewSubtreeMap(rw, ro, preview)
 }
 
+// distinctSubtrees returns the distinct non-empty subtree markers across the
+// three intent axes, preserving first-seen order (write, read, preview). It is
+// the single source the boot scaffold and the lazy per-chat scaffold both seed,
+// so a derived chat scope's markers match the base scope's. A zero-value map
+// yields an empty slice (provision-only scaffold, no markers).
+func distinctSubtrees(sm southface.SubtreeMap) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 2)
+	for _, intent := range []southface.Intent{southface.IntentWrite, southface.IntentRead, southface.IntentPreview} {
+		sub := sm.For(intent)
+		if sub == "" {
+			continue
+		}
+		if _, dup := seen[sub]; dup {
+			continue
+		}
+		seen[sub] = struct{}{}
+		out = append(out, sub)
+	}
+	return out
+}
+
 // rejectWildcardDownloadable enforces the ADR-0029 exfil-bar: the whole-scope
 // "*" downloadable token is refused for the single-tenant trusted_operator fleet
 // posture. A "*" token anywhere in the comma-separated -downloadable-prefixes
@@ -1427,38 +1449,56 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	scope := objectstore.ScopeID(cfg.filesystemID)
 	provisionCtx, cancelProvision := context.WithTimeout(context.Background(), provisionTimeout)
 	defer cancelProvision()
-	if err := eng.ProvisionScope(provisionCtx, scope); err != nil {
+
+	// The distinct subtree markers the scaffold seeds (the boot scope at startup,
+	// and every derived chat scope lazily on first touch). Collected ONCE from the
+	// three intent axes so the boot path and the lazy decorator seed the identical
+	// set. A zero-value SubtreeMap yields an empty list and scaffoldScope seeds no
+	// marker (provision-only).
+	scaffoldMarkers := distinctSubtrees(cfg.subtrees)
+
+	// scaffoldScope provisions a scope and seeds its subtree dir-markers
+	// (idempotent, ErrExist == success). Boot calls it for the base scope
+	// (behavior unchanged); the lazy-provision decorator calls it for a derived
+	// chat scope on that scope's first data verb (D5, ADR-0030), reusing the
+	// SAME provisioning verbs so a derived scope's markers match the base's.
+	scaffoldScope := func(ctx context.Context, e objectstore.Engine, s objectstore.ScopeID) error {
+		if err := e.ProvisionScope(ctx, s); err != nil {
+			return err
+		}
+		for _, sub := range scaffoldMarkers {
+			if err := e.MakeDir(ctx, s, sub); err != nil && !errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("scaffold subtree %q: %w", sub, err)
+			}
+		}
+		return nil
+	}
+
+	// bareEng is the un-decorated engine. The lazy decorator scaffolds THROUGH
+	// it (not through itself) so the scaffold's own ProvisionScope/MakeDir never
+	// re-enter the decorator's first-touch guard.
+	bareEng := eng
+
+	// Boot-scaffold the base scope up front (behavior unchanged: provision +
+	// seed the base's markers). The engine stays subtree-agnostic; compose
+	// supplies the marker list. Approach (a): engine.MakeDir is the tested path;
+	// no engine-interface change.
+	if err := scaffoldScope(provisionCtx, bareEng, scope); err != nil {
 		return nil, err
 	}
 
-	// Seed subtree dir-markers after provision (idempotent scaffold). The engine
-	// stays subtree-agnostic; compose supplies the list via the SubtreeMap. The
-	// loop collects the distinct non-empty For() values across the three intent
-	// axes, then calls MakeDir for each, treating ErrExist as success (idempotent:
-	// a restart re-provisions without erasing and this loop is a no-op).
-	// Approach (a): engine.MakeDir is the tested path; no engine-interface change.
-	{
-		// Collect distinct non-empty subtree values from the three intent axes and
-		// seed a dir-marker for each (idempotent: ErrExist is treated as success).
-		// A zero-value SubtreeMap has no non-empty For() values and the loop is a
-		// no-op; a configured map yields at most two distinct subtrees (read and
-		// preview share "uploads" under the default). The engine stays subtree-
-		// agnostic; compose supplies the subtree list via the SubtreeMap (approach a).
-		seen := make(map[string]struct{})
-		for _, intent := range []southface.Intent{southface.IntentWrite, southface.IntentRead, southface.IntentPreview} {
-			sub := cfg.subtrees.For(intent)
-			if sub == "" {
-				continue
-			}
-			if _, dup := seen[sub]; dup {
-				continue
-			}
-			seen[sub] = struct{}{}
-			if err := eng.MakeDir(provisionCtx, scope, sub); err != nil && !errors.Is(err, fs.ErrExist) {
-				return nil, fmt.Errorf("scaffold subtree %q: %w", sub, err)
-			}
-		}
-	}
+	// Lazy per-chat scaffold (D5, ADR-0030): wrap the engine ONCE so BOTH the
+	// north filesapi plane and the south southface plane share the decorator,
+	// killing the uploads-first/writes-first asymmetry. On the first data verb
+	// per UNSEEN, legitimately-derived scope ("<base>" or "<base>-<16hex>") the
+	// decorator scaffolds that scope's markers via scaffoldScope before
+	// delegating; a scope that is not derived-legal is passed straight through
+	// and refused exactly as today (fail-closed preserved). Applied to eng here,
+	// before the shared broker.NewEngine seam below, so both listeners inherit it.
+	eng = objectstore.NewLazyProvisionEngine(bareEng, cfg.filesystemID,
+		func(ctx context.Context, s objectstore.ScopeID) error {
+			return scaffoldScope(ctx, bareEng, s)
+		})
 
 	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
 	// post-provision step fails before ownership passes to teardownServer,

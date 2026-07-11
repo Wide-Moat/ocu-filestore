@@ -31,6 +31,17 @@ type FileObject struct {
 	SizeBytes int64 `json:"size_bytes"`
 	// CreatedAt is the store-stamped durable RFC-3339 UTC creation time.
 	CreatedAt string `json:"created_at"`
+	// Sha256 is the lowercase-hex SHA-256 of the stored content (D6,
+	// PARITY-LEDGER-147). It is an ADDITIVE OPTIONAL response field: the engine
+	// already computes this digest in its single write pass, so the north list
+	// standardises on it (NOT md5) for content dedup - an edited same-size file
+	// carries a new digest and is re-uploaded. omitempty keeps the field ABSENT
+	// for a record with no recorded digest (a pre-D6 handle, or a reconcile-minted
+	// whole-tree object), so a client falls back to name+size - the designed
+	// back-compat window. ADR-0028 froze the six-field body and DEFERRED a
+	// checksum field; this addition is the deferred field, standardised on sha256
+	// (canon ADR in flight: content-hash manifest, D6, PARITY-LEDGER-147).
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 // fileObjectType is the constant Files-API object tag.
@@ -49,6 +60,7 @@ func newFileObject(r handlestore.Record) FileObject {
 		MimeType:  r.Mime,
 		SizeBytes: r.Size,
 		CreatedAt: r.CreatedAt,
+		Sha256:    r.Sha256,
 	}
 }
 

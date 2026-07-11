@@ -172,7 +172,7 @@ func TestConformance_S3(t *testing.T) { runConformance(t, s3ConfTarget) }
 // backend directly — backend-truth probes live only in the factory).
 func confWrite(t *testing.T, e Engine, sc ScopeID, p, content string, overwrite bool) {
 	t.Helper()
-	if err := e.WriteStream(context.Background(), sc, p, strings.NewReader(content), overwrite); err != nil {
+	if _, err := e.WriteStream(context.Background(), sc, p, strings.NewReader(content), overwrite); err != nil {
 		t.Fatalf("WriteStream(%q): %v", p, err)
 	}
 }
@@ -199,7 +199,7 @@ func runConformance(t *testing.T, f confFactory) {
 		e, sc := tg.eng, tg.scope
 
 		confWrite(t, e, sc, "dst.txt", "old", false)
-		if err := e.WriteStream(ctx, sc, "dst.txt", strings.NewReader("clobber"), false); !errors.Is(err, ErrAlreadyExists) {
+		if _, err := e.WriteStream(ctx, sc, "dst.txt", strings.NewReader("clobber"), false); !errors.Is(err, ErrAlreadyExists) {
 			t.Fatalf("WriteStream(existing, overwrite=false) = %v, want ErrAlreadyExists", err)
 		}
 		if got := confRead(t, e, sc, "dst.txt"); got != "old" {
@@ -280,7 +280,7 @@ func runConformance(t *testing.T, f confFactory) {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
-					results[i] = e.WriteStream(ctx, sc, p, strings.NewReader(contents[i]), false)
+					_, results[i] = e.WriteStream(ctx, sc, p, strings.NewReader(contents[i]), false)
 				}(i)
 			}
 			wg.Wait()
@@ -347,7 +347,7 @@ func runConformance(t *testing.T, f confFactory) {
 		tg := f(t)
 		e, sc := tg.eng, tg.scope
 
-		if err := e.WriteStream(ctx, sc, "nope/f.txt", strings.NewReader("x"), false); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := e.WriteStream(ctx, sc, "nope/f.txt", strings.NewReader("x"), false); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("WriteStream(missing parent) = %v, want fs.ErrNotExist", err)
 		}
 		if err := e.MakeDir(ctx, sc, "nope/d"); !errors.Is(err, fs.ErrNotExist) {
@@ -577,7 +577,7 @@ func runConformance(t *testing.T, f confFactory) {
 		e, sc := tg.eng, tg.scope
 
 		src := &failAfterReader{serve: 256 << 10, err: errors.New("conformance: source died mid-stream")}
-		if err := e.WriteStream(ctx, sc, "partial.bin", src, false); err == nil {
+		if _, err := e.WriteStream(ctx, sc, "partial.bin", src, false); err == nil {
 			t.Fatal("WriteStream(failing source) = nil, want error")
 		}
 		if _, err := e.Stat(ctx, sc, "partial.bin"); !errors.Is(err, fs.ErrNotExist) {
@@ -604,7 +604,7 @@ func runConformance(t *testing.T, f confFactory) {
 		cctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		src := &cancelAtReader{cancel: cancel, at: 256 << 10}
-		if err := e.WriteStream(cctx, sc, "cancelled.bin", src, false); !errors.Is(err, context.Canceled) {
+		if _, err := e.WriteStream(cctx, sc, "cancelled.bin", src, false); !errors.Is(err, context.Canceled) {
 			t.Fatalf("WriteStream under cancel = %v, want errors.Is(context.Canceled)", err)
 		}
 		if _, err := e.Stat(ctx, sc, "cancelled.bin"); !errors.Is(err, fs.ErrNotExist) {
@@ -678,7 +678,7 @@ func runConformance(t *testing.T, f confFactory) {
 				}),
 			).Draw(rt, "path")
 
-			err := e.WriteStream(ctx, sc, p, strings.NewReader("contained"), true)
+			_, err := e.WriteStream(ctx, sc, p, strings.NewReader("contained"), true)
 			if err != nil {
 				return // rejection is always acceptable
 			}

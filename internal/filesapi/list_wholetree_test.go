@@ -5,6 +5,8 @@ package filesapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -299,13 +301,18 @@ type recordingEngine struct {
 	*fakeEngine
 }
 
-func (e *recordingEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, _ bool) error {
+func (e *recordingEngine) WriteStream(_ context.Context, _ string, path string, r io.Reader, _ bool) (string, error) {
 	b, err := io.ReadAll(r)
 	if err != nil {
-		return err
+		return "", err
 	}
 	e.fakeEngine.seedObject(path, b)
-	return nil
+	// Return the SAME single-pass content digest the real engines compute (D6),
+	// so a create through this recording engine threads a real hex SHA-256 into
+	// the durable record - the create->list content-hash keystone asserts against
+	// the precomputed digest of these exact bytes.
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // createDoc drives POST /v1/files with a real multipart body and returns the

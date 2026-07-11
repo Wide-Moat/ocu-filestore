@@ -1026,7 +1026,7 @@ func TestTeardownServerCloseDoesNotEraseScope(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 

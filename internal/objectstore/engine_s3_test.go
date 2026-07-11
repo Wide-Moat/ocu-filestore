@@ -749,8 +749,15 @@ func TestS3Live_WriteStream_SmallSinglePut(t *testing.T) {
 	ctx := context.Background()
 	body := []byte("small single put body")
 
-	if err := e.WriteStream(ctx, scope, "small.txt", bytes.NewReader(body), false); err != nil {
+	wantHex := hex.EncodeToString(func() []byte { s := sha256.Sum256(body); return s[:] }())
+	// D6: WriteStream RETURNS the single-pass content digest (not just the object
+	// tag). Assert the returned value equals the local hash on the live backend.
+	gotDigest, err := e.WriteStream(ctx, scope, "small.txt", bytes.NewReader(body), false)
+	if err != nil {
 		t.Fatalf("WriteStream: %v", err)
+	}
+	if gotDigest != wantHex {
+		t.Fatalf("WriteStream returned digest = %q, want the content sha256 %q", gotDigest, wantHex)
 	}
 
 	fi, err := e.Stat(ctx, scope, "small.txt")
@@ -768,13 +775,13 @@ func TestS3Live_WriteStream_SmallSinglePut(t *testing.T) {
 		t.Fatalf("readback = %q, want %q", buf.Bytes(), body)
 	}
 
-	want := sha256.Sum256(body)
-	if got := liveDigestTag(t, e, string(scope)+"/small.txt"); got != hex.EncodeToString(want[:]) {
-		t.Fatalf("ocu-sha256 tag = %q, want %q", got, hex.EncodeToString(want[:]))
+	// The returned digest ALSO equals the persisted ocu-sha256 object tag.
+	if got := liveDigestTag(t, e, string(scope)+"/small.txt"); got != wantHex {
+		t.Fatalf("ocu-sha256 tag = %q, want %q", got, wantHex)
 	}
 
 	// Empty stream: a zero-byte object is a valid single PUT.
-	if err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
 		t.Fatalf("WriteStream(empty): %v", err)
 	}
 	if fi, err := e.Stat(ctx, scope, "empty.bin"); err != nil || fi.Size != 0 {
@@ -800,7 +807,7 @@ func TestS3Live_WriteStream_LargeMPU(t *testing.T) {
 		body[i] = byte(i * 31 / 7)
 	}
 
-	if err := e.WriteStream(ctx, scope, "large.bin", bytes.NewReader(body), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "large.bin", bytes.NewReader(body), false); err != nil {
 		t.Fatalf("WriteStream(48 MiB): %v", err)
 	}
 
@@ -846,10 +853,10 @@ func TestS3Live_WriteStream_NoReplace412(t *testing.T) {
 	ctx := context.Background()
 	first := []byte("the first writer wins")
 
-	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(first), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(first), false); err != nil {
 		t.Fatalf("WriteStream(first): %v", err)
 	}
-	err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("loser")), false)
+	_, err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("loser")), false)
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("WriteStream(second, overwrite=false) = %v, want ErrAlreadyExists", err)
 	}
@@ -858,7 +865,7 @@ func TestS3Live_WriteStream_NoReplace412(t *testing.T) {
 	// if the rig's backend rejects conditional Complete, this fails loudly
 	// here — surface it, never silently degrade.
 	big := make([]byte, 17<<20)
-	err = e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(big), false)
+	_, err = e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(big), false)
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("WriteStream(multipart, overwrite=false onto existing) = %v, want ErrAlreadyExists (conditional Complete)", err)
 	}
@@ -876,7 +883,7 @@ func TestS3Live_WriteStream_NoReplace412(t *testing.T) {
 
 	// overwrite=true replaces cleanly.
 	second := []byte("replaced")
-	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(second), true); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader(second), true); err != nil {
 		t.Fatalf("WriteStream(overwrite=true): %v", err)
 	}
 	buf.Reset()
@@ -893,7 +900,7 @@ func TestS3Live_MPU_AbortOnError(t *testing.T) {
 	ctx := context.Background()
 
 	src := &failAfterReader{serve: 20 << 20, err: errors.New("simulated source failure")}
-	err := e.WriteStream(ctx, scope, "broken.bin", src, false)
+	_, err := e.WriteStream(ctx, scope, "broken.bin", src, false)
 	if err == nil {
 		t.Fatal("WriteStream with failing source: got nil error")
 	}
@@ -913,7 +920,7 @@ func TestS3Live_WriteStream_PartialNeverVisible(t *testing.T) {
 	ctx := context.Background()
 
 	src := &failAfterReader{serve: 33 << 20, err: errors.New("died mid-third-part")}
-	if err := e.WriteStream(ctx, scope, "partial.bin", src, false); err == nil {
+	if _, err := e.WriteStream(ctx, scope, "partial.bin", src, false); err == nil {
 		t.Fatal("WriteStream with failing source: got nil error")
 	}
 	var buf bytes.Buffer
@@ -940,7 +947,7 @@ func TestS3Live_WriteStream_CancelCtx(t *testing.T) {
 	cctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	src := &cancelAtReader{cancel: cancel, at: 20 << 20}
-	err := e.WriteStream(cctx, scope, "cancelled.bin", src, false)
+	_, err := e.WriteStream(cctx, scope, "cancelled.bin", src, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("WriteStream under cancel = %v, want errors.Is(context.Canceled)", err)
 	}
@@ -998,7 +1005,7 @@ func TestS3Live_MakeDir_MissingParent(t *testing.T) {
 		t.Fatalf("MakeDir(d/sub) under existing parent: %v", err)
 	}
 
-	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.MakeDir(ctx, scope, "f.txt"); !errors.Is(err, fs.ErrExist) {
@@ -1006,7 +1013,7 @@ func TestS3Live_MakeDir_MissingParent(t *testing.T) {
 	}
 
 	// WriteStream into a missing parent refuses too (decision 2 parity).
-	if err := e.WriteStream(ctx, scope, "ghost/f.txt", bytes.NewReader([]byte("x")), false); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := e.WriteStream(ctx, scope, "ghost/f.txt", bytes.NewReader([]byte("x")), false); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("WriteStream(missing parent) = %v, want fs.ErrNotExist", err)
 	}
 }
@@ -1018,7 +1025,7 @@ func TestS3Live_RemoveFile_Parity(t *testing.T) {
 	e, scope := liveS3Engine(t)
 	ctx := context.Background()
 
-	if err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "f.txt", bytes.NewReader([]byte("x")), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.RemoveFile(ctx, scope, "f.txt"); err != nil {
@@ -1045,7 +1052,7 @@ func TestS3Live_RemoveFile_Parity(t *testing.T) {
 	if err := e.MakeDir(ctx, scope, "full-d"); err != nil {
 		t.Fatalf("MakeDir: %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "full-d/child.txt", bytes.NewReader([]byte("y")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "full-d/child.txt", bytes.NewReader([]byte("y")), false); err != nil {
 		t.Fatalf("WriteStream(child): %v", err)
 	}
 	err := e.RemoveFile(ctx, scope, "full-d")
@@ -1076,10 +1083,10 @@ func TestS3Live_CopyFile_NoReplace412(t *testing.T) {
 	e, scope := liveS3Engine(t)
 	ctx := context.Background()
 
-	if err := e.WriteStream(ctx, scope, "src.txt", bytes.NewReader([]byte("source body")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "src.txt", bytes.NewReader([]byte("source body")), false); err != nil {
 		t.Fatalf("WriteStream(src): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "dst.txt", bytes.NewReader([]byte("existing dst")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "dst.txt", bytes.NewReader([]byte("existing dst")), false); err != nil {
 		t.Fatalf("WriteStream(dst): %v", err)
 	}
 
@@ -1105,7 +1112,7 @@ func TestS3Live_CopyFile_NoReplace412(t *testing.T) {
 	}
 
 	// Zero-byte source with overwrite=false (the empty-MPU special case).
-	if err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "empty.bin", bytes.NewReader(nil), false); err != nil {
 		t.Fatalf("WriteStream(empty): %v", err)
 	}
 	if err := e.CopyFile(ctx, scope, "empty.bin", "empty-copy.bin", false); err != nil {
@@ -1127,7 +1134,7 @@ func TestS3Live_Copy_SameObjectGuard(t *testing.T) {
 	ctx := context.Background()
 	body := []byte("survivor")
 
-	if err := e.WriteStream(ctx, scope, "same.txt", bytes.NewReader(body), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "same.txt", bytes.NewReader(body), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.CopyFile(ctx, scope, "same.txt", "same.txt", false); !errors.Is(err, ErrAlreadyExists) {
@@ -1160,7 +1167,7 @@ func TestS3Live_Copy_SpecialCharKeys(t *testing.T) {
 		"mixed +%& name.dat",
 	} {
 		body := []byte(fmt.Sprintf("special body %d", i))
-		if err := e.WriteStream(ctx, scope, name, bytes.NewReader(body), false); err != nil {
+		if _, err := e.WriteStream(ctx, scope, name, bytes.NewReader(body), false); err != nil {
 			t.Fatalf("WriteStream(%q): %v", name, err)
 		}
 		dst := fmt.Sprintf("copies/c%d", i)
@@ -1196,7 +1203,7 @@ func TestS3Live_CopyThresholdSwitch(t *testing.T) {
 	for i := range body {
 		body[i] = byte(i * 13 / 5)
 	}
-	if err := e.WriteStream(ctx, scope, "big-src.bin", bytes.NewReader(body), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "big-src.bin", bytes.NewReader(body), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.CopyFile(ctx, scope, "big-src.bin", "big-dst.bin", true); err != nil {
@@ -1229,7 +1236,7 @@ func TestS3Live_MoveFile_VerifyThenDelete(t *testing.T) {
 	ctx := context.Background()
 	body := []byte("movable bytes")
 
-	if err := e.WriteStream(ctx, scope, "from.txt", bytes.NewReader(body), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "from.txt", bytes.NewReader(body), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.MoveFile(ctx, scope, "from.txt", "to.txt", false); err != nil {
@@ -1247,7 +1254,7 @@ func TestS3Live_MoveFile_VerifyThenDelete(t *testing.T) {
 		t.Fatalf("source after move = %v, want fs.ErrNotExist", err)
 	}
 
-	if err := e.WriteStream(ctx, scope, "zero.bin", bytes.NewReader(nil), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "zero.bin", bytes.NewReader(nil), false); err != nil {
 		t.Fatalf("WriteStream(zero): %v", err)
 	}
 	if err := e.MoveFile(ctx, scope, "zero.bin", "zero-moved.bin", false); err != nil {
@@ -1269,7 +1276,7 @@ func TestS3Live_MoveDest_PathContainment(t *testing.T) {
 	e, scope := liveS3Engine(t)
 	ctx := context.Background()
 
-	if err := e.WriteStream(ctx, scope, "safe.txt", bytes.NewReader([]byte("contained")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "safe.txt", bytes.NewReader([]byte("contained")), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	if err := e.MakeDir(ctx, scope, "d"); err != nil {
@@ -1304,13 +1311,13 @@ func TestS3Live_MoveDir_Recursive(t *testing.T) {
 	if err := e.MakeDir(ctx, scope, "tree"); err != nil {
 		t.Fatalf("MakeDir(tree): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "tree/f1.txt", bytes.NewReader([]byte("one")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "tree/f1.txt", bytes.NewReader([]byte("one")), false); err != nil {
 		t.Fatalf("WriteStream(f1): %v", err)
 	}
 	if err := e.MakeDir(ctx, scope, "tree/sub"); err != nil {
 		t.Fatalf("MakeDir(sub): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "tree/sub/f2.txt", bytes.NewReader([]byte("two")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "tree/sub/f2.txt", bytes.NewReader([]byte("two")), false); err != nil {
 		t.Fatalf("WriteStream(f2): %v", err)
 	}
 	if err := e.MakeDir(ctx, scope, "tree/hollow"); err != nil {
@@ -1598,13 +1605,13 @@ func TestS3Live_SEC54_TeardownEmpties(t *testing.T) {
 	e, scope := liveS3Engine(t)
 	ctx := context.Background()
 
-	if err := e.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("alpha")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "a.txt", bytes.NewReader([]byte("alpha")), false); err != nil {
 		t.Fatalf("WriteStream(a.txt): %v", err)
 	}
 	if err := e.MakeDir(ctx, scope, "d"); err != nil {
 		t.Fatalf("MakeDir(d): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "d/b.txt", bytes.NewReader([]byte("beta")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "d/b.txt", bytes.NewReader([]byte("beta")), false); err != nil {
 		t.Fatalf("WriteStream(d/b.txt): %v", err)
 	}
 
@@ -1644,10 +1651,10 @@ func TestS3Live_Teardown_VersionSweep(t *testing.T) {
 	prefix := string(scope) + "/"
 
 	// Build version history: two object versions, then a delete-marker.
-	if err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("one")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("one")), false); err != nil {
 		t.Fatalf("WriteStream(v1): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("two")), true); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "v.txt", bytes.NewReader([]byte("two")), true); err != nil {
 		t.Fatalf("WriteStream(v2 overwrite): %v", err)
 	}
 	if err := e.RemoveFile(ctx, scope, "v.txt"); err != nil {
@@ -1790,7 +1797,7 @@ func TestS3Live_ProvisionPreservesDirtyPrefix(t *testing.T) {
 	}
 
 	// The provisioned scope also serves fresh writes.
-	if err := e.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("fresh")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "fresh.txt", bytes.NewReader([]byte("fresh")), false); err != nil {
 		t.Fatalf("WriteStream(fresh after provision): %v", err)
 	}
 	var buf bytes.Buffer
@@ -1811,13 +1818,13 @@ func TestS3Live_ScopeIsolation(t *testing.T) {
 	t.Cleanup(func() { liveSweepScope(t, e, scopeB) })
 
 	for _, sc := range []ScopeID{scopeA, scopeB} {
-		if err := e.WriteStream(ctx, sc, "keep.txt", bytes.NewReader([]byte("survivor bytes")), false); err != nil {
+		if _, err := e.WriteStream(ctx, sc, "keep.txt", bytes.NewReader([]byte("survivor bytes")), false); err != nil {
 			t.Fatalf("WriteStream(%s/keep.txt): %v", sc, err)
 		}
 		if err := e.MakeDir(ctx, sc, "nest"); err != nil {
 			t.Fatalf("MakeDir(%s/nest): %v", sc, err)
 		}
-		if err := e.WriteStream(ctx, sc, "nest/deep.txt", bytes.NewReader([]byte("deep")), false); err != nil {
+		if _, err := e.WriteStream(ctx, sc, "nest/deep.txt", bytes.NewReader([]byte("deep")), false); err != nil {
 			t.Fatalf("WriteStream(%s/nest/deep.txt): %v", sc, err)
 		}
 	}
@@ -1977,5 +1984,92 @@ func TestS3_CompleteMultipart_HeadTransientClassification(t *testing.T) {
 				t.Fatalf("mapS3Err(%v) = %v; a not-found HEAD must not classify as transient (would mask real NoSuchUpload)", tc.in, mapped)
 			}
 		})
+	}
+}
+
+// TestS3_MapS3ErrPreservesBackendDetail pins operator-actionability on the
+// retryable classes: a 5xx refusal whose code the taxonomy does not model
+// (e.g. XMinioStorageFull from a full backend, HTTP 507) maps to ErrTransient
+// AND the message carries the backend status and code. Without them the
+// daemon log shows only the bare sentinel and the operator cannot see WHAT
+// the backend refused. Only the code and status are included — never the
+// backend message body (no credential byte, decision 7).
+func TestS3_MapS3ErrPreservesBackendDetail(t *testing.T) {
+	in := opErr(&awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 507}},
+			Err:      &smithy.GenericAPIError{Code: "XMinioStorageFull", Message: "backend full"},
+		},
+	})
+	got := mapS3Err("mkdir", in)
+	if !errors.Is(got, ErrTransient) {
+		t.Fatalf("mapS3Err(507) = %v, want ErrTransient", got)
+	}
+	for _, want := range []string{"507", "XMinioStorageFull"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Fatalf("mapS3Err(507) message %q lacks %q (a bare sentinel is not actionable)", got.Error(), want)
+		}
+	}
+}
+
+// TestS3Live_LazyScaffoldDerivedScopeFirstTouch drives the D5 lazy-provision
+// chain against the real backend (gated like every live S3 leg): a FRESH
+// derived scope "<base>-<16hex>" whose first touches are exactly the two
+// production shapes — the north create's ensure-parent (MakeDir tolerating
+// EEXIST, then the joined uploads/ write) and the south agent write under
+// outputs/ — both through ONE decorator over the s3 engine, with the SAME
+// scaffold verbs the daemon boot path composes. It pins on real S3 what the
+// local-engine units pin hermetically: the scaffold seeds BOTH subtree
+// markers (not just the scope root), the joined write lands, and the
+// listing reports it.
+func TestS3Live_LazyScaffoldDerivedScopeFirstTouch(t *testing.T) {
+	eng, base := liveS3Engine(t)
+	derived := ScopeID(string(base) + "-a1b2c3d4e5f60718")
+	t.Cleanup(func() { liveSweepScope(t, eng, derived) })
+
+	scaffold := func(ctx context.Context, scope ScopeID) error {
+		return scaffoldMarkers(ctx, eng, scope, lazyMarkers)
+	}
+	wrapped := NewLazyProvisionEngine(eng, string(base), scaffold)
+	ctx := context.Background()
+
+	// North create shape: EnsureDir's MakeDir (EEXIST tolerated — the lazy
+	// scaffold has just seeded the marker), then the joined object write.
+	if err := wrapped.MakeDir(ctx, derived, "uploads"); err != nil && !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("MakeDir(uploads) on fresh derived scope: %v", err)
+	}
+	if _, err := wrapped.WriteStream(ctx, derived, "uploads/probe.bin", bytes.NewReader([]byte("north")), false); err != nil {
+		t.Fatalf("north-shaped first write to fresh derived scope: %v", err)
+	}
+
+	// South shape through the SAME decorator: the agent writes an output.
+	if _, err := wrapped.WriteStream(ctx, derived, "outputs/result.txt", bytes.NewReader([]byte("south")), false); err != nil {
+		t.Fatalf("south-shaped write: %v", err)
+	}
+
+	// Both subtree markers exist as directories on the backend.
+	for _, sub := range lazyMarkers {
+		fi, serr := wrapped.Stat(ctx, derived, sub)
+		if serr != nil {
+			t.Fatalf("Stat(%q): %v (subtree marker not scaffolded)", sub, serr)
+		}
+		if !fi.IsDir {
+			t.Fatalf("Stat(%q) = %+v, want a directory marker", sub, fi)
+		}
+	}
+
+	// The joined object is listable under the derived scope's uploads/.
+	entries, lerr := wrapped.List(ctx, derived, "uploads")
+	if lerr != nil {
+		t.Fatalf("List(uploads): %v", lerr)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Name == "probe.bin" && !e.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("uploads/probe.bin not in listing; entries=%v", entries)
 	}
 }

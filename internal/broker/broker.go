@@ -22,6 +22,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
@@ -253,8 +254,9 @@ func (a engineAdapter) ReadRange(ctx context.Context, scope, path string, offset
 	return mapEngineErr(a.e.ReadRange(ctx, objectstore.ScopeID(scope), path, offset, length, w))
 }
 
-func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) error {
-	return mapEngineErr(a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite))
+func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) (string, error) {
+	digest, err := a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite)
+	return digest, mapEngineErr(err)
 }
 
 func toSouthfaceFileInfo(fi objectstore.FileInfo) southface.FileInfo {
@@ -293,9 +295,12 @@ func mapEngineErr(err error) error {
 		// denyMalformed (invalid_argument/400) — a client request fault.
 		return southface.ErrInvalidRange
 	case errors.Is(err, objectstore.ErrThrottled):
-		return southface.ErrBackendThrottled
+		// WRAP, never replace: the mirror stays the errors.Is target while the
+		// message keeps the engine's verb and backend detail (status/code) for
+		// the daemon log — a bare sentinel is not operator-actionable.
+		return fmt.Errorf("%w (%v)", southface.ErrBackendThrottled, err)
 	case errors.Is(err, objectstore.ErrTransient):
-		return southface.ErrBackendTransient
+		return fmt.Errorf("%w (%v)", southface.ErrBackendTransient, err)
 	default:
 		return err
 	}

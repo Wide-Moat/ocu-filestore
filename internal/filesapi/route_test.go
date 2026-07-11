@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/denywire"
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 )
 
 // doReq drives the handler with a fresh recorder and returns it. The default
@@ -96,6 +97,69 @@ func TestRouteScopeAbsentFailsClosed(t *testing.T) {
 	}
 	if w.Code == http.StatusForbidden {
 		t.Fatal("absent scope returned 403; must never leak a scope distinction")
+	}
+}
+
+// TestNorthScopeShapeGuard is the north choke-point wire keystone (ADR-0030
+// north face, open question #348). Driving the REAL fenced header source over
+// the route, it pins that:
+//
+//   - a shape-legal filesystem_id ("fs-fleet-abcdef0123456789") resolves and
+//     reaches the store (a plain "fs-fleet" is likewise accepted, backward
+//     compatible: no chat suffix required);
+//   - a traversal-shaped id ("fs-fleet-abc/123", "fs-fleet-../etc") is refused
+//     at the north edge with the existing 503 fail-closed deny (NEVER a 403 that
+//     would leak a scope distinction) BEFORE the store is ever read.
+//
+// The non-vacuous leg is getCalls: a refused traversal id must NOT reach the
+// store. This is a cooperative shape guard (single legal path element), not a
+// per-chat authorization point.
+func TestNorthScopeShapeGuard(t *testing.T) {
+	reqWithScope := func(h *Handler, id string) (*httptest.ResponseRecorder, *fakeStore) {
+		store := newFakeStore()
+		store.put("fid-x", id, handlestore.Record{Filename: "f", ObjectRef: "obj/f", Size: 1})
+		h = newTestHandler(Deps{Scope: NewFencedScopeSource(), Store: store})
+		r := httptest.NewRequest(http.MethodGet, "/v1/files/fid-x", nil)
+		r.Header.Set(fencedScopeHeader, id)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w, store
+	}
+
+	t.Run("legal chat-suffixed id resolves and reads the store", func(t *testing.T) {
+		w, store := reqWithScope(nil, "fs-fleet-abcdef0123456789")
+		if w.Code != http.StatusOK {
+			t.Fatalf("legal scope -> %d, want 200", w.Code)
+		}
+		if store.getCalls == 0 {
+			t.Fatal("legal scope never reached the store; the guard must not block a shape-legal id")
+		}
+	})
+
+	t.Run("plain base is backward compatible", func(t *testing.T) {
+		w, store := reqWithScope(nil, "fs-fleet")
+		if w.Code != http.StatusOK {
+			t.Fatalf("plain base scope -> %d, want 200", w.Code)
+		}
+		if store.getCalls == 0 {
+			t.Fatal("plain base never reached the store")
+		}
+	})
+
+	for _, id := range []string{"fs-fleet-abc/123", "fs-fleet-../etc"} {
+		t.Run("traversal id refused at the edge: "+id, func(t *testing.T) {
+			w, store := reqWithScope(nil, id)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("traversal scope %q -> %d, want 503 (shape guard fail-closed)", id, w.Code)
+			}
+			if w.Code == http.StatusForbidden {
+				t.Fatalf("traversal scope %q -> 403; must never leak a scope distinction", id)
+			}
+			if store.getCalls != 0 {
+				t.Fatalf("traversal scope %q reached the store (%d Get calls); the guard must refuse at the north edge",
+					id, store.getCalls)
+			}
+		})
 	}
 }
 

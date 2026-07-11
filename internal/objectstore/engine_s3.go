@@ -309,7 +309,11 @@ func parentKey(key string) string {
 // the package sentinels; transport-level timeouts and connection failures
 // are transient; authorization and clock-skew refusals are terminal typed
 // errors that are never retried. No credential material ever appears in the
-// returned error.
+// returned error. The retryable classes keep the backend's error CODE and
+// HTTP status in the message (never the backend message body): a bare
+// sentinel in the daemon log names the class but not the condition, and an
+// operator acting on "transient backend failure" cannot tell a storage-full
+// refusal from a flapping transport.
 func mapS3Err(verb string, err error) error {
 	if err == nil {
 		return nil
@@ -319,16 +323,17 @@ func mapS3Err(verb string, err error) error {
 	}
 
 	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
+	apiMatched := errors.As(err, &apiErr)
+	if apiMatched {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NoSuchBucket", "NotFound", "404":
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, fs.ErrNotExist)
 		case "PreconditionFailed":
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrAlreadyExists)
 		case "SlowDown", "ServiceUnavailable", "Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequests":
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrThrottled)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend code %s)", verb, ErrThrottled, apiErr.ErrorCode())
 		case "RequestTimeout", "InternalError":
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrTransient)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend code %s)", verb, ErrTransient, apiErr.ErrorCode())
 		case "AccessDenied":
 			return fmt.Errorf("s3 %s: %w", verb, errS3AccessDenied)
 		case "RequestTimeTooSkewed":
@@ -338,6 +343,13 @@ func mapS3Err(verb string, err error) error {
 
 	var respErr *awshttp.ResponseError
 	if errors.As(err, &respErr) {
+		// An unmodeled backend code (e.g. a storage-full refusal) reaches this
+		// branch with the API error still attached; carry its code alongside
+		// the status so the log names the refusal.
+		code := ""
+		if apiMatched {
+			code = ", code " + apiErr.ErrorCode()
+		}
 		switch sc := respErr.HTTPStatusCode(); {
 		case sc == http.StatusNotFound:
 			return fmt.Errorf("objectstore: s3 %s: %w", verb, fs.ErrNotExist)
@@ -346,9 +358,9 @@ func mapS3Err(verb string, err error) error {
 		case sc == http.StatusForbidden:
 			return fmt.Errorf("s3 %s: %w", verb, errS3AccessDenied)
 		case sc == http.StatusServiceUnavailable, sc == http.StatusTooManyRequests:
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrThrottled)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend status %d%s)", verb, ErrThrottled, sc, code)
 		case sc >= 500:
-			return fmt.Errorf("objectstore: s3 %s: %w", verb, ErrTransient)
+			return fmt.Errorf("objectstore: s3 %s: %w (backend status %d%s)", verb, ErrTransient, sc, code)
 		}
 	}
 
@@ -1456,17 +1468,17 @@ func noCancelCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 // write is never visible (a multipart object only exists after Complete).
 // After upload, a HEAD verifies the size; a mismatch deletes the object and
 // errors.
-func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r io.Reader, overwrite bool) error {
+func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r io.Reader, overwrite bool) (string, error) {
 	key, err := e.objectKey(scope, p)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ok, err := e.parentExists(ctx, key)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !ok {
-		return &fs.PathError{Op: "write", Path: p, Err: fs.ErrNotExist}
+		return "", &fs.PathError{Op: "write", Path: p, Err: fs.ErrNotExist}
 	}
 
 	hasher := sha256.New()
@@ -1475,13 +1487,19 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 
 	n, ended, rerr := fillBuffer(src, buf)
 	if rerr != nil {
-		return fmt.Errorf("objectstore: s3 writestream: read source: %w", rerr)
+		return "", fmt.Errorf("objectstore: s3 writestream: read source: %w", rerr)
 	}
 
+	// digest is the single-pass content hash the caller records (D6). It is
+	// finalised once the whole stream has passed the hasher - for a single
+	// PutObject that is right after fillBuffer ended the stream; for a multipart
+	// upload it is after writeMultipart drained the remainder. It is the SAME
+	// value stored in the ocu-sha256 object tag.
+	var digest string
 	var total int64
 	if ended && int64(n) <= e.singlePutCutoff {
 		total = int64(n)
-		digest := hex.EncodeToString(hasher.Sum(nil))
+		digest = hex.EncodeToString(hasher.Sum(nil))
 		in := &s3.PutObjectInput{
 			Bucket:        aws.String(e.bucket),
 			Key:           aws.String(key),
@@ -1493,17 +1511,17 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 			in.IfNoneMatch = aws.String("*")
 		}
 		if _, perr := e.client.PutObject(ctx, in); perr != nil {
-			return mapS3Err("writestream", perr)
+			return "", mapS3Err("writestream", perr)
 		}
 	} else {
 		var werr error
 		total, werr = e.writeMultipart(ctx, key, src, buf, n, ended, overwrite)
 		if werr != nil {
-			return werr
+			return "", werr
 		}
 		// The digest tag lands after Complete (multipart metadata is fixed
 		// at Create, before a single-pass digest can exist).
-		digest := hex.EncodeToString(hasher.Sum(nil))
+		digest = hex.EncodeToString(hasher.Sum(nil))
 		if _, terr := e.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
 			Bucket: aws.String(e.bucket),
 			Key:    aws.String(key),
@@ -1511,7 +1529,7 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 				{Key: aws.String(digestTagKey), Value: aws.String(digest)},
 			}},
 		}); terr != nil {
-			return mapS3Err("writestream tag", terr)
+			return "", mapS3Err("writestream tag", terr)
 		}
 	}
 
@@ -1522,7 +1540,7 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 		Bucket: aws.String(e.bucket), Key: aws.String(key),
 	})
 	if herr != nil {
-		return mapS3Err("writestream verify", herr)
+		return "", mapS3Err("writestream verify", herr)
 	}
 	if got := aws.ToInt64(head.ContentLength); got != total {
 		cctx, cancel := noCancelCtx(ctx)
@@ -1532,11 +1550,11 @@ func (e *s3Engine) WriteStream(ctx context.Context, scope ScopeID, p string, r i
 			Bucket: aws.String(e.bucket), Key: aws.String(key),
 		})
 		if delErr != nil {
-			return errors.Join(sizeErr, fmt.Errorf("objectstore: s3 writestream: cleanup delete of torn object also failed: %w", mapS3Err("writestream cleanup", delErr)))
+			return "", errors.Join(sizeErr, fmt.Errorf("objectstore: s3 writestream: cleanup delete of torn object also failed: %w", mapS3Err("writestream cleanup", delErr)))
 		}
-		return sizeErr
+		return "", sizeErr
 	}
-	return nil
+	return digest, nil
 }
 
 // writeMultipart streams the remainder of src as a multipart upload whose
