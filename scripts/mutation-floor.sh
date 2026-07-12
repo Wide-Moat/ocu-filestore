@@ -16,31 +16,55 @@
 # gremlins job stays advisory (its coverage now reads real, useful as a surfaced
 # signal, but its kill stays timing-flaky).
 #
-# HARDENING: the go-mutesting score formula counts SKIPPED mutants in the
-# numerator (score = (killed + error + skipped) / total). A skipped mutant is one
-# whose `go test -timeout` exited non-zero-without-a-verdict (a timeout, or a
-# compile-broken mutant), so a run where every mutant skips would report a fake
-# 1.000000 and pass any floor while no test asserted on anything. The in-scope
-# suites finish in about a second (rapid runs the whole property set well inside
-# the per-mutant timeout below), so no skip occurs today; the guard below fails
-# the gate closed if that ever changes - a slower runner, a fatter dependency, or
-# a new slow property test that pushes a mutant past the timeout. The guard also
-# fails closed when no mutant reaches a PASS/FAIL verdict at all (a misconfigured
-# package path generating zero mutants: "100% of nothing").
+# EXECUTION: every mutant runs through scripts/mutation-exec.sh (a go-mutesting
+# custom --exec script) rather than the tool's built-in executor. Neither path
+# is bounded by the tool itself: `go test -timeout` arms only once the test
+# binary runs (compile and init time sit outside it) and the custom-exec path
+# applies no timeout at all (an unenforced TODO in the tool). Whole runs have
+# wedged indefinitely under environmental pressure (two mutation walks over
+# one working tree corrupt each other; never run them concurrently), and an
+# ARMED nightly gate must be hang-proof by construction, not by assuming a
+# quiet runner. The exec script therefore hard-KILLs the test run at
+# MUTATE_TIMEOUT + 30s and maps the timeout to KILLED - a mutant that hangs the
+# suite IS detected (the suite would never let it ship). Each timeout is logged
+# so the STORM guard below can red when timeouts stop being an exception.
 #
-#   EXEC_TIMEOUT=60: per-mutant `go test -timeout`, up from the tool default 10s.
-#     Not required for correctness (the guard reds a timeout storm either way),
-#     but it keeps a legitimately-slow-but-honest suite from tripping the guard on
-#     a loaded runner, so nobody is tempted to weaken the guard to "fix" a flake.
+# HARDENING - the gate fails CLOSED on every anomaly the score formula would
+# otherwise absorb silently. The formula counts killed + errored + skipped in
+# the numerator; the summary line prints killed (passed), escaped (failed),
+# duplicated, skipped and total, but NOT errored:
+#   - skipped > 0: a skip is a mutant that did not compile (the exec script
+#     exits 2 only there; timeouts are killed, not skipped). Skips inflate the
+#     numerator without any test asserting on anything -> red.
+#   - errored > 0 (computed as total - killed - escaped - skipped): errored
+#     mutants inflate the numerator INVISIBLY - the line does not print them.
+#     An exec-script anomaly (a signal death, an unknown exit) lands here -> red.
+#   - killed == 0 && escaped == 0: no mutant reached a PASS/FAIL verdict
+#     ("100% of nothing", e.g. a misconfigured package path) -> red.
+#   - unparsable summary line: a tool version bump could change the format and
+#     silently disarm all of the above -> red rather than trust it.
+#   - timeout STORM: more than 25% of verdicts reached only via the external
+#     hard kill means the measurement is sick (a loaded runner, a broken
+#     suite), not that assertions got stronger -> red for owner triage.
+#
+#   EXEC_TIMEOUT=60: feeds go-mutesting --exec-timeout, which the exec script
+#     receives as MUTATE_TIMEOUT: the inner `go test -timeout`, plus +30s for
+#     the external hard KILL (compile time sits outside the Go-level flag).
 #
 # The floor is FLOOR, an integer percent. A package whose go-mutesting score
 # falls below FLOOR/100 fails the script (exit 1). FLOOR defaults to a value
 # below the measured baselines; the caller may raise it as the ratchet target
 # is approached.
 #
-# Measured baselines (local, full rapid, exec-timeout 60):
-#   internal/authz  : 16/16 killed (1.000000)
-#   internal/broker : 52/52 killed (1.000000, 1 duplicated)
+# Measured baselines (local, full rapid, exec script, no exclusions):
+#   internal/authz  : 16/16 killed (1.000000, 1 duplicated, 0 timeouts)
+#   internal/broker : 49/52 killed (0.942308, 0 timeouts). The 3 survivors are
+#     equivalent mutants, each sitting on a deliberate defence-in-depth
+#     redundancy: the empty-after-TrimSpace prefix drop (re-dropped by the
+#     bare-root drop below it), the empty-path pre-check (re-refused by the
+#     filepath.Clean equality guard), and the "continue" after the "*" token
+#     (prefixes after "*" are never consulted - the match-all shortcut
+#     precedes the prefix loop). Killing them means deleting the redundancy.
 # FLOOR default 80 sits below both, so a real regression reds while the score's
 # small run-to-run wobble (duplicate/equivalent-mutant classification) does not.
 
@@ -48,10 +72,10 @@ set -u
 
 FLOOR="${MUTATION_FLOOR:-80}"
 
-# Per-mutant `go test -timeout`, in seconds. Overridable only to red-probe the
-# skip guard (a real skip is otherwise unreachable: the suites finish far inside
-# any sane timeout, and an over-sleeping test panics -> FAIL -> counted killed,
-# never skipped).
+# Per-mutant test timeout, in seconds. Passed to go-mutesting as --exec-timeout
+# and surfaced to the exec script as MUTATE_TIMEOUT (inner `go test -timeout`;
+# the script adds +30s for its external hard KILL). Overridable to red-probe
+# the timeout path with an artificially tiny window.
 EXEC_TIMEOUT="${MUTATION_EXEC_TIMEOUT:-60}"
 
 # Custody-relevant packages: the authorization resolver and the downloadable /
@@ -66,29 +90,26 @@ if ! command -v go-mutesting >/dev/null 2>&1; then
   exit 2
 fi
 
-# EXTERNAL HARD TIMEOUT per go-mutesting invocation. go-mutesting's --exec-timeout
-# is NOT reliably enforced (its custom executor path carries a `// TODO timeout`),
-# so a mutant whose `go test` blocks in a syscall can hang the whole run
-# indefinitely - which in CI would run to the job cap. Bound each invocation
-# externally: on a hang, the process is killed, go-mutesting emits no score line,
-# and the no-score guard below reds the gate LOUDLY instead of hanging. A required
-# gate must never hang. Uses coreutils `timeout` when present, else a perl alarm.
-INVOCATION_TIMEOUT="${MUTATION_INVOCATION_TIMEOUT:-600}"
+# The per-mutant exec script (timeout-as-killed; see the header). go-mutesting
+# splits --exec on spaces, so the checkout path must not contain one.
+EXEC_SCRIPT="$(cd "$(dirname "$0")" && pwd)/mutation-exec.sh"
+case "$EXEC_SCRIPT" in
+  *" "*)
+    echo "::error::checkout path contains a space; go-mutesting splits --exec on spaces and cannot address ${EXEC_SCRIPT}" >&2
+    exit 2
+    ;;
+esac
+if [ ! -x "$EXEC_SCRIPT" ]; then
+  echo "::error::${EXEC_SCRIPT} is missing or not executable" >&2
+  exit 2
+fi
 
-# BLACKLIST of known go-mutesting-hanging mutant checksums. go-mutesting mutates in
-# a deterministic AST order, so a hanging mutant reproduces with the same MD5 every
-# run and is excluded by checksum. go-mutesting's built-in executor hangs on
-# internal/authz branch/if-flip mutants: each COMPILES then blocks the executor in
-# a syscall (~0% CPU, never returns; the tool's per-mutant timeout is unenforced -
-# the `// TODO timeout` path). This is a go-mutesting defect, NOT a code defect
-# (resolver.go has no loop; the range in intentGranted is finite over a slice).
-# Because the hang is a whole CLASS (if-flips), this gate is scheduled NIGHTLY not
-# per-PR (see mutation.yml): the external timeout above turns any UNLISTED hang
-# into a red an owner triages, while the listed checksums let the nightly measure a
-# real score. Excluded so far (both confirmed stable across runs):
-#   49c3159a2b715624220d71abdcc5866c - internal/authz/resolver.go, a branch/if flip
-#   6bbe942ee9d83d013b214fc59aefd94b - internal/authz/resolver.go, a second if flip
-BLACKLIST="$(cd "$(dirname "$0")" && pwd)/mutation-blacklist.txt"
+# WHOLE-INVOCATION backstop, per go-mutesting invocation. The exec script
+# bounds every mutant, so a healthy run cannot approach this; it catches a
+# hang OUTSIDE the per-mutant path (the tool itself wedging). On expiry the
+# process group is killed, no score line is emitted, and the no-score guard
+# reds the gate LOUDLY instead of hanging. A required gate must never hang.
+INVOCATION_TIMEOUT="${MUTATION_INVOCATION_TIMEOUT:-900}"
 
 bounded_mutesting() {
   if command -v timeout >/dev/null 2>&1; then
@@ -111,20 +132,27 @@ bounded_mutesting() {
   fi
 }
 
-# Assemble the blacklist flag only if the file exists and is non-empty (an empty
-# --blacklist file makes go-mutesting error).
-bl_flag=""
-if [ -s "$BLACKLIST" ]; then
-  bl_flag="--blacklist=${BLACKLIST}"
-fi
-
 rc=0
 for pkg in $PKGS; do
   echo "--- go-mutesting ${pkg} (floor ${FLOOR}%, exec-timeout=${EXEC_TIMEOUT}s, invocation-timeout=${INVOCATION_TIMEOUT}s) ---"
+  # Per-package timeout log: the exec script appends one line per mutant whose
+  # verdict came from the external hard kill; the storm guard reads it below.
+  tlog="$(mktemp)"
   # Capture the run; go-mutesting prints one line:
   #   The mutation score is <f> (<killed> passed, <escaped> failed, <dup> duplicated, <skipped> skipped, total is <n>)
-  out="$(bounded_mutesting --exec-timeout "${EXEC_TIMEOUT}" ${bl_flag} "$pkg" 2>&1)" || true
+  out="$(MUTATION_TIMEOUT_LOG="$tlog" bounded_mutesting --exec "$EXEC_SCRIPT" --exec-timeout "${EXEC_TIMEOUT}" "$pkg" 2>&1)" || true
   echo "$out" | tail -1
+
+  # A KILLed invocation (or a KILLed exec script) can leave a mutant swapped
+  # into the working tree with the original parked at <file>.tmp. Restore
+  # before anything else so a red never leaves the tree mutated.
+  find . -name '*.go.tmp' 2>/dev/null | while IFS= read -r t; do
+    mv "$t" "${t%.tmp}"
+  done
+
+  timeouts="$(wc -l < "$tlog" | tr -d ' ')"
+  rm -f "$tlog"
+
   score_line="$(printf '%s\n' "$out" | grep -E 'mutation score is' | tail -1)"
   if [ -z "$score_line" ]; then
     echo "::error::no mutation score parsed for ${pkg} (go-mutesting produced no score line)" >&2
@@ -132,27 +160,47 @@ for pkg in $PKGS; do
     continue
   fi
 
-  # HARD SKIP / NO-VERDICT GUARD (see header). Parse the counts out of the summary
-  # line and fail closed on any anomaly. skipped counts as killed in the score
-  # formula, so a skip would fake-inflate; a zero-verdict run measured nothing.
+  # HARD GUARDS (see header). Parse the counts out of the summary line and fail
+  # closed on any anomaly.
   killed="$(printf '%s\n' "$score_line" | sed -n 's/.*is [0-9.]* (\([0-9]*\) passed.*/\1/p')"
   escaped="$(printf '%s\n' "$score_line" | sed -n 's/.* passed, \([0-9]*\) failed.*/\1/p')"
   skipped="$(printf '%s\n' "$score_line" | sed -n 's/.*duplicated, \([0-9]*\) skipped.*/\1/p')"
+  total="$(printf '%s\n' "$score_line" | sed -n 's/.*total is \([0-9]*\)).*/\1/p')"
   # Fail closed on an UNPARSABLE summary: a go-mutesting version bump could change
-  # the line and silently disarm the guard (an empty count in `[ "" -gt 0 ]` is a
-  # bash error, not a false). Require all three counts to have parsed.
-  if [ -z "$killed" ] || [ -z "$escaped" ] || [ -z "$skipped" ]; then
-    echo "::error::${pkg} summary line did not parse into killed/escaped/skipped counts - go-mutesting output format may have changed. Fail closed rather than trust an unparsed line: ${score_line}" >&2
+  # the line and silently disarm the guards (an empty count in `[ "" -gt 0 ]` is a
+  # bash error, not a false). Require all four counts to have parsed.
+  if [ -z "$killed" ] || [ -z "$escaped" ] || [ -z "$skipped" ] || [ -z "$total" ]; then
+    echo "::error::${pkg} summary line did not parse into killed/escaped/skipped/total counts - go-mutesting output format may have changed. Fail closed rather than trust an unparsed line: ${score_line}" >&2
     rc=1
     continue
   fi
   if [ "$skipped" -gt 0 ]; then
-    echo "::error::${pkg} produced ${skipped} skipped mutant(s) - a mutant that did not reach a real test verdict (timeout, or a compile-broken mutant). go-mutesting counts skipped as killed, so this would fake-inflate the score. Fail closed; raise --exec-timeout, then re-run." >&2
+    echo "::error::${pkg} produced ${skipped} skipped mutant(s) - a mutant that did not compile. Skips count in the score numerator with no test asserting on anything, so this would fake-inflate the score. Fail closed; triage the non-compiling mutant, then re-run." >&2
+    rc=1
+    continue
+  fi
+  errored=$((total - killed - escaped - skipped))
+  if [ "$errored" -ne 0 ]; then
+    echo "::error::${pkg} produced ${errored} errored mutant(s) (total ${total} vs killed ${killed} + escaped ${escaped} + skipped ${skipped}). Errored mutants count in the score numerator WITHOUT appearing in the summary line - an invisible inflation. Fail closed; an exec-script anomaly (signal death, unknown exit) is the usual cause." >&2
     rc=1
     continue
   fi
   if [ "$killed" -eq 0 ] && [ "$escaped" -eq 0 ]; then
     echo "::error::${pkg} had no mutant reach a PASS/FAIL verdict (killed=0, escaped=0). The suite never ran against a mutant; the score is meaningless. Fail closed." >&2
+    rc=1
+    continue
+  fi
+
+  # TIMEOUT STORM guard: timeout-as-killed is sound for the odd hang-class
+  # mutant, but when a quarter of all verdicts come only from the hard kill the
+  # measurement itself is sick (a loaded runner, a broken suite) - the score no
+  # longer reflects assertion strength. Red for owner triage.
+  verdicts=$((killed + escaped))
+  if [ "$timeouts" -gt 0 ]; then
+    echo "note: ${timeouts} of ${verdicts} verdict(s) for ${pkg} came from the external hard timeout (timeout-as-killed)"
+  fi
+  if [ $((timeouts * 4)) -gt "$verdicts" ]; then
+    echo "::error::${pkg}: ${timeouts} of ${verdicts} verdicts are timeout-kills (over the 25% storm ceiling). The measurement is dominated by hard kills, not assertions. Fail closed; triage the runner or the suite." >&2
     rc=1
     continue
   fi
@@ -166,7 +214,7 @@ for pkg in $PKGS; do
     rc=1
     continue
   fi
-  echo "parsed score ${score_pct}% for ${pkg} (killed=${killed}, escaped=${escaped}, skipped=${skipped}, floor ${FLOOR}%)"
+  echo "parsed score ${score_pct}% for ${pkg} (killed=${killed}, escaped=${escaped}, skipped=${skipped}, timeouts=${timeouts}, floor ${FLOOR}%)"
   if [ "$score_pct" -lt "$FLOOR" ]; then
     echo "::error::${pkg} mutation score ${score_pct}% is below the ${FLOOR}% floor" >&2
     rc=1
@@ -174,7 +222,7 @@ for pkg in $PKGS; do
 done
 
 if [ "$rc" -ne 0 ]; then
-  echo "mutation-floor: FAILED (a package fell below the ${FLOOR}% floor, produced a skipped/no-verdict mutant, or emitted an unparsable summary)" >&2
+  echo "mutation-floor: FAILED (a package fell below the ${FLOOR}% floor or tripped a fail-closed guard: skipped/errored/no-verdict mutants, a timeout storm, or an unparsable summary)" >&2
   exit 1
 fi
-echo "mutation-floor: all custody packages at or above the ${FLOOR}% floor, no skipped mutants"
+echo "mutation-floor: all custody packages at or above the ${FLOOR}% floor, no skipped/errored mutants, timeouts under the storm ceiling"
