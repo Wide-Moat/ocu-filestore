@@ -9,7 +9,7 @@
 # ABOVE the measured score (must FAIL on the comparison) and once with the shipped
 # floor 80 (must PASS). The score is identical between the two runs; only the floor
 # moves, so a RED here can only be the threshold firing. The high floor is 101, not
-# 100: both custody packages measure a full 100% at the shipped settings, and the
+# 100: the probe package (authz) measures 100% at the shipped settings, and the
 # comparison is strict `-lt`, so a floor of 100 would NOT red a 100% score (100 is
 # not < 100). 101 is unreachable by construction, so the high-floor run always reds
 # on a real below-floor comparison regardless of the exact score. Two extra

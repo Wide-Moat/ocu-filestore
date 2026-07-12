@@ -126,9 +126,10 @@ func NewPrefixDownloadablePolicy(prefixes []string) authz.StoredTagFunc {
 
 // hasDotDotComponent reports whether path carries a ".." as a whole
 // "/"-delimited component (not merely as a substring of a legitimate name such
-// as "..config"). It is the fail-closed companion to the filepath.Clean
-// equality check: a path that is already clean cannot carry a ".." component,
-// but the explicit test documents the egress-gate invariant in one place.
+// as "..config"). It is the LOAD-BEARING half of the bypass-01 guard for
+// leading-".." paths: filepath.Clean KEEPS leading ".." components ("..",
+// "../a" are already clean), so the Clean-equality check alone would pass
+// them through to the match-all/prefix logic.
 func hasDotDotComponent(path string) bool {
 	for _, c := range strings.Split(path, "/") {
 		if c == ".." {

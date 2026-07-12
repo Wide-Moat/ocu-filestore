@@ -21,6 +21,13 @@
 #     Note the INVERSION relative to `go test`: a failing suite means the
 #     mutant was caught, so `go test` exit 1 maps to script exit 0 and vice
 #     versa (same mapping as the tool's built-in executor).
+#   - BUILD-FAILURE CLASSIFICATION: modern Go toolchains exit 1 for a build
+#     failure too (never 2), so a non-compiling mutant is indistinguishable
+#     from a killed one by exit code alone - counting it KILLED would inflate
+#     the score with verdicts no test earned. The toolchain prints the
+#     "[build failed]" marker for build failures; rc=1 plus that marker is
+#     reclassified to SKIP. An exit 2 from an older toolchain still maps to
+#     SKIP directly.
 #   - go-mutesting applies NO timeout to this script (its custom-exec path
 #     carries an unenforced timeout TODO), so the script bounds the test run
 #     ITSELF: an external hard KILL at MUTATE_TIMEOUT + 30 seconds. The +30s
@@ -64,27 +71,27 @@ if [ -n "${TEST_RECURSIVE:-}" ]; then
   pkg="${pkg}/..."
 fi
 
-# Per-mutant test output is discarded: go-mutesting already prints the diff of
+# Per-mutant test output is captured only to classify the exit (the build-
+# failure marker, see the header); go-mutesting already prints the diff of
 # every escaped mutant, which is the artifact a triage needs.
+out_file="$(mktemp)"
 if command -v timeout >/dev/null 2>&1; then
   # coreutils timeout (the CI/Linux path). --signal=KILL cannot be blocked by
   # a wedged test binary; expiry surfaces as exit 137 (128+9).
   timeout --signal=KILL "$HARD_TIMEOUT" \
-    go test -timeout "${MUTATE_TIMEOUT}s" "$pkg" >/dev/null 2>&1
+    go test -timeout "${MUTATE_TIMEOUT}s" "$pkg" >"$out_file" 2>&1
   rc=$?
 else
   # Hosts without coreutils (macOS): run `go test` in its own session and
   # SIGKILL the whole group on the alarm, exit 124. A child that died on a
   # signal maps to 128+n so it lands in the errored bucket, never in a
-  # verdict it did not earn.
+  # verdict it did not earn. Output flows to the inherited redirect.
   perl -e '
     use POSIX qw(setsid);
     my $t = shift;
     my $pid = fork();
     if ($pid == 0) {
       setsid();
-      open(STDOUT, ">", "/dev/null");
-      open(STDERR, ">", "/dev/null");
       exec @ARGV or die "exec: $!";
     }
     $SIG{ALRM} = sub { kill(-9, $pid); waitpid($pid, 0); exit 124; };
@@ -92,9 +99,16 @@ else
     waitpid($pid, 0);
     if ($? & 127) { exit(128 + ($? & 127)); }
     exit($? >> 8);
-  ' "$HARD_TIMEOUT" go test -timeout "${MUTATE_TIMEOUT}s" "$pkg"
+  ' "$HARD_TIMEOUT" go test -timeout "${MUTATE_TIMEOUT}s" "$pkg" >"$out_file" 2>&1
   rc=$?
 fi
+
+# A build failure exits 1 on modern toolchains (see the header): reclassify
+# to SKIP by the toolchain marker before the verdict map below.
+if [ "$rc" -eq 1 ] && grep -q '\[build failed\]$' "$out_file"; then
+  rc=2
+fi
+rm -f "$out_file"
 
 restore
 

@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 #
@@ -29,18 +30,27 @@
 # suite IS detected (the suite would never let it ship). Each timeout is logged
 # so the STORM guard below can red when timeouts stop being an exception.
 #
-# HARDENING - the gate fails CLOSED on every anomaly the score formula would
-# otherwise absorb silently. The formula counts killed + errored + skipped in
-# the numerator; the summary line prints killed (passed), escaped (failed),
-# duplicated, skipped and total, but NOT errored:
-#   - skipped > 0: a skip is a mutant that did not compile (the exec script
-#     exits 2 only there; timeouts are killed, not skipped). Skips inflate the
-#     numerator without any test asserting on anything -> red.
-#   - errored > 0 (computed as total - killed - escaped - skipped): errored
-#     mutants inflate the numerator INVISIBLY - the line does not print them.
-#     An exec-script anomaly (a signal death, an unknown exit) lands here -> red.
+# SCORING - the floor does NOT use the tool's own score. The tool's formula
+# counts killed + errored + skipped in the numerator, and skips are a NORMAL
+# population here: the mutator emits invalid Go over some identifiers, and the
+# exec script classifies those to SKIP via the toolchain's "[build failed]"
+# marker (modern `go test` exits 1 for build failures, same as a real kill -
+# by exit code alone every non-compiling mutant would count as KILLED and
+# inflate the score with verdicts no test earned). The floor recomputes the
+# honest score from the summary counts,
+#     score = killed / (killed + escaped)
+# and compares THAT against FLOOR.
+#
+# HARDENING - the gate fails CLOSED on every anomaly that would otherwise
+# pass silently:
+#   - errored > 0 (computed as total - killed - escaped - skipped): the
+#     summary line never prints errored mutants; an exec-script anomaly (a
+#     signal death, an unknown exit) lands there -> red.
 #   - killed == 0 && escaped == 0: no mutant reached a PASS/FAIL verdict
 #     ("100% of nothing", e.g. a misconfigured package path) -> red.
+#   - verdicts < MIN_VERDICTS: a verdict collapse - nearly everything skipped
+#     as non-compiling, so the floor is measuring (almost) nothing. Catches a
+#     toolchain change that reroutes real verdicts into the skip bucket -> red.
 #   - unparsable summary line: a tool version bump could change the format and
 #     silently disarm all of the above -> red rather than trust it.
 #   - timeout STORM: more than 25% of verdicts reached only via the external
@@ -56,15 +66,18 @@
 # below the measured baselines; the caller may raise it as the ratchet target
 # is approached.
 #
-# Measured baselines (local, full rapid, exec script, no exclusions):
-#   internal/authz  : 16/16 killed (1.000000, 1 duplicated, 0 timeouts)
-#   internal/broker : 49/52 killed (0.942308, 0 timeouts). The 3 survivors are
-#     equivalent mutants, each sitting on a deliberate defence-in-depth
-#     redundancy: the empty-after-TrimSpace prefix drop (re-dropped by the
-#     bare-root drop below it), the empty-path pre-check (re-refused by the
-#     filepath.Clean equality guard), and the "continue" after the "*" token
-#     (prefixes after "*" are never consulted - the match-all shortcut
-#     precedes the prefix loop). Killing them means deleting the redundancy.
+# Measured baselines (local, full rapid, exec script, no exclusions), stated
+# over REAL verdicts - killed/(killed+escaped); the skipped column is the
+# non-compiling-mutant population the mutator emits naturally:
+#   internal/authz  : 6/6 killed (100%), 10 skipped, 1 duplicated, 0 timeouts
+#   internal/broker : 28/31 killed (90%), 21 skipped, 0 timeouts. The 3
+#     survivors are equivalent mutants, each sitting on a deliberate
+#     defence-in-depth redundancy: the empty-after-TrimSpace prefix drop
+#     (re-dropped by the bare-root drop below it), the empty-path pre-check
+#     (re-refused by the filepath.Clean equality guard), and the "continue"
+#     after the "*" token (prefixes after "*" are never consulted - the
+#     match-all shortcut precedes the prefix loop). Killing them means
+#     deleting the redundancy.
 # FLOOR default 80 sits below both, so a real regression reds while the score's
 # small run-to-run wobble (duplicate/equivalent-mutant classification) does not.
 
@@ -77,6 +90,11 @@ FLOOR="${MUTATION_FLOOR:-80}"
 # the script adds +30s for its external hard KILL). Overridable to red-probe
 # the timeout path with an artificially tiny window.
 EXEC_TIMEOUT="${MUTATION_EXEC_TIMEOUT:-60}"
+
+# Minimum real verdicts (killed + escaped) per package - the verdict-collapse
+# guard (see the header). The baselines carry 6 (authz) and 31 (broker)
+# verdicts; a drop below 4 means the measurement, not the suite, changed.
+MIN_VERDICTS="${MUTATION_MIN_VERDICTS:-4}"
 
 # Custody-relevant packages: the authorization resolver and the downloadable /
 # credential-scope broker. These carry no live-rig dependency, so go-mutesting
@@ -174,11 +192,6 @@ for pkg in $PKGS; do
     rc=1
     continue
   fi
-  if [ "$skipped" -gt 0 ]; then
-    echo "::error::${pkg} produced ${skipped} skipped mutant(s) - a mutant that did not compile. Skips count in the score numerator with no test asserting on anything, so this would fake-inflate the score. Fail closed; triage the non-compiling mutant, then re-run." >&2
-    rc=1
-    continue
-  fi
   errored=$((total - killed - escaped - skipped))
   if [ "$errored" -ne 0 ]; then
     echo "::error::${pkg} produced ${errored} errored mutant(s) (total ${total} vs killed ${killed} + escaped ${escaped} + skipped ${skipped}). Errored mutants count in the score numerator WITHOUT appearing in the summary line - an invisible inflation. Fail closed; an exec-script anomaly (signal death, unknown exit) is the usual cause." >&2
@@ -190,12 +203,20 @@ for pkg in $PKGS; do
     rc=1
     continue
   fi
+  verdicts=$((killed + escaped))
+
+  # Verdict-collapse guard (see the header): skips are a normal population,
+  # but when nearly everything skips the floor measures nothing.
+  if [ "$verdicts" -lt "$MIN_VERDICTS" ]; then
+    echo "::error::${pkg} reached only ${verdicts} real verdict(s) (killed+escaped), below the ${MIN_VERDICTS} minimum - almost every mutant skipped as non-compiling. A toolchain change may have rerouted real verdicts into the skip bucket. Fail closed." >&2
+    rc=1
+    continue
+  fi
 
   # TIMEOUT STORM guard: timeout-as-killed is sound for the odd hang-class
   # mutant, but when a quarter of all verdicts come only from the hard kill the
   # measurement itself is sick (a loaded runner, a broken suite) - the score no
   # longer reflects assertion strength. Red for owner triage.
-  verdicts=$((killed + escaped))
   if [ "$timeouts" -gt 0 ]; then
     echo "note: ${timeouts} of ${verdicts} verdict(s) for ${pkg} came from the external hard timeout (timeout-as-killed)"
   fi
@@ -205,15 +226,9 @@ for pkg in $PKGS; do
     continue
   fi
 
-  # Extract the float, scale to an integer percent (x100, truncated) with awk so
-  # the comparison needs no floating-point shell arithmetic.
-  score_pct="$(printf '%s\n' "$score_line" \
-    | awk '{for(i=1;i<=NF;i++) if($i+0==$i){printf "%d", $i*100; exit}}')"
-  if [ -z "$score_pct" ]; then
-    echo "::error::could not parse a numeric score from: ${score_line}" >&2
-    rc=1
-    continue
-  fi
+  # HONEST score over real verdicts (see SCORING in the header): integer
+  # percent, truncated - never the tool's own skip-inflated number.
+  score_pct=$((killed * 100 / verdicts))
   echo "parsed score ${score_pct}% for ${pkg} (killed=${killed}, escaped=${escaped}, skipped=${skipped}, timeouts=${timeouts}, floor ${FLOOR}%)"
   if [ "$score_pct" -lt "$FLOOR" ]; then
     echo "::error::${pkg} mutation score ${score_pct}% is below the ${FLOOR}% floor" >&2
@@ -222,7 +237,7 @@ for pkg in $PKGS; do
 done
 
 if [ "$rc" -ne 0 ]; then
-  echo "mutation-floor: FAILED (a package fell below the ${FLOOR}% floor or tripped a fail-closed guard: skipped/errored/no-verdict mutants, a timeout storm, or an unparsable summary)" >&2
+  echo "mutation-floor: FAILED (a package fell below the ${FLOOR}% floor or tripped a fail-closed guard: errored mutants, a verdict collapse, a timeout storm, or an unparsable summary)" >&2
   exit 1
 fi
-echo "mutation-floor: all custody packages at or above the ${FLOOR}% floor, no skipped/errored mutants, timeouts under the storm ceiling"
+echo "mutation-floor: all custody packages at or above the ${FLOOR}% floor over real verdicts, no errored mutants, no verdict collapse, timeouts under the storm ceiling"

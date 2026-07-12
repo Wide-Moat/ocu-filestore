@@ -119,13 +119,13 @@ jobs:
 
   mutation-floor:
     runs-on: ubuntu-latest
-    # ARMED, NIGHTLY (or manually dispatched). A go-mutesting score below the
+    # ARMED, NIGHTLY (or manually dispatched). A mutation score below the
     # floor in scripts/mutation-floor.sh fails this job, as does any of its
-    # fail-closed guards (skipped/errored/no-verdict mutants, a timeout storm,
-    # an unparsable summary). Not per-PR: a slow or hanging mutant costs a
-    # full hard-timeout window (see the `on:` comment), so the runtime is
-    # nightly-shaped. The per-PR freshness gate below enforces that a recent
-    # run of THIS job stayed green.
+    # fail-closed guards (errored mutants, a verdict collapse, a timeout
+    # storm, an unparsable summary). Not per-PR: a slow or hanging mutant
+    # costs a full hard-timeout window (see the `on:` comment), so the
+    # runtime is nightly-shaped. The per-PR freshness gate below enforces
+    # that a recent run of THIS job stayed green.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # Job-level backstop: even if a hang defeats both the per-mutant kill in
     # mutation-exec.sh and the per-invocation timeout in mutation-floor.sh, the
