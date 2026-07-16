@@ -40,7 +40,7 @@ func TestWriteStreamConcurrentNoReplace(t *testing.T) {
 			// Each WriteStream runs its early Stat (destination absent for
 			// BOTH — the pipe has produced nothing yet, so neither has
 			// committed) and then blocks reading its pipe.
-			errs[i] = eng.WriteStream(ctx, scope, "race.bin", readers[i], false)
+			_, errs[i] = eng.WriteStream(ctx, scope, "race.bin", readers[i], false)
 		}(i)
 	}
 
@@ -90,7 +90,7 @@ func TestCopyFileConcurrentNoReplace(t *testing.T) {
 	bodies := make([][]byte, n)
 	for i := range bodies {
 		bodies[i] = []byte(fmt.Sprintf("COPY-SOURCE-%02d", i))
-		if err := eng.WriteStream(ctx, scope, fmt.Sprintf("src%02d.bin", i), bytes.NewReader(bodies[i]), false); err != nil {
+		if _, err := eng.WriteStream(ctx, scope, fmt.Sprintf("src%02d.bin", i), bytes.NewReader(bodies[i]), false); err != nil {
 			t.Fatalf("seed src%02d: %v", i, err)
 		}
 	}
@@ -145,7 +145,7 @@ func TestMoveFileConcurrentNoReplace(t *testing.T) {
 
 	bodies := [][]byte{[]byte("MOVER-A"), []byte("MOVER-B")}
 	for i, b := range bodies {
-		if err := eng.WriteStream(ctx, scope, fmt.Sprintf("mv%d.bin", i), bytes.NewReader(b), false); err != nil {
+		if _, err := eng.WriteStream(ctx, scope, fmt.Sprintf("mv%d.bin", i), bytes.NewReader(b), false); err != nil {
 			t.Fatalf("seed mv%d: %v", i, err)
 		}
 	}

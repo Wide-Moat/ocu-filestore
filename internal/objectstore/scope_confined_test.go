@@ -23,7 +23,7 @@ func TestScopeConfinedEngine_AllowsOwnScope(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, ScopeID("own")); err != nil {
 		t.Fatalf("ProvisionScope(own): %v", err)
 	}
-	if err := eng.WriteStream(ctx, ScopeID("own"), "a.txt", strings.NewReader("hi"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, ScopeID("own"), "a.txt", strings.NewReader("hi"), false); err != nil {
 		t.Fatalf("WriteStream(own): %v", err)
 	}
 	var buf bytes.Buffer
@@ -59,7 +59,7 @@ func TestScopeConfinedEngine_RefusesForeignScopeEveryVerb(t *testing.T) {
 		"MoveFile":       func() error { return eng.MoveFile(ctx, foreign, "a", "b", false) },
 		"RemoveFile":     func() error { return eng.RemoveFile(ctx, foreign, "a") },
 		"ReadRange":      func() error { return eng.ReadRange(ctx, foreign, "a", 0, 1, &bytes.Buffer{}) },
-		"WriteStream":    func() error { return eng.WriteStream(ctx, foreign, "a", strings.NewReader("x"), false) },
+		"WriteStream":    func() error { _, e := eng.WriteStream(ctx, foreign, "a", strings.NewReader("x"), false); return e },
 	}
 	for name, fn := range checks {
 		if err := fn(); !errors.Is(err, ErrForeignScope) {

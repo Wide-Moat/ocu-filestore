@@ -206,16 +206,16 @@ func TestS3Live_DeleteAllVersions_Direct(t *testing.T) {
 	// Build history: two versions of one key plus a delete-marker, and a
 	// second key with one version, so the batch carries Versions AND
 	// DeleteMarkers together.
-	if err := e.WriteStream(ctx, scope, "h.txt", bytes.NewReader([]byte("one")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "h.txt", bytes.NewReader([]byte("one")), false); err != nil {
 		t.Fatalf("WriteStream(v1): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "h.txt", bytes.NewReader([]byte("two")), true); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "h.txt", bytes.NewReader([]byte("two")), true); err != nil {
 		t.Fatalf("WriteStream(v2): %v", err)
 	}
 	if err := e.RemoveFile(ctx, scope, "h.txt"); err != nil {
 		t.Fatalf("RemoveFile(h.txt): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "k.txt", bytes.NewReader([]byte("k")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "k.txt", bytes.NewReader([]byte("k")), false); err != nil {
 		t.Fatalf("WriteStream(k): %v", err)
 	}
 
@@ -419,7 +419,7 @@ func TestS3Live_ProvisionScaffold_ParentExists(t *testing.T) {
 	}
 
 	// WriteStream into the outputs subtree must succeed without manual re-seeding.
-	if err := e.WriteStream(ctx, scope, "outputs/probe.bin", bytes.NewReader([]byte("probe")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "outputs/probe.bin", bytes.NewReader([]byte("probe")), false); err != nil {
 		t.Fatalf("WriteStream(outputs/probe.bin) after re-provision: %v", err)
 	}
 }
@@ -437,7 +437,7 @@ func TestS3Live_OwnerDataPreservedOnReProvision(t *testing.T) {
 	if err := e.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope (first): %v", err)
 	}
-	if err := e.WriteStream(ctx, scope, "owner.bin", bytes.NewReader([]byte("OWNER")), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "owner.bin", bytes.NewReader([]byte("OWNER")), false); err != nil {
 		t.Fatalf("WriteStream (owner): %v", err)
 	}
 
@@ -500,7 +500,7 @@ func TestS3Live_MoveFile_NonVacuousVerify(t *testing.T) {
 	ctx := context.Background()
 	body := []byte("verify-then-delete order matters")
 
-	if err := e.WriteStream(ctx, scope, "src.bin", bytes.NewReader(body), false); err != nil {
+	if _, err := e.WriteStream(ctx, scope, "src.bin", bytes.NewReader(body), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	srcDigest := liveDigestTag(t, e, string(scope)+"/src.bin")

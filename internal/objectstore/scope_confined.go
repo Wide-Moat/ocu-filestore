@@ -135,9 +135,9 @@ func (e *scopeConfinedEngine) ReadRange(ctx context.Context, scope ScopeID, path
 	return e.inner.ReadRange(ctx, scope, path, offset, length, w)
 }
 
-func (e *scopeConfinedEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
+func (e *scopeConfinedEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) (string, error) {
 	if err := e.guard(scope); err != nil {
-		return err
+		return "", err
 	}
 	return e.inner.WriteStream(ctx, scope, path, r, overwrite)
 }

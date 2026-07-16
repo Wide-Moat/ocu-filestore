@@ -69,6 +69,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// North shape guard (ADR-0030 north face, open question #348): the resolved
+	// filesystem_id must be a single, clean path element. A traversal-shaped scope
+	// (a separator, NUL, "." / "..", or a non-clean form) is refused at THIS choke
+	// point - the one place FilesystemID is derived per request - so a malformed
+	// scope never reaches the store or the engine. It reuses the SAME 503
+	// fail-closed deny as the missing-scope path (no distinct deny class, so it can
+	// never leak a scope distinction and is never a 403). This is a COOPERATIVE
+	// shape guard, not a per-chat authorization point: the caller supplies the whole
+	// filesystem_id, so this cannot enforce which chat a caller may reach - per-chat
+	// isolation lives on the credential/south path. It enforces only that the value
+	// is a legal directory element.
+	if err := validateScopeShape(ps.FilesystemID); err != nil {
+		reqLog.Warn("files-api request with malformed scope shape",
+			slog.String(observ.KeyReason, "malformed_scope_shape"))
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.BackendUnavailable), "malformed scope shape")
+		return
+	}
+
 	path := r.URL.Path
 	switch {
 	case path == filesRoot:

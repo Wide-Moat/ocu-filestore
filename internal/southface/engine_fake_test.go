@@ -5,6 +5,8 @@ package southface
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -377,20 +379,20 @@ func (e *fakeEngine) ReadRange(_ context.Context, scope, path string, offset, le
 // pipe CloseWithError — returns that error and links NO node, so a partial or
 // aborted upload is never namespace-visible). On a clean read it links a new
 // file node with the read bytes.
-func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Reader, overwrite bool) error {
+func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Reader, overwrite bool) (string, error) {
 	e.mu.Lock()
 	n, parent, _, _, err := e.walk(scope, path)
 	if err != nil {
 		e.mu.Unlock()
-		return err
+		return "", err
 	}
 	if parent == nil {
 		e.mu.Unlock()
-		return pathErr("open", path, fs.ErrNotExist) // path names the scope root
+		return "", pathErr("open", path, fs.ErrNotExist) // path names the scope root
 	}
 	if n != nil && !overwrite {
 		e.mu.Unlock()
-		return errAlreadyExists
+		return "", errAlreadyExists
 	}
 	e.mu.Unlock()
 
@@ -399,7 +401,7 @@ func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Rea
 	// until the read completes cleanly (temp+rename invisibility).
 	buf, rerr := io.ReadAll(r)
 	if rerr != nil {
-		return rerr
+		return "", rerr
 	}
 
 	e.mu.Lock()
@@ -408,14 +410,18 @@ func (e *fakeEngine) WriteStream(_ context.Context, scope, path string, r io.Rea
 	// changed while reading).
 	_, parent, leaf, _, err := e.walk(scope, path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if parent == nil {
-		return pathErr("open", path, fs.ErrNotExist)
+		return "", pathErr("open", path, fs.ErrNotExist)
 	}
 	parent.children[leaf] = &node{name: leaf, isDir: false, size: int64(len(buf)), mtime: e.nextMtime(), data: buf}
 	e.recordMut(path)
-	return nil
+	// Return the single-pass content digest (D6), matching the real engines: the
+	// south upload discards it (it mints no north handle), but the seam contract
+	// requires it on a successful write.
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // mkdirSeed creates a directory (and parents) for seeding a tree.

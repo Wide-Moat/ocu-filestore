@@ -205,8 +205,8 @@ func (s stubEngine) RemoveFile(context.Context, objectstore.ScopeID, string) err
 func (s stubEngine) ReadRange(context.Context, objectstore.ScopeID, string, int64, int64, io.Writer) error {
 	return s.err
 }
-func (s stubEngine) WriteStream(context.Context, objectstore.ScopeID, string, io.Reader, bool) error {
-	return s.err
+func (s stubEngine) WriteStream(context.Context, objectstore.ScopeID, string, io.Reader, bool) (string, error) {
+	return "", s.err
 }
 
 // TestEngineAdapterRemapsTypedSentinels feeds each engine error class through
@@ -407,7 +407,7 @@ func TestEngineAdapterRealLocalVerbs(t *testing.T) {
 
 	// --- WriteStream + Stat --------------------------------------------------
 	content := []byte("hello delegation")
-	if err := a.WriteStream(ctx, scope, "greet.txt", strings.NewReader(string(content)), false); err != nil {
+	if _, err := a.WriteStream(ctx, scope, "greet.txt", strings.NewReader(string(content)), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 	fi, err := a.Stat(ctx, scope, "greet.txt")
@@ -534,5 +534,22 @@ func TestMapEngineErr_TransientThrottled(t *testing.T) {
 				t.Fatalf("mirror %v unexpectedly matches %v", a, b)
 			}
 		}
+	}
+}
+
+// TestEngineAdapterKeepsBackendDetailOnTransient pins that the adapter's
+// sentinel remap WRAPS the engine error instead of replacing it: the
+// southface mirror stays errors.Is-matchable (the spine's classification
+// contract) while the message keeps the engine's verb and backend detail —
+// the daemon log line for a backend refusal must name what was refused, not
+// just the class.
+func TestEngineAdapterKeepsBackendDetailOnTransient(t *testing.T) {
+	in := fmt.Errorf("objectstore: s3 mkdir: %w (backend status 507, code XMinioStorageFull)", objectstore.ErrTransient)
+	got := mapEngineErr(in)
+	if !errors.Is(got, southface.ErrBackendTransient) {
+		t.Fatalf("mapEngineErr = %v, want errors.Is(ErrBackendTransient)", got)
+	}
+	if !strings.Contains(got.Error(), "XMinioStorageFull") {
+		t.Fatalf("mapEngineErr message %q dropped the backend detail", got.Error())
 	}
 }

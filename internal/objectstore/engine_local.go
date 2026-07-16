@@ -6,7 +6,9 @@ package objectstore
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -620,27 +622,40 @@ func (e *localVolumeEngine) ReadRange(ctx context.Context, scope ScopeID, path s
 // stat-then-rename TOCTOU: of two concurrent overwrite=false writers
 // exactly one wins); the early Stat is a fast-path reject only, sparing the
 // stream consumption.
-func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
+func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) (string, error) {
 	sr, err := e.openScope(scope)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer sr.Close()
 
 	cleanPath, err := guestPath(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if !overwrite {
 		if _, err := sr.root.Stat(cleanPath); err == nil {
-			return ErrAlreadyExists
+			return "", ErrAlreadyExists
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("objectstore: stat destination: %w", err)
+			return "", fmt.Errorf("objectstore: stat destination: %w", err)
 		}
 	}
 
-	return writeTempAndCommit(sr, cleanPath, ctxReader{ctx: ctx, r: r}, overwrite)
+	// Compute the content SHA-256 (D6, PARITY-LEDGER-147) in the SAME single pass
+	// that streams the bytes to disk - an io.TeeReader feeds the hasher exactly the
+	// bytes writeTempAndCommit copies, so the digest never triggers a second read
+	// of the committed object. The digest is finalised only after a SUCCESSFUL
+	// commit: an aborted stream (read error, size abort) returns "" alongside its
+	// error, matching the s3 engine's empty-digest-on-error contract. CopyFile
+	// keeps calling writeTempAndCommit directly (no digest - it is not a
+	// content-recording verb).
+	hasher := sha256.New()
+	src := io.TeeReader(ctxReader{ctx: ctx, r: r}, hasher)
+	if err := writeTempAndCommit(sr, cleanPath, src, overwrite); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // writeTempAndCommit is the shared atomic-write tail for WriteStream and
