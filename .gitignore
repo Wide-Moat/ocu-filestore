@@ -35,3 +35,7 @@ build/
 
 # ─── local-only Claude Code instructions ───
 CLAUDE.local.md
+
+# go-mutesting run artifacts
+report.json
+*.go.tmp

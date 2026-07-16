@@ -117,6 +117,9 @@ func TestIntentDenied(t *testing.T) {
 		{"preview-only caller requests write", []Intent{IntentPreview}, IntentWrite},
 		{"preview-only caller requests read", []Intent{IntentPreview}, IntentRead},
 		{"read-only caller requests write", []Intent{IntentRead}, IntentWrite},
+		// Write subsumes READ ONLY (ADR-0029); the render axis stays explicitly
+		// granted, so a write-only caller is denied preview (NFR-SEC-49).
+		{"write-only caller requests preview", []Intent{IntentWrite}, IntentPreview},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := CallerEvidence{Scope: "fs1", GrantedIntents: tc.grants}

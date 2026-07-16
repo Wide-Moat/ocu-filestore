@@ -96,6 +96,14 @@ func TestCeilingsAdapterRemapsSentinels(t *testing.T) {
 		t.Fatalf("AcquireBytes(in-ceiling): got %v, want nil", err)
 	}
 	sess.ReleaseBytes(2)
+	// The release must REACH the real gauge, not merely return: with the 2
+	// bytes back, the full ceiling is acquirable again. A swallowed release
+	// would leak the quota permanently (the gauge stays at 2 and this
+	// full-ceiling acquire is denied).
+	if err := sess.AcquireBytes(4); err != nil {
+		t.Fatalf("AcquireBytes(full ceiling after release): got %v, want nil (ReleaseBytes did not reach the gauge)", err)
+	}
+	sess.ReleaseBytes(4)
 }
 
 // downGuard is an auditgate.Guard whose every Mandate fails with the REAL

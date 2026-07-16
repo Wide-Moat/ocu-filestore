@@ -34,16 +34,23 @@ ADR still `proposed`), **TBD** (contract surface not yet pinned),
 
 ## Follow-ups (tracked, not yet scheduled)
 
-- **Arm the mutation gate.** `.gremlins.yaml` coverpkg now includes the
-  `credscope.go` and `pathresolver.go` guards, but the gate stays advisory:
-  on the pinned Go 1.26 toolchain gremlins v0.6.0 reports every mutant as
-  "Not covered" (0 killed / 0 lived) across all in-scope packages despite
-  their mandatory property-tests, so there is no real efficacy figure to
-  ratchet against. When gremlins (a fixed release, or a different mutation
-  tool) produces a stable, correct efficacy figure on the pinned toolchain,
-  set `threshold.efficacy` / `threshold.mutant-coverage` to `floor(baseline)`
-  in `.gremlins.yaml` and drop `continue-on-error` in
-  `.github/workflows/mutation.yml`. See the rationale block in `.gremlins.yaml`.
+- **Raise the mutation floor.** The mutation gate is now ARMED via
+  go-mutesting (`scripts/mutation-floor.sh`, the `mutation-floor` job in
+  `.github/workflows/mutation.yml`): a mutation score below the floor fails the
+  job. The armed floor is 80% over the authorization resolver
+  (`internal/authz`, baseline 0.9375) and the downloadable/credential-scope
+  broker (`internal/broker`, baseline 0.849). Remaining follow-up: raise the
+  floor toward the canon 60 minimum as the score stabilises (the guards already
+  read above it); extend the armed set to the path-containment guard
+  (`pathresolver.go`) once a rig-free mutation slice is carved for objectstore;
+  and arm the gremlins lens itself only if a de-flaked measurement path
+  appears. gremlins stays advisory: it kills on a per-mutant timeout it
+  calibrates from one clean run, and the in-scope pgregory.net/rapid property
+  suites re-run per mutant blow that budget, so both its dimensions collapse to
+  a load-driven number. The go.mod `module`-on-line-1 fix lets gremlins
+  attribute coverage correctly (no more phantom 0/0), so its advisory summary
+  is meaningful. See the rationale blocks in `.gremlins.yaml` and
+  `scripts/mutation-floor.sh`.
 - **Handle-store hardening debt.** Two open issues track follow-up work on the
   keystone resolver path (Files-API handle-store, above): #19 (auditgate
   fail-open alignment) and #20 (defense-in-depth hardening). Both are scheduled
