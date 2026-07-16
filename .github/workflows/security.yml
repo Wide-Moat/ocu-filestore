@@ -29,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: naming denylist
         # The project keeps a denylist of terms that must not appear in the
         # tree (working names, third-party naming). The list is maintained as
@@ -94,9 +96,13 @@ jobs:
   sast-semgrep:
     runs-on: ubuntu-latest
     container:
-      image: semgrep/semgrep
+      # Pinned to a version tag + its digest (not the moving `latest`) so a
+      # security scanner cannot change under us between runs. Bump deliberately.
+      image: semgrep/semgrep:1.166.0@sha256:c180f0c93a17b420c0af5006214a29d3c747c5459c732b740191adf657dd0068
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: semgrep
         # Emit SARIF for the Security tab AND keep the blocking exit code: run
         # the SARIF pass non-blocking, then a second gating pass. `|| true` on
@@ -125,6 +131,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: trivy filesystem — CRITICAL,HIGH blocks
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
         with:
