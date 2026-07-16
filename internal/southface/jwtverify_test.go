@@ -182,18 +182,17 @@ func TestStorageJWTVerifier_ES256Supported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	xb := priv.PublicKey.X.Bytes()
-	yb := priv.PublicKey.Y.Bytes()
-	// Left-pad coordinates to 32 octets (base64url of the fixed-width SEC1 halves).
-	pad := func(b []byte) []byte {
-		out := make([]byte, 32)
-		copy(out[32-len(b):], b)
-		return out
+	// SEC1 uncompressed point: 0x04 || X || Y, each coordinate a fixed-width
+	// 32-octet half for P-256 — exactly the base64url payload the JWK wants.
+	raw, err := priv.PublicKey.Bytes()
+	if err != nil {
+		t.Fatalf("PublicKey.Bytes: %v", err)
 	}
+	xb, yb := raw[1:33], raw[33:65]
 	jwk := map[string]any{
 		"kty": "EC", "crv": "P-256", "kid": "ec1", "use": "sig", "alg": "ES256",
-		"x": base64.RawURLEncoding.EncodeToString(pad(xb)),
-		"y": base64.RawURLEncoding.EncodeToString(pad(yb)),
+		"x": base64.RawURLEncoding.EncodeToString(xb),
+		"y": base64.RawURLEncoding.EncodeToString(yb),
 	}
 	jwks, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
 	v, err := NewStorageJWTVerifier(jwks, vtIssuer, vtAudience, fixedNow(1000))

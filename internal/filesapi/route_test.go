@@ -115,10 +115,10 @@ func TestRouteScopeAbsentFailsClosed(t *testing.T) {
 // store. This is a cooperative shape guard (single legal path element), not a
 // per-chat authorization point.
 func TestNorthScopeShapeGuard(t *testing.T) {
-	reqWithScope := func(h *Handler, id string) (*httptest.ResponseRecorder, *fakeStore) {
+	reqWithScope := func(id string) (*httptest.ResponseRecorder, *fakeStore) {
 		store := newFakeStore()
 		store.put("fid-x", id, handlestore.Record{Filename: "f", ObjectRef: "obj/f", Size: 1})
-		h = newTestHandler(Deps{Scope: NewFencedScopeSource(), Store: store})
+		h := newTestHandler(Deps{Scope: NewFencedScopeSource(), Store: store})
 		r := httptest.NewRequest(http.MethodGet, "/v1/files/fid-x", nil)
 		r.Header.Set(fencedScopeHeader, id)
 		w := httptest.NewRecorder()
@@ -127,7 +127,7 @@ func TestNorthScopeShapeGuard(t *testing.T) {
 	}
 
 	t.Run("legal chat-suffixed id resolves and reads the store", func(t *testing.T) {
-		w, store := reqWithScope(nil, "fs-fleet-abcdef0123456789")
+		w, store := reqWithScope("fs-fleet-abcdef0123456789")
 		if w.Code != http.StatusOK {
 			t.Fatalf("legal scope -> %d, want 200", w.Code)
 		}
@@ -137,7 +137,7 @@ func TestNorthScopeShapeGuard(t *testing.T) {
 	})
 
 	t.Run("plain base is backward compatible", func(t *testing.T) {
-		w, store := reqWithScope(nil, "fs-fleet")
+		w, store := reqWithScope("fs-fleet")
 		if w.Code != http.StatusOK {
 			t.Fatalf("plain base scope -> %d, want 200", w.Code)
 		}
@@ -148,7 +148,7 @@ func TestNorthScopeShapeGuard(t *testing.T) {
 
 	for _, id := range []string{"fs-fleet-abc/123", "fs-fleet-../etc"} {
 		t.Run("traversal id refused at the edge: "+id, func(t *testing.T) {
-			w, store := reqWithScope(nil, id)
+			w, store := reqWithScope(id)
 			if w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("traversal scope %q -> %d, want 503 (shape guard fail-closed)", id, w.Code)
 			}
