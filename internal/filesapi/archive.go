@@ -91,6 +91,23 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 
 	ids := r.URL.Query()[archiveFileIDParam]
 
+	// --- per-id op charge BEFORE any resolution (egress cost symmetry) ---
+	// A bundle of N ids draws N further tokens from the SAME per-session bucket
+	// a single-object read draws one from, so an archive is never cheaper per
+	// object than N content reads — without it, one op token buys an unbounded
+	// file_id list's worth of store resolution, engine stats, and streamed
+	// bytes (the request line bounds the id count near 25k, not this route).
+	// The charge lands on NAMED ids up front, before Store.Get runs for any of
+	// them: an over-budget request is refused with zero resolution work, and
+	// the cost is id-count-only, so the refusal can never leak whether any
+	// named id resolves.
+	for range ids {
+		if err := sess.TryConsumeOp(); err != nil {
+			denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Throttle), "archive member operation budget exceeded")
+			return
+		}
+	}
+
 	// --- resolve + authorize + downloadable-check + Stat every id ---
 	// A skip is silent (keystone: absent == cross-scope == not-downloadable is
 	// never distinguishable). A backend fault fails the whole request 503.
