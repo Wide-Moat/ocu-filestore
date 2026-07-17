@@ -59,7 +59,9 @@ func newStallServer(t *testing.T, scope string, frameTimeout time.Duration) (*ht
 	res := &fakeResolver{grant: Grant{Downloadable: true}}
 	reg := &recordingRegistry{sess: sess}
 	d := newDispatcherWithEngine(res, &fakeGuard{}, reg, 1<<20, eng)
-	d.maxFileSize = 1 << 24
+	// 32 MiB: above the ~26 MiB stall payload, so the response-size ceiling
+	// admits it and the test exercises the write-deadline, not the ceiling.
+	d.maxFileSize = 1 << 25
 	d.frameReadTimeout = frameTimeout
 	d.frameWriteTimeout = frameTimeout
 
