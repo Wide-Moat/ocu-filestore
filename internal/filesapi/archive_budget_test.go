@@ -75,7 +75,7 @@ func TestArchiveChargesOneOpPerNamedID(t *testing.T) {
 
 // TestArchiveOverBudgetRefusesBeforeAnyWork is the amplification keystone: a
 // request naming more ids than the op budget covers is refused 429 BEFORE any
-// store resolution, engine stat, or byte — the per-id charge lands on NAMED
+// store resolution, engine stat, or byte -- the per-id charge lands on NAMED
 // ids up front, so a stuffed file_id list cannot buy unpaid resolve/stat work
 // (and the charge is id-count-only: nothing about resolvability leaks).
 func TestArchiveOverBudgetRefusesBeforeAnyWork(t *testing.T) {

@@ -22,12 +22,12 @@ import (
 // archivePath is the additive OCU-extension collection verb: GET
 // /v1/files/archive bundles the named accessible files into a single zip. It is
 // a SIBLING off /v1/files, not a per-resource path, so the router MUST intercept
-// it BEFORE the /v1/files/ prefix case — otherwise "archive" is parsed as a
+// it BEFORE the /v1/files/ prefix case -- otherwise "archive" is parsed as a
 // {file_id}.
 const archivePath = "/v1/files/archive"
 
 // archiveFileIDParam is the repeated query parameter naming the file_id set to
-// bundle. It is read as r.URL.Query()["file_id"] — a []string, one value per id.
+// bundle. It is read as r.URL.Query()["file_id"] -- a []string, one value per id.
 const archiveFileIDParam = "file_id"
 
 // contentTypeZip is the archive success RESPONSE Content-Type.
@@ -40,8 +40,8 @@ const archiveFilename = "archive.zip"
 
 // archiveMember is one resolved+authorized+downloadable file that will become a
 // zip entry: the durable record, its normalised engine path, the broker-resolved
-// grant, and the Stat'd byte length. The set is assembled — every id resolved,
-// authorized, downloadable-checked, and Stat'd — BEFORE any status is committed,
+// grant, and the Stat'd byte length. The set is assembled -- every id resolved,
+// authorized, downloadable-checked, and Stat'd -- BEFORE any status is committed,
 // so the 200 can never be walked back once the zip stream starts.
 type archiveMember struct {
 	rec     handlestore.Record
@@ -59,11 +59,11 @@ type archiveMember struct {
 // anti-enumeration keystone lifted to the WHOLE set:
 //
 //   - Per id, Store.Get collapses absent and cross-scope into the SAME
-//     ErrNotFound — such an id is SILENTLY excluded (never a per-id error, never
+//     ErrNotFound -- such an id is SILENTLY excluded (never a per-id error, never
 //     a probe oracle). A non-downloadable grant is likewise excluded, not a 403
 //     for the whole archive: "accessible" means resolvable AND downloadable.
 //   - When NO named id resolves in scope (or none is downloadable) the response
-//     is the header-less keystone 404 — never 403, never a 200 empty zip: a
+//     is the header-less keystone 404 -- never 403, never a 200 empty zip: a
 //     distinguishable response would leak whether ANY named id exists elsewhere.
 //   - A backend FAULT is not a per-id skip: an ErrStoreUnavailable from the store
 //     (or any non-ErrNotFound resolution error) fails the WHOLE request 503.
@@ -94,7 +94,7 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 	// --- per-id op charge BEFORE any resolution (egress cost symmetry) ---
 	// A bundle of N ids draws N further tokens from the SAME per-session bucket
 	// a single-object read draws one from, so an archive is never cheaper per
-	// object than N content reads — without it, one op token buys an unbounded
+	// object than N content reads -- without it, one op token buys an unbounded
 	// file_id list's worth of store resolution, engine stats, and streamed
 	// bytes (the request line bounds the id count near 25k, not this route).
 	// The charge lands on NAMED ids up front, before Store.Get runs for any of
@@ -116,7 +116,7 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 		rec, err := h.deps.Store.Get(r.Context(), fileID, ps.FilesystemID)
 		if err != nil {
 			if errors.Is(err, handlestore.ErrNotFound) {
-				// Keystone: absent OR cross-scope. Silently excluded — no per-id
+				// Keystone: absent OR cross-scope. Silently excluded -- no per-id
 				// error, no probe oracle.
 				continue
 			}
@@ -150,13 +150,13 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 		}
 
 		// downloadable AT READ (NFR-SEC-73): a non-downloadable object is not an
-		// accessible member — silently excluded, never a whole-archive 403.
+		// accessible member -- silently excluded, never a whole-archive 403.
 		if !grant.Downloadable {
 			continue
 		}
 
 		// Stat the size for the zip entry BEFORE any ALLOW is Mandated. A vanished
-		// object (Stat fault) is excluded like any other inaccessible member — no
+		// object (Stat fault) is excluded like any other inaccessible member -- no
 		// allow-then-deny, no partial-set leak.
 		info, serr := h.deps.Engine.Stat(r.Context(), ps.FilesystemID, engPath)
 		if serr != nil {
@@ -172,7 +172,7 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 
 	// --- empty set -> keystone 404 (anti-enumeration) ---
 	// No named id resolved in scope (or none was downloadable). The response is
-	// the header-less keystone 404 — never 403, never a 200 empty zip: a
+	// the header-less keystone 404 -- never 403, never a 200 empty zip: a
 	// distinguishable response would leak whether ANY named id exists elsewhere.
 	// The empty file_id list lands here too (nothing to resolve resolves nothing).
 	if len(members) == 0 {
