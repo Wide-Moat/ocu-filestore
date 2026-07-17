@@ -19,39 +19,43 @@ import (
 var ErrForeignScope = errors.New("objectstore: request scope is not the engine's provisioned scope")
 
 // scopeConfinedEngine wraps an Engine and confines EVERY data and lifecycle verb
-// to the single provisioned scope the deployment granted (the daemon's
-// -filesystem-id). A verb whose scope argument is not the allowed scope is
-// refused with ErrForeignScope BEFORE the inner engine runs, so a forged or
-// mis-wired scope can never steer the backend prefix to another tenant. This is
-// defense-in-depth on top of the credential-scope extractor: the extractor binds
-// the scope from the VERIFIED claim, and this guard independently pins the engine
-// to the one scope it was provisioned for.
+// to the deployment's provisioned scope FAMILY: the daemon's -filesystem-id base
+// plus its legitimately-derived per-chat scopes (ADR-0030 "<base>-<16 hex>").
+// A verb whose scope argument is outside the family is refused with
+// ErrForeignScope BEFORE the inner engine runs, so a forged or mis-wired scope
+// can never steer the backend prefix to another tenant. This is defense-in-depth
+// on top of the credential-scope extractor: the extractor binds the scope from
+// the VERIFIED claim, and this guard independently pins the engine to the one
+// scope family it was provisioned for. Membership is decided by the SAME
+// ScopeFamily the lazy-provision scaffolder uses (built once at compose), so
+// what the scaffolder legitimizes and what this guard admits cannot drift.
 type scopeConfinedEngine struct {
-	inner   Engine
-	allowed ScopeID
+	inner  Engine
+	family ScopeFamily
 }
 
 var _ Engine = (*scopeConfinedEngine)(nil)
 
-// NewScopeConfinedEngine wraps inner so every verb is confined to allowed. A verb
-// naming any other scope is ErrForeignScope. The allowed scope must pass the same
-// shape guard the inner engine applies, so a malformed provisioned scope is a
-// hard construction error rather than a guard that silently admits everything.
-func NewScopeConfinedEngine(inner Engine, allowed ScopeID) (Engine, error) {
+// NewScopeConfinedEngine wraps inner so every verb is confined to the family. A
+// verb naming any scope outside it is ErrForeignScope. A nil inner or a
+// zero-value family is a hard construction error rather than a guard that
+// silently refuses everything (the family's own shape guards ran in
+// NewScopeFamily).
+func NewScopeConfinedEngine(inner Engine, family ScopeFamily) (Engine, error) {
 	if inner == nil {
 		return nil, errors.New("objectstore: scope-confined engine requires an inner engine")
 	}
-	if err := validateScopeID(allowed); err != nil {
-		return nil, fmt.Errorf("objectstore: scope-confined engine allowed scope: %w", err)
+	if !family.valid() {
+		return nil, errors.New("objectstore: scope-confined engine requires a family built by NewScopeFamily")
 	}
-	return &scopeConfinedEngine{inner: inner, allowed: allowed}, nil
+	return &scopeConfinedEngine{inner: inner, family: family}, nil
 }
 
-// guard is the SOLE confinement site: it refuses any scope that is not the
-// engine's provisioned scope. Every verb calls it before delegating.
+// guard is the SOLE confinement site: it refuses any scope outside the
+// engine's provisioned scope family. Every verb calls it before delegating.
 func (e *scopeConfinedEngine) guard(scope ScopeID) error {
-	if scope != e.allowed {
-		return fmt.Errorf("%w: %q (provisioned %q)", ErrForeignScope, scope, e.allowed)
+	if !e.family.Contains(scope) {
+		return fmt.Errorf("%w: %q (provisioned family of %q)", ErrForeignScope, scope, e.family.Base())
 	}
 	return nil
 }

@@ -2030,7 +2030,7 @@ func TestS3Live_LazyScaffoldDerivedScopeFirstTouch(t *testing.T) {
 	scaffold := func(ctx context.Context, scope ScopeID) error {
 		return scaffoldMarkers(ctx, eng, scope, lazyMarkers)
 	}
-	wrapped := NewLazyProvisionEngine(eng, string(base), scaffold)
+	wrapped := mustLazy(t, eng, string(base), scaffold)
 	ctx := context.Background()
 
 	// North create shape: EnsureDir's MakeDir (EEXIST tolerated — the lazy

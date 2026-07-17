@@ -5,8 +5,8 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"io"
-	"regexp"
 	"sync"
 )
 
@@ -34,12 +34,11 @@ import (
 // uploads-first/writes-first asymmetry.
 type lazyProvisionEngine struct {
 	Engine
-	// shapeRe matches a legitimately-derived scope of this deployment's base:
-	// the bootBase followed by "-" and exactly 16 lowercase-hex digits.
-	shapeRe *regexp.Regexp
-	// bootBase is the deployment's base scope; the base itself is also a
-	// legal (un-suffixed) scope.
-	bootBase string
+	// family is the deployment's scope family (base + "<base>-<16 hex>"),
+	// the SAME ScopeFamily instance the scope-confined guard decides with,
+	// so what this decorator scaffolds and what the guard admits cannot
+	// drift apart.
+	family ScopeFamily
 	// scaffold seeds a scope's markers idempotently (ProvisionScope + the
 	// marker MakeDir loop). It is the SAME helper the boot path calls, bound
 	// to the wrapped engine and the boot marker list by the compose site.
@@ -67,26 +66,37 @@ type scaffoldState struct {
 
 // NewLazyProvisionEngine wraps eng so the FIRST data verb per UNSEEN,
 // legitimately-derived scope lazily scaffolds that scope's markers via
-// scaffold before the wrapped verb runs. bootBase is the deployment's base
-// scope; a scope is derived-legal iff it equals bootBase or matches
-// "^<bootBase>-[0-9a-f]{16}$". A scope that is not derived-legal is passed
-// straight through (fail-closed: the wrapped engine refuses it as today).
-func NewLazyProvisionEngine(eng Engine, bootBase string, scaffold func(ctx context.Context, scope ScopeID) error) Engine {
+// scaffold before the wrapped verb runs. family is the deployment's scope
+// family built by NewScopeFamily at compose (shared with the scope-confined
+// guard): a scope is derived-legal iff the family contains it. A scope that is
+// not derived-legal is passed straight through (fail-closed: the wrapped
+// engine refuses it as today). A nil engine or scaffold, or a zero-value
+// family, is a hard construction error rather than a decorator that silently
+// scaffolds nothing.
+func NewLazyProvisionEngine(eng Engine, family ScopeFamily, scaffold func(ctx context.Context, scope ScopeID) error) (Engine, error) {
+	if eng == nil {
+		return nil, errors.New("objectstore: lazy-provision engine requires an inner engine")
+	}
+	if !family.valid() {
+		return nil, errors.New("objectstore: lazy-provision engine requires a family built by NewScopeFamily")
+	}
+	if scaffold == nil {
+		return nil, errors.New("objectstore: lazy-provision engine requires a scaffold func")
+	}
 	return &lazyProvisionEngine{
 		Engine:   eng,
-		shapeRe:  regexp.MustCompile("^" + regexp.QuoteMeta(bootBase) + "-[0-9a-f]{16}$"),
-		bootBase: bootBase,
+		family:   family,
 		scaffold: scaffold,
 		state:    make(map[ScopeID]*scaffoldState),
-	}
+	}, nil
 }
 
 // derivedLegal reports whether scope is a legitimately-derived scope of this
-// deployment's base: the base itself, or "<bootBase>-<16 lowercase-hex>". A
-// random attacker scope is NOT derived-legal, so it is never auto-provisioned.
+// deployment: exactly family membership (the base itself, or
+// "<base>-<16 lowercase-hex>"). A random attacker scope is NOT derived-legal,
+// so it is never auto-provisioned.
 func (e *lazyProvisionEngine) derivedLegal(scope ScopeID) bool {
-	s := string(scope)
-	return s == e.bootBase || e.shapeRe.MatchString(s)
+	return e.family.Contains(scope)
 }
 
 // ensureScaffold scaffolds a derived-legal scope's markers, memoizing SUCCESS
