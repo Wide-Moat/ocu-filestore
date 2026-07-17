@@ -17,7 +17,7 @@ import (
 // provisioned scope: the confinement never blocks the legitimate scope.
 func TestScopeConfinedEngine_AllowsOwnScope(t *testing.T) {
 	inner := NewLocalVolumeEngine(t.TempDir())
-	eng, err := NewScopeConfinedEngine(inner, ScopeID("own"))
+	eng, err := NewScopeConfinedEngine(inner, mustFamily(t, "own"))
 	if err != nil {
 		t.Fatalf("NewScopeConfinedEngine: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestScopeConfinedEngine_AllowsOwnScope(t *testing.T) {
 // leaks a foreign prefix to the inner engine.
 func TestScopeConfinedEngine_RefusesForeignScopeEveryVerb(t *testing.T) {
 	inner := NewLocalVolumeEngine(t.TempDir())
-	eng, err := NewScopeConfinedEngine(inner, ScopeID("own"))
+	eng, err := NewScopeConfinedEngine(inner, mustFamily(t, "own"))
 	if err != nil {
 		t.Fatalf("NewScopeConfinedEngine: %v", err)
 	}
@@ -86,16 +86,15 @@ func TestScopeConfinedEngine_RefusesForeignScopeEveryVerb(t *testing.T) {
 }
 
 // TestScopeConfinedEngine_FailClosedConstruction proves a nil inner or a
-// malformed provisioned scope is a hard construction error, never a guard that
-// silently admits everything.
+// family that did not come from NewScopeFamily is a hard construction error,
+// never a guard that silently admits (or silently refuses) everything. The
+// malformed-base refusals live on NewScopeFamily itself.
 func TestScopeConfinedEngine_FailClosedConstruction(t *testing.T) {
-	if _, err := NewScopeConfinedEngine(nil, ScopeID("own")); err == nil {
+	if _, err := NewScopeConfinedEngine(nil, mustFamily(t, "own")); err == nil {
 		t.Fatalf("accepted a nil inner engine")
 	}
 	inner := NewLocalVolumeEngine(t.TempDir())
-	for _, bad := range []string{"", ".", "..", "a/b"} {
-		if _, err := NewScopeConfinedEngine(inner, ScopeID(bad)); err == nil {
-			t.Fatalf("accepted a malformed provisioned scope %q", bad)
-		}
+	if _, err := NewScopeConfinedEngine(inner, ScopeFamily{}); err == nil {
+		t.Fatalf("accepted a zero-value family; must demand NewScopeFamily")
 	}
 }

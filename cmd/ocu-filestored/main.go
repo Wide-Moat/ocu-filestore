@@ -1504,13 +1504,24 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 			return nil, err
 		}
 	}
+	// The deployment scope family (ADR-0030): the -filesystem-id base plus its
+	// legitimately-derived per-chat scopes "<base>-<16 hex>". Built ONCE and
+	// shared by the confinement guard and the lazy-provision scaffolder below,
+	// so what the scaffolder legitimizes and what the guard admits is the same
+	// predicate by construction. NewScopeFamily also refuses a derived-shaped
+	// base outright, keeping distinct deployments' families disjoint.
+	scopeFamily, err := objectstore.NewScopeFamily(objectstore.ScopeID(cfg.filesystemID))
+	if err != nil {
+		return nil, err
+	}
+
 	// GA Wave 1 engine confinement (ADR-0013/0029): wrap the backend engine so
-	// EVERY verb is confined to the daemon's single provisioned scope
-	// (-filesystem-id). A verb naming any other scope is refused at the engine
-	// with ErrForeignScope -> denyScopeMismatch (403), independent of the
-	// credential-scope path: the engine holds its own authority over the backend
-	// prefix and never keys an object under a scope it holds no title to.
-	confined, err := objectstore.NewScopeConfinedEngine(eng, objectstore.ScopeID(cfg.filesystemID))
+	// EVERY verb is confined to the daemon's provisioned scope family. A verb
+	// naming a scope outside it is refused at the engine with ErrForeignScope
+	// -> denyScopeMismatch (403), independent of the credential-scope path: the
+	// engine holds its own authority over the backend prefix and never keys an
+	// object under a scope it holds no title to.
+	confined, err := objectstore.NewScopeConfinedEngine(eng, scopeFamily)
 	if err != nil {
 		return nil, err
 	}
@@ -1612,10 +1623,13 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// delegating; a scope that is not derived-legal is passed straight through
 	// and refused exactly as today (fail-closed preserved). Applied to eng here,
 	// before the shared broker.NewEngine seam below, so both listeners inherit it.
-	eng = objectstore.NewLazyProvisionEngine(bareEng, cfg.filesystemID,
+	eng, err = objectstore.NewLazyProvisionEngine(bareEng, scopeFamily,
 		func(ctx context.Context, s objectstore.ScopeID) error {
 			return scaffoldScope(ctx, bareEng, s)
 		})
+	if err != nil {
+		return nil, err
+	}
 
 	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
 	// post-provision step fails before ownership passes to teardownServer,

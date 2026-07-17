@@ -31,7 +31,7 @@ func newLazyDeployment(t *testing.T, bootBase string) (bare Engine, wrapped Engi
 	scaffold := func(ctx context.Context, scope ScopeID) error {
 		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
 	}
-	wrapped = NewLazyProvisionEngine(bare, bootBase, scaffold)
+	wrapped = mustLazy(t, bare, bootBase, scaffold)
 	return bare, wrapped, base
 }
 
@@ -175,7 +175,7 @@ func TestLazyScaffoldConcurrentFirstTouchScaffoldsOnce(t *testing.T) {
 		mu.Unlock()
 		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
 	}
-	wrapped := NewLazyProvisionEngine(bare, bootBase, scaffold)
+	wrapped := mustLazy(t, bare, bootBase, scaffold)
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -230,7 +230,7 @@ func TestLazyScaffoldTransientFailureIsRetriedOnNextTouch(t *testing.T) {
 		}
 		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
 	}
-	wrapped := NewLazyProvisionEngine(bare, bootBase, scaffold)
+	wrapped := mustLazy(t, bare, bootBase, scaffold)
 
 	// First touch: the scaffold fails; the verb surfaces the transient error.
 	if _, err := wrapped.WriteStream(ctx, derived, "outputs/f.txt", bytes.NewReader([]byte("x")), false); !errors.Is(err, ErrTransient) {
@@ -275,7 +275,7 @@ func TestLazyScaffoldCanceledFirstTouchDoesNotPoison(t *testing.T) {
 		}
 		return scaffoldMarkers(ctx, bare, scope, lazyMarkers)
 	}
-	wrapped := NewLazyProvisionEngine(bare, bootBase, scaffold)
+	wrapped := mustLazy(t, bare, bootBase, scaffold)
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
