@@ -233,6 +233,79 @@ func TestListKeysetCursorNoRepeatOnDeletedBoundary(t *testing.T) {
 	}
 }
 
+// TestListAscendingWalkPicksUpConcurrentTailInsert pins the mid-walk-insert
+// safety that makes ASCENDING CreatedAt the correct DEFAULT list order (the
+// property a descending default would silently break, task #182). A paginating
+// full-walk consumer (exporter, audit replay, archive) reads page 1, and a
+// CONCURRENT create lands with a LATER CreatedAt than every page-1 record -- i.e.
+// at the tail of the ascending order, strictly AFTER page 1's cursor. The
+// resumed walk MUST include that record: in ascending order a tail insert always
+// sorts after any prior cursor, so it is picked up, never skipped. (Under a
+// descending default the concurrent create would sort ABOVE the cursor and be
+// silently dropped -- the reason Fable ruled ASC stays the default walk and the
+// newest-first need is served by an explicit order=desc param, not a flip.)
+//
+// Red-probe: if a future change makes List resume by anything other than a
+// strict "after the (CreatedAt,FileID) tuple" comparison (e.g. a snapshot taken
+// at page-1 time, or a descending default), the tail insert is dropped and the
+// exactly-once/nothing-skipped assertion below goes RED.
+func TestListAscendingWalkPicksUpConcurrentTailInsert(t *testing.T) {
+	_, s := newTestStore(t)
+	// Two records already present, ascending CreatedAt.
+	const (
+		t1 = "2026-01-01T00:00:01Z"
+		t2 = "2026-01-01T00:00:02Z"
+		t3 = "2026-01-01T00:00:03Z"
+	)
+	r1 := "1111111111111111111111111111111a"
+	r2 := "2222222222222222222222222222222b"
+	r3 := "3333333333333333333333333333333c"
+	seedRec(s, r1, "fs-A", t1)
+	seedRec(s, r2, "fs-A", t2)
+	// r3 is the "concurrent tail insert": a record with a LATER CreatedAt than
+	// every record page 1 consumes. It is seeded before the walk resumes so the
+	// (t2,r2) boundary cursor is well-defined (a record sorts after it); the
+	// invariant under test is that a resume from a cursor named at (t2,r2)
+	// INCLUDES a record that sorts after it -- which is exactly what a concurrent
+	// create landing at the ascending tail does. A descending default would put
+	// r3 ABOVE the cursor and silently skip it.
+	seedRec(s, r3, "fs-A", t3)
+
+	// Page 1, limit 2: consumes (t1,r1),(t2,r2); the boundary cursor names (t2,r2)
+	// (well-defined because r3 sorts after it in ascending order).
+	p1, err := s.List(context.Background(), ListInput{Scope: "fs-A", Limit: 2})
+	if err != nil {
+		t.Fatalf("List page1: %v", err)
+	}
+	if len(p1.Records) != 2 || p1.Records[0].FileID != r1 || p1.Records[1].FileID != r2 {
+		t.Fatalf("page1 = %v, want [r1, r2] in ascending CreatedAt order", recIDs(p1.Records))
+	}
+	if !p1.HasMore || p1.NextCursor == "" {
+		t.Fatalf("page1 HasMore=%v NextCursor=%q, want a continuation naming (t2,r2)", p1.HasMore, p1.NextCursor)
+	}
+
+	// Resume from the (t2,r2) boundary cursor. The tail record r3 MUST appear: it
+	// is ahead of the cursor in ascending order.
+	p2, err := s.List(context.Background(), ListInput{Scope: "fs-A", Cursor: p1.NextCursor, Limit: 10})
+	if err != nil {
+		t.Fatalf("List resume: %v", err)
+	}
+	seen := map[string]int{}
+	for _, r := range p2.Records {
+		seen[r.FileID]++
+	}
+	if seen[r3] != 1 {
+		t.Fatalf("concurrent tail insert r3 appeared %d times on the resumed walk, "+
+			"want exactly 1 (ascending order must pick up a create that lands after "+
+			"the cursor; a descending default would silently skip it) -- resume=%v",
+			seen[r3], recIDs(p2.Records))
+	}
+	// And the resume must NOT repeat a pre-insert record already consumed.
+	if seen[r1] != 0 || seen[r2] != 0 {
+		t.Fatalf("resume repeated a consumed record (r1=%d r2=%d), want 0 each", seen[r1], seen[r2])
+	}
+}
+
 // recIDs projects a record slice to its FileIDs for readable failure output.
 func recIDs(recs []Record) []string {
 	out := make([]string, len(recs))
