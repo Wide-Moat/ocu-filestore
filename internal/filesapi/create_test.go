@@ -1560,3 +1560,52 @@ func TestCreateBackendFailureDenyClasses(t *testing.T) {
 		assertCreateDenied(t, w, http.StatusTooManyRequests)
 	})
 }
+
+// TestCreateForeignScopeIs403 pins the wire class for a FOREIGN-SCOPE refusal on
+// the create path: the engine refused a scope the caller holds no title to
+// (southface.ErrForeignScope), which is a CLIENT-attributable authorization denial
+// -> 403 permission_denied (scope_mismatch), NOT an internal 500. The sentinel's
+// own contract (southface/engine.go: errForeignScope "classifies as
+// denyScopeMismatch (permission_denied/403)") and the read path
+// (download_octetstream.go: foreign scope -> 4xx anti-enum) both say client-error;
+// only the create classifiers mislabelled it internal.
+//
+// Anti-enumeration is inapplicable on the scope axis: the engine is confined to one
+// provisioned scope and refuses EVERY foreign name identically BEFORE the inner
+// engine runs, so 403 leaks no existence bit (unlike the uuid->object axis). And
+// the same endpoint already denies ScopeMismatch/403 at the north attestation
+// check (createParams request-vs-attested scope), so the boundary is not secret --
+// reusing that exact wire class keeps the north-attest catch and the engine-backstop
+// catch wire-indistinguishable.
+//
+// BOTH classifiers are covered because a foreign scope reaches create through TWO
+// legs: join mode faults in the ensure-parent MakeDir (the switch), and static-path
+// mode (empty CreateSubtree) skips EnsureDir and faults in WriteStream
+// (denyClassForEngineErr). Fixing only one leg MOVES the bug. Red-probe: revert
+// either classifier's ErrForeignScope case and that sub-test reds to 500 alone.
+func TestCreateForeignScopeIs403(t *testing.T) {
+	body := []byte("FOREIGN-BYTES")
+	params := createParamsJSON(t, map[string]any{
+		"path": "/report.txt", "declared_size_bytes": len(body),
+	})
+
+	t.Run("join_mode_ensure_parent_foreign_scope_denies_403", func(t *testing.T) {
+		// Join mode: the ensure-parent MakeDir hits the engine's foreign-scope
+		// refusal -> the ensure-leg switch must map it to 403, not 500.
+		h, eng, _ := createSetupSubtree("uploads")
+		eng.makeDirErr = southface.ErrForeignScope
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusForbidden)
+	})
+
+	t.Run("static_path_mode_writestream_foreign_scope_denies_403", func(t *testing.T) {
+		// Static-path mode (empty CreateSubtree): EnsureDir is skipped, so the
+		// foreign-scope refusal surfaces from WriteStream -> denyClassForEngineErr
+		// must map it to 403, not 500. This is the leg a single-classifier fix
+		// would leave 500ing.
+		h, eng, _ := createSetupSubtree("")
+		eng.writeErr = southface.ErrForeignScope
+		w := doCreate(h, params, body)
+		assertCreateDenied(t, w, http.StatusForbidden)
+	})
+}
