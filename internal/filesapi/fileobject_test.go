@@ -31,6 +31,49 @@ func TestFileObjectMapsRecord(t *testing.T) {
 	}
 }
 
+// TestFileObjectDerivesMimeWhenAbsent is the read-plane content-type guard: a
+// guest FUSE write stores an S3 object with no Content-Type, so the durable
+// Record's Mime is "" for every agent-written file. The projection must derive
+// a media type from the filename extension so a File Pane preview (or any F9
+// reader) can classify the model's output. A stored Mime always wins. This is
+// the non-vacuous guard that keeps the fix honest: it stays RED until the
+// read-time derivation lands (revert resolveMime -> mime_type "" for a .png).
+func TestFileObjectDerivesMimeWhenAbsent(t *testing.T) {
+	cases := []struct {
+		filename string
+		stored   string
+		want     string
+	}{
+		// The load-bearing case: a guest-written PNG with no stored mime must
+		// project image/png so the preview classifies it as an image.
+		{"chart.png", "", "image/png"},
+		{"notes.txt", "", "text/plain"},
+		// A stored content type always wins over the extension.
+		{"report.pdf", "application/pdf", "application/pdf"},
+		// A stored type wins even when it disagrees with the extension.
+		{"data.bin", "application/json", "application/json"},
+		// No extension and no stored type -> empty, not a guess.
+		{"README", "", ""},
+	}
+	for _, c := range cases {
+		fo := newFileObject(handlestore.Record{
+			FileID:   "fid-mime",
+			Filename: c.filename,
+			Mime:     c.stored,
+		})
+		// Derived types may carry a charset suffix from the platform mime table;
+		// compare on the bare media type.
+		got := fo.MimeType
+		if i := strings.IndexByte(got, ';'); i >= 0 {
+			got = strings.TrimSpace(got[:i])
+		}
+		if got != c.want {
+			t.Fatalf("newFileObject(%q, stored=%q).MimeType = %q, want %q",
+				c.filename, c.stored, fo.MimeType, c.want)
+		}
+	}
+}
+
 // TestFileObjectOmitsDownloadableAndObjectRef pins that the marshalled
 // FileObject carries NO downloadable field (resolved at read only, NFR-SEC-73)
 // and NEVER leaks the backend object_ref or the scope.
