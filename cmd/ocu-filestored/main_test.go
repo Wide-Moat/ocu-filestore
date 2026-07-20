@@ -675,6 +675,14 @@ func TestRunVerifyStorageJWTGate(t *testing.T) {
 	if err := os.WriteFile(emptyJWKS, nil, 0o600); err != nil {
 		t.Fatalf("write empty jwks: %v", err)
 	}
+	// keylessJWKS is NONEMPTY (passes the read+len!=0 checks) but has no usable
+	// key: without the boot-time verifier construction it would slip past the gate,
+	// bind a healthy socket, then 401 EVERY request via the reject-all fallback in
+	// newCredentialScopeExtractor. The gate must fail-fast on it.
+	keylessJWKS := filepath.Join(root, "keyless.json")
+	if err := os.WriteFile(keylessJWKS, []byte(`{"keys":[]}`), 0o600); err != nil {
+		t.Fatalf("write keyless jwks: %v", err)
+	}
 	full := []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}
 
 	for _, tc := range []struct {
@@ -686,6 +694,7 @@ func TestRunVerifyStorageJWTGate(t *testing.T) {
 		{"missing_audience", []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss"}},
 		{"unreadable_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", filepath.Join(root, "nope.json"), "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
 		{"empty_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", emptyJWKS, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
+		{"keyless_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", keylessJWKS, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := run(append(append([]string{}, base...), tc.args...))

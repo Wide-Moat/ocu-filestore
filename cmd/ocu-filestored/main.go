@@ -528,6 +528,19 @@ func runCtx(ctx context.Context, args []string) error {
 			return fmt.Errorf("%w: -storage-jwks-path %q is empty", errMissingRequiredFlag, *storageJWKSPath)
 		}
 		cfg.storageJWKS = jwksBytes
+		// FAIL-FAST at boot: construct the verifier NOW so a structurally-invalid
+		// but nonempty JWKS (an empty key set {"keys":[]}, an unsupported kty/crv,
+		// a malformed/off-curve key) aborts boot instead of binding a healthy
+		// socket that then 401s EVERY request via the reject-all fallback in
+		// newCredentialScopeExtractor. The read+nonempty checks above do NOT parse
+		// the keys, so without this a bad-but-nonempty JWKS passes the gate,
+		// reports healthy/live, and silently serves an always-reject verifier --
+		// the exact "can never silently fall back" outcome this gate promises to
+		// prevent. The verifier is rebuilt (identically) in the extractor; this is
+		// the cheap boot-time validation, not the serving instance.
+		if _, err := southface.NewStorageJWTVerifier(cfg.storageJWKS, cfg.storageJWTIssuer, cfg.storageJWTAudience, nil); err != nil {
+			return fmt.Errorf("%w: -storage-jwks-path %q is not a usable JWKS: %v", errMissingRequiredFlag, *storageJWKSPath, err)
+		}
 	}
 
 	// Build the structured logger AFTER validate (which refused bad flags)
