@@ -45,9 +45,13 @@
 #     same tool. Comparing tool to tool catches drift but not systematic error.
 #  7. Findings are ATTRIBUTED by planted artefact -- file name for semgrep,
 #     package plus CVE id for trivy. A finding total proves the gate reddened;
-#     it does not prove it reddened on the planted payload, and this tree
-#     already carries a pre-existing HIGH (see the clean-leg report) that
-#     would satisfy any count check on its own.
+#     it does not prove it reddened on the PLANTED payload. That is why a count
+#     check is never enough: any unrelated advisory the tree may carry -- and
+#     the set of those changes without a commit here, as upstream publishes and
+#     as dependencies are bumped -- would satisfy a count on its own. So the
+#     dirty leg names the payload, and additionally requires each planted
+#     advisory to be ABSENT from the clean leg's output (see rule 7's check
+#     further down), which holds whether the baseline is clean today or not.
 #  8. The expected MESSAGE FRAGMENT is pinned, not just an exit code or a
 #     count. A check that compares only the number of violations passes a
 #     violation reported for the wrong reason.
