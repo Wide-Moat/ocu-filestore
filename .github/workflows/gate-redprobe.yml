@@ -34,6 +34,14 @@ on:
       - '.github/workflows/security.yml'
       - '.github/workflows/gate-redprobe.yml'
       - 'scripts/*-redprobe.sh'
+      # The release pipeline is the SUBJECT of the release-signing probe, not
+      # merely a neighbour of it: an edit to release.yml changes what that probe
+      # measures, so it must run in the same pull request as the edit. The
+      # exceptions ledger is listed for the same reason from the other side —
+      # adding an entry is the one change that can turn that probe green, so it
+      # arrives with the verdict it produced.
+      - '.github/workflows/release.yml'
+      - '.github/signing-order-exceptions'
       # Scanner suppression surfaces. .gitleaks.toml exists; .semgrepignore and
       # .trivyignore deliberately do NOT exist in this tree today. They are
       # listed anyway as tripwires: the commit that first introduces a
@@ -61,17 +69,31 @@ concurrency:
   group: gate-redprobe-${{ github.ref }}
   cancel-in-progress: true
 
-# NOT WIRED HERE: scripts/release-signing-redprobe.sh.
-# That probe currently exits 3 — its 23 red legs all pass and its green control
-# is clean, but it reports a REAL pre-existing violation in the committed
-# workflow: SIGN-AFTER-PUBLISH on job `ghcr-image` in release.yml, where the
-# image is pushed to the registry before it is signed. Adding it as a blocking
-# job would therefore paint CI permanently red until the owner picks a remedy
-# for release.yml, and the finding is a release-process decision, not a CI
-# wiring decision. The other way to land it — marking the job
-# continue-on-error — is precisely the false-green pattern that probe was
-# written to detect, so it is not available either. The wiring decision is
-# deferred to the owner; run the probe by hand in the meantime.
+# THE RELEASE-SIGNING PROBE AND ITS EXCEPTIONS LEDGER
+# scripts/release-signing-redprobe.sh is wired below as a blocking job, and it
+# reports a REAL pre-existing violation in release.yml: SIGN-AFTER-PUBLISH on
+# job `ghcr-image`, which pushes the image to the registry before anything signs
+# it. Closing that restructures the release pipeline, which is the owner's call
+# on the release process rather than a CI-wiring decision, so it is not fixed
+# here — and neither of the two ways to land the job around it is acceptable.
+# Leaving a blocking job permanently red is not: within a week "filestore checks
+# is always red" becomes the expected state and a real regression rides through
+# unnoticed, which is the same failure as switching the gate off. Marking the
+# job continue-on-error is not either: that is the exact false-green pattern the
+# probe was written to detect, so using it here would defeat the thing being
+# wired.
+#
+# The third path: a finding the change in hand can close gets FIXED; a finding
+# that needs work elsewhere gets NAMED. This one is named in
+# .github/signing-order-exceptions, keyed on FILE PLUS JOB — a file-keyed entry
+# would have blanketed every future signing-order violation anywhere in
+# release.yml, including a second publishing job added later. The probe prints
+# every admitted gap on every run, so "found nothing" and "found something we
+# agreed to carry" never look alike; it refuses to run at all on a ledger entry
+# it cannot parse; and it FAILS on an entry whose file+job no longer violates,
+# so the list is forced to shrink rather than asked to. Growth in that file is
+# visible in a diff a reviewer has to approve; shrinkage would not be, which is
+# why the probe enforces it.
 
 jobs:
   redprobe-secrets-gate:
@@ -105,3 +127,33 @@ jobs:
         # intent. It also measures, advisory-only, the coverage gap between the
         # required `trivy fs` context and the unscanned builder base image.
         run: bash scripts/sast-sca-gate-redprobe.sh
+
+  redprobe-release-signing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The subject is a file in the tree, not the commit history: this
+          # probe parses .github/workflows/release.yml and mutates copies of it
+          # in a temp directory. A shallow checkout is the whole subject.
+          persist-credentials: false
+      - name: ensure PyYAML is available to the probe
+        # The probe PARSES the workflow rather than grepping it, and refuses to
+        # run (exit 2) without PyYAML. A blocking job must not depend on
+        # whichever Python packages a runner image happens to ship this month,
+        # so the dependency is made explicit. Installed from the distro archive
+        # the runner image already trusts rather than from PyPI, so this adds no
+        # new supply-chain surface to a security-gate workflow.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null && exit 0
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-yaml
+      - name: red-probe the release signing gate (sbom-and-sign in release.yml)
+        # BLOCKING, with no continue-on-error: this probe exists to detect a
+        # signing job whose failure is recorded as a success, so suppressing its
+        # own failure the same way would be self-defeating. It exits non-zero on
+        # a broken probe (1), an unparseable ledger (2), a signing-order
+        # violation no ledger entry admits (3), and a ledger entry that has
+        # outlived the violation it names (4) — that last one is what stops the
+        # exceptions ledger from quietly becoming a permanent allow-list.
+        run: bash scripts/release-signing-redprobe.sh

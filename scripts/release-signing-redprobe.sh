@@ -52,19 +52,52 @@
 # image is pullable under its release tag before any signature exists. If
 # sbom-and-sign fails — expired OIDC, Rekor unavailable, the SBOM action
 # down — the unsigned image stays published and red CI retracts nothing.
-# The analyzer reports this as SIGN-AFTER-PUBLISH, and the committed file
-# therefore exits 3 (see EXIT CODES).
+# The analyzer reports this as SIGN-AFTER-PUBLISH.
+#
+# THE EXCEPTIONS LEDGER
+# Closing that finding restructures the release pipeline, which is the owner's
+# call, so left alone the probe exits 3 forever and can never be a CI gate. Both
+# obvious ways out are worse than the disease: a blocking job left permanently
+# red teaches every reader that "filestore checks is always red" is the normal
+# state, and a real regression then rides through unnoticed; and marking the job
+# continue-on-error is precisely the false-green pattern this probe exists to
+# detect. So neither. A finding the change in hand can close gets FIXED; a
+# finding that needs work elsewhere gets NAMED, in
+# .github/signing-order-exceptions (override with $SIGNING_ORDER_EXCEPTIONS),
+# together with the condition that deletes the entry.
+#
+# An entry is keyed on FILE PLUS JOB — `path/to/workflow.yml::job-id` — not on a
+# file. A file-keyed entry would admit every present and future signing-order
+# violation anywhere in release.yml, including one raised against a second
+# publishing job added months later; that is an allow-list, not an admission. A
+# malformed entry is refused rather than skipped, an entry naming a workflow
+# outside the tree is refused (it could never match, so it could never be
+# reported stale either), and a violation with no single job to attribute it to
+# cannot be admitted at all. Every admitted gap PRINTS on every run, so a reader
+# can tell "the gate found nothing" from "the gate found something we agreed to
+# carry". An entry whose file+job no longer violates is a HARD ERROR: growth in
+# the ledger shows up in a diff a reviewer has to agree to, shrinkage does not,
+# so the probe forces the shrinkage instead of asking for it.
 #
 # EXIT CODES
-#   0  the analyzer is proven two-sided AND the committed workflow is clean
+#   0  the analyzer and its ledger are proven two-sided AND the committed
+#      workflow carries no violation beyond the ones the ledger admits (which
+#      are printed, never silent)
 #   1  PROBE INTEGRITY FAILURE — a mutation failed to redden, reddened with the
-#      wrong message, or the green control did not come back clean. Nothing the
-#      analyzer says about the committed workflow can be trusted in this state.
-#   2  the probe could not run (missing python3 / PyYAML / workflow file)
+#      wrong message, the green control did not come back clean, or a ledger leg
+#      failed. Nothing the analyzer says about the committed workflow can be
+#      trusted in this state.
+#   2  the probe could not run (missing python3 / PyYAML / workflow file, or an
+#      exceptions ledger it could not parse — running on a ledger half of which
+#      was silently dropped would report a gap as unadmitted with no way to see
+#      why)
 #   3  the analyzer is sound, and the COMMITTED workflow carries a violation
-#      (today: SIGN-AFTER-PUBLISH). Non-zero on purpose: a live finding must
+#      that no ledger entry admits. Non-zero on purpose: a live finding must
 #      never read as green, and it is reported separately from exit 1 so a
 #      broken probe is never mistaken for a broken pipeline.
+#   4  the LEDGER has rotted: an entry names a file+job that no longer violates.
+#      Delete the entry. Separate from 3 because the pipeline is fine and only
+#      the bookkeeping is not; both are printed when both apply.
 #
 # Usage:
 #   scripts/release-signing-redprobe.sh             # full probe, working tree
@@ -83,8 +116,11 @@
 # with `git show REF:...` so a CI or audit run can pin exactly which revision
 # was judged instead of whatever happens to be checked out.
 #
-# Not wired into `make check`: it needs python3 + PyYAML, and its exit-3 state
-# is an owner decision, not a developer's pre-push chore.
+# Wired into .github/workflows/gate-redprobe.yml as a blocking job, on a paths
+# filter that includes release.yml and the ledger, so an edit to either arrives
+# in the same pull request as the probe's verdict on it. Not wired into
+# `make check`: it needs python3 + PyYAML, which the Go toolchain does not
+# carry.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -241,10 +277,113 @@ SIGN_JOB = "sbom-and-sign"
 
 
 # ---------------------------------------------------------------------------
+# EXCEPTIONS LEDGER
+#
+# A finding the change in hand can close gets FIXED. A finding that needs work
+# elsewhere gets NAMED here, with the condition that removes it. Neither gets
+# switched off: a gate left permanently red decays into noise exactly as a
+# disabled one decays into absence, and a real regression then rides through it.
+#
+# Entries are keyed on FILE PLUS JOB. Keying on the file alone would admit every
+# present and future signing-order violation anywhere in that workflow, which is
+# an allow-list wearing an admission's label.
+# ---------------------------------------------------------------------------
+
+EXCEPTIONS_DEFAULT = os.path.join(REPO_ROOT, ".github", "signing-order-exceptions")
+SEPARATOR = "::"
+
+
+def ledger_key(path):
+    """The name a ledger entry must use for this file.
+
+    Repo-relative when the file is inside the repository — so an entry reads the
+    way a reviewer writes it and survives a different checkout directory — and
+    an absolute real path otherwise.
+    """
+    real = os.path.realpath(path)
+    root = os.path.realpath(REPO_ROOT)
+    if real.startswith(root + os.sep):
+        return os.path.relpath(real, root)
+    return real
+
+
+def load_ledger(path):
+    """Parse the ledger into ({(file key, job id)}, [complaints]).
+
+    A caller handed a complaint must REFUSE TO RUN rather than proceed on a
+    ledger it did not understand. Every rejection below exists because the
+    silent alternative rots: a line the parser skipped would leave a gap
+    unadmitted and the gate red for a reason the ledger claims to have named,
+    with nothing on screen connecting the two; and an entry naming a workflow
+    that is not in the tree could never match a violation, so it could never be
+    reported stale either, and would sit there forever.
+    """
+    entries, errors = set(), []
+    if not os.path.exists(path):
+        return entries, errors
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split(SEPARATOR)
+            if len(parts) != 2:
+                errors.append(
+                    "%s:%d: %r is not '<workflow path>%s<job id>' — %d separator(s), "
+                    "exactly 1 required" % (path, lineno, line, SEPARATOR, len(parts) - 1))
+                continue
+            f, job = parts[0].strip(), parts[1].strip()
+            if not f or not job:
+                errors.append(
+                    "%s:%d: %r leaves the %s empty; an entry keyed on a file alone "
+                    "would admit every violation in that workflow, present and future"
+                    % (path, lineno, line, "job id" if f else "workflow path"))
+                continue
+            abs_ = os.path.realpath(os.path.join(REPO_ROOT, f))
+            if not os.path.isfile(abs_):
+                errors.append(
+                    "%s:%d: %r names a workflow that is not in the tree; it can never "
+                    "match a violation, and so can never be reported stale either"
+                    % (path, lineno, line))
+                continue
+            entries.add((ledger_key(abs_), job))
+    return entries, errors
+
+
+def partition(violations, subject_key, entries):
+    """Split violations into (reported, admitted) and name the stale entries.
+
+    A violation is admitted only when an entry names BOTH this file and the
+    exact job the violation is attributed to. A violation with no job — a
+    missing tag trigger, a workflow in which no publisher is recognised at all —
+    belongs to the workflow rather than to one job, so no entry can name it and
+    it is always reported.
+
+    STALE is the anti-rot rule: an entry for THIS file that admitted nothing no
+    longer has a violation to carry, and must be deleted. It is scoped to the
+    subject because a run judges one workflow, and an entry about a file this
+    run did not analyze has not been shown to be stale — only unexercised.
+    """
+    reported, admitted, used = [], [], set()
+    for code, job, msg in violations:
+        key = (subject_key, job)
+        if job is not None and key in entries:
+            admitted.append((code, job, msg))
+            used.add(key)
+        else:
+            reported.append((code, job, msg))
+    stale = sorted(e for e in entries if e[0] == subject_key and e not in used)
+    return reported, admitted, stale
+
+
+# ---------------------------------------------------------------------------
 # ANALYZER
 #
-# Returns a list of (CODE, message). CODE is the pinned fragment the red-probe
-# asserts on; the message carries the evidence a human needs.
+# Returns a list of (CODE, job, message). CODE is the pinned fragment the
+# red-probe asserts on; the message carries the evidence a human needs; job is
+# the job the violation is attributed to, or None when it belongs to the
+# workflow as a whole. The ledger admits by (file, job), so an unattributed
+# violation is one no entry can ever admit — that is deliberate.
 # ---------------------------------------------------------------------------
 
 def triggers_of(wf):
@@ -440,8 +579,11 @@ def analyze(path):
         wf = yaml.safe_load(fh)
     v = []
 
-    def bad(code, msg):
-        v.append((code, msg))
+    def bad(code, msg, job=None):
+        # `job` is the job this violation is attributed to, and it is the second
+        # half of the ledger key. None means the violation belongs to the
+        # workflow rather than to any one job, and is therefore unadmittable.
+        v.append((code, job, msg))
 
     jobs = wf.get("jobs") or {}
 
@@ -456,7 +598,8 @@ def analyze(path):
 
     if SIGN_JOB not in jobs:
         bad("SBOM-SIGN-JOB-MISSING",
-            "job '%s' is absent from the workflow; nothing signs a release" % SIGN_JOB)
+            "job '%s' is absent from the workflow; nothing signs a release" % SIGN_JOB,
+            SIGN_JOB)
         job = {}
     else:
         job = jobs[SIGN_JOB] or {}
@@ -467,15 +610,16 @@ def analyze(path):
             if dep not in jobs:
                 bad("NEEDS-UNKNOWN-JOB",
                     "job '%s' needs '%s', which is not defined; the graph never "
-                    "runs" % (name, dep))
+                    "runs" % (name, dep), name)
     if SIGN_JOB in jobs and SIGN_JOB in transitive_needs(jobs, SIGN_JOB):
         bad("NEEDS-CYCLE",
-            "job '%s' transitively needs itself; the graph is unrunnable" % SIGN_JOB)
+            "job '%s' transitively needs itself; the graph is unrunnable" % SIGN_JOB,
+            SIGN_JOB)
 
     if "if" in job:
         bad("SBOM-SIGN-CONDITIONAL",
             "job '%s' carries an if: (%s); a skipped job reports success and "
-            "signs nothing" % (SIGN_JOB, job.get("if")))
+            "signs nothing" % (SIGN_JOB, job.get("if")), SIGN_JOB)
     # continue-on-error is the same class as if: and just as invisible in a
     # green run — the difference is that the job DOES run, fails, and is then
     # recorded as successful. Every downstream needs-edge is satisfied by a job
@@ -485,29 +629,29 @@ def analyze(path):
             "job '%s' carries continue-on-error: %s; the job's failure is "
             "recorded as success, so every downstream needs-edge is satisfied "
             "by a run that signed nothing"
-            % (SIGN_JOB, show(job.get("continue-on-error"))))
+            % (SIGN_JOB, show(job.get("continue-on-error"))), SIGN_JOB)
     for step in steps_of(job):
         if is_signing_step(step) and continue_on_error_set(step):
             bad("SBOM-SIGN-CONTINUE-ON-ERROR",
                 "step '%s' in job '%s' carries continue-on-error: %s; the "
                 "signing step can fail while the job still reports success"
                 % (step.get("name") or uses_of(step) or "<unnamed>", SIGN_JOB,
-                   show(step.get("continue-on-error"))))
+                   show(step.get("continue-on-error"))), SIGN_JOB)
     for dep in sorted(transitive_needs(jobs, SIGN_JOB)):
         if "if" in (jobs.get(dep) or {}):
             bad("SBOM-SIGN-UPSTREAM-CONDITIONAL",
                 "'%s' depends on '%s', which carries an if:; when the upstream "
-                "skips, the signing job skips with it" % (SIGN_JOB, dep))
+                "skips, the signing job skips with it" % (SIGN_JOB, dep), dep)
 
     perms = job.get("permissions") or {}
     if str(perms.get("id-token", "")).strip().lower() != "write":
         bad("OIDC-PERMISSION-MISSING",
             "job '%s' does not grant id-token: write; cosign keyless signing "
-            "cannot obtain an OIDC token" % SIGN_JOB)
+            "cannot obtain an OIDC token" % SIGN_JOB, SIGN_JOB)
     if str(perms.get("attestations", "")).strip().lower() != "write":
         bad("ATTESTATION-PERMISSION-MISSING",
             "job '%s' does not grant attestations: write; build provenance "
-            "cannot be recorded" % SIGN_JOB)
+            "cannot be recorded" % SIGN_JOB, SIGN_JOB)
 
     # --- B. it really produces an SBOM and real signatures -------------------
     has_installer = False
@@ -534,20 +678,20 @@ def analyze(path):
 
     if not has_installer:
         bad("COSIGN-INSTALL-MISSING",
-            "job '%s' never installs cosign; no step can sign" % SIGN_JOB)
+            "job '%s' never installs cosign; no step can sign" % SIGN_JOB, SIGN_JOB)
     if not has_sbom:
         bad("SBOM-STEP-MISSING",
             "job '%s' has no SBOM generation step; the release ships without a "
-            "bill of materials" % SIGN_JOB)
+            "bill of materials" % SIGN_JOB, SIGN_JOB)
     if not has_blob_sign:
         bad("COSIGN-BLOB-MISSING",
             "job '%s' never runs 'cosign sign-blob'; the released binaries are "
-            "unsigned" % SIGN_JOB)
+            "unsigned" % SIGN_JOB, SIGN_JOB)
 
     if not image_sign_refs:
         bad("COSIGN-IMAGE-SIGN-MISSING",
             "job '%s' never runs 'cosign sign' on the container image; the "
-            "published image is unsigned" % SIGN_JOB)
+            "published image is unsigned" % SIGN_JOB, SIGN_JOB)
     else:
         for line in image_sign_refs:
             # Signing by digest is the property under test. A mutable tag can be
@@ -556,24 +700,25 @@ def analyze(path):
             if "@" not in line:
                 bad("COSIGN-IMAGE-BY-TAG",
                     "'cosign sign' targets a mutable tag, not a digest (%s); the "
-                    "tag can be repointed after signing" % line)
+                    "tag can be repointed after signing" % line, SIGN_JOB)
             elif not re.search(r"@\s*(\$\{\{[^}]*digest[^}]*\}\}|sha256:)", line):
                 bad("COSIGN-IMAGE-BY-TAG",
-                    "'cosign sign' reference carries no resolvable digest (%s)" % line)
+                    "'cosign sign' reference carries no resolvable digest (%s)" % line,
+                    SIGN_JOB)
 
     if not attest_steps:
         bad("PROVENANCE-ATTEST-MISSING",
             "job '%s' has no actions/attest-build-provenance step; no build "
-            "provenance is attested" % SIGN_JOB)
+            "provenance is attested" % SIGN_JOB, SIGN_JOB)
     else:
         if not any("subject-path" in w for w in attest_steps):
             bad("PROVENANCE-BINARY-MISSING",
                 "no build-provenance attestation covers a released binary "
-                "(no subject-path)")
+                "(no subject-path)", SIGN_JOB)
         if not any("subject-digest" in w for w in attest_steps):
             bad("PROVENANCE-IMAGE-MISSING",
                 "no build-provenance attestation covers the container image "
-                "(no subject-digest)")
+                "(no subject-digest)", SIGN_JOB)
 
     # --- C. signing precedes publish ----------------------------------------
     pubs = publishers(jobs)
@@ -591,7 +736,8 @@ def analyze(path):
             bad("SIGN-AFTER-PUBLISH",
                 "publishing job '%s' (%s) does not depend on '%s'; the artifact "
                 "is publicly retrievable before any signature exists, and a "
-                "later signing failure retracts nothing" % (name, why, SIGN_JOB))
+                "later signing failure retracts nothing" % (name, why, SIGN_JOB),
+                name)
         elif not hard_gated(jobs, name, SIGN_JOB):
             # The edge exists but does not gate. Asserting only the edge makes
             # this check satisfiable by an ordering hint: the publisher runs
@@ -603,21 +749,61 @@ def analyze(path):
                 "job '%s' carries %s: it does not hold the pipeline when the "
                 "signing job fails or is skipped, so the edge orders the jobs "
                 "without gating them"
-                % (name, why, SIGN_JOB, culprit[0], culprit[1]))
+                % (name, why, SIGN_JOB, culprit[0], culprit[1]), name)
     return v
 
 
 def render(violations, prefix=""):
-    for code, msg in violations:
+    for code, _job, msg in violations:
         print("%sVIOLATION %s: %s" % (prefix, code, msg))
 
 
+def admitted_lines(admitted, subject_key):
+    """One line per admitted gap, naming the exact ledger key that carries it.
+
+    Built as a list rather than printed in place so the self-test can assert
+    that an admission is VISIBLE. An admitted gap that printed nothing would be
+    indistinguishable from a gate that found nothing, which is the failure mode
+    a switched-off gate has.
+    """
+    return ["ADMITTED %s (%s%s%s): %s" % (code, subject_key, SEPARATOR, job, msg)
+            for code, job, msg in admitted]
+
+
+def render_stale(stale, prefix=""):
+    for f, job in stale:
+        print("%sSTALE LEDGER ENTRY %s%s%s: this file+job no longer violates the "
+              "signing-order invariant. DELETE the entry — a ledger that keeps "
+              "entries it no longer needs stops shrinking on its own and becomes "
+              "a permanent allow-list wearing a temporary label."
+              % (prefix, f, SEPARATOR, job))
+
+
+LEDGER_PATH = os.environ.get("SIGNING_ORDER_EXCEPTIONS", EXCEPTIONS_DEFAULT)
+LEDGER_ENTRIES, LEDGER_ERRORS = load_ledger(LEDGER_PATH)
+if LEDGER_ERRORS:
+    print("NOT RUN: %s is not a ledger this probe understands. Refusing to judge the"
+          % LEDGER_PATH, file=sys.stderr)
+    print("         workflow on a ledger half of which was silently dropped: a skipped",
+          file=sys.stderr)
+    print("         line leaves a named gap unadmitted and the gate red with nothing on",
+          file=sys.stderr)
+    print("         screen connecting the two.", file=sys.stderr)
+    for e in LEDGER_ERRORS:
+        print("  %s" % e, file=sys.stderr)
+    sys.exit(2)
+
 if MODE_CHECK:
-    vs = analyze(MODE_CHECK)
+    key = ledger_key(MODE_CHECK)
+    vs, adm, st = partition(analyze(MODE_CHECK), key, LEDGER_ENTRIES)
     render(vs)
-    if not vs:
-        print("ok: %s satisfies every release-signing assertion" % MODE_CHECK)
-    sys.exit(1 if vs else 0)
+    for line in admitted_lines(adm, key):
+        print(line)
+    render_stale(st)
+    if not vs and not st:
+        print("ok: %s satisfies every release-signing assertion%s"
+              % (MODE_CHECK, " beyond the admitted gap(s) above" if adm else ""))
+    sys.exit(1 if vs else (4 if st else 0))
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +1159,7 @@ def leg_problems(got, expect):
     """
     problems = []
     by_code = {}
-    for code, msg in got:
+    for code, _job, msg in got:
         by_code.setdefault(code, []).append(msg)
     wanted = {}
     for code, subs in expect:
@@ -1043,6 +1229,11 @@ else:
     real_text = load_real()
     SUBJECT = "%s (working tree)" % WORKFLOW_REL
 
+# The ledger names a workflow's identity IN THE REPOSITORY, never wherever the
+# copy under test happens to sit. Under --ref the subject is a temp extraction
+# of the same file, and an entry must go on matching it.
+SUBJECT_KEY = WORKFLOW_REL
+
 fail = 0
 print("release-signing red-probe — subject: %s" % SUBJECT)
 
@@ -1055,6 +1246,12 @@ if "pull_request" not in _events:
     print("     no pull_request trigger, so '%s' can never run on a PR: marking it a "
           "required PR context would make it eternally green, because GitHub counts "
           "a skipped required check as passed." % SIGN_JOB)
+# Name the ledger in force before any verdict, so a reader never has to guess
+# which admissions this run was working under.
+print("     ledger:   %s%s"
+      % (LEDGER_PATH,
+         (" — %d entr%s" % (len(LEDGER_ENTRIES), "y" if len(LEDGER_ENTRIES) == 1 else "ies"))
+         if LEDGER_ENTRIES else " — no admitted gaps"))
 print()
 
 # --- GREEN control -----------------------------------------------------------
@@ -1074,7 +1271,7 @@ for idx, (label, mutate, expect, also) in enumerate(MUTATIONS, start=1):
     mutated = mutate(copy.deepcopy(repaired))
     path = dump(mutated, "%02d-%s.yml" % (idx, re.sub(r"[^a-z0-9]+", "-", label.lower())[:40]))
     got = analyze(path)
-    codes = {c for c, _ in got}
+    codes = {c for c, _, _ in got}
     expect_codes = []
     for code, _ in expect:
         if code not in expect_codes:
@@ -1112,28 +1309,214 @@ for idx, (label, mutate, expect, also) in enumerate(MUTATIONS, start=1):
 
 print()
 
+# --- LEDGER legs -------------------------------------------------------------
+#
+# The ledger is a suppression mechanism, so it is probed exactly as the analyzer
+# is: nothing about it is taken on the word of the run that uses it. The legs
+# pin the SPLIT — which violations were reported, which were admitted, which
+# entries went stale — as (CODE, job) pairs, not as counts, because "one
+# violation reported" is satisfied equally by admitting the right gap and by
+# admitting the wrong one.
+#
+# Two traps these legs are shaped to avoid:
+#
+#   * An over-broadness leg that asserts only "the other job is still reported"
+#     passes VACUOUSLY while the key parser is broken: an unrecognised entry
+#     suppresses nothing, so both violations are reported and the leg sees the
+#     red it expected, for the wrong reason. Every leg below therefore also pins
+#     the ADMITTED set, which is empty whenever the entry was not understood.
+#   * The subject key is passed in explicitly rather than derived from the temp
+#     file each fixture is dumped to, so a leg states which workflow identity it
+#     is reasoning about instead of depending on where the fixture landed.
+
+committed = yaml.safe_load(real_text)
+ADMITTED_ENTRY = "%s%s%s" % (WORKFLOW_REL, SEPARATOR, "ghcr-image")
+_ledger_idx = 0
+
+
+def with_second_publisher(wf):
+    """release.yml plus a second publishing job, of the kind a file-keyed entry
+    would have silently swallowed on the day someone added it."""
+    wf = copy.deepcopy(wf)
+    wf["jobs"]["ghcr-image-arm64"] = copy.deepcopy(wf["jobs"]["ghcr-image"])
+    return wf
+
+
+def without_tag_trigger(wf):
+    wf = copy.deepcopy(wf)
+    wf.pop(True if True in wf else "on", None)
+    wf["on"] = {"workflow_dispatch": None}
+    return wf
+
+
+def ledger_leg(label, wf, lines, want_reported, want_admitted, want_stale,
+               want_errors=0, want_printed=(), subject_key=None):
+    """One ledger leg: build a ledger, split one subject with it, pin the split.
+
+    want_reported / want_admitted are (CODE, job) pairs; a violation with no job
+    is spelled (CODE, None) and can never be admitted.
+    """
+    global fail, _ledger_idx
+    _ledger_idx += 1
+    key = subject_key or WORKFLOW_REL
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower())[:40]
+    path = dump(wf, "L%02d-%s.yml" % (_ledger_idx, slug))
+    lpath = os.path.join(work, "L%02d-%s.ledger" % (_ledger_idx, slug))
+    with open(lpath, "w", encoding="utf-8") as fh:
+        fh.write("".join(ln + "\n" for ln in lines))
+    entries, errors = load_ledger(lpath)
+    reported, admitted, stale = partition(analyze(path), key, entries)
+    printed = admitted_lines(admitted, key)
+
+    problems = []
+    if len(errors) != want_errors:
+        problems.append("parser raised %d malformed-entry error(s), expected %d%s"
+                        % (len(errors), want_errors,
+                           "".join("\n         %s" % e for e in errors)))
+    for what, got, want in (
+            ("reported", sorted((c, j or "") for c, j, _ in reported), sorted(want_reported)),
+            ("admitted", sorted((c, j or "") for c, j, _ in admitted), sorted(want_admitted)),
+            ("stale", sorted(stale), sorted(want_stale))):
+        want = [(a, b or "") for a, b in want]
+        if got != want:
+            problems.append("%s %s, expected %s" % (what, got, want))
+    if want_printed and not any(all(s in line for s in want_printed) for line in printed):
+        problems.append("no printed admission line says %s\n         printed: %s"
+                        % ("; ".join(repr(s) for s in want_printed),
+                           " | ".join(printed) or "nothing"))
+
+    if problems:
+        print("FAIL ledger leg %02d (%s)" % (_ledger_idx, label))
+        for p in problems:
+            print("     %s" % p)
+        fail = 1
+    else:
+        print("ok   ledger leg %02d: %s" % (_ledger_idx, label))
+
+
+ledger_leg(
+    "the named file+job is admitted, and the admission is printed",
+    committed, [ADMITTED_ENTRY],
+    want_reported=[],
+    want_admitted=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_stale=[],
+    want_printed=("SIGN-AFTER-PUBLISH", ADMITTED_ENTRY, "does not depend on"))
+
+ledger_leg(
+    "with the ledger emptied the same finding comes back (not a blanket)",
+    committed, [],
+    want_reported=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_admitted=[], want_stale=[])
+
+ledger_leg(
+    "a second publishing job in the same file is still reported",
+    with_second_publisher(committed), [ADMITTED_ENTRY],
+    want_reported=[("SIGN-AFTER-PUBLISH", "ghcr-image-arm64")],
+    want_admitted=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_stale=[])
+
+ledger_leg(
+    "an entry naming a different job admits nothing, and is itself stale",
+    committed, ["%s%s%s" % (WORKFLOW_REL, SEPARATOR, "image-scan")],
+    want_reported=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_admitted=[],
+    want_stale=[(WORKFLOW_REL, "image-scan")])
+
+ledger_leg(
+    # Deliberately paired with a WORKING entry for the other job. Asserting only
+    # "the foreign entry admitted nothing" would pass just as well against a
+    # parser that understood no entry at all; requiring the second entry to
+    # admit proves the mechanism was running while the foreign one was ignored.
+    "an entry naming a different file admits nothing here",
+    with_second_publisher(committed),
+    [".github/workflows/security.yml%sghcr-image" % SEPARATOR,
+     "%s%sghcr-image-arm64" % (WORKFLOW_REL, SEPARATOR)],
+    want_reported=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_admitted=[("SIGN-AFTER-PUBLISH", "ghcr-image-arm64")],
+    want_stale=[])
+
+ledger_leg(
+    "an entry whose file+job no longer violates is refused as stale",
+    copy.deepcopy(repaired), [ADMITTED_ENTRY],
+    want_reported=[], want_admitted=[],
+    want_stale=[(WORKFLOW_REL, "ghcr-image")])
+
+ledger_leg(
+    "a malformed entry is refused loudly, never skipped or read generously",
+    committed,
+    # A bare path is the format the reference implementation used, and is
+    # refused here rather than read as "the whole file": that generous reading
+    # is exactly the blanket this key exists to prevent.
+    [WORKFLOW_REL,
+     "%sghcr-image" % SEPARATOR,
+     "%s%sghcr-image%sextra" % (WORKFLOW_REL, SEPARATOR, SEPARATOR),
+     "%s%s" % (WORKFLOW_REL, SEPARATOR),
+     ".github/workflows/no-such-workflow.yml%sghcr-image" % SEPARATOR],
+    want_reported=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_admitted=[], want_stale=[], want_errors=5)
+
+ledger_leg(
+    "a violation with no job to name cannot be admitted by any entry",
+    without_tag_trigger(committed), [ADMITTED_ENTRY],
+    want_reported=[("TAG-TRIGGER-MISSING", None)],
+    want_admitted=[("SIGN-AFTER-PUBLISH", "ghcr-image")],
+    want_stale=[])
+
+print()
+
 # --- the committed file ------------------------------------------------------
-real = analyze(WORKFLOW)
-if not real:
-    print("ok   committed workflow: every release-signing assertion holds")
-else:
+real, admitted, stale = partition(analyze(WORKFLOW), SUBJECT_KEY, LEDGER_ENTRIES)
+if admitted:
+    print("ADMITTED committed workflow: %d known gap%s named in %s."
+          % (len(admitted), "" if len(admitted) == 1 else "s", LEDGER_PATH))
+    print("     Named, not switched off: each entry carries the condition that deletes")
+    print("     it, and this probe fails the moment an entry outlives its violation.")
+    for line in admitted_lines(admitted, SUBJECT_KEY):
+        print("     %s" % line)
+if stale:
+    print("STALE ledger: %d entr%s no longer carr%s a violation."
+          % (len(stale), "y" if len(stale) == 1 else "ies",
+             "ies" if len(stale) == 1 else "y"))
+    render_stale(stale, prefix="     ")
+if real:
     print("FINDING committed workflow: %d violation(s) — the analyzer is proven "
           "two-sided above, so these are real." % len(real))
     render(real, prefix="     ")
+elif admitted:
+    print("ok   committed workflow: no violation beyond the admitted gap%s above"
+          % ("" if len(admitted) == 1 else "s"))
+else:
+    print("ok   committed workflow: every release-signing assertion holds")
 
 print()
+_proven = ("Analyzer and ledger proven two-sided (1 green control, %d red legs, %d "
+           "ledger legs, each pinned to its own message/split)."
+           % (len(MUTATIONS), _ledger_idx))
 if fail:
-    print("PROBE INTEGRITY FAILURE — the analyzer is not two-sided; its verdict on the")
-    print("committed workflow means nothing until the failures above are resolved.")
+    print("PROBE INTEGRITY FAILURE — the analyzer or its ledger is not two-sided; the")
+    print("verdict on the committed workflow means nothing until the failures above are")
+    print("resolved.")
     cleanup()
     sys.exit(1)
 if real:
-    print("Analyzer proven two-sided (1 green control, %d red legs, each pinned to its "
-          "own message)." % len(MUTATIONS))
+    print(_proven)
     print("The committed release pipeline carries the violation(s) listed above.")
     cleanup()
     sys.exit(3)
-print("Analyzer proven two-sided and the committed release pipeline is clean.")
+if stale:
+    print(_proven)
+    print("The pipeline is fine; the ledger is not. Delete the stale entr%s above — a"
+          % ("y" if len(stale) == 1 else "ies"))
+    print("ledger that keeps entries it no longer needs stops shrinking and becomes a")
+    print("permanent allow-list.")
+    cleanup()
+    sys.exit(4)
+print(_proven)
+if admitted:
+    print("The committed release pipeline carries no violation beyond the %d admitted "
+          "gap%s printed above." % (len(admitted), "" if len(admitted) == 1 else "s"))
+else:
+    print("The committed release pipeline is clean.")
 cleanup()
 sys.exit(0)
 PYEOF
