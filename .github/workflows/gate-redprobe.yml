@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: gate-redprobe
+
+# Red-probe the Layer-0 security gates: prove they still redden on a planted
+# defect. A gate that has never been shown to fail is indistinguishable from a
+# gate that cannot fail, and the ways a scanner goes quietly blind — a widened
+# allowlist, a retired rule, a config file that stops being loaded, a scan that
+# walks zero bytes — all leave the job green.
+#
+# Each probe drives the real scanner (the same image, the same ruleset, the
+# same flags as the job it measures) against two trees: the committed tree,
+# asserted to pass, and that tree plus one planted defect, asserted to fail AND
+# to name the planted artefact. Both directions have to hold; asserting only
+# the red one passes a scanner that fails on everything.
+#
+# WHY A PATHS TRIGGER AND NOT ONLY A SCHEDULE
+# A purely scheduled probe breaks quietly. Its redness surfaces a day after the
+# edit that caused it, on a run nobody is watching, attributed to no author and
+# attached to no diff — by then the weakening has merged and the connection is
+# gone. The paths filter below puts "you weakened the allowlist" and "the probe
+# reddened" in the same pull request, with the same author, at review time.
+# Three minutes on a PR that edits the gate configuration is a fair price;
+# three minutes on every PR is not, which is why the filter is narrow. The
+# daily schedule stays as the backstop for the drift these probes cannot
+# attribute to any local edit: an upstream ruleset that retires a rule, or a
+# vulnerability database that changes what a clean tree looks like.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # The gate definitions themselves, and the probes that measure them.
+      - '.github/workflows/security.yml'
+      - '.github/workflows/gate-redprobe.yml'
+      - 'scripts/*-redprobe.sh'
+      # Scanner suppression surfaces. .gitleaks.toml exists; .semgrepignore and
+      # .trivyignore deliberately do NOT exist in this tree today. They are
+      # listed anyway as tripwires: the commit that first introduces a
+      # suppression file for semgrep or trivy is exactly the commit that must
+      # arrive with proof the gate it suppresses still reddens, and a path
+      # filter fires on file creation just as it fires on edits.
+      - '.gitleaks.toml'
+      - '.semgrepignore'
+      - '.trivyignore'
+  schedule:
+    # Daily at 04:41 UTC. Deliberately off the top of the hour (the scheduler
+    # surge there delays and occasionally drops runs) and clear of the 07:13
+    # nightly and the 02:00/03:00 weekly scans, so the probes do not contend
+    # with the gates they measure for a runner.
+    - cron: '41 4 * * *'
+
+permissions:
+  # The probes read the tree and shell out to docker. They publish nothing,
+  # comment on nothing, and need no token beyond the checkout.
+  contents: read
+
+concurrency:
+  # Safe to cancel a superseded run: a new push replaces the tree the probe was
+  # asked about, so the in-flight verdict is about a commit nobody will merge.
+  group: gate-redprobe-${{ github.ref }}
+  cancel-in-progress: true
+
+# NOT WIRED HERE: scripts/release-signing-redprobe.sh.
+# That probe currently exits 3 — its 23 red legs all pass and its green control
+# is clean, but it reports a REAL pre-existing violation in the committed
+# workflow: SIGN-AFTER-PUBLISH on job `ghcr-image` in release.yml, where the
+# image is pushed to the registry before it is signed. Adding it as a blocking
+# job would therefore paint CI permanently red until the owner picks a remedy
+# for release.yml, and the finding is a release-process decision, not a CI
+# wiring decision. The other way to land it — marking the job
+# continue-on-error — is precisely the false-green pattern that probe was
+# written to detect, so it is not available either. The wiring decision is
+# deferred to the owner; run the probe by hand in the meantime.
+
+jobs:
+  redprobe-secrets-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Both scanners walk commits, not the checkout. The probe clones this
+          # checkout and hands the clone to gitleaks and to trufflehog in git
+          # mode, and it cross-checks each tool's scanned-commit count against
+          # `git rev-list --count`. A shallow checkout would shrink the history
+          # under test and the probe would report a smaller scan as a pass.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: red-probe the secrets gate (secrets-gitleaks, secrets-trufflehog)
+        # Roughly three minutes: three full-history trufflehog passes plus the
+        # gitleaks legs. Docker is preinstalled on ubuntu-latest; the probe
+        # pulls the same pinned scanner images security.yml runs.
+        run: bash scripts/secrets-gate-redprobe.sh
+
+  redprobe-sast-sca-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: red-probe the SAST/SCA gates (sast-semgrep, sca-trivy-fs)
+        # The clean legs assert the committed tree passes, so this job reddens
+        # on a real new finding as well as on a blinded gate — that is the
+        # intent. It also measures, advisory-only, the coverage gap between the
+        # required `trivy fs` context and the unscanned builder base image.
+        run: bash scripts/sast-sca-gate-redprobe.sh
