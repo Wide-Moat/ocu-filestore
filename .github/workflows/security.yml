@@ -130,11 +130,14 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          # Block on HIGH as well as CRITICAL: a HIGH-severity dependency vuln is
-          # still a real exposure, and a CRITICAL-only floor let it merge. The
-          # tree is clean at this floor today (no .trivyignore waiver needed); a
-          # future HIGH that trivy reddens is triaged with a dated, tracked
-          # .trivyignore entry, never blindly silenced.
+          # Block on HIGH as well as CRITICAL: a HIGH-severity dependency
+          # vuln is still a real exposure, and a CRITICAL-only floor let it
+          # merge. What this floor reddens gets FIXED — the first real one,
+          # CVE-2026-56852 in golang.org/x/text, was closed by bumping the
+          # dependency in dc6f311, not waived. A suppression, if one is ever
+          # genuinely needed, is not a bare .trivyignore line: it names its
+          # reason and the condition that deletes it, and fails the gate once
+          # it no longer applies — see .github/signing-order-exceptions.
           severity: CRITICAL,HIGH
           exit-code: "1"
           ignore-unfixed: "false"
