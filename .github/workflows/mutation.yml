@@ -15,17 +15,21 @@ name: mutation
 # conformance and e2e suites. The scope lives in .gremlins.yaml at the repo
 # root (coverpkg) so it is declared once.
 #
-# ADVISORY (continue-on-error: true) for now. gremlins is slow and its
-# coverage-to-mutant position matching is not yet reliable on this repo's Go
-# toolchain — it can report covered lines as "NOT COVERED", which would make a
-# blocking threshold meaningless. Running it advisory surfaces the efficacy
-# summary in the job log without gating merges.
+# ADVISORY (continue-on-error: true) for now, for two reasons. gremlins is
+# slow. And it misattributes coverage here — it reports covered lines as "NOT
+# COVERED", which would make a blocking threshold meaningless. That second
+# reason is diagnosed ONCE, in .gremlins.yaml beside the thresholds it holds at
+# 0; the cause is gremlins-side, and that file also records what would fix it.
+# Read it there rather than re-deriving a cause here. Running the job advisory
+# surfaces the efficacy summary in the job log without gating merges.
 #
-# Ratchet plan: once gremlins reports a stable, correct efficacy figure on the
-# pinned Go toolchain, set unleash.threshold.efficacy /
-# unleash.threshold.mutant-coverage in .gremlins.yaml to floor(baseline) and
-# drop continue-on-error below so a regression in assertion strength fails the
-# gate.
+# Ratchet plan: the threshold can become meaningful once the coverage
+# misattribution is resolved by one of the remedies .gremlins.yaml names — not
+# by anything about the Go toolchain, which measures this repo correctly. Once
+# it is resolved and gremlins reports a stable, correct efficacy figure, set
+# unleash.threshold.efficacy / unleash.threshold.mutant-coverage in
+# .gremlins.yaml to floor(baseline) and drop continue-on-error below so a
+# regression in assertion strength fails the gate.
 
 on:
   pull_request:
