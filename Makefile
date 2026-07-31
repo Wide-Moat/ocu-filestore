@@ -195,11 +195,14 @@ deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0
 
 # ── mutation (advisory — NOT part of `make check`) ────────────────────────────
 #
-# Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
-# (authz, denyclass, ceilings). Mutation testing measures assertion strength —
-# it rewrites covered source and re-runs the suite; a mutant the tests still
-# pass on is a line executed but not asserted on, which line coverage cannot
-# see. The coverpkg scope is read from .gremlins.yaml at the repo root.
+# Mirrors the mutation.yml CI job invocation for invocation: the same path
+# arguments, the same --exclude-files rules. Whatever that job mutates, this
+# target mutates; a package added to one belongs in the other, and neither
+# list is restated outside those two recipes. Mutation testing measures
+# assertion strength — it rewrites covered source and re-runs the suite; a
+# mutant the tests still pass on is a line executed but not asserted on, which
+# line coverage cannot see. The coverpkg scope is read from .gremlins.yaml at
+# the repo root.
 #
 # gremlins unleash takes a single path argument, so the packages are run in a
 # loop. Advisory and deliberately excluded from `make check`: gremlins is slow,
@@ -207,7 +210,7 @@ deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0
 # first line of go.mod; see .gremlins.yaml for the full rationale), so it is a
 # standalone advisory target, not a pre-push gate.
 
-mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings — pinned to $(GREMLINS_VERSION)
+mutation: ## go-gremlins mutation test (advisory) over the same scope as the mutation.yml CI job — pinned to $(GREMLINS_VERSION)
 	@if ! command -v gremlins >/dev/null 2>&1; then \
 	  echo "gremlins not found — install with:"; \
 	  echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
