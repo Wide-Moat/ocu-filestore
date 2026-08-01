@@ -125,6 +125,14 @@ var (
 	// supplied a malformed window that is a request fault regardless of which
 	// engine is bound. Match it with errors.Is.
 	errInvalidRange = errors.New("southface: invalid read range")
+
+	// errForeignScope mirrors objectstore.ErrForeignScope: the engine refused a
+	// verb naming a scope other than its provisioned scope (GA Wave 1 engine
+	// confinement, ADR-0013/0029). It classifies as denyScopeMismatch
+	// (permission_denied/403): the request named a scope it holds no title to,
+	// caught at the engine's own authority over the backend prefix. Match it with
+	// errors.Is.
+	errForeignScope = errors.New("southface: engine refused a foreign scope")
 )
 
 // ErrAlreadyExists and ErrInvalidPath are the EXPORTED aliases of the two
@@ -147,6 +155,8 @@ var (
 	ErrNotADirectory = errNotADirectory
 	// ErrInvalidRange is the exported alias of errInvalidRange.
 	ErrInvalidRange = errInvalidRange
+	// ErrForeignScope is the exported alias of errForeignScope.
+	ErrForeignScope = errForeignScope
 )
 
 // isPathEscape mirrors the engine's containment-escape collapse helper: an
@@ -398,6 +408,12 @@ func denyClassForEngineErr(err error) string {
 		return denyThrottle
 	case errors.Is(err, errBackendTransient):
 		return denyBackendUnavailable
+	case errors.Is(err, errForeignScope):
+		// A verb reached the engine naming a scope other than its provisioned
+		// one: the engine's own confinement fired. It is a scope deny
+		// (permission_denied/403), the same broker-resolved truth as the
+		// STAGE-1b channel-scope cross-check, named at the engine's authority.
+		return denyScopeMismatch
 	case errors.Is(err, errInvalidPath), isPathEscape(err):
 		return denyNotFound
 	default:
