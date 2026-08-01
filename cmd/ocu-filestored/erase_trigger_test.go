@@ -114,11 +114,48 @@ func trailingDenial(subject string) string {
 // NEGATED one, and a global `(?i)` would fold `A-Z` into `A-Za-z` and forbid the
 // ordinary lowercase words the gap is there to allow.
 //
-// The stated limit: the passive assertion is out of reach. "<the erase verb> is
-// run on every stop, so nothing survives" states the call as plainly as the
-// active form does and is not refused — because "<the erase verb> is called by
-// nothing in the product" is the same grammar and is honest, so refusing the
+// Stated limit, recall side: the passive assertion is out of reach. "<the erase
+// verb> is run on every stop, so nothing survives" states the call as plainly as
+// the active form does and is not refused — because "<the erase verb> is called
+// by nothing in the product" is the same grammar and is honest, so refusing the
 // passive would buy that recall back with a false red on a plain denial.
+//
+// Stated limit, precision side: the first shape keys on PROXIMITY, not on
+// objecthood. It reads a listed calling verb, then at most 24 characters holding
+// no capital, no semicolon and no period, then the identifier — and nothing in
+// that decides WHOSE verb it is. So a sentence whose listed verb governs some
+// other object, and which only then denies the erase verb a caller, has its
+// trailing acquittal refused and is reported as a lie.
+//
+// Measured at this revision: five such sentences planted as comments in a
+// scanned daemon file, all five reported, all five by the product-path arm.
+// "Close runs a bounded drain, and <the erase verb> has no product caller at
+// all." — the leading verb belongs to the drain. "Close runs the drain and <the
+// erase verb> is called by nothing in the product." "the readyz probe fires
+// every 10s and <the erase verb> is reached by nothing." "the boot path calls
+// the scaffold and <the erase verb> is reached by no product path."
+// "Provisioning runs at boot while <the erase verb> is reached by nothing." The
+// same five sentences against the revision before this refusal landed: rc=0.
+// This refusal is what reports them.
+//
+// The 24-character gap is the whole boundary, and it is arbitrary from the
+// sentence's point of view. Measured on one sentence held otherwise fixed: a gap
+// of 24 reds, the same clause lengthened to 25 goes green, one capital anywhere
+// inside the gap goes green, one semicolon inside it goes green. That is why the
+// honest denial shipped in `internal/broker/broker.go` survives — it names a
+// call of ANOTHER identifier, and the capitals and the semicolon that identifier
+// happens to carry are what clear the refusal, not anything the guard
+// understands about which verb governs what.
+//
+// When this fires on prose that is true, the cheap move is to reword: give the
+// denial its own sentence, push the intervening clause past 24 characters, or
+// pick a verb the list does not hold. The other move is eraseHonestProse, and it
+// SUPPRESSES NOTHING. Adding the sentence there moves the red out of the corpus
+// scan and into the honest-prose loop, where it is reported against the sentence
+// instead of against whichever shipped file carries it, and the test still
+// fails — measured. That is the point of that list: it turns a complaint about
+// an author's prose into a complaint about this calibration, and the calibration
+// is then what has to change.
 var eraseActionAssertion = regexp.MustCompile(`\b(?i:runs?|calls?|invokes?|triggers?|fires?|schedules?|performs?|executes?)\b[^.\n;A-Z]{0,24}(?i:` +
 	eraseVerb + `)\b|\b(?i:tears?|tearing)[- ]down\b`)
 
@@ -142,8 +179,24 @@ var eraseActionAssertion = regexp.MustCompile(`\b(?i:runs?|calls?|invokes?|trigg
 //
 // Recall: a claim that joins the two with no connector at all ("Close and <the
 // erase verb> run together") is invisible to this arm. The explicit-verb shapes
-// — runs, calls, invokes, triggers — belong to product-path-runs-the-erase-verb,
-// which is where a sentence that spells the call out is caught.
+// belong to product-path-runs-the-erase-verb, and that hand-off covers a good
+// deal less than it reads, because the arm it hands to carries a CLOSED verb
+// list. That list admits runs, calls, invokes, triggers, fires, schedules,
+// performs and executes, and nothing else. A same-family claim written with a
+// ninth verb reaches no arm at all: this one asks for its enumeration marker and
+// finds none, and that one asks for a listed verb and finds none.
+//
+// Measured, eight sentences of that family planted as comments in a scanned
+// daemon file — reaches, hits, drives, issues, enters, completes, initiates,
+// applies — eight of eight green, rc=0 over the whole corpus. Substituting a
+// listed verb into those same eight sentences reported eight of eight. The verb
+// is the entire difference; nothing else in them changed.
+//
+// The tail is unbounded by construction, which is why this is a limit to know
+// rather than one to close. English closes no set of verbs meaning "to call", so
+// each entry added to that list buys exactly the one synonym it spells and the
+// next author reaches for the next one. Read the hand-off as covering the eight
+// verbs the other arm lists, not as covering explicit-verb prose.
 //
 // Precision, which is narrowed here but NOT complete: an em-dash parenthetical
 // CLOSES with the character an enumeration OPENS with, so "Close — drain,
