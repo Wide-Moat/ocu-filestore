@@ -21,23 +21,29 @@ import (
 
 // --- STOP-DEADLINE ----------------------------------------------------------
 //
-// Five shipped files tell a service manager how long the daemon may take to
+// Four shipped keys tell a service manager how long the daemon may take to
 // stop: the systemd unit's TimeoutStopSec, two k8s manifests'
 // terminationGracePeriodSeconds, and two compose files' stop_grace_period. Set
 // any of them below what a stop can actually cost and the manager SIGKILLs the
 // daemon mid-drain — in-flight operations die half-served on a stop the
 // operator asked for gracefully.
 //
-// Those five numbers were hand-maintained against a stop model written in
-// prose, and prose drifts: the numbers were once sized for a teardown phase
-// that never ran, then re-sized for a single drain when the daemon had grown a
-// second listener with its own bound. Neither pass was checked against the
-// constants that actually bound the stop.
+// Those numbers were hand-maintained against a stop model written in prose, and
+// prose drifts: they were once sized for a teardown phase that never ran, then
+// re-sized for a single drain when the daemon had grown a second listener with
+// its own bound. Neither pass was checked against the constants that actually
+// bound the stop.
 //
-// So this guard derives the worst case from those constants and reads the five
-// numbers out of the shipped files. It reds when a bound grows and when a
+// So this guard derives the worst case from those constants and reads every
+// stated deadline out of the shipped tree. It reds when a bound grows and when a
 // shipped number shrinks, and neither side is written down twice: the durations
-// come from the Go source by AST, the deadlines from the manifests by parse.
+// come from the Go source by AST, the deadlines from the tree by scan.
+//
+// A deadline counts as stated whether it is spelled as a manifest key or in
+// English. An operator who reads only deploy/README.md gets the stop budget from
+// a sentence, and a sentence that quotes a superseded figure misinforms exactly
+// the same reader the keys inform. The prose dialect in deadlineDialects is what
+// holds those sentences to the same derivation.
 //
 // The model it derives is only honest while the two data-plane listeners close
 // CONCURRENTLY — that is what makes the drain term a max instead of a sum.
@@ -197,15 +203,30 @@ func worstCaseStopCost(t *testing.T, root string) (time.Duration, string) {
 	return total, derivation
 }
 
-// deadlineDialect is one service manager's way of spelling a stop deadline. The
-// capture group is the whole-second value. `sample` is a canonical instance the
-// pattern must still match: a rotted pattern matches nothing at all and would
-// otherwise report a clean scan forever.
+// deadlineDialect is one way of spelling a stop deadline — four of them are a
+// service manager's key, the fifth is English. Exactly one capture group is
+// non-empty per match and it holds the whole-second value. `sample` is a
+// canonical instance the pattern must still match: a rotted pattern matches
+// nothing at all and would otherwise report a clean scan forever.
 type deadlineDialect struct {
 	kind   string
 	re     *regexp.Regexp
 	sample string
 	want   int
+}
+
+// seconds returns the whole-second value a match carries. An alternation spells
+// the number in a different group per branch, so the value is the first
+// non-empty capture; no capture at all is a pattern bug, never a zero, because
+// a zero would silently pass every deadline check below it.
+func (d deadlineDialect) seconds(m []string) (int, error) {
+	for _, g := range m[1:] {
+		if g == "" {
+			continue
+		}
+		return strconv.Atoi(g)
+	}
+	return 0, fmt.Errorf("dialect %q matched %q but captured no value", d.kind, m[0])
 }
 
 var deadlineDialects = []deadlineDialect{
@@ -227,18 +248,56 @@ var deadlineDialects = []deadlineDialect{
 		sample: "    stop_grace_period: 35s",
 		want:   35,
 	},
+	{
+		// The English dialect. An operator reading deploy/README.md learns the
+		// stop budget from a sentence, not from a manifest key, and a sentence
+		// drifts on its own schedule: the four keys above were raised in one
+		// commit and a README went on quoting the superseded figure, understating
+		// the budget by the exact margin that had been added to cover the second
+		// listener. A number stated in prose is a shipped number.
+		//
+		// The pattern is deliberately narrow. It is NOT enough for a number and
+		// the word "stop" to share a sentence: the tree is full of honest prose
+		// about the 30 s worst case, the 25 s drain and the 5 s ops close, and
+		// every one of those would be a false red. The number must be ADJACENT to
+		// the phrase "stop grace" — either just before it ("the <N>s stop grace")
+		// or just after the key it names ("stop_grace_period <N>s") — because that
+		// adjacency is what makes the sentence a statement of the GRACE rather
+		// than of some other duration on the stop path. The examples are written
+		// with a placeholder on purpose: an English pattern matches English, and
+		// a real number here would enter the scan as a shipped deadline. The one
+		// instance that SHOULD is `sample`, and it is declared as such below.
+		kind: "prose stop grace",
+		re: regexp.MustCompile(`(?i)(?:\b(\d+)s[ \t]+stop[-_ ]grace\b` +
+			`|\bstop[-_ ]grace(?:[-_ ]period)?[ \t]+(?:of[ \t]+|is[ \t]+|at[ \t]+)?(\d+)s\b)`),
+		sample: "the 35s stop grace above the daemon's worst-case stop",
+		want:   35,
+	},
 }
 
-// shippedStopDeadlines is the ledger of files that carry a stop deadline. It is
-// checked in BOTH directions against a scan of the tracked tree: a new manifest
-// that sets a deadline must be added here, and an entry whose file stopped
+// shippedStopDeadlines is the ledger of files that carry a stop deadline, and
+// the dialects each one carries. It is checked in BOTH directions against a scan
+// of the tracked tree: a file that sets a deadline in a dialect not listed for it
+// goes unchecked until it is added here, and a listed dialect whose file stopped
 // carrying one is a hard error rather than a quietly-skipped line.
-var shippedStopDeadlines = map[string]string{
-	"contrib/systemd/ocu-filestored.service": "systemd TimeoutStopSec",
-	"examples/k8s/broker-deployment.yaml":    "k8s terminationGracePeriodSeconds",
-	"examples/k8s/sandbox-peer-pod.yaml":     "k8s terminationGracePeriodSeconds",
-	"deploy/docker-compose.yml":              "compose stop_grace_period",
-	"deploy/docker-compose.fleet.yml":        "compose stop_grace_period",
+//
+// A file can carry more than one dialect. The two compose files state the same
+// budget twice — once as the key the daemon is stopped by, once in the comment
+// that justifies it — and both statements are read by someone.
+var shippedStopDeadlines = map[string][]string{
+	"contrib/systemd/ocu-filestored.service": {"systemd TimeoutStopSec"},
+	"examples/k8s/broker-deployment.yaml":    {"k8s terminationGracePeriodSeconds"},
+	"examples/k8s/sandbox-peer-pod.yaml":     {"k8s terminationGracePeriodSeconds"},
+	"deploy/docker-compose.yml":              {"compose stop_grace_period", "prose stop grace"},
+	"deploy/docker-compose.fleet.yml":        {"compose stop_grace_period", "prose stop grace"},
+	"deploy/README.md":                       {"prose stop grace"},
+	// The prose dialect's own canonical instance. Unlike the four key dialects,
+	// whose patterns are line-anchored and so cannot match their own sample
+	// sitting on a `sample:` line, an English pattern matches English wherever it
+	// is written — including here. Declaring it is the honest resolution: the
+	// scan gets no self-exemption, and the sample is held to the same worst-case
+	// coverage as a shipped number, which is what makes it canonical.
+	"cmd/ocu-filestored/stop_deadline_test.go": {"prose stop grace"},
 }
 
 // stopDeadline is one deadline found in one shipped file.
@@ -278,9 +337,9 @@ func discoverStopDeadlines(t *testing.T, root string) []stopDeadline {
 		content := string(b)
 		for _, d := range deadlineDialects {
 			for _, m := range d.re.FindAllStringSubmatch(content, -1) {
-				secs, cerr := strconv.Atoi(m[1])
+				secs, cerr := d.seconds(m)
 				if cerr != nil {
-					t.Fatalf("%s: %s value %q is not a whole number of seconds: %v", rel, d.kind, m[1], cerr)
+					t.Fatalf("%s: %s match %q does not yield a whole number of seconds: %v", rel, d.kind, m[0], cerr)
 				}
 				found = append(found, stopDeadline{file: rel, kind: d.kind, seconds: secs})
 			}
@@ -313,9 +372,9 @@ func TestShippedStopDeadlinesCoverWorstCaseStopCost(t *testing.T) {
 		if m == nil {
 			t.Fatalf("dialect %q no longer matches its own instance %q; the pattern is dead and the scan is vacuous", d.kind, d.sample)
 		}
-		got, err := strconv.Atoi(m[1])
+		got, err := d.seconds(m)
 		if err != nil || got != d.want {
-			t.Fatalf("dialect %q captured %q from %q, want %d; the pattern reads the wrong field", d.kind, m[1], d.sample, d.want)
+			t.Fatalf("dialect %q read %v from %q, want %d; the pattern reads the wrong field", d.kind, m[1:], d.sample, d.want)
 		}
 	}
 
@@ -324,24 +383,34 @@ func TestShippedStopDeadlinesCoverWorstCaseStopCost(t *testing.T) {
 
 	found := discoverStopDeadlines(t, root)
 
-	// Both directions against the ledger: an undeclared file that sets a deadline
-	// would go unchecked, and a declared file that stopped setting one leaves a
-	// stale entry standing in for a guard that no longer runs.
-	seen := make(map[string]bool, len(found))
+	// Both directions against the ledger, per file AND per dialect: a file that
+	// sets a deadline in a dialect not declared for it would go unchecked, and a
+	// declared dialect the scan no longer finds leaves a stale entry standing in
+	// for a guard that no longer runs.
+	seen := make(map[string]map[string]bool, len(shippedStopDeadlines))
 	for _, d := range found {
-		seen[d.file] = true
-		want, declared := shippedStopDeadlines[d.file]
-		if !declared {
-			t.Errorf("%s sets a stop deadline but is not in shippedStopDeadlines; add it so the guard covers it", d)
-			continue
+		if seen[d.file] == nil {
+			seen[d.file] = make(map[string]bool)
 		}
-		if want != d.kind {
-			t.Errorf("%s is declared as %q in shippedStopDeadlines but carries a %q deadline", d.file, want, d.kind)
+		seen[d.file][d.kind] = true
+
+		declared := false
+		for _, kind := range shippedStopDeadlines[d.file] {
+			if kind == d.kind {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			t.Errorf("%s states a stop deadline in a dialect shippedStopDeadlines does not declare for that file (declared: %v); add it so the guard covers it",
+				d, shippedStopDeadlines[d.file])
 		}
 	}
-	for file, kind := range shippedStopDeadlines {
-		if !seen[file] {
-			t.Errorf("shippedStopDeadlines declares %s (%s) but the scan found no deadline there; retire the stale entry or restore the deadline", file, kind)
+	for file, kinds := range shippedStopDeadlines {
+		for _, kind := range kinds {
+			if !seen[file][kind] {
+				t.Errorf("shippedStopDeadlines declares %s (%s) but the scan found no such deadline there; retire the stale entry or restore the deadline", file, kind)
+			}
 		}
 	}
 
