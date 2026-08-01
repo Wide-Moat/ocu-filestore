@@ -1314,8 +1314,10 @@ func newBackendTLSClient() *http.Client {
 // wraps them in the broker adapters, provisions the engine scope, and returns
 // the per-session south-face Server. A non-admitted triple returns the
 // admission refusal BEFORE any socket is bound (NFR-SEC-60); the caller serves
-// the returned Server and Closes it for teardown (engine TeardownScope +
-// registry/ceilings Release).
+// the returned Server and Closes it to stop. That Close drains in-flight
+// requests, releases the per-session ceilings entry and closes the handle-store
+// descriptor — process state only. It leaves every stored byte where it is; see
+// teardownServer.Close for why a stop is not an owner change.
 //
 // l is threaded into the southface.Config so the session's dispatcher, the
 // accept gate, and the http.Server ErrorLog all emit structured JSON via the

@@ -55,6 +55,14 @@ import (
 // eraseVerb is the engine method whose product-side wiring this ledger tracks.
 const eraseVerb = "TeardownScope"
 
+// eraseDenialTail is the trailing half of an honest denial: the erase verb
+// followed, through at most a copula, by the word that denies it. It is what
+// lets "TeardownScope has no product caller at all" acquit a claim pattern that
+// only saw the verb preceded by "calls". The copula gap is deliberately narrow
+// — a negation further along the sentence belongs to a different clause and may
+// not launder a claim about the verb itself.
+const eraseDenialTail = `[ \t]+(?:has|had|is|are|was|were|gets?|does|do|did)?[ \t]*\b(?:never|no|not|nothing|neither)\b`
+
 // eraseCallSite is one syntactic call of the erase verb.
 type eraseCallSite struct {
 	file string // repo-relative
@@ -273,10 +281,15 @@ func (p erasePromise) validate(t *testing.T) {
 
 var erasePromises = []erasePromise{
 	{
-		id:    "erase-at-provision",
-		re:    regexp.MustCompile(`(?i)erase[-\s]at[-\s]provision`),
-		lie:   "This is the erase-at-provision path.",
-		truth: "ProvisionScope is ensure-scaffold-if-absent: it creates the scope when absent and sweeps only the staging sub-directory. Owner data at the scope root survives every provision.",
+		id:  "erase-at-provision",
+		re:  regexp.MustCompile(`(?i)erase[-\s]at[-\s]provision`),
+		lie: "This is the erase-at-provision path.",
+		// Prose that names the semantics as RETIRED is the opposite of a promise:
+		// it tells the reader the erase is gone and often explains what an
+		// assertion would have looked like while it was there.
+		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:retired|removed|deleted|dropped|former(?:ly)?|old|previous(?:ly)?|superseded|no longer|never|not)\b[^.\n]*erase[-\s]at[-\s]provision`),
+		acquitted: "On the retired erase-at-provision semantics the scope booted empty.",
+		truth:     "ProvisionScope is ensure-scaffold-if-absent: it creates the scope when absent and sweeps only the staging sub-directory. Owner data at the scope root survives every provision.",
 	},
 	{
 		id:    "stop-erases-the-workspace",
@@ -311,10 +324,11 @@ var erasePromises = []erasePromise{
 	},
 	{
 		// The shape that hid in CONSTITUTION.md for five commits after the
-		// rollback stopped erasing: a scope said to be torn down on some error
-		// path. The claim is about the SCOPE, so both words are required — the
-		// tree is full of `teardownServer`, teardown sweeps and teardown bounds
-		// that describe the verb without claiming anything calls it.
+		// rollback stopped erasing: an error path credited with erasing the
+		// scope it had provisioned. The claim is about the SCOPE, so both words
+		// are required — the tree is full of `teardownServer`, teardown sweeps
+		// and teardown bounds that describe the verb without claiming anything
+		// calls it.
 		id: "scope-torn-down",
 		re: regexp.MustCompile(`(?i)\bscopes?\b[^.\n]{0,60}\btorn down\b|\b(?:torn|tears?|tearing)[- ]down\b[^.\n]{0,60}\bscopes?\b`),
 		lie: "If session compose fails after the scope is provisioned, the scope is torn down " +
@@ -333,9 +347,31 @@ var erasePromises = []erasePromise{
 			eraseVerb + `|` + eraseVerb + `[^.\n]{0,40}\b(?:is|are|gets?)\s+(?:then\s+)?(?:run|called|invoked|triggered|fired|scheduled|performed|executed)\b`),
 		lie: "Enforced: `cmd/ocu-filestored/main.go:compose` — a post-`ProvisionScope` " +
 			"construction error runs `TeardownScope` before returning `nil, err`.",
-		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb),
+		// The denial acquits from EITHER side of the identifier: a sentence can
+		// name the verb and only then deny it a caller, and reading only up to
+		// the semicolon turns that denial into a claim. The trailing form is
+		// deliberately tight — the negation must attach to the verb through at
+		// most a copula, so a negation stranded in a later clause ("... on
+		// rollback, so nothing leaks") cannot launder a claim about the verb.
+		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb + `|[^.\n]*` + eraseVerb + eraseDenialTail),
 		acquitted: "Nothing in the product calls `TeardownScope`.",
 		truth:     "No product path calls the verb — not compose, not the rollback latch, not Close. The engines implement it and the tests exercise it; nothing else reaches it.",
+	},
+	{
+		// The identifier-shaped variant of scope-torn-down. That arm requires the
+		// literal word "scope", so it cannot see a claim that spells the scope
+		// INSIDE the verb's name — there is no word boundary in the middle of
+		// `TeardownScope`, and prose that says "Close tears down (engine
+		// TeardownScope)" names the erase without ever writing "scope" as a word.
+		// This arm keys on the lifecycle moment instead: a stop, a close or a
+		// teardown said to carry the erase verb with it.
+		id: "lifecycle-carries-the-erase-verb",
+		re: regexp.MustCompile(`(?i)\b(?:close[sd]?|closing|shut[- ]?down|shuts down|stop(?:s|ped|ping)?|teardown|tears?[- ]down|torn[- ]down|tearing[- ]down|exit(?:s|ing)?)\b[^.\n]{0,60}\b` + eraseVerb + `\b`),
+		lie: "the caller serves the returned Server and Closes it for teardown " +
+			"(engine " + eraseVerb + " + registry/ceilings Release).",
+		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb + `|[^.\n]*` + eraseVerb + eraseDenialTail),
+		acquitted: "Close does NOT call TeardownScope: shutdown is not an owner change.",
+		truth:     "Close drains, releases the ceilings entry and closes the handle-store fd. No lifecycle moment — not close, not stop, not exit — reaches the erase verb.",
 	},
 	{
 		// A named pairing is a promise about a mechanism, not just a phrase: it
@@ -350,17 +386,43 @@ var erasePromises = []erasePromise{
 }
 
 // erasePromiseCorpus is the prose this repository SHIPS: the docs a reader
-// trusts and the deployment manifests whose comments justify a setting. Shipped
-// is defined as tracked — untracked working material makes no promise to anyone.
+// trusts, the deployment manifests whose comments justify a setting, and the Go
+// comments an implementer reads next to the code they describe. Shipped is
+// defined as tracked — untracked working material makes no promise to anyone.
 // The vendored contracts are excluded on top of that: they are upstream
 // artifacts this repo may not edit, so a claim inside one is not ours to fix.
+//
+// Go files enter through their COMMENTS ALONE (goCommentText). A docstring is
+// the densest promise in the tree — it is read by whoever is about to change the
+// function under it — and leaving .go out of the corpus is what let a compose
+// docstring go on naming an erase for five commits after the erase left.
+//
+// One Go file in ten thousand is exempt, and only for a reason the ledger
+// already draws elsewhere: a file that SYNTACTICALLY CALLS the erase verb is
+// demonstrating it. Its comments describe a call the reader can step into, not a
+// path that does not exist, so "call TeardownScope directly, assert the scope is
+// empty" is a true sentence about a real call. Because the whole prose arm
+// stands down the moment a PRODUCT path calls the verb (see the skip in
+// TestDocsDoNotPromiseAnUnwiredErase), the exemption can only ever cover a test
+// file. A test file that does not call the verb stays fully in the corpus:
+// main_test.go, which carried a false close-time erase claim, is one.
 func erasePromiseCorpus(t *testing.T, root string) map[string]string {
 	t.Helper()
-	out, err := exec.Command("git", "-C", root, "ls-files", "-z", "*.md", "*.yml", "*.yaml").Output()
+	out, err := exec.Command("git", "-C", root, "ls-files", "-z", "*.md", "*.yml", "*.yaml", "*.go").Output()
 	if err != nil {
 		t.Fatalf("git ls-files for the doc corpus: %v", err)
 	}
+
+	demonstrates := make(map[string]bool)
+	for _, s := range scanEraseCallSites(t, root, true) {
+		demonstrates[s.file] = true
+	}
+	if len(demonstrates) == 0 {
+		t.Fatal("no file calls the erase verb at all, not even a test; the detector behind the corpus exemption is vacuous")
+	}
+
 	corpus := make(map[string]string)
+	goFiles := 0
 	for _, rel := range strings.Split(string(out), "\x00") {
 		if rel == "" || strings.HasPrefix(rel, "contracts/") {
 			continue
@@ -369,12 +431,91 @@ func erasePromiseCorpus(t *testing.T, root string) map[string]string {
 		if rerr != nil {
 			t.Fatalf("read tracked doc %q: %v", rel, rerr)
 		}
+		if strings.HasSuffix(rel, ".go") {
+			if demonstrates[rel] {
+				continue
+			}
+			corpus[rel] = goCommentText(t, rel, b)
+			goFiles++
+			continue
+		}
 		corpus[rel] = string(b)
 	}
 	if len(corpus) == 0 {
 		t.Fatal("doc corpus is empty; the guard is vacuous")
 	}
+	if goFiles == 0 {
+		t.Fatal("doc corpus holds no Go file; the comment arm of the guard is vacuous")
+	}
+	// The file that carried the docstring lie this arm was widened to catch must
+	// be in the corpus, or the widening is decorative.
+	if _, ok := corpus["cmd/ocu-filestored/main.go"]; !ok {
+		t.Fatal("cmd/ocu-filestored/main.go is not in the doc corpus; the Go-comment arm cannot see the daemon's own docstrings")
+	}
+	if _, ok := corpus["cmd/ocu-filestored/main_test.go"]; !ok {
+		t.Fatal("cmd/ocu-filestored/main_test.go is not in the doc corpus; a test file that does not call the erase verb must not be exempt")
+	}
 	return corpus
+}
+
+// goCommentText projects a Go source file onto its COMMENTS ALONE, byte for
+// byte: every byte outside a comment becomes a space, every newline stays where
+// it was, and each comment's own `//` or `/*`/`*/` marker is blanked too. The
+// projection is exactly as long as the file, so an offset into it still indexes
+// the original and lineAt still reports the real line — the same one-byte-for-
+// one-byte discipline proseBlocks relies on.
+//
+// Code is blanked rather than dropped because only comments are prose. An
+// identifier, a struct tag, or a test fixture string is not a claim to a reader,
+// and reading one as a claim would make this guard fire on the very literals
+// that spell out the lies it hunts (erasePromises, a few hundred lines up, is
+// full of them). Blanking the comment markers is what lets a bulleted docstring
+// split into blocks the way the equivalent markdown would.
+func goCommentText(t *testing.T, rel string, src []byte) string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, rel, src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s for the doc corpus: %v", rel, err)
+	}
+
+	out := make([]byte, len(src))
+	for i, b := range src {
+		if b == '\n' {
+			out[i] = '\n'
+			continue
+		}
+		out[i] = ' '
+	}
+
+	base := fset.File(f.Pos()).Base()
+	for _, group := range f.Comments {
+		for _, c := range group.List {
+			start, end := int(c.Pos())-base, int(c.End())-base
+			if start < 0 || end > len(src) || start >= end {
+				t.Fatalf("%s: comment span [%d,%d) is outside the %d-byte source", rel, start, end, len(src))
+			}
+			copy(out[start:end], src[start:end])
+			// Blank the marker so `//   - foo` reads as a list item, exactly as
+			// `   - foo` would in markdown.
+			blank(out[start:min(start+2, end)])
+			if strings.HasPrefix(c.Text, "/*") {
+				blank(out[max(start, end-2):end])
+			}
+		}
+	}
+	return string(out)
+}
+
+// blank overwrites b with spaces, leaving newlines in place so the projection
+// keeps the original's line structure.
+func blank(b []byte) {
+	for i := range b {
+		if b[i] != '\n' {
+			b[i] = ' '
+		}
+	}
 }
 
 // proseBlock is one paragraph-sized unit of a document with its newlines

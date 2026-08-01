@@ -140,7 +140,9 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 
 // TestComposeAdmittedServesAndCloses pins WIRE-MAIN: the admitted triple
 // composes the stack, provisions a session, and serves on a real socket; Close
-// tears down cleanly (engine TeardownScope + registry/ceilings release).
+// then returns cleanly, having drained the session and released the
+// registry/ceilings entry and the handle-store descriptor. It erases nothing —
+// TestTeardownServerCloseDoesNotEraseScope is the arm that pins that.
 func TestComposeAdmittedServesAndCloses(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
