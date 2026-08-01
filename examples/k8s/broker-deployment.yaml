@@ -44,14 +44,18 @@ spec:
         app.kubernetes.io/name: ocu-filestored
         app.kubernetes.io/component: storage-broker
     spec:
-      # Graceful stop is ONE phase: a bounded connection drain (25 s) in which
-      # in-flight south-face operations finish or fail-closed, then listener
-      # shutdown. 35 s = the drain plus margin for force-closing stragglers.
+      # A graceful stop costs at most 30 s: the data-plane listeners drain
+      # CONCURRENTLY — in-flight operations finish or fail-closed, each plane
+      # bounded at 25 s, so 25 s of wall clock even with the north Files-API
+      # plane live — and then the loopback ops listener shuts down under its own
+      # 5 s bound. 35 s leaves margin over that sum.
       # No scope sweep runs behind the drain, so this value does not scale with
       # how much data the PVC holds. The corollary: the PVC keeps every stored
       # object after the pod goes away, and deleting the pod is not a way to
-      # discard the workspace. Must match the systemd unit's TimeoutStopSec
-      # (see contrib/systemd/ocu-filestored.service).
+      # discard the workspace. Keep it in step with the systemd unit's
+      # TimeoutStopSec (see contrib/systemd/ocu-filestored.service);
+      # cmd/ocu-filestored/stop_deadline_test.go derives the worst case from the
+      # drain constants and fails if this number stops clearing it.
       terminationGracePeriodSeconds: 35
 
       securityContext:

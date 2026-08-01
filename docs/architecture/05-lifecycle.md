@@ -499,29 +499,51 @@ contract itself:
    signal, so a **second** `SIGTERM`/`SIGINT` during a wedged drain hits the
    default disposition and **hard-kills** the process instead of being
    swallowed. `SdNotifyStopping` then sends `STOPPING=1`.
-3. **Bounded drain.** `srv.Close` runs the server's drain. Inside
-   `tlsServer.Close` ([`internal/southface/tlsserver.go`](../../internal/southface/tlsserver.go)),
+3. **Bounded drain, both planes at once.** `srv.Close` runs the server's drain.
+   Inside `tlsServer.Close` ([`internal/southface/tlsserver.go`](../../internal/southface/tlsserver.go)),
    `srv.Shutdown` is given a bounded `tlsShutdownDrainTimeout` (**25 s**) for
-   in-flight operations to finish. If the drain expires, the straggling
-   connections are **force-closed** (`srv.Close`) so the shutdown can always
-   proceed; both the drain-expiry and the force-close errors surface via
-   `errors.Join`. The 25 s bound sits deliberately under a typical service
-   manager's 30 s stop-grace, so the drain and the force-close both fit before a
-   `SIGKILL`. Nothing is scheduled behind them — the margin covers the drain
-   alone and does not have to scale with how much data the scope holds. A wedged
-   peer can never hold the server open indefinitely.
+   in-flight operations to finish; `MountB.Close`
+   ([`internal/northface/mountb.go`](../../internal/northface/mountb.go)) does
+   the same under `mountDrainTimeout` (**25 s**). `dualServer.Close` starts both
+   **concurrently**, so the drain phase costs the longer of the two, not their
+   sum. That is not only an arithmetic saving: an `http.Server` keeps accepting
+   new connections until its own `Shutdown` runs, so closing the planes in
+   sequence would leave the second one admitting fresh work for the whole of the
+   first one's drain — after the operator asked the daemon to stop. The planes
+   are distinct binds over the same stateless adapters, which already serve both
+   at once, so overlapping their drains adds no sharing that serving does not
+   already have.
+   If a drain expires, the straggling connections are **force-closed**
+   (`srv.Close`) so the shutdown can always proceed; both the drain-expiry and
+   the force-close errors surface via `errors.Join`. A wedged peer can never
+   hold the server open indefinitely.
 4. **Process state is released, the scope is not.** `teardownServer.Close`
    releases the per-session ceilings entry and closes the durable handle-store
    descriptor. It does **not** erase the scope: shutdown is not an owner change
    ([§3.2](#32-close-releases-process-state-only)). The graceful drain leaves no
    host-side artifact to unlink either — the TLS listener is a TCP socket the
    kernel reclaims on close, so the shutdown-before-serve path needs no explicit
-   socket removal.
+   socket removal. Neither release blocks. The loopback ops listener is then
+   shut down under its own bounded `opsShutdownDrainTimeout` (**5 s**), and
+   because it closes *after* the data-plane drain, its bound is additive.
 5. **errors.Join everywhere.** Every exit path combines the serve, close, and
    ops-listener results with `errors.Join`, so a close error is never silently
    dropped behind a serve error or vice versa.
 6. **Audit-sink lock release.** Back in `run`, the deferred `afl.Release()`
    releases the single-instance lock once the shutdown path has finished.
+
+Only two phases of that path are bounded, so the worst-case graceful stop is
+`max(tlsShutdownDrainTimeout, mountDrainTimeout) + opsShutdownDrainTimeout` —
+**30 s** at today's constants. Every stop deadline this repository ships (the
+systemd unit's `TimeoutStopSec`, the k8s manifests'
+`terminationGracePeriodSeconds`, the compose files' `stop_grace_period`) has to
+clear that sum, or the service manager `SIGKILL`s the daemon mid-drain and
+in-flight operations die half-served. The sum is not copied into those files by
+hand: `cmd/ocu-filestored/stop_deadline_test.go` derives it from the three
+constants by parsing the source, reads each shipped deadline out of its own
+manifest, and fails when a constant grows past a deadline, when a deadline drops
+below the constants, or when a manifest starts setting a deadline the guard was
+never told about.
 
 ### 6.1 The listener-fault path
 
@@ -582,11 +604,11 @@ stateDiagram-v2
     Serving --> Draining: SIGTERM / SIGINT
     Serving --> Draining: Serve returns (listener fault)
 
-    Draining --> ForceClosing: drain exceeds shutdownDrainTimeout (25s)
+    Draining --> ForceClosing: a plane's drain exceeds its 25s bound
     Draining --> TearingDown: in-flight ops finished within bound
     ForceClosing --> TearingDown: stragglers force-closed
 
-    TearingDown --> Exit_Clean: ceilings release + handle-store close + flock release
+    TearingDown --> Exit_Clean: ceilings release + handle-store close + ops listener (5s) + flock release
 
     Serving --> [*]: 2nd SIGTERM/SIGINT during wedged drain (hard kill, default disposition)
 

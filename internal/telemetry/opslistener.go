@@ -177,6 +177,17 @@ func (ol *OpsListener) Serve() {
 	}
 }
 
+// opsShutdownDrainTimeout bounds the ops listener's graceful shutdown. The ops
+// listener is closed AFTER the data-plane listeners have drained, so this bound
+// is additive: it is the last term of the daemon's worst-case stop cost, and
+// every shipped stop-grace period has to clear that sum. A scrape is a
+// short-lived local GET, so a small bound is enough.
+//
+// cmd/ocu-filestored/stop_deadline_test.go reads this constant by name and reds
+// if a shipped deadline stops covering the sum. Renaming it without updating
+// that anchor fails the guard loudly rather than silently.
+const opsShutdownDrainTimeout = 5 * time.Second
+
 // Close shuts down the ops listener gracefully.
 //
 // srv.Shutdown only closes listeners the http.Server is tracking, i.e. the one
@@ -188,7 +199,7 @@ func (ol *OpsListener) Serve() {
 // Serve ever ran. Closing a listener Serve already closed returns net.ErrClosed,
 // which is the expected, benign case and is swallowed.
 func (ol *OpsListener) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), opsShutdownDrainTimeout)
 	defer cancel()
 	err := ol.srv.Shutdown(ctx)
 	if cerr := ol.ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {

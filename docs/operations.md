@@ -129,15 +129,21 @@ The daemon registers `SIGTERM` and `SIGINT`. On either signal:
 
 1. The daemon logs `signal received; starting bounded drain` at INFO.
 2. Sends `STOPPING=1` to systemd via `NOTIFY_SOCKET` (no-op if unset).
-3. Begins a **bounded 25-second graceful drain**: in-flight operations are
-   allowed to finish. Operations still open after 25 seconds are
-   force-closed.
+3. Begins a **bounded 25-second graceful drain on every data-plane listener at
+   once**: the south-face TLS listener and, when the Files-API plane is
+   configured, the north listener stop accepting and let their in-flight
+   operations finish. The two drains overlap, so the phase costs 25 seconds of
+   wall clock however many planes are live. Operations still open at the bound
+   are force-closed.
 4. The per-session ceilings entry is released and the durable handle-store
-   descriptor is closed.
-5. The south-face TLS listener shuts down.
-6. The ops listener shuts down.
-7. The daemon exits; every error from the steps above is joined and written
+   descriptor is closed. Neither blocks.
+5. The ops listener shuts down under its own **5-second** bound.
+6. The daemon exits; every error from the steps above is joined and written
    to stderr, so none is dropped behind another.
+
+A graceful stop therefore costs at most **30 seconds**: the 25-second
+concurrent drain plus the 5-second ops-listener shutdown. Nothing else on the
+path is bounded because nothing else blocks.
 
 **A stop does not erase the scope.** No step of the shutdown path removes a
 single stored byte. The daemon holds the owner's workspace, it does not own
@@ -153,11 +159,18 @@ first signal releases the signal intercept so the second one reaches the
 runtime directly.
 
 **Relationship to systemd `TimeoutStopSec`:** the contrib unit sets
-`TimeoutStopSec=35s` — 10 seconds above the 25-second drain bound — so a
-clean stop always has time to drain and to force-close stragglers before
-systemd sends `SIGKILL`. The margin covers the drain only; no scope sweep
-runs behind it, so it does not have to scale with how much data the scope
-holds.
+`TimeoutStopSec=35s`, above the 30-second worst-case stop, so a clean stop
+always has time to drain, to force-close stragglers, and to shut the ops
+listener down before systemd sends `SIGKILL`. The k8s
+`terminationGracePeriodSeconds` and the compose `stop_grace_period` carry the
+same 35 s for the same reason. No scope sweep runs behind the drain, so none of
+them has to scale with how much data the scope holds.
+
+Those five numbers are not maintained by hand. `stop_deadline_test.go` derives
+the worst-case stop from the drain constants in the source and reads every
+shipped deadline out of its manifest, failing if a constant grows past a
+deadline or a deadline drops below the constants. A sixth manifest that sets a
+stop deadline without being declared to that guard fails it too.
 
 ---
 

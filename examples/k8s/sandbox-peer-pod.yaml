@@ -38,12 +38,15 @@ metadata:
     app.kubernetes.io/component: storage-session
     app.kubernetes.io/part-of: open-computer-use
 spec:
-  # Single-phase graceful stop: a 25 s connection drain, then listener
-  # shutdown. 35 s = the drain plus margin for force-closing stragglers.
+  # A graceful stop costs at most 30 s: the data-plane listeners drain
+  # CONCURRENTLY under a 25 s per-plane bound, then the loopback ops listener
+  # shuts down under a 5 s bound. 35 s leaves margin over that sum.
   # Nothing sweeps the scope on the way out, so this value does not scale with
   # how much data the PVC holds, and the PVC keeps every stored object after
-  # the pod goes away. Must match the systemd unit's TimeoutStopSec and
-  # broker-deployment.yaml.
+  # the pod goes away. Keep it in step with the systemd unit's TimeoutStopSec
+  # and broker-deployment.yaml; cmd/ocu-filestored/stop_deadline_test.go
+  # derives the worst case from the drain constants and fails if this number
+  # stops clearing it.
   terminationGracePeriodSeconds: 35
 
   securityContext:

@@ -45,10 +45,13 @@
 #   protocol; the guest's edge-injected Bearer is a DIFFERENT credential path.
 # - cap_drop ALL + no-new-privileges + the default-deny seccomp profile
 #   (NFR-SEC-02) all carry over from the pre-recut posture.
-# - stop_grace_period 30s sits above the daemon's bounded 25s in-flight drain,
-#   so a graceful stop always lets the drain finish before the SIGKILL
-#   fallback. Nothing is queued behind the drain: a stop leaves every stored
-#   object in place and the next start re-serves them.
+# - stop_grace_period 35s sits above the daemon's worst-case 30s stop: the
+#   data-plane listeners drain CONCURRENTLY under a 25s per-plane bound, then
+#   the loopback ops listener shuts down under a 5s bound. So a graceful stop
+#   always finishes before the SIGKILL fallback. Nothing is queued behind the
+#   drain: a stop leaves every stored object in place and the next start
+#   re-serves them. cmd/ocu-filestored/stop_deadline_test.go derives that worst
+#   case from the drain constants and fails if this number stops clearing it.
 # - The loopback ops listener (127.0.0.1:9464: /metrics, /healthz, /readyz)
 #   is bound inside the container and is the readiness source: the healthcheck
 #   execs the daemon's own -health-check self-probe, which dials that live ops
@@ -82,7 +85,7 @@ services:
       # ./seccomp/ocu-filestored.json — that is what makes the default-deny
       # hardening (NFR-SEC-02) actually load at container create.
       - seccomp:./seccomp/ocu-filestored.json
-    stop_grace_period: 30s
+    stop_grace_period: 35s
     environment:
       # The s3 engine's OWN backend credential (one credential, one client —
       # NFR-SEC-25). These reach the engine through objectstore's dedicated env

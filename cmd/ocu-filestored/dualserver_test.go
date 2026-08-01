@@ -99,6 +99,72 @@ func TestDualServerCloseJoinsBothErrors(t *testing.T) {
 	}
 }
 
+// closeGatePatience bounds how long a gatedCloser waits for its peer's Close to
+// be entered. It only elapses when the closes do NOT overlap, so a red result
+// costs this once instead of hanging the suite.
+const closeGatePatience = 2 * time.Second
+
+// errCloseNotConcurrent is what a gatedCloser reports when it waited out the
+// gate without its peer's Close ever starting.
+var errCloseNotConcurrent = errors.New("peer listener Close was never entered")
+
+// gatedCloser is a listener whose Close blocks until the PEER listener's Close
+// has been entered. Two of them wired to each other complete only if both
+// Closes are in flight at once; a sequential Close leaves the first one waiting
+// on a peer that has not started yet, and it reports that stall as an error.
+type gatedCloser struct {
+	entered chan struct{} // closed on entry to Close
+	peer    chan struct{} // the peer's entered channel
+}
+
+// Serve blocks until this listener's Close is entered, mirroring a real
+// listener's accept loop.
+func (g *gatedCloser) Serve() error {
+	<-g.entered
+	return nil
+}
+
+func (g *gatedCloser) Close() error {
+	close(g.entered)
+	select {
+	case <-g.peer:
+		return nil
+	case <-time.After(closeGatePatience):
+		return errCloseNotConcurrent
+	}
+}
+
+// TestDualServerClosesBothListenersConcurrently pins that Close puts BOTH
+// listener shutdowns in flight at once.
+//
+// Closing them one after the other costs two things. It adds the two bounded
+// drains together, so a stop can take as long as their sum — and every shipped
+// stop-grace period is sized on the assumption that it cannot
+// (TestShippedStopDeadlinesCoverWorstCaseStopCost derives the deadline from the
+// concurrent model this test pins). It also leaves the second listener ACCEPTING
+// NEW connections for the whole of the first listener's drain, because
+// http.Server.Shutdown closes only its own listener: a plane the operator has
+// already told to stop keeps admitting fresh work for up to a full drain.
+func TestDualServerClosesBothListenersConcurrently(t *testing.T) {
+	south := &gatedCloser{entered: make(chan struct{})}
+	north := &gatedCloser{entered: make(chan struct{})}
+	south.peer = north.entered
+	north.peer = south.entered
+
+	d := newDualServer(south, north)
+
+	start := time.Now()
+	err := d.Close()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Close = %v; the two listener Closes did not overlap. A sequential close adds the drain bounds together and lets the second plane admit new work for the whole of the first drain", err)
+	}
+	if elapsed >= closeGatePatience {
+		t.Fatalf("Close took %v, at or past the %v gate; the closes did not overlap", elapsed, closeGatePatience)
+	}
+}
+
 // TestDualServerNilNorthIsSouthOnly pins that a nil north degrades to south-only:
 // Serve and Close act on the south listener alone, with no nil panic.
 func TestDualServerNilNorthIsSouthOnly(t *testing.T) {

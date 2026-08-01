@@ -34,9 +34,10 @@ What is complete and operational:
 - Fail-closed hash-chained audit sink (OCSF File System Activity): an
   audit-write failure permanently latches the broker into 100%-deny until
   restart.
-- Graceful shutdown: `SIGTERM`/`SIGINT` → bounded 25s drain → listener
-  shutdown. The scope on disk is left untouched: its bytes belong to the
-  owner, not to the daemon that served them.
+- Graceful shutdown: `SIGTERM`/`SIGINT` → every data-plane listener drains at
+  once under a bounded 25s → ops listener shutdown under a bounded 5s, so a
+  stop costs at most 30s. The scope on disk is left untouched: its bytes belong
+  to the owner, not to the daemon that served them.
 - Structured JSON logging (`slog`, to stderr), ops listener
   (`127.0.0.1:9464`) with `/metrics`, `/healthz`, `/readyz`, `sd_notify`
   (`READY=1`/`STOPPING=1`), and `x-request-id` correlation.
@@ -107,10 +108,11 @@ Stop cleanly (drains in-flight ops; the workspace stays on disk):
 docker compose -f deploy/docker-compose.yml stop
 ```
 
-`stop_grace_period` is 30 s — above the daemon's 25 s drain bound — so an
-in-flight operation always gets its full drain window before SIGKILL. Nothing
-else is scheduled behind the drain: stopping the daemon does not remove the
-scope, and starting it again re-serves the same bytes. See
+`stop_grace_period` is 35 s — above the daemon's 30 s worst-case stop (a 25 s
+concurrent drain, then a 5 s ops-listener shutdown) — so an in-flight operation
+always gets its full drain window before SIGKILL. Nothing else is scheduled
+behind the drain: stopping the daemon does not remove the scope, and starting it
+again re-serves the same bytes. See
 [docs/operations.md](docs/operations.md) for what a stop does and does not do.
 
 ## Building locally
