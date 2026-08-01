@@ -41,7 +41,7 @@ func TestPrefixDownloadablePolicyMatchesPrefix(t *testing.T) {
 		path string
 		want bool
 	}{
-		// Paths are engine-relative with no leading slash (ADR-0029 inv-5) — the
+		// Paths are engine-relative with no leading slash (ADR-0029 inv-5) - the
 		// StoredTagFunc input the resolver delivers on both planes.
 		{"pub/report.pdf", true},
 		{"pub", true},
@@ -66,11 +66,11 @@ func TestPrefixDownloadablePolicyMatchesPrefix(t *testing.T) {
 // EGRESS-ARTIFACT bit on intent=read without ever turning a non-downloadable
 // object into a read deny. A prefixed object grants Downloadable=true; an
 // unconfigured object is "readable in-session but yields no egress-eligible
-// artifact" — the read is ALLOWED with Grant{Downloadable: false}, and the
+// artifact" - the read is ALLOWED with Grant{Downloadable: false}, and the
 // egress deny is the consuming op's decision on that bit, not a resolver error.
 //
 // This assertion was previously pinned to ErrNotDownloadable for the
-// unconfigured path — an over-deny that refused the whole read. It is flipped
+// unconfigured path - an over-deny that refused the whole read. It is flipped
 // here to match canon invariant 5 ("a non-downloadable object is readable
 // in-session but yields no egress-eligible artifact"), not to make the test
 // green: the policy func is unchanged (it still reports false for the
@@ -106,7 +106,7 @@ func TestPrefixPolicyFeedsResolverReadEgressBit(t *testing.T) {
 }
 
 // TestPreviewStaysNonDownloadable pins SEC-73: intent=preview is structurally
-// non-downloadable regardless of the stored tag — even for an object under a
+// non-downloadable regardless of the stored tag - even for an object under a
 // configured downloadable prefix. The resolver enforces the preview rule; the
 // tag func is never consulted for preview, so a spy tag proves it is not
 // called.
@@ -167,12 +167,12 @@ func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
 
 	// A bare root "/" stays the matches-nothing sentinel, DISTINCT from "*": a
 	// deployment that wants the whole scope egress-able configures "*", never the
-	// bare root. Under the engine-relative convention this holds two ways over —
+	// bare root. Under the engine-relative convention this holds two ways over -
 	// "/" trims to "" and is dropped, AND even an empty prefix reaching
 	// pathUnderPrefix would match nothing (HasPrefix(engine-relative-path, "/") is
 	// false). This asserts the sentinel BEHAVIOUR, not the empty-drop mechanism;
 	// the mechanism is defence-in-depth (see downloadable.go), so this leg passes
-	// whether or not the drop is present — the load-bearing guarantee is the
+	// whether or not the drop is present - the load-bearing guarantee is the
 	// no-leading-slash convention, covered by TestPrefixDownloadableCrossPlaneEngineRelative.
 	rootTag := NewPrefixDownloadablePolicy([]string{"/"})
 	for _, path := range []string{"anything", "deep/nested/file.bin", "pub/x"} {
@@ -184,10 +184,22 @@ func TestPrefixPolicyNormalizesConfiguredPrefixes(t *testing.T) {
 			t.Fatalf("rootTag(%q): downloadable true, want false (bare root is a matches-nothing sentinel, not match-all)", path)
 		}
 	}
+
+	// A dropped entry is SKIPPED, never a stop: a bare "/" (or any entry that
+	// trims to empty) in the middle of the list must not swallow the prefixes
+	// configured after it.
+	afterRoot := NewPrefixDownloadablePolicy([]string{"/", "pub"})
+	dl, err := afterRoot(context.Background(), "fs1", "pub/report.pdf")
+	if err != nil {
+		t.Fatalf("afterRoot(pub/report.pdf): err %v", err)
+	}
+	if !dl {
+		t.Fatal("afterRoot(pub/report.pdf): downloadable false, want true - a dropped bare-root entry must not stop processing of later prefixes")
+	}
 }
 
 // TestPrefixPolicyFailClosedOnError pins that the policy returns (false, err)
-// on an internal lookup failure so the resolver denies egress — fail-closed.
+// on an internal lookup failure so the resolver denies egress - fail-closed.
 func TestPrefixPolicyFailClosedOnError(t *testing.T) {
 	// A path that the policy cannot classify (e.g. an empty path) is treated
 	// as non-downloadable, never silently downloadable.
@@ -216,8 +228,8 @@ func TestPrefixPolicyFailClosedOnError(t *testing.T) {
 func TestPrefixPolicyMatchAllStar(t *testing.T) {
 	star := NewPrefixDownloadablePolicy([]string{"*"})
 
-	// Every canonical in-scope path — including a root-level file with no
-	// sub-prefix (the fs-fleet outputs layout) — is downloadable under "*".
+	// Every canonical in-scope path - including a root-level file with no
+	// sub-prefix (the fs-fleet outputs layout) - is downloadable under "*".
 	for _, path := range []string{"/p.txt", "/deep/nested/output.docx", "/pub/x", "/outputs/report.pdf"} {
 		dl, err := star(context.Background(), "fs1", path)
 		if err != nil {
@@ -231,19 +243,24 @@ func TestPrefixPolicyMatchAllStar(t *testing.T) {
 	// Containment is preserved: "*" widens the in-scope surface, never the
 	// boundary. A traversal-bearing path is still fail-closed to non-downloadable
 	// (the bypass-01 guard runs before the match-all shortcut).
-	for _, bad := range []string{"/../escape", "/a/../../etc/passwd", "/dir/./x"} {
+	// The list deliberately spans BOTH halves of the bypass-01 guard: the
+	// slash-led forms are non-canonical (filepath.Clean rewrites them), while
+	// "..", "../escape" and "../../etc/passwd" are Clean-STABLE - Clean keeps
+	// leading ".." components, so the explicit hasDotDotComponent check is the
+	// ONLY thing refusing them. Dropping that check must redden this test.
+	for _, bad := range []string{"/../escape", "/a/../../etc/passwd", "/dir/./x", "..", "../escape", "../../etc/passwd"} {
 		dl, err := star(context.Background(), "fs1", bad)
 		if err != nil {
 			t.Fatalf("star(%q): err %v", bad, err)
 		}
 		if dl {
-			t.Fatalf("star(%q): downloadable true, want false — the whole-scope token must not grant a non-canonical/traversal path", bad)
+			t.Fatalf("star(%q): downloadable true, want false - the whole-scope token must not grant a non-canonical/traversal path", bad)
 		}
 	}
 
 	// Regression guard on the two-sided contract: WITHOUT the token, the same
 	// root-level path is NOT downloadable (a plain "/pub" prefix does not cover
-	// it), and a bare "/" is STILL the matches-nothing sentinel — "*" is the only
+	// it), and a bare "/" is STILL the matches-nothing sentinel - "*" is the only
 	// way to express whole-scope, never the bare root.
 	noStar := NewPrefixDownloadablePolicy([]string{"/pub"})
 	if dl, _ := noStar(context.Background(), "fs1", "/p.txt"); dl {
@@ -260,7 +277,7 @@ func TestPrefixPolicyMatchAllStar(t *testing.T) {
 // NO leading slash ("outputs/report.pdf"), one convention across the south and
 // north planes. Before ADR-0029 the south plane passed the leading-slash form
 // ("/outputs/report.pdf") while the north Files-API plane passed engine-relative
-// ("outputs/report.pdf"), so a single configured prefix could never match both —
+// ("outputs/report.pdf"), so a single configured prefix could never match both -
 // the observed F9 pane 403. With the convention unified, a prefix configured as
 // engine-relative "outputs" matches the engine-relative path both planes now
 // present, and does NOT match the stale leading-slash form.
@@ -268,7 +285,7 @@ func TestPrefixDownloadableCrossPlaneEngineRelative(t *testing.T) {
 	// The fleet-shipped downloadable prefix is engine-relative, no leading slash.
 	tag := NewPrefixDownloadablePolicy([]string{"outputs"})
 
-	// Both planes now present the engine-relative path — the join makes the
+	// Both planes now present the engine-relative path - the join makes the
 	// south path "outputs/uploads/x" and the north path "outputs/report.pdf",
 	// both without a leading slash. The tag must grant on both.
 	for _, p := range []string{"outputs/report.pdf", "outputs/uploads/x", "outputs"} {
@@ -281,7 +298,7 @@ func TestPrefixDownloadableCrossPlaneEngineRelative(t *testing.T) {
 		}
 	}
 
-	// The stale LEADING-SLASH form must NOT match the engine-relative prefix —
+	// The stale LEADING-SLASH form must NOT match the engine-relative prefix -
 	// this is the exact cross-plane mismatch ADR-0029 settles. A "/outputs/x"
 	// path does not lie under the engine-relative "outputs" prefix on a path
 	// boundary, so it is (correctly) non-downloadable; the fix is that the south

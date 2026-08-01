@@ -1,7 +1,18 @@
-// Module path reflects this public repo's broker module. Each dependency
-// arrives through the architecture repo's dependency policy (license gate +
-// supply-chain gate); see NOTICE for third-party license notices.
 module github.com/Wide-Moat/ocu-filestore
+
+// The module directive stays on line 1 so tools that derive the module path
+// from the first line of go.mod (go-gremlins v0.6.0's modPkg() calls
+// TrimPrefix("module ") on the first line, not a real go.mod parser) resolve
+// the true path and attribute coverage correctly. A leading comment block
+// broke that: gremlins captured the comment text as the module name, so its
+// coverage keys never matched the real package paths and every mutant was
+// reported "Not covered"  -  a phantom 0/0 across every in-scope package. See
+// .gremlins.yaml for the mutation-gate arming that this ordering unblocks.
+//
+// Dependency-policy note: this module reflects the public broker repo. Each
+// dependency arrives through the architecture repo's dependency policy
+// (license gate + supply-chain gate); see NOTICE for third-party license
+// notices.
 
 go 1.26.5
 
