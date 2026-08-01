@@ -71,10 +71,12 @@ single pod may mount the volume at a time.
    that cannot be verified by `auditgate.Verify`. The chain would be silently
    broken (NFR-SEC-79).
 
-2. **Local-volume engine scope operations.** `TeardownScope` performs a
-   recursive directory removal (erase-before-reuse, NFR-SEC-54). Concurrent
-   access from two processes during teardown is undefined and dangerous — one
-   could be writing while the other is removing.
+2. **Local-volume engine scope operations.** The scope-erase verb performs a
+   recursive directory removal (NFR-SEC-54). Concurrent access from two
+   processes during that removal is undefined and dangerous — one could be
+   writing while the other is removing. No product path invokes the verb yet
+   (see [docs/engines.md](../../docs/engines.md)), but the single-writer rule
+   is what keeps it safe once one does.
 
 3. **Single-instance flock guard.** The daemon acquires `LOCK_EX|LOCK_NB` on a
    lock file at startup (T2-7). This is a second enforcement layer at the

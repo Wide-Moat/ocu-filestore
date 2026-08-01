@@ -132,12 +132,20 @@ The daemon registers `SIGTERM` and `SIGINT`. On either signal:
 3. Begins a **bounded 25-second graceful drain**: in-flight operations are
    allowed to finish. Operations still open after 25 seconds are
    force-closed.
-4. `TeardownScope` runs **unconditionally** regardless of drain outcome —
-   the erase-before-reuse (NFR-SEC-54) is never skipped by a clean stop.
+4. The per-session ceilings entry is released and the durable handle-store
+   descriptor is closed.
 5. The south-face TLS listener shuts down.
 6. The ops listener shuts down.
-7. The daemon exits; both the serve error and the teardown error (if any)
-   are joined and written to stderr.
+7. The daemon exits; every error from the steps above is joined and written
+   to stderr, so none is dropped behind another.
+
+**A stop does not erase the scope.** No step of the shutdown path removes a
+single stored byte. The daemon holds the owner's workspace, it does not own
+it, so stopping the process — cleanly, on a fault, or by SIGKILL — leaves
+every object in place and the next start re-serves them. Erasing a scope is
+keyed to a change of owner, not to the process lifecycle; the engines
+implement the erase verb but nothing in the product invokes it today. See
+[docs/engines.md](engines.md) for the verb and the open trigger question.
 
 **A second signal during shutdown** (while the drain is running) kills the
 process immediately with the OS default disposition (hard kill). The
@@ -146,8 +154,10 @@ runtime directly.
 
 **Relationship to systemd `TimeoutStopSec`:** the contrib unit sets
 `TimeoutStopSec=35s` — 10 seconds above the 25-second drain bound — so a
-clean stop always has time to drain, force-close stragglers, AND run
-erase-before-reuse before systemd sends `SIGKILL`.
+clean stop always has time to drain and to force-close stragglers before
+systemd sends `SIGKILL`. The margin covers the drain only; no scope sweep
+runs behind it, so it does not have to scale with how much data the scope
+holds.
 
 ---
 
@@ -212,7 +222,7 @@ last record it wrote (which landed after the copy), so the next record's
 **Correct rotation procedure:**
 
 ```sh
-# 1. Stop the daemon (drains in-flight ops, runs erase-before-reuse).
+# 1. Stop the daemon (drains in-flight ops; stored objects are untouched).
 systemctl stop ocu-filestored
 
 # 2. Rotate the file (move/rename while the daemon is not running).

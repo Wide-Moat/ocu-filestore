@@ -46,8 +46,9 @@
 # - cap_drop ALL + no-new-privileges + the default-deny seccomp profile
 #   (NFR-SEC-02) all carry over from the pre-recut posture.
 # - stop_grace_period 30s sits above the daemon's bounded 25s in-flight drain,
-#   so a graceful stop always lets the drain + erase-before-reuse teardown
-#   (NFR-SEC-54) finish before the SIGKILL fallback.
+#   so a graceful stop always lets the drain finish before the SIGKILL
+#   fallback. Nothing is queued behind the drain: a stop leaves every stored
+#   object in place and the next start re-serves them.
 # - The loopback ops listener (127.0.0.1:9464: /metrics, /healthz, /readyz)
 #   is bound inside the container and is the readiness source: the healthcheck
 #   execs the daemon's own -health-check self-probe, which dials that live ops

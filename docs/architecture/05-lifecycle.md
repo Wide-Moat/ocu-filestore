@@ -12,8 +12,10 @@ file links to it rather than restating it.
 The storage broker is component-04 of the system architecture. The lifecycle
 design exists to satisfy a specific set of security NFRs at process boundaries:
 
-- **NFR-SEC-54** — erase-before-reuse: a scope's bytes must never survive into a
-  later session, on *any* exit including a crash.
+- **NFR-SEC-54** — erase before reuse: a scope's bytes must not survive a change
+  of owner. Both engines implement the erase; what is missing is the trigger, and
+  [§3.4](#34-the-erase-verb-has-no-trigger) says so plainly rather than claiming
+  a sweep that does not run.
 - **NFR-SEC-60** — admission before bind: a non-admitted profile/tenancy/
   credential triple must be refused before a socket is opened.
 - **NFR-SEC-46 / NFR-SEC-78** — per-session ceilings and pre-buffer size
@@ -56,7 +58,7 @@ compose:
    engine  →  resolver  →  audit sink  →  ceilings registry
         │
         ▼
-   ProvisionScope  (erase-at-provision)            ── NFR-SEC-54 crash path
+   ProvisionScope  (ensure scaffold, never erases)  ── owner data survives
         │
         ▼
    southface.Serve  (build the per-session TLS HTTPS/HTTP-2 server)
@@ -147,8 +149,8 @@ per-session ceilings registry (`ceilings.NewRegistry`). The audit sink's
 on-latch callback is wired to flip the `audit_sink_latched` gauge and emit an
 ERROR line the moment the fail-closed latch trips.
 
-It then provisions the scope (`eng.ProvisionScope`, [§3.1](#31-provision--erase-
-at-provision)) under a bounded one-minute context, and finally calls
+It then provisions the scope (`eng.ProvisionScope`, [§3.1](#31-provision--ensure-the-scaffold-never-erase))
+under a bounded one-minute context, and finally calls
 `southface.Serve`, which builds the per-session south-face TLS HTTPS/HTTP-2
 server — loading the certificate/key at construction and wiring the
 credential-scope source — ready to bind `-south-bind` on the first `Serve` call
@@ -157,9 +159,9 @@ through the Egress trust-edge (guest → edge → service), an HTTPS `service_ur
 dial on every tier; the host-dials-guest unix-socket/vsock ladder carries the
 exec/control channel only, never storage (ADR-0014 §Decision).
 
-The returned `Server` is wrapped in a `teardownServer` so that `Close` also runs
-the scope erase and releases the ceilings entry ([§3.2](#32-teardown--erase-
-before-reuse-on-every-exit)).
+The returned `Server` is wrapped in a `teardownServer` so that `Close` also
+releases the ceilings entry and the durable handle-store descriptor. It does
+not erase the scope ([§3.2](#32-close-releases-process-state-only)).
 
 ### 1.5 Bounded lifecycle contexts
 
@@ -254,67 +256,129 @@ operation fail-closed.
 
 ---
 
-## 3. Scope lifecycle — erase-before-reuse
+## 3. Scope lifecycle
 
-The broker is an *ephemeral* workspace: it never takes on durable retention of
-customer bytes. A filesystem scope is provisioned at session grant and erased at
-session end, on every exit path. This is NFR-SEC-54. The local-volume engine
-implements it in
-[`internal/objectstore/engine_local.go`](../../internal/objectstore/engine_local.go);
-the s3 engine mirrors the same contract (see [`../engines.md`](../engines.md),
-erase-before-reuse).
+A filesystem scope is provisioned when the daemon starts serving it. It is
+removed when its owner changes — and that second half is the one to read
+carefully, because the erase exists as a verb and has no caller.
 
-### 3.1 Provision — erase at provision
+The broker is an *ephemeral* workspace in the sense that matters for retention:
+it never takes on durable custody of customer bytes, and long-term retention
+belongs to the customer's own store. That is a statement about whose data it is,
+not a promise that the daemon deletes anything when it stops.
 
-`ProvisionScope` does **not** assume a clean slate. If a scope directory already
-exists — left behind by a daemon that crashed mid-session, whose `TeardownScope`
-never ran — it is erased *before serving*:
+### 3.1 Provision — ensure the scaffold, never erase
+
+`ProvisionScope` makes the scope usable without disturbing what is already in
+it. It is idempotent, and safe to run against a scope holding a live owner's
+data:
 
 1. `validateScopeID` rejects an ill-shaped id.
 2. `os.Lstat` the scope dir. A symlinked scope entry refuses *before any
-   removal* (erasing through a link could destroy a target outside the base
+   modification* (acting through a link could reach a target outside the base
    dir); a non-directory entry refuses.
-3. An existing directory is erased wholesale (`removeAllCtx`, a
-   cancellation-aware `RemoveAll` that checks `ctx.Err()` before descending each
-   level, so erasing a huge scope is promptly interruptible).
-4. The directory is recreated at `0700`, and the guest-invisible staging area
-   (`.ocu-staging`) is recreated empty.
+3. If the directory exists, only the guest-invisible staging area
+   (`.ocu-staging`) is swept, discarding the partial writes a crashed daemon
+   left behind. Owner data at the scope root is untouched.
+4. The directory is created at `0700` if absent, and the staging area is
+   recreated empty.
 
-This is the **crash path**: erase-at-provision guarantees a restart never
-re-serves prior-session bytes, even when the previous process died before its
-teardown ran.
+**Provision does not erase, and this is load-bearing.** It used to: a scope
+directory found on disk was removed wholesale before serving, on the theory that
+it could only be crash residue. It could also be a live owner's data, and an
+ordinary restart destroyed it. Sweeping staging alone still clears the orphaned
+partial writes a crash leaves, which is the part a restart genuinely has to fix.
 
-### 3.2 Teardown — erase before reuse on every exit
+### 3.2 Close releases process state only
+
+`teardownServer.Close`
+([`cmd/ocu-filestored/main.go`](../../cmd/ocu-filestored/main.go)) closes the
+session, releases the per-session ceilings entry and closes the durable
+handle-store descriptor. All three errors surface via `errors.Join`, so none is
+dropped behind another.
+
+**Close does not call `TeardownScope`.** Process shutdown is not an owner change.
+A daemon that erased on stop would make an upgrade, a config reload or a crash
+loop indistinguishable from a decision to discard the owner's workspace.
+
+### 3.3 The erase verb
 
 `TeardownScope` erases *all* contents of the scope and recreates it empty: after
 it returns, a re-grant of the same `filesystem_id` reads `fs.ErrNotExist` for
 every prior path. The same symlink and non-directory refusals apply before any
 removal. If the scope is already gone it is recreated so a re-grant is usable. A
 best-effort parent `fsync` makes the recreated entry durable (meaningful on
-Linux, a no-op on darwin); a sync failure never fails the teardown because the
-erase already completed.
+Linux, a no-op on darwin); a sync failure never fails the call because the erase
+already completed. The s3 engine mirrors the contract over a flat keyspace,
+sweeping non-current versions, delete markers and orphaned multipart uploads
+(see [`../engines.md`](../engines.md)).
 
 **SEC-54 boundary (documented honestly):** this is an OS-level remove+recreate,
 **not** a cryptographic erase. The substrate is operator disk; freed blocks may
 persist until overwritten by unrelated writes. Per-session crypto-erase (a DEK
 that is destroyed) is the deferred full-shelf arm.
 
-Teardown runs **unconditionally** on `Close`. `teardownServer.Close`
-([`cmd/ocu-filestored/main.go`](../../cmd/ocu-filestored/main.go)) closes the
-session first, then runs `TeardownScope` regardless of whether the session close
-failed, then releases the ceilings entry. Both the close error and the teardown
-error surface via `errors.Join` — a teardown error is never silently dropped
-behind a session-close error, and vice versa.
+### 3.4 The erase verb has no trigger
 
-### 3.3 The guest-invisible staging area
+Nothing in the product calls `TeardownScope`. There is no flag, no administrative
+route and no signal path that reaches it, and the two whole-filesystem operations
+that could carry one (`removeFilesystem`, `migrateFilesystem`) are unimplemented
+because the frozen wire contract leaves their bodies unspecified. The verb is
+reachable from tests and from nowhere else.
+
+This service cannot close the gap on its own authority. The architecture canon
+re-homes erase-before-reuse to the session-sandbox component, states that erase
+and residue-drop are that component's invariants rather than this service's, and
+gives this service no erase or scope-lifecycle invariant among its own. It names
+no event, on any surface this service can observe, that means "the owner has
+changed". Inventing one here would be inventing a security behaviour.
+
+So the gap is carried named rather than described away. A guard test
+(`cmd/ocu-filestored/erase_trigger_test.go`) holds both ends of it: while no
+product path calls the verb, no shipped document may claim an erase runs; the
+moment a product path does call it, the guard reds and sends whoever wired it
+back to restate what these documents may now promise.
+
+**What an operator must know today.** A scope outlives every process that served
+it. Bytes leave only when a caller deletes them. Removing a whole scope is an
+out-of-band action — remove the scope directory, or delete the prefix with the
+backend's own tooling — taken while the daemon for that `filesystem_id` is
+stopped.
+
+### 3.5 Open question — the erase trigger
+
+For the owner. Canon gives this service no owner-change event, so the question
+is which surface should carry one. Three shapes, cheapest first:
+
+1. **An operator-plane route.** The erase becomes an explicit administrative
+   action on a host-side listener, authorized like any other operator action and
+   audited as one. Cheapest to build and the easiest to reason about, because
+   the trigger is a human decision with an actor attached. It is also the
+   loudest: nothing erases unless somebody asks.
+2. **A control-plane signal on the session↔`filesystem_id` binding.** The
+   component that owns that binding tells this service when a scope's owner has
+   changed, and the erase runs on that signal. Closest to what NFR-SEC-54
+   describes, and the only shape that makes erase-before-reuse automatic. It
+   needs canon to define the event and the surface it arrives on, which is the
+   part that does not exist.
+3. **A whole-filesystem wire verb.** `removeFilesystem` is already a frozen
+   operation name on the mount surface. Blocked, not merely unbuilt: the
+   contract leaves its body unspecified, and this repository does not invent a
+   body for a frozen operation.
+
+The prior question is which of these canon is prepared to name, because until it
+names one this service builds none of them.
+
+### 3.6 The guest-invisible staging area
 
 Every write streams into a process-unique temp name inside `.ocu-staging` at the
 scope root, is fsync'd, then committed into place (`writeTempAndCommit`). The
 staging area is **guest-invisible**: it never appears in a listing of the scope
 root (`List` skips it), it is unaddressable through any data verb (`guestPath`
-rejects it as a reserved name), and it is swept by both the Provision and
-Teardown erases. The result for the crash path: a partial write left by a
-crashed daemon never survives into a later session. The temp suffix comes from
+rejects it as a reserved name), and it is swept at every Provision — the one
+sweep a restart does perform. The result for the crash path: a partial write
+left by a crashed daemon is discarded at the next start, while the completed
+writes around it survive. The temp suffix comes from
 the OS CSPRNG (`crypto/rand`) — a predictable suffix would be a symlink-race
 vector — and the no-replace commit is an atomic `link(2)` (EEXIST decides the
 race at the kernel, no stat-then-rename TOCTOU window).
@@ -439,31 +503,33 @@ contract itself:
    `tlsServer.Close` ([`internal/southface/tlsserver.go`](../../internal/southface/tlsserver.go)),
    `srv.Shutdown` is given a bounded `tlsShutdownDrainTimeout` (**25 s**) for
    in-flight operations to finish. If the drain expires, the straggling
-   connections are **force-closed** (`srv.Close`) so teardown can always
+   connections are **force-closed** (`srv.Close`) so the shutdown can always
    proceed; both the drain-expiry and the force-close errors surface via
    `errors.Join`. The 25 s bound sits deliberately under a typical service
-   manager's 30 s stop-grace, so the drain, the force-close, **and** the scope
-   erase all fit before a `SIGKILL`. A wedged peer can never hold the server
-   open indefinitely, because the caller's teardown runs *after* `Close`
-   returns.
-4. **Teardown always runs.** `teardownServer.Close` runs `TeardownScope`
-   (erase-before-reuse, NFR-SEC-54) **unconditionally** after the server close —
-   a clean stop signal must never skip the erase — then releases the ceilings
-   entry. The graceful drain leaves no host-side artifact to unlink: the TLS
-   listener is a TCP socket the kernel reclaims on close, so the
-   shutdown-before-serve path needs no explicit socket removal.
+   manager's 30 s stop-grace, so the drain and the force-close both fit before a
+   `SIGKILL`. Nothing is scheduled behind them — the margin covers the drain
+   alone and does not have to scale with how much data the scope holds. A wedged
+   peer can never hold the server open indefinitely.
+4. **Process state is released, the scope is not.** `teardownServer.Close`
+   releases the per-session ceilings entry and closes the durable handle-store
+   descriptor. It does **not** erase the scope: shutdown is not an owner change
+   ([§3.2](#32-close-releases-process-state-only)). The graceful drain leaves no
+   host-side artifact to unlink either — the TLS listener is a TCP socket the
+   kernel reclaims on close, so the shutdown-before-serve path needs no explicit
+   socket removal.
 5. **errors.Join everywhere.** Every exit path combines the serve, close, and
-   ops-listener results with `errors.Join`, so a teardown error is never
-   silently dropped behind a serve error or vice versa.
+   ops-listener results with `errors.Join`, so a close error is never silently
+   dropped behind a serve error or vice versa.
 6. **Audit-sink lock release.** Back in `run`, the deferred `afl.Release()`
-   releases the single-instance lock after teardown completes.
+   releases the single-instance lock once the shutdown path has finished.
 
 ### 6.1 The listener-fault path
 
 If `Serve` returns *before* a signal (a listener fault), `serveUntilSignal` still
-runs teardown: `srv.Close` (which runs the unconditional `TeardownScope`) and the
-ops-listener shutdown, joining all results. The erase-before-reuse guarantee is
-identical on this path — a fault is not an excuse to leave bytes behind.
+runs the shutdown path: `srv.Close` and the ops-listener shutdown, joining all
+results. A fault is not an excuse to leak a descriptor or a ceilings entry. Like
+every other exit, it leaves the scope on disk exactly as the last acknowledged
+operation left it.
 
 ---
 
@@ -509,7 +575,7 @@ stateDiagram-v2
 
     Composing --> Exit_NonAdmit: admission refused (NFR-SEC-60)
     Composing --> Exit_NonAdmit: audit sink unwritable (NFR-SEC-79)
-    Composing --> Provisioned: seams built + ProvisionScope (erase-at-provision)
+    Composing --> Provisioned: seams built + ProvisionScope (scaffold only, no erase)
 
     Provisioned --> Serving: southface.Serve binds -south-bind TLS HTTPS/HTTP-2 listener; SdNotifyReady
 
@@ -520,7 +586,7 @@ stateDiagram-v2
     Draining --> TearingDown: in-flight ops finished within bound
     ForceClosing --> TearingDown: stragglers force-closed
 
-    TearingDown --> Exit_Clean: TeardownScope erase-before-reuse (NFR-SEC-54) + ceilings release + flock release
+    TearingDown --> Exit_Clean: ceilings release + handle-store close + flock release
 
     Serving --> [*]: 2nd SIGTERM/SIGINT during wedged drain (hard kill, default disposition)
 
@@ -529,17 +595,17 @@ stateDiagram-v2
     Exit_Clean --> [*]
 
     note right of TearingDown
-        Teardown runs on EVERY exit path
-        (signal OR listener fault).
-        errors.Join surfaces both
-        serve and teardown errors.
+        Releases PROCESS state on every
+        exit path (signal OR listener fault).
+        The scope on disk is not touched:
+        shutdown is not an owner change.
     end note
 
     note right of Provisioned
-        Crash before TearingDown leaves
-        the scope on disk; the NEXT start's
-        ProvisionScope erases it before
-        serving (crash path, NFR-SEC-54).
+        The scope survives every exit,
+        clean or crashed. The next start
+        re-serves the same bytes and
+        sweeps only .ocu-staging.
     end note
 ```
 
@@ -554,7 +620,7 @@ stateDiagram-v2
   surface).
 - [`../configuration.md`](../configuration.md) — the flag/env surface and the
   flag→env precedence rule.
-- [`../engines.md`](../engines.md) — engine selection, the erase-before-reuse
-  guarantee per engine, the storage egress lane.
+- [`../engines.md`](../engines.md) — engine selection, the scope-erase verb per
+  engine and its missing trigger, the storage egress lane.
 - [`../testing.md`](../testing.md) — which lifecycle tests skip on darwin
   (live-S3) and how to run the full suite.

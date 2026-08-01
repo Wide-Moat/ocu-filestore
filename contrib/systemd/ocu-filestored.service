@@ -56,17 +56,15 @@ ExecStart=/usr/local/bin/ocu-filestored \
     -tenancy single-tenant \
     -ops-listen 127.0.0.1:9464
 
-# Graceful stop is TWO phases: SIGTERM → bounded 25s connection drain → a
-# SEPARATE TeardownScope erase-before-reuse (NFR-SEC-54) bounded by the
-# daemon's teardownTimeout (10 min = 600s). TimeoutStopSec must cover BOTH or
-# systemd SIGKILLs mid-erase and leaves customer bytes on the engine root.
-# 625s = 25s drain + 600s teardown. On the local-volume shelf the erase is a
-# single directory subtree; to shorten this, lower the daemon's
-# teardownTimeout and keep this at drain + that bound. Must match the k8s
+# Graceful stop is ONE phase: SIGTERM → bounded 25s connection drain →
+# listener shutdown. Nothing is scheduled behind the drain — stopping the
+# daemon does not erase the scope, so this value covers the drain alone and
+# does not scale with how much data the engine root holds. 35s = the 25s
+# drain plus margin for the force-close of stragglers. Must match the k8s
 # terminationGracePeriodSeconds in examples/k8s/.
 # A second SIGTERM during the drain kills the process immediately (the
 # daemon releases the signal intercept after the first signal).
-TimeoutStopSec=625s
+TimeoutStopSec=35s
 KillMode=mixed
 KillSignal=SIGTERM
 

@@ -363,15 +363,27 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// object. DownloadablePolicyRef is deliberately left empty (Q2 deferred —
 	// downloadable resolves at read, never stamped at write).
 	//
-	// DESIGN-ACCEPTED ORPHAN WINDOW: the bytes are committed to the engine
-	// namespace BEFORE the handle is Put, so a Put failure below leaves a
-	// fully-written object with NO file_id — orphan bytes reachable by no
-	// Files-API verb (List/Get/content/delete all resolve through the handle
-	// store). This is accepted, not a leak: the ALLOW was already audited, the
-	// caller gets a 503 and no id, and the orphan is reclaimed by the engine's
-	// workspace Provision/Teardown sweep (the ephemeral-workspace model — the
-	// broker takes on no durable retention). The alternative (handle-before-bytes)
-	// would mint a file_id that resolves to absent bytes — a worse contract. ---
+	// ORPHAN WINDOW, accepted on ordering grounds and NOT reclaimed: the bytes
+	// are committed to the engine namespace BEFORE the handle is Put, so a Put
+	// failure below leaves a fully-written object with NO file_id — orphan bytes
+	// reachable by no Files-API verb (List/Get/content/delete all resolve
+	// through the handle store).
+	//
+	// The ordering is still right: handle-before-bytes would mint a file_id that
+	// resolves to absent bytes, and a dangling id is a worse contract than an
+	// unreferenced object. The ALLOW is already audited and the caller gets a
+	// 503 with no id, so nothing downstream is misled.
+	//
+	// What does NOT happen is reclamation. Nothing sweeps these bytes: provision
+	// only clears the staging area, shutdown erases nothing, and the engine's
+	// scope-erase verb has no product caller (cmd/ocu-filestored/erase_trigger_test.go).
+	// An orphan therefore persists for the life of the scope — disk on the
+	// local-volume engine, billed storage on S3. The window is narrow (a
+	// handle-store write failure after a successful upload) so the accumulation
+	// is bounded in practice, but it is unbounded in principle and reclaiming it
+	// is an open question that belongs with the erase-trigger decision in
+	// docs/architecture/05-lifecycle.md §3.5 — a reclaim pass needs to know what
+	// a scope's lifecycle is before it can know what is safe to collect. ---
 	rec, perr := h.deps.Store.Put(r.Context(), handlestore.PutInput{
 		Scope:     ps.FilesystemID,
 		ObjectRef: engineRef,

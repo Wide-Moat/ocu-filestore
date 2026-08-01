@@ -318,12 +318,12 @@ in a `ctxReader`. A window past EOF short-reads to EOF without error (the
 `LimitReader` absorbs the EOF); an offset at or past EOF yields zero bytes. No
 whole-object buffering.
 
-### 4.7 Erase-before-reuse and the crash path (NFR-SEC-54)
+### 4.7 The two lifecycle verbs (NFR-SEC-54)
 
-Both lifecycle verbs deliver SEC-54 erase-before-reuse, and both refuse a
-symlinked or non-directory scope entry *before* any removal — `os.RemoveAll`
-on a symlink would erase the link target's contents, which may live outside
-`baseDir`.
+The lifecycle verbs are asymmetric on purpose: one erases, the other never
+does. Both refuse a symlinked or non-directory scope entry *before* touching
+anything — `os.RemoveAll` on a symlink would erase the link target's contents,
+which may live outside `baseDir`.
 
 - `TeardownScope` removes the scope directory's contents
   (`removeAllCtx` — a cancellation-aware `os.RemoveAll` that, like
@@ -331,13 +331,15 @@ on a symlink would erase the link target's contents, which may live outside
   empty, so a re-grant of the same `filesystem_id` reads `fs.ErrNotExist` for
   every prior path. A best-effort parent `fsync` makes the recreated entry
   durable (meaningful on Linux, a no-op on darwin; a sync failure never fails
-  the teardown).
-- `ProvisionScope` is **erase-at-provision**: a scope directory left behind by
-  a daemon that crashed mid-session — whose `TeardownScope` never ran — is
-  erased before serving, so a restart never re-serves prior-session bytes. The
-  same sweep removes any orphaned partial write in the staging area, which is
-  then recreated empty. `OpenScopeRoot` refuses an absent directory, so
-  `ProvisionScope` must run before any data verb on a fresh scope.
+  the call). Nothing in the product invokes this verb — see
+  [`05-lifecycle.md` §3.4](05-lifecycle.md#34-the-erase-verb-has-no-trigger).
+- `ProvisionScope` **ensures the scaffold and erases nothing**: it creates the
+  scope directory when absent and sweeps only the staging sub-directory,
+  discarding a crashed daemon's orphaned partial writes while leaving owner
+  data at the scope root exactly where it was. `OpenScopeRoot` refuses an
+  absent directory, so `ProvisionScope` must run before any data verb on a
+  fresh scope. Erasing here instead would key erase to the process lifecycle,
+  and a restart would destroy a live owner's workspace.
 
 The SEC-54 boundary is stated explicitly in the code: this is an OS-level
 remove+recreate, **not** a cryptographic erase. The substrate is operator
@@ -558,11 +560,12 @@ engine's non-empty shape), and a genuinely missing path refuses
 `fs.ErrNotExist`. The conformance `RemoveFile_DirParity` test pins this matrix
 on both engines.
 
-### 6.9 Erase-before-reuse on a flat, possibly-versioned keyspace (SEC-54)
+### 6.9 Erasing a flat, possibly-versioned keyspace (SEC-54)
 
-Both `ProvisionScope` and `TeardownScope` call the shared `eraseScope` sweep,
-the S3 analogue of the local engine's erase-at-provision/teardown. The sweep
-has three parts:
+`TeardownScope` calls the `eraseScope` sweep, the S3 analogue of the local
+engine's recursive removal. `ProvisionScope` does not: S3 prefixes are virtual,
+so provision has nothing to create and — as on the local engine — nothing to
+erase. The sweep has three parts:
 
 1. **Versioning probe** (`bucketVersioned`, cached once per engine; a failed
    probe is not cached). Enabled *or suspended* versioning both keep historical
@@ -722,7 +725,7 @@ sequenceDiagram
 | S3 backend leg transits the fixed-proxy storage lane; env proxy ignored; no `InsecureSkipVerify`; direct dial only behind a loud dev flag | NFR-SEC-16, NFR-SEC-85, ADR-0011 |
 | Lexical + containment path resolution; `ScopeID` trusted, path never; single key-join site | NFR-SEC-25, NFR-SEC-43 |
 | Depth-bomb cap; bounded per-stream memory (one reused part buffer) | NFR-SEC-46 |
-| Erase-before-reuse and erase-at-provision on both engines; version-aware S3 sweep, fail-closed on denied version listing; MPU abort backstop | NFR-SEC-54 |
+| Scope erase implemented on both engines (no trigger wired yet, [`05-lifecycle.md` §3.4](05-lifecycle.md#34-the-erase-verb-has-no-trigger)); version-aware S3 sweep, fail-closed on denied version listing; MPU abort backstop | NFR-SEC-54 |
 | Two engines from day one behind one interface, proven equal by the conformance suite | ADR-0010 |
 
 The seam is intentionally minimal: the smallest interface that lets the layers

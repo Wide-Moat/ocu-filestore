@@ -186,9 +186,9 @@ func mapCeilingsErr(err error) error {
 
 // engineAdapter narrows the string scope to the named objectstore.ScopeID per
 // call over the 10 data verbs the southface consumer seam declares. It does
-// NOT wrap Kind/ProvisionScope/TeardownScope — those lifecycle verbs are
-// called by main on the real engine directly (scope provision and
-// erase-before-reuse, NFR-SEC-54), not through the consumer seam.
+// NOT wrap Kind/ProvisionScope/TeardownScope — those lifecycle verbs belong to
+// main on the real engine, not to the consumer seam. (main calls ProvisionScope;
+// TeardownScope has no product caller at all, see objectstore.Engine.)
 //
 // Engine errors pass through with a narrow remap: the four objectstore typed
 // sentinels are translated to the southface mirrors (ErrAlreadyExists,

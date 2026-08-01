@@ -390,8 +390,8 @@ func (e *s3Engine) Kind() EngineKind { return S3 }
 // virtual (no directory object to create), so provision validates the scope
 // ID and returns nil. Callers: compose scaffold loop seeds subtree dir-markers
 // after provision via MakeDir (approach a); the engine stays subtree-agnostic.
-// Erase-before-reuse is the responsibility of TeardownScope, called only on an
-// explicit owner-change grant — never on process lifecycle.
+// Erasing a scope is TeardownScope's job and is keyed to a change of owner,
+// never to the process lifecycle.
 func (e *s3Engine) ProvisionScope(ctx context.Context, scope ScopeID) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -408,7 +408,12 @@ func (e *s3Engine) ProvisionScope(ctx context.Context, scope ScopeID) error {
 // aborts every orphaned in-progress multipart upload under the prefix. A
 // versioned bucket whose version listing is denied REFUSES with a typed
 // error — never a clean report while bytes remain.
-// Callers: explicit owner-change grant only, never process lifecycle.
+//
+// No product path calls this. The erase belongs to a change of owner and never
+// to the process lifecycle, but canon names no owner-change event this service
+// can observe, so the trigger does not exist yet and the verb is reachable only
+// from tests. cmd/ocu-filestored/erase_trigger_test.go pins that in both
+// directions; do not wire this to boot or shutdown to close the gap.
 func (e *s3Engine) TeardownScope(ctx context.Context, scope ScopeID) error {
 	return e.eraseScope(ctx, scope)
 }

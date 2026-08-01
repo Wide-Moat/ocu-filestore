@@ -38,14 +38,13 @@ metadata:
     app.kubernetes.io/component: storage-session
     app.kubernetes.io/part-of: open-computer-use
 spec:
-  # Two-phase graceful stop: 25 s connection drain THEN a separate
-  # TeardownScope erase-before-reuse (NFR-SEC-54) bounded by the daemon's
-  # teardownTimeout (10 min = 600 s). The grace period must cover BOTH or the
-  # kubelet SIGKILLs mid-erase and orphans customer bytes on the persistent
-  # PVC. 625 s = 25 s drain + 600 s teardown. To shorten it, lower the
-  # daemon's teardownTimeout and keep this at drain + that bound. Must match
-  # the systemd unit's TimeoutStopSec and broker-deployment.yaml.
-  terminationGracePeriodSeconds: 625
+  # Single-phase graceful stop: a 25 s connection drain, then listener
+  # shutdown. 35 s = the drain plus margin for force-closing stragglers.
+  # Nothing sweeps the scope on the way out, so this value does not scale with
+  # how much data the PVC holds, and the PVC keeps every stored object after
+  # the pod goes away. Must match the systemd unit's TimeoutStopSec and
+  # broker-deployment.yaml.
+  terminationGracePeriodSeconds: 35
 
   securityContext:
     runAsNonRoot: true

@@ -912,11 +912,14 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 	}
 }
 
-// TestServeUntilSignalSigtermRunsTeardown pins T1-9/SEC-54 stop path: a real
-// SIGTERM delivered to the process makes serveUntilSignal close the server
-// (teardown runs) and SURFACES the close error — a teardown failure on a
-// clean signal stop is never silently dropped.
-func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
+// TestServeUntilSignalSigtermClosesServer pins the T1-9 stop path: a real
+// SIGTERM delivered to the process makes serveUntilSignal close the server and
+// SURFACES the close error — a close failure on a clean signal stop is never
+// silently dropped.
+//
+// Close releases process state only; no scope erase is involved on this path or
+// any other (see erase_trigger_test.go).
+func TestServeUntilSignalSigtermClosesServer(t *testing.T) {
 	teardownErr := errors.New("teardown failed loudly")
 	srv := &fakeLifecycleServer{
 		serveStarted: make(chan struct{}),

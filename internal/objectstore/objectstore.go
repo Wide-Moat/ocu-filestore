@@ -173,8 +173,11 @@ type Engine interface {
 	ProvisionScope(ctx context.Context, scope ScopeID) error
 	// TeardownScope erases ALL contents of the named scope — erase-before-reuse
 	// (NFR-SEC-54). After it returns, no path written in the prior session is
-	// readable. Callers: explicit owner-change grant only, never process
-	// lifecycle (shutdown, restart, or composition failure).
+	// readable. The erase belongs to a change of owner and never to the process
+	// lifecycle (shutdown, restart, or composition failure). It has no product
+	// caller today: canon names no owner-change event this service can observe,
+	// so the trigger was never built and the verb is reachable only from tests
+	// (cmd/ocu-filestored/erase_trigger_test.go).
 	TeardownScope(ctx context.Context, scope ScopeID) error
 
 	// List returns the entries of the named directory, ONE level only

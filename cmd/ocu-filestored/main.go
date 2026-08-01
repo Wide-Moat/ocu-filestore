@@ -1444,8 +1444,9 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		Clock:                time.Now,
 	})
 
-	// Provision = ensure-scaffold-if-absent, idempotent, does NOT erase;
-	// erase is owner-change-driven (TeardownScope), never boot-driven.
+	// Provision = ensure-scaffold-if-absent, idempotent, does NOT erase. Boot
+	// is not an owner change, and a boot that erased would destroy a live
+	// owner's workspace on every ordinary restart.
 	scope := objectstore.ScopeID(cfg.filesystemID)
 	provisionCtx, cancelProvision := context.WithTimeout(context.Background(), provisionTimeout)
 	defer cancelProvision()
@@ -1505,10 +1506,9 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// compose returns nil,err WITHOUT a closer for that scope. This deferred
 	// rollback releases the durable handle-store fd on every post-provision
 	// error path so a failed compose never leaks an open log fd. It does NOT
-	// erase the scope — a composition failure is not an owner-change event;
-	// erase-before-reuse is TeardownScope's responsibility, called only on an
-	// explicit owner-change grant. Disarmed (committed = true) once the
-	// teardownServer takes ownership.
+	// erase the scope — a composition failure is not an owner change, and the
+	// scope may already hold a live owner's data. Disarmed (committed = true)
+	// once the teardownServer takes ownership.
 	committed := false
 	defer func() {
 		if committed {
@@ -1660,8 +1660,8 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 
 	// Wrap the server so Close drains the session, releases the per-session
 	// ceilings, and closes the handle-store fd — all without touching the scope
-	// on disk. TeardownScope is the owner-change verb (callers: explicit grant
-	// only, never process lifecycle); Close does NOT call it.
+	// on disk. Close does NOT call TeardownScope: shutdown is not an owner
+	// change. Nothing else calls it either — see teardownServer below.
 	return &teardownServer{
 		Server:      fanned,
 		ceiling:     reg,
@@ -1672,10 +1672,16 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 
 // teardownServer wraps the per-session south-face Server so Close also drains
 // in-flight requests, releases the per-session ceilings entry, and closes the
-// durable handle-store descriptor. It does NOT erase the scope on Close —
-// erase-before-reuse (TeardownScope) is owner-change-driven, never triggered
-// by process shutdown. The southface session's own Close releases the registry
-// binding and unlinks the socket.
+// durable handle-store descriptor. The southface session's own Close releases
+// the registry binding and unlinks the socket.
+//
+// The name is a historical misnomer worth keeping in mind: it tears down
+// PROCESS state, not storage. It does not erase the scope, and neither does
+// anything else — the engines implement TeardownScope but no product path
+// invokes it, because the architecture canon defines no owner-change event this
+// service can observe. cmd/ocu-filestored/erase_trigger_test.go holds that gap
+// named in both directions and docs/architecture/05-lifecycle.md §3.4 states it
+// for readers.
 type teardownServer struct {
 	southface.Server
 	ceiling *ceilings.Registry
