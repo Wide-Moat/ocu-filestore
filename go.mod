@@ -3,7 +3,7 @@
 // supply-chain gate); see NOTICE for third-party license notices.
 module github.com/Wide-Moat/ocu-filestore
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.0
@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/aws/smithy-go v1.27.3
-	golang.org/x/text v0.38.0
+	golang.org/x/text v0.39.0
 	pgregory.net/rapid v1.3.0
 )
 
