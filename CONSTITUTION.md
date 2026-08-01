@@ -190,21 +190,46 @@ TBD body and building on it is the forbidden shortcut — the corner cut under
 ship-pressure — and it is forbidden for every verb, present and future, not just
 the one fenced today.
 
-The current application is `POST /v1/files` (createFile): its upload body is
-marked `x-ocu-tbd-bodies` in the frozen contract pending #304 / ADR-0025, so it
-serves a clean 501. When #304 pins the upload body, createFile LEAVES the fenced
-set and the write path lands; #11 itself still stands, guarding the next
-frozen-named verb whose body the canon has not yet pinned. What resolves at #304
-is createFile's membership in the fenced set, not the rule.
+The current application is the south face. Three members of the frozen
+`OperationName` enum — `fileDelete`, `readFileMetadata`,
+`releaseQuarantinedFiles` — carry bodies the contract still marks
+`x-ocu-tbd`. They exist as `Op` constants, so the set the code declares covers
+the WHOLE frozen enum rather than only the part it serves, but they are held out
+of the routable set: no handler, no required-intent row, no route. A request
+naming one is an unknown route, refused like any other.
+
+`POST /v1/files` (createFile) was the earlier application and has left the fenced
+set: the write plane landed once its body was pinned. The rule outlived it, which
+is the point — what resolves when a body is pinned is one verb's membership, not
+the rule.
 
 - Frozen-wire-contract discipline: the contract's `x-ocu-tbd-bodies` marker and
   CLAUDE.md's "never invent a body" rule — ADR-0023 (north contract) / ADR-0025
   (F9 scope-field transport, the upload-body pin)
-- Enforced: `internal/filesapi/create_fenced.go:serveCreate` returns the
-  `Unimplemented` deny (501) and touches no store and no engine while the upload
-  body is unpinned. The guard is `internal/filesapi/create_fenced_test.go:TestCreateIsFenced501`
-  — it asserts `POST /v1/files` returns 501 AND that the fenced create touched
-  nothing (no store, no engine) while the body is `x-ocu-tbd`.
+- Enforced: `internal/southface/envelope.go` admits only the pinned-body ops to
+  `knownOps`, and `internal/southface/handler_stub.go:newHandlerRegistry` builds
+  handlers over that same set — so an unpinned verb has no handler to hang an
+  invented body on. Admitting any one of the three reds three guards, each on its
+  own axis — measured, not assumed:
+  `internal/southface/intent_binding_test.go:TestRouteOpIntentBindingMapClosed`
+  (a routable op with no required intent, which is the authorization axis an
+  unpinned body cannot supply),
+  `internal/southface/intent_binding_test.go:TestPreviewSessionNeverWritesOrDownloads`
+  (an op with no intent row is not refused for a preview session on every
+  route), and `internal/southface/restparity_fixtures_test.go` (route-table
+  completeness). Alongside them,
+  `internal/southface/contract_parity_test.go:TestOpEnumMatchesContract` covers
+  the adjacent move — it reds if a fenced name is DROPPED from the declared op
+  set rather than fenced in it — and
+  `internal/southface/parseroute_fuzz_test.go` seeds `fileDelete` as an enum
+  member that must not parse to a routable op.
+- Limit, stated rather than papered over: none of those guards takes the TBD
+  MARKER as its subject. They red because admitting an unpinned verb leaves the
+  tables around the routable set incomplete, so an author who also invented the
+  intent row and the route fixture would clear them. What would close it is a
+  guard whose subject IS the fence — asserting the enum members this package
+  deliberately keeps unroutable stay out of `knownOps` — so removing the fence
+  reds on its own terms instead of as a side-effect.
 
 ## 12. Never resolve a north file_id through the ephemeral store
 
@@ -256,14 +281,18 @@ among the enforced invariants above. Each entry below is real, intended behavior
 with NO guard that reds today; it graduates into the enforced set only when a
 guard that provably reds is written for it.
 
-- **Write-plane upload semantics (ceilings + audit-before-ack on createFile) —
-  pending #304.** The eventual `POST /v1/files` upload handler must enforce the
-  per-session ceilings and emit the audit event before acknowledging the write.
-  That behavior has NO guard yet because the handler does not yet exist: the
-  upload body is `x-ocu-tbd` and createFile serves a clean 501 (invariant #11
-  guards the fence, and #11's test asserts the fenced create touches no store and
-  no engine). What #11 does NOT guard is the upload-ceilings / audit-before-ack
-  behavior of the real handler — there is nothing to guard until #304 → #305 pin
-  the body and land the handler. When the write path lands, its ceilings and
-  audit-before-ack semantics need their own reddening guard before they may be
-  restated as an enforced invariant. Until then this is aspirational-pending-#304.
+Nothing is listed here today. The one entry this section carried — the
+write-plane upload semantics (ceilings + audit-before-ack on createFile), held
+aspirational while the upload body was unpinned and the handler did not exist —
+graduated when the write plane landed. `internal/filesapi/create.go:serveCreate`
+is the real handler, and its semantics red under
+`internal/filesapi/create_test.go`: `TestCreateAuditBeforeAckAllowPrecedesWrite`
+(the ALLOW record lands before the first byte reaches the engine),
+`TestCreateAuditDownDeniesEngineUntouched` (an audit-down denies with the engine
+never touched), and `TestCreatePreAssemblyCeilingRejectEngineUntouched` /
+`TestCreateAtCeilingAdmitted` (the declared-size ceiling refused before assembly,
+at-ceiling still admitted).
+
+An empty section is not a claim that everything is guarded. It is a claim that
+nothing load-bearing is KNOWN to be unguarded — and the moment something is, it
+belongs here by name, not among the enforced rules above.
