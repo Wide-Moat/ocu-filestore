@@ -103,15 +103,33 @@ jobs:
         with:
           # Both scanners walk commits, not the checkout. The probe clones this
           # checkout and hands the clone to gitleaks and to trufflehog in git
-          # mode, and it cross-checks each tool's scanned-commit count against
-          # `git rev-list --count`. A shallow checkout would shrink the history
-          # under test and the probe would report a smaller scan as a pass.
+          # mode, and it cross-checks gitleaks' scanned-commit count against
+          # `git rev-list --count` and trufflehog's scanned-byte count against
+          # zero. A shallow checkout would shrink the history under test and the
+          # probe would report a smaller scan as a pass.
           fetch-depth: 0
           persist-credentials: false
       - name: red-probe the secrets gate (secrets-gitleaks, secrets-trufflehog)
-        # Roughly three minutes: three full-history trufflehog passes plus the
-        # gitleaks legs. Docker is preinstalled on ubuntu-latest; the probe
-        # pulls the same pinned scanner images security.yml runs.
+        # Roughly three minutes: three full-history trufflehog passes, one
+        # pull-request-range pass, plus the gitleaks legs. Docker is
+        # preinstalled on ubuntu-latest.
+        #
+        # The probe DERIVES both scanner invocations from security.yml at the
+        # ref under test rather than carrying its own copy of them, and it
+        # proves the derivation reads the file by mutating a copy. That is not
+        # tidiness: the hand-copied version ran an image that exists in no
+        # registry (`v3.95.7` is the ACTION's git tag, and the action is a
+        # composite that docker-runs ghcr.io/trufflesecurity/trufflehog at its
+        # `version` input, defaulting to `latest`), so this job reported NOT RUN
+        # and exited 2 here while reporting a PASS on any laptop with some
+        # trufflehog image cached.
+        #
+        # The probe therefore pulls what each context pulls: the pinned gitleaks
+        # image, and whatever the trufflehog action's moving default tag
+        # resolves to. It refuses to run — it never substitutes a near-enough
+        # build — when either is unavailable, and it refuses when security.yml
+        # moves the action to a revision whose entrypoint it has not been
+        # checked against.
         run: bash scripts/secrets-gate-redprobe.sh
 
   redprobe-sast-sca-gate:
