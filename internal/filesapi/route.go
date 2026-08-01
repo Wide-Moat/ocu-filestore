@@ -109,7 +109,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) routeCollection(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqID string, reqLog *slog.Logger) {
 	switch r.Method {
 	case http.MethodGet:
-		h.serveList(w, r, ps, reqLog)
+		h.serveList(w, r, ps, reqID, reqLog)
 	case http.MethodPost:
 		h.serveCreate(w, r, ps, reqID, reqLog)
 	default:

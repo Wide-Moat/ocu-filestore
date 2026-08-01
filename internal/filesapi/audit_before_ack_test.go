@@ -5,6 +5,7 @@ package filesapi
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
@@ -40,7 +41,11 @@ func (e *tracingEngine) ReadRange(ctx context.Context, scope, path string, off, 
 	return e.fakeEngine.ReadRange(ctx, scope, path, off, length, w)
 }
 
-// tracingStore records "store:delete" in the shared trace when Delete runs.
+// tracingStore records "store:delete" in the shared trace when Delete runs and
+// "store:ensure" when EnsureObject runs. EnsureObject is the DURABLE MINT the
+// north list's engine-namespace reconcile drives: it writes a new handle record
+// into the durable store, so it is the side effect the list's ALLOW audit must
+// precede (NFR-SEC-79 — no durable store mutation before its record).
 type tracingStore struct {
 	*fakeStore
 	trace *[]string
@@ -49,6 +54,11 @@ type tracingStore struct {
 func (s *tracingStore) Delete(ctx context.Context, fileID, scope string) error {
 	*s.trace = append(*s.trace, "store:delete")
 	return s.fakeStore.Delete(ctx, fileID, scope)
+}
+
+func (s *tracingStore) EnsureObject(ctx context.Context, in handlestore.EnsureInput) (handlestore.Record, error) {
+	*s.trace = append(*s.trace, "store:ensure")
+	return s.fakeStore.EnsureObject(ctx, in)
 }
 
 // TestAuditBeforeAckContentMandatePrecedesEngine pins that on a successful
@@ -104,6 +114,74 @@ func TestAuditBeforeAckContentMandateFailsZeroEffect(t *testing.T) {
 		if e == "engine:read" {
 			t.Fatalf("engine read ran after a failed allow audit; trace = %v", trace)
 		}
+	}
+}
+
+// TestAuditBeforeAckListMandatePrecedesReconcileMint pins that on GET /v1/files
+// the list's ALLOW audit Mandate is recorded BEFORE the engine-namespace
+// reconcile mints a durable handle (Store.EnsureObject). The reconcile is a
+// MUTATION of the durable handle store, so a mint that lands before any audit
+// record is exactly the NFR-SEC-79 violation: a durable state change with no
+// preceding durable record. The engine is seeded so the reconcile really walks a
+// namespace and really mints.
+//
+// This pins ORDER, not existence — a presence-only check ("some ALLOW event was
+// emitted") stays green when the Mandate is moved after the reconcile.
+func TestAuditBeforeAckListMandatePrecedesReconcileMint(t *testing.T) {
+	var trace []string
+	base := newFakeStore()
+	store := &tracingStore{fakeStore: base, trace: &trace}
+	eng := newFakeEngine()
+	eng.seedObject("outputs/report.pdf", []byte("pdf"))
+	h := newTestHandler(Deps{
+		Store:  store,
+		Engine: eng,
+		Guard:  &orderingGuard{trace: &trace},
+		Scope:  fakeScope{ps: southface.PeerScope{FilesystemID: "fs-alpha", GrantedIntents: []southface.Intent{southface.IntentRead}}, ok: true},
+	})
+
+	w := doReq(h, http.MethodGet, "/v1/files")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	if base.ensureMints == 0 {
+		t.Fatal("the reconcile minted nothing; the ordering assertion below would be vacuous")
+	}
+	if len(trace) < 2 || trace[0] != "audit:allow" || trace[1] != "store:ensure" {
+		t.Fatalf("trace = %v, want [audit:allow store:ensure ...] (the ALLOW audit precedes the durable mint)", trace)
+	}
+}
+
+// TestListAuditFailureDeniesWithZeroMint is the fail-closed twin: when the audit
+// gate is down the list denies 503 and the reconcile mints NOTHING — no durable
+// handle is created without a durable record, and no page envelope reaches the
+// caller.
+func TestListAuditFailureDeniesWithZeroMint(t *testing.T) {
+	var trace []string
+	base := newFakeStore()
+	store := &tracingStore{fakeStore: base, trace: &trace}
+	eng := newFakeEngine()
+	eng.seedObject("outputs/report.pdf", []byte("pdf"))
+	h := newTestHandler(Deps{
+		Store:  store,
+		Engine: eng,
+		Guard:  &orderingGuard{trace: &trace, err: auditgate.ErrAuditUnavailable},
+		Scope:  fakeScope{ps: southface.PeerScope{FilesystemID: "fs-alpha", GrantedIntents: []southface.Intent{southface.IntentRead}}, ok: true},
+	})
+
+	w := doReq(h, http.MethodGet, "/v1/files")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (audit gate down); body %s", w.Code, w.Body.String())
+	}
+	if base.ensureMints != 0 {
+		t.Fatalf("the reconcile minted %d durable handles after a failed audit; want 0", base.ensureMints)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("deny body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if _, present := env["data"]; present {
+		t.Fatalf("a 503 audit-down list returned a page envelope: %q", w.Body.String())
 	}
 }
 
