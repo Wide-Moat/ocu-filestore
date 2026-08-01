@@ -286,6 +286,28 @@ var deadlineDialects = []deadlineDialect{
 		// pattern anchored to the start and end of a line could not see it: the
 		// restatement understated the budget by 10 s and the guard reported a
 		// clean scan. A key is a key wherever it is written down.
+		//
+		// Stated limit, and the price of the same decision: a key is read
+		// wherever it is written INCLUDING inside a sentence that says the figure
+		// is retired. "Before the second listener landed the contrib unit shipped
+		// `TimeoutStopSec=<N>s`; that figure was superseded and the unit ships
+		// <M>s today" is honest prose, and this dialect reports <N> as a shipped
+		// deadline and fails it against the bound.
+		//
+		// It is STATED rather than pinned in innocentDurationProse, which is where
+		// the English dialect's retired-value near-miss lives, and the difference
+		// between the two near-misses is why. The English one is innocent by
+		// construction — "a 30s grace" is missing the qualifier that names the
+		// stop grace, so leaving it alone costs the pattern nothing. This one is
+		// the key ITSELF, character for character, and only the prose around it
+		// says the value is dead. Pinning it would force one of two changes and
+		// both cost more than the false red: anchoring the key back to its own
+		// line, which is exactly what let an understated restatement of it ship
+		// once already, or acquitting on retired-value vocabulary, which hands a
+		// genuinely stale key the word "superseded" to hide behind. The failure
+		// directions are not equal either — this one reds a build over one
+		// sentence, and the author drops the retired figure or writes it without
+		// the key; the other SIGKILLs a daemon mid-drain.
 		kind: "systemd TimeoutStopSec",
 		re:   regexp.MustCompile(`\bTimeoutStopSec[ \t]*=[ \t]*(\d+)s?\b`),
 		samples: []deadlineSample{
@@ -370,6 +392,13 @@ var deadlineDialects = []deadlineDialect{
 // noun with the qualifier that makes it a stop deadline missing. A dialect that
 // reads any of them reports a false deadline, and a false deadline is a red
 // build against an honest sentence.
+//
+// Every entry is English, and that is a fact about the other dialects rather
+// than an omission here. The k8s and compose keys are line-anchored, so a key
+// quoted mid-sentence is not read at all and there is no near-miss to pin. The
+// systemd key is deliberately unanchored and DOES have one — the key itself,
+// inside a sentence that says the figure is retired — which is carried as a
+// stated limit at that dialect, for the reason given there.
 var innocentDurationProse = []string{
 	"the 5s poll interval",
 	"a 90s CI job",
