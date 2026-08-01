@@ -413,15 +413,26 @@ var shippedStopDeadlines = map[string][]string{
 	"cmd/ocu-filestored/stop_deadline_test.go": {"prose stop grace", "systemd TimeoutStopSec"},
 }
 
-// stopDeadline is one deadline found in one shipped file.
+// stopDeadline is one deadline found at one place in one shipped file.
+//
+// The line is part of the finding, not decoration. A file states the budget more
+// than once and can state it twice in the SAME dialect — deploy/docker-compose.yml
+// carries the key the daemon is stopped by and, sixty lines earlier, the comment
+// that justifies it, and both are read by an English pattern. Told only "that
+// file, that dialect, that value", a reader has to go and find which of the two
+// is wrong.
 type stopDeadline struct {
-	file    string
+	file string
+	// line is where the statement STARTS, which for a wrapped sentence is the
+	// line carrying the name of the grace rather than the one carrying the
+	// number. That is the anchor a reader wants: the sentence begins there.
+	line    int
 	kind    string
 	seconds int
 }
 
 func (d stopDeadline) String() string {
-	return fmt.Sprintf("%s (%s) = %ds", d.file, d.kind, d.seconds)
+	return fmt.Sprintf("%s:%d (%s) = %ds", d.file, d.line, d.kind, d.seconds)
 }
 
 // discoverStopDeadlines scans every TRACKED file for a stop deadline in any of
@@ -449,12 +460,24 @@ func discoverStopDeadlines(t *testing.T, root string) []stopDeadline {
 		scanned++
 		content := string(b)
 		for _, d := range deadlineDialects {
-			for _, m := range d.re.FindAllStringSubmatch(content, -1) {
-				secs, cerr := d.seconds(m)
-				if cerr != nil {
-					t.Fatalf("%s: %s match %q does not yield a whole number of seconds: %v", rel, d.kind, m[0], cerr)
+			// Indexes rather than strings: the same match has to yield both the
+			// captured value and the offset the line is counted from. lineAt is
+			// the erase ledger's mapping, shared because both guards report a
+			// finding at the line a reader opens.
+			for _, loc := range d.re.FindAllStringSubmatchIndex(content, -1) {
+				groups := make([]string, 0, len(loc)/2)
+				for i := 0; i < len(loc); i += 2 {
+					if loc[i] < 0 {
+						groups = append(groups, "")
+						continue
+					}
+					groups = append(groups, content[loc[i]:loc[i+1]])
 				}
-				found = append(found, stopDeadline{file: rel, kind: d.kind, seconds: secs})
+				secs, cerr := d.seconds(groups)
+				if cerr != nil {
+					t.Fatalf("%s: %s match %q does not yield a whole number of seconds: %v", rel, d.kind, groups[0], cerr)
+				}
+				found = append(found, stopDeadline{file: rel, line: lineAt(content, loc[0]), kind: d.kind, seconds: secs})
 			}
 		}
 	}
@@ -464,6 +487,9 @@ func discoverStopDeadlines(t *testing.T, root string) []stopDeadline {
 	sort.Slice(found, func(i, j int) bool {
 		if found[i].file != found[j].file {
 			return found[i].file < found[j].file
+		}
+		if found[i].line != found[j].line {
+			return found[i].line < found[j].line
 		}
 		return found[i].kind < found[j].kind
 	})
@@ -512,6 +538,26 @@ func TestShippedStopDeadlinesCoverWorstCaseStopCost(t *testing.T) {
 	t.Logf("worst-case graceful stop: %s", derivation)
 
 	found := discoverStopDeadlines(t, root)
+
+	// Every finding must point at a line, and the line must discriminate. A file
+	// that states the budget twice in ONE dialect is the case that makes "that
+	// file, that dialect, that value" ambiguous; if the tree stopped containing
+	// such a pair the field would be decoration, and nobody would notice it had
+	// stopped being recorded.
+	twiceInOneDialect := 0
+	for i, a := range found {
+		if a.line <= 0 {
+			t.Errorf("%s was scanned without a line; a finding that cannot point at a line sends its reader off to search the file", a)
+		}
+		for _, b := range found[i+1:] {
+			if a.file == b.file && a.kind == b.kind && a.line != b.line {
+				twiceInOneDialect++
+			}
+		}
+	}
+	if twiceInOneDialect == 0 {
+		t.Errorf("no shipped file states the budget twice in one dialect; the line recorded with each finding is no longer what tells two statements apart, so a report naming only the file and the dialect would be unambiguous again — confirm that before trusting this")
+	}
 
 	// Both directions against the ledger, per file AND per dialect: a file that
 	// sets a deadline in a dialect not declared for it would go unchecked, and a
