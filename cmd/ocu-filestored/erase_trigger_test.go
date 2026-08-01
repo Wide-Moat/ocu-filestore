@@ -183,6 +183,12 @@ func TestNoProductPathTriggersScopeErase(t *testing.T) {
 
 // erasePromise is one prose claim shape that is true only if some product path
 // invokes the erase verb.
+//
+// The patterns match PHRASES, not propositions: they are deliberately blind to
+// negation, so prose must state what the service does rather than deny what it
+// does not. Where an honest denial has to use the forbidden phrase — the
+// documents that exist precisely to say the erase never runs — the promise
+// carries an `except` acquittal instead of the prose being bent around a regex.
 type erasePromise struct {
 	id string
 	// re matches the claim.
@@ -191,8 +197,78 @@ type erasePromise struct {
 	// a pattern that no longer matches its own instance has rotted into a
 	// permanent pass and is caught before the corpus is scanned.
 	lie string
+	// except, when set, acquits a hit that falls INSIDE one of its matches — the
+	// honest-denial forms of the same phrase. Containment (not mere adjacency)
+	// is what acquits: an acquittal written to cover the SENTENCE around a
+	// denial cannot reach a claim in the next sentence, because `[^.\n]` stops
+	// at the period. An acquittal that would swallow the promise's own lie is
+	// rejected before the corpus is scanned — that is the disarm this mechanism
+	// could otherwise become.
+	except *regexp.Regexp
+	// acquitted is a canonical instance of the honest denial. It must be matched
+	// by re AND acquitted by except, which proves the acquittal is both live and
+	// load-bearing. Set exactly when except is set.
+	acquitted string
 	// truth is what the code actually does, reported when the claim is found.
 	truth string
+}
+
+// acquits reports whether p.except covers a hit at [start,end) in text — the
+// hit must fall inside a single except match, not merely share a neighbourhood
+// with one.
+func (p erasePromise) acquits(text string, start, end int) bool {
+	if p.except == nil {
+		return false
+	}
+	for _, m := range p.except.FindAllStringIndex(text, -1) {
+		if m[0] <= start && end <= m[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// hits returns the index range of every unacquitted match of the promise.
+func (p erasePromise) hits(text string) [][]int {
+	var out [][]int
+	for _, m := range p.re.FindAllStringIndex(text, -1) {
+		if p.acquits(text, m[0], m[1]) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// validate proves the promise still works before it is trusted against the
+// corpus. A pattern that no longer matches its own lie is dead and would pass
+// forever; an acquittal that does not cover its own denial turns honest prose
+// into a false red; an acquittal that covers the LIE is a disarm wearing the
+// mechanism's clothes.
+func (p erasePromise) validate(t *testing.T) {
+	t.Helper()
+
+	if !p.re.MatchString(p.lie) {
+		t.Fatalf("promise pattern %q no longer matches its own instance %q; the pattern is dead and its arm is vacuous", p.id, p.lie)
+	}
+	if p.except == nil {
+		if p.acquitted != "" {
+			t.Fatalf("promise %q carries an acquitted instance %q but no except pattern; nothing proves the instance is acquitted", p.id, p.acquitted)
+		}
+		return
+	}
+	if p.acquitted == "" {
+		t.Fatalf("promise %q carries an except pattern with no acquitted instance; an unexercised acquittal can widen without anyone noticing", p.id)
+	}
+	if !p.re.MatchString(p.acquitted) {
+		t.Fatalf("promise %q: the acquitted instance %q is not matched by the claim pattern at all, so the acquittal carries no weight — either the instance is not the honest denial of this claim, or the except pattern is unnecessary", p.id, p.acquitted)
+	}
+	if len(p.hits(p.acquitted)) != 0 {
+		t.Fatalf("promise %q: the except pattern does not acquit its own honest denial %q; shipped prose that states the truth would be reported as a lie", p.id, p.acquitted)
+	}
+	if len(p.hits(p.lie)) == 0 {
+		t.Fatalf("promise %q: the except pattern acquits the promise's own lie %q; the acquittal disarms the arm it belongs to", p.id, p.lie)
+	}
 }
 
 var erasePromises = []erasePromise{
@@ -233,6 +309,44 @@ var erasePromises = []erasePromise{
 		lie:   "the erase-before-reuse (NFR-SEC-54) is never skipped by a clean stop.",
 		truth: "A clean stop skips the erase because nothing schedules one.",
 	},
+	{
+		// The shape that hid in CONSTITUTION.md for five commits after the
+		// rollback stopped erasing: a scope said to be torn down on some error
+		// path. The claim is about the SCOPE, so both words are required — the
+		// tree is full of `teardownServer`, teardown sweeps and teardown bounds
+		// that describe the verb without claiming anything calls it.
+		id: "scope-torn-down",
+		re: regexp.MustCompile(`(?i)\bscopes?\b[^.\n]{0,60}\btorn down\b|\b(?:torn|tears?|tearing)[- ]down\b[^.\n]{0,60}\bscopes?\b`),
+		lie: "If session compose fails after the scope is provisioned, the scope is torn down " +
+			"before the error returns.",
+		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing)\b[^.\n]*\b(?:torn|tears?|tearing)[- ]down\b`),
+		acquitted: "A provisioned scope is never torn down.",
+		truth:     "The post-provision rollback latch is release-only: it closes the durable handle-store descriptor and leaves the scope exactly as provisioned. A scope outlives the composition that provisioned it and the process that served it.",
+	},
+	{
+		// The other half of the same shape: a document that names a product
+		// location and says the erase verb runs there. This is the claim an
+		// implementer checks against the code, so it is the one that must not
+		// outlive the call it describes.
+		id: "product-path-runs-the-erase-verb",
+		re: regexp.MustCompile(`(?i)\b(?:runs?|calls?|invokes?|triggers?|fires?|schedules?|performs?|executes?)\b[^.\n]{0,40}` +
+			eraseVerb + `|` + eraseVerb + `[^.\n]{0,40}\b(?:is|are|gets?)\s+(?:then\s+)?(?:run|called|invoked|triggered|fired|scheduled|performed|executed)\b`),
+		lie: "Enforced: `cmd/ocu-filestored/main.go:compose` — a post-`ProvisionScope` " +
+			"construction error runs `TeardownScope` before returning `nil, err`.",
+		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb),
+		acquitted: "Nothing in the product calls `TeardownScope`.",
+		truth:     "No product path calls the verb — not compose, not the rollback latch, not Close. The engines implement it and the tests exercise it; nothing else reaches it.",
+	},
+	{
+		// A named pairing is a promise about a mechanism, not just a phrase: it
+		// tells a reader that provisioning arms a later teardown.
+		id:        "teardown-partner",
+		re:        regexp.MustCompile(`(?i)\bteardown partner\b`),
+		lie:       "## 7. Never a provisioned scope without a teardown partner",
+		except:    regexp.MustCompile(`(?i)\bno teardown partner\b`),
+		acquitted: "There is no teardown partner.",
+		truth:     "Provisioning arms nothing. No path pairs a provisioned scope with a later teardown, because no owner-change event exists for one to hang on.",
+	},
 }
 
 // erasePromiseCorpus is the prose this repository SHIPS: the docs a reader
@@ -240,13 +354,13 @@ var erasePromises = []erasePromise{
 // is defined as tracked — untracked working material makes no promise to anyone.
 // The vendored contracts are excluded on top of that: they are upstream
 // artifacts this repo may not edit, so a claim inside one is not ours to fix.
-func erasePromiseCorpus(t *testing.T, root string) map[string][]string {
+func erasePromiseCorpus(t *testing.T, root string) map[string]string {
 	t.Helper()
 	out, err := exec.Command("git", "-C", root, "ls-files", "-z", "*.md", "*.yml", "*.yaml").Output()
 	if err != nil {
 		t.Fatalf("git ls-files for the doc corpus: %v", err)
 	}
-	corpus := make(map[string][]string)
+	corpus := make(map[string]string)
 	for _, rel := range strings.Split(string(out), "\x00") {
 		if rel == "" || strings.HasPrefix(rel, "contracts/") {
 			continue
@@ -255,13 +369,72 @@ func erasePromiseCorpus(t *testing.T, root string) map[string][]string {
 		if rerr != nil {
 			t.Fatalf("read tracked doc %q: %v", rel, rerr)
 		}
-		corpus[rel] = strings.Split(string(b), "\n")
+		corpus[rel] = string(b)
 	}
 	if len(corpus) == 0 {
 		t.Fatal("doc corpus is empty; the guard is vacuous")
 	}
 	return corpus
 }
+
+// proseBlock is one paragraph-sized unit of a document with its newlines
+// flattened to spaces, plus the byte offset it starts at in the original. The
+// substitution is one byte for one byte, so an offset inside the block plus the
+// block's own offset still indexes the document — which is what lets a hit be
+// reported at its own line.
+type proseBlock struct {
+	offset int
+	text   string
+}
+
+// blockStarter recognises the markdown constructs that begin a new unit of
+// prose: a heading, a list item, a table row, a block quote, a rule.
+var blockStarter = regexp.MustCompile(`^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|\||>|-{3,}\s*$|\*{3,}\s*$|_{3,}\s*$)`)
+
+// proseBlocks splits a document into the units a single claim can occupy. A
+// claim routinely WRAPS across lines, so lines must be joined; it does not span
+// a blank line, a heading or a neighbouring bullet, so those end the block.
+//
+// The block is what makes the acquittals in erasePromises safe. Judged over a
+// whole flattened document, a heading's "Never" would sit in the same sentence
+// as the next paragraph's claim — headings carry no full stop — and would acquit
+// it. Judged over a fixed two-line window, a denial one line too far above the
+// claim it acquits would be cut away and the honest prose reported as a lie.
+// Judged over the block, both hold: the denial and the claim are in the unit a
+// reader reads together, or they are not related at all.
+func proseBlocks(text string) []proseBlock {
+	var blocks []proseBlock
+	start, end := -1, -1
+	flush := func() {
+		if start >= 0 {
+			blocks = append(blocks, proseBlock{offset: start, text: strings.ReplaceAll(text[start:end], "\n", " ")})
+		}
+		start, end = -1, -1
+	}
+
+	offset := 0
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			flush()
+		default:
+			if start >= 0 && blockStarter.MatchString(trimmed) {
+				flush()
+			}
+			if start < 0 {
+				start = offset
+			}
+			end = offset + len(line)
+		}
+		offset += len(line) + 1 // + the newline that Split consumed
+	}
+	flush()
+	return blocks
+}
+
+// lineAt maps a byte offset in a document to its 1-based line number.
+func lineAt(text string, offset int) int { return 1 + strings.Count(text[:offset], "\n") }
 
 // TestDocsDoNotPromiseAnUnwiredErase is the ERASE-TRIGGER-054 ledger's prose
 // arm. While no product path calls the erase verb, shipped prose may not tell a
@@ -275,12 +448,10 @@ func erasePromiseCorpus(t *testing.T, root string) map[string][]string {
 func TestDocsDoNotPromiseAnUnwiredErase(t *testing.T) {
 	root := repoRoot(t)
 
-	// Every pattern must still match its own canonical instance. A pattern that
-	// has rotted matches nothing at all and would pass the corpus scan forever.
+	// Every pattern must still match its own canonical instance, and every
+	// acquittal must cover its own denial without covering the claim.
 	for _, p := range erasePromises {
-		if !p.re.MatchString(p.lie) {
-			t.Fatalf("promise pattern %q no longer matches its own instance %q; the pattern is dead and its arm is vacuous", p.id, p.lie)
-		}
+		p.validate(t)
 	}
 
 	if sites := scanEraseCallSites(t, root, false); len(sites) != 0 {
@@ -296,30 +467,14 @@ func TestDocsDoNotPromiseAnUnwiredErase(t *testing.T) {
 
 	found := 0
 	for _, f := range files {
-		lines := corpus[f]
-		seen := make(map[string]bool)
-		for i := range lines {
-			// Prose wraps, so a claim routinely straddles two lines. Match over a
-			// two-line window and report the window's first line; the seen-set
-			// keeps a claim from being reported once alone and again as the tail
-			// of the window before it.
-			window := lines[i]
-			if i+1 < len(lines) {
-				window += " " + lines[i+1]
-			}
+		text := corpus[f]
+		for _, b := range proseBlocks(text) {
 			for _, p := range erasePromises {
-				hit := p.re.FindString(window)
-				if hit == "" {
-					continue
+				for _, m := range p.hits(b.text) {
+					found++
+					t.Errorf("%s:%d promises an erase that nothing triggers [%s]\n  claim: %s\n  actual: %s",
+						f, lineAt(text, b.offset+m[0]), p.id, strings.Join(strings.Fields(b.text[m[0]:m[1]]), " "), p.truth)
 				}
-				key := p.id + "\x00" + strings.Join(strings.Fields(hit), " ")
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				found++
-				t.Errorf("%s:%d promises an erase that nothing triggers [%s]\n  claim: %s\n  actual: %s",
-					f, i+1, p.id, strings.Join(strings.Fields(hit), " "), p.truth)
 			}
 		}
 	}

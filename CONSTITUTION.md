@@ -85,14 +85,42 @@ the deployment's prefix set — never stamped at write.
   false tag yields `Grant{Downloadable: false}` (read allowed), not a read
   denial.
 
-## 7. Never a provisioned scope without a teardown partner
+## 7. Never erase on a process-lifecycle event
 
-If session compose fails after the scope is provisioned, the scope is torn down
-before the error returns. No half-provisioned scope ever leaks past startup.
+Erase is keyed to an OWNER CHANGE. Boot, restart, a clean stop and a failed
+composition are not owner changes, so none of them may remove a byte:
+`ProvisionScope` is ensure-scaffold-if-absent (it creates the scope when absent
+and sweeps only the guest-invisible staging area), `Close` releases process
+state alone, and the post-provision rollback latch is release-only — it closes
+the durable handle-store descriptor and leaves the scope exactly as it found it.
+Keying the erase to the process lifecycle once destroyed a live owner's
+workspace on an ordinary restart; that defect is what this rule exists to
+prevent.
 
-- NFR-SEC-54
-- Enforced: `cmd/ocu-filestored/main.go:compose` — a post-`ProvisionScope`
-  construction error runs `TeardownScope` before returning `nil, err`.
+The consequence is stated here rather than left to be discovered: there is
+no teardown partner. A provisioned scope is never torn down — not on the error
+path that provisioned it, not at shutdown, not anywhere. Both engines implement
+the erase verb; no product path calls `TeardownScope`, because canon gives this
+service no owner-change event to observe. Erase-before-reuse and residue-drop
+are the session-sandbox component's invariants, and this service's own invariant
+list carries no scope-lifecycle row, so building a trigger here would be
+inventing a security behaviour. A composition that fails after provisioning
+therefore leaves the scaffold it created standing, and removing a whole scope is
+an out-of-band action taken while the daemon for that `filesystem_id` is
+stopped. The gap is carried named: `docs/architecture/05-lifecycle.md` §3.4
+states it for readers and §3.5 puts the trigger question to the owner.
+
+- NFR-SEC-54 — canon re-homes erase-before-reuse to the session sandbox; no
+  component-04 invariant claims it here
+- Enforced: `cmd/ocu-filestored/erase_trigger_test.go` holds both ends of the
+  gap. `TestNoProductPathTriggersScopeErase` parses every product source file
+  and reds the moment any of them calls the erase verb — the regression guard
+  for the restart-wipes-the-owner defect, and the forcing function that sends
+  whoever wires a real trigger back to restate this section.
+  `TestDocsDoNotPromiseAnUnwiredErase` reds on shipped prose that tells a reader
+  an erase runs, so this section cannot rot back into a promise. That `Close`
+  keeps the owner's bytes is proven live against a real engine by
+  `cmd/ocu-filestored/main_test.go:TestTeardownServerCloseDoesNotEraseScope`.
 
 ## 8. Never let one session exhaust shared resources
 
