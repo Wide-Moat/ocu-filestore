@@ -166,10 +166,12 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// for write on its OWN filesystem (component-08 has already done the upstream
 	// three-axis authorization before the F9 call), exactly as the south upload
 	// grants write from the channel scope. The placeholder ScopeSource stamps only
-	// read intent on ps.GrantedIntents (the read plane's need), so a write-class
-	// verb ADDS write intent here rather than widening the scope-source grant for
-	// every plane — see writeEvidenceIntents. The broker-side Resolver is still
-	// the deny-by-default decision; this evidence is only an input to it. ---
+	// read intent on ps.GrantedIntents (what the four read-class verbs need), so a
+	// write-class verb ADDS write intent here rather than widening the scope-source
+	// grant for every plane — see writeEvidenceIntents. The broker-side Resolver is
+	// still the deny-by-default decision and this evidence is only an input to it,
+	// but with the shipped scope source it has no axis left to fail on, so the arm
+	// below is a guarded seam rather than a live gate (see fencedGrantedIntents). ---
 	req = southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: engineRef, Intent: southface.IntentWrite}
 	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: writeEvidenceIntents(ps)}
 	grant, err = h.deps.Resolver.Resolve(r.Context(), evidence, req)
@@ -554,12 +556,12 @@ func (h *Handler) openCreateFilePart(mr *multipart.Reader, denyReject func(audit
 // writeEvidenceIntents returns the intent grant a WRITE-CLASS north verb (create
 // and delete) presents to the Resolver: the scope's own granted intents PLUS
 // write. The placeholder ScopeSource stamps only read intent on
-// ps.GrantedIntents (the read plane's need); a write verb adds IntentWrite so
-// the Resolver's intentGranted gate passes, MIRRORING how the south upload
-// resolves write from the attested channel scope. It de-duplicates so a scope
-// source that already grants write is not double-listed. The broker-side
-// Resolver remains the deny-by-default decision; this is only an input to that
-// re-derivation.
+// ps.GrantedIntents (what the four read-class verbs need); a write verb adds
+// IntentWrite so the Resolver's intentGranted gate passes, MIRRORING how the
+// south upload resolves write from the attested channel scope. It de-duplicates
+// so a scope source that already grants write is not double-listed. The
+// broker-side Resolver remains the deny-by-default decision; this is only an
+// input to that re-derivation.
 func writeEvidenceIntents(ps southface.PeerScope) []southface.Intent {
 	out := make([]southface.Intent, 0, len(ps.GrantedIntents)+1)
 	hasWrite := false

@@ -125,6 +125,9 @@ func (h *Handler) serveArchive(w http.ResponseWriter, r *http.Request, ps southf
 
 		// Re-derive read authorization broker-side. A resolver deny excludes the
 		// member (it is not accessible); it is never a 403 for the whole archive.
+		// Under the shipped F9 grant the resolver cannot error here at all (see
+		// fencedGrantedIntents), so the exclusion that actually fires on this loop
+		// is the downloadable gate below, on the resolved value.
 		req := southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: engPath, Intent: southface.IntentRead}
 		evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
 		grant, rerr := h.deps.Resolver.Resolve(r.Context(), evidence, req)

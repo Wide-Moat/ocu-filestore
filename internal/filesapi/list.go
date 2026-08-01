@@ -68,7 +68,11 @@ const listScopeRootPath = "."
 //     has been named and no authorization resolved yet, so it records no
 //     activity).
 //   - Resolve(intent=read) at the scope root from the attested scope: the three
-//     axes are re-derived broker-side per request, deny-by-default.
+//     axes are re-derived broker-side per request, deny-by-default. Under the
+//     shipped F9 grant that re-derivation has no axis left to fail on, so
+//     denyList's resolver-error arm is defence in depth against a future scope
+//     source, not a refusal a deployment produces today — see
+//     fencedGrantedIntents.
 //   - Mandate the ALLOW BEFORE the reconcile (audit-before-ack, SEC-79). The
 //     reconcile MUTATES the durable handle store (EnsureObject mints handles),
 //     so no durable state may change ahead of its record; an audit failure

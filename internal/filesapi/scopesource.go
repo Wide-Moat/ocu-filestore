@@ -62,13 +62,49 @@ const fencedScopeHeader = "X-OCU-Filesystem-Id"
 // fencedGrantedIntents is the intent grant the placeholder ScopeSource stamps on
 // the derived PeerScope.
 //
-// FENCED (pending ADR-0025): the read/delete Files-API endpoints exercise the
-// read axis, so the placeholder grants read intent. The real F9 request shape
-// will carry the attested intent grant from component-08's upstream
-// authorization; until then this is the minimal grant the read plane needs. It
-// is the broker-side Resolver that makes the actual allow/deny decision per
-// request (deny-by-default), so this grant is an input to that re-derivation,
-// never the decision itself.
+// FENCED (pending ADR-0025): the six served routes do NOT share one axis. Four
+// are read-class — metadata, list, content and archive each Resolve with
+// IntentRead.
+// Two are WRITE-class: create is a content mutation and delete is a namespace
+// mutation, the same split the repo's closed route-op map (southface's
+// opRequiredIntent) gives createFile and removeFile. This placeholder grants
+// read ONLY, so each write-class verb ADDS IntentWrite to its own evidence at
+// its own call site (writeEvidenceIntents) rather than widening the grant for
+// every plane. The real F9 request shape will carry the attested intent grant
+// from component-08's upstream authorization; until then the grant a request
+// reaches the Resolver with is this fixed read plus those two per-verb
+// additions — never a per-verb grant derived from the caller.
+//
+// What that costs, stated here rather than left for a reader to derive: with
+// this fixed grant, and against the resolver cmd/ocu-filestored actually wires,
+// no Resolve call this package makes can return an error.
+//
+//   - Intent axis: a read verb asks read and presents read; a write verb asks
+//     write and presents writeEvidenceIntents, which always contains write.
+//     Satisfied by construction, on every verb.
+//   - Scope axis: each handler builds ResolveRequest.Filesystem and
+//     CallerEvidence.Scope from the same ps.FilesystemID, and Scope below has
+//     already refused an absent or empty one, so neither the empty-scope nor the
+//     request-disagrees-with-evidence branch is reachable.
+//   - Downloadable axis: the shipped tag source
+//     (broker.NewPrefixDownloadablePolicy) returns a nil error on every path, so
+//     the resolver's fail-closed tag-error branch cannot fire either.
+//
+// So the resolver-error deny arms on this plane (denyList, denyDelete, and
+// denyRead's authorization branch) are DEFENCE IN DEPTH against a future scope
+// source, not refusals a deployment can produce today: no flag, prefix set, or
+// request shape reaches them. They stay — the seams they guard (Deps.Resolver,
+// Deps.Scope) are filled by composition, and the answer flips the moment the F9
+// grant becomes real — but nothing should describe them as a live denial. What
+// DOES refuse live on this plane is the ops/s ceiling, the keystone 404, and the
+// downloadable egress gate on the two byte-emitting verbs; that gate reads
+// Grant.Downloadable, a resolved VALUE, not a resolver error, and it refuses
+// under the shipped prefix policy today. TestShippedGrantLeavesResolverNoAxisToFail
+// pins the reachability so this paragraph cannot go stale in silence.
+//
+// It is still the broker-side Resolver that makes the allow/deny decision per
+// request (deny-by-default); this grant is an input to that re-derivation, never
+// the decision itself.
 var fencedGrantedIntents = []southface.Intent{southface.IntentRead}
 
 // validateScopeShape refuses a filesystem_id whose bytes are not a single,

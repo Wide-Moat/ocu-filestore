@@ -40,6 +40,9 @@ import (
 //     broker-side per request, deny-by-default. The record ALREADY resolved in
 //     scope at this point, so a 403 here is a downstream authorization verdict on
 //     a resolved object, never the keystone's absent-vs-foreign distinction.
+//     Under the shipped F9 grant no axis can fail, so that 403 is a shape the
+//     seam permits rather than one a deployment produces — see
+//     fencedGrantedIntents.
 //   - Mandate the ALLOW BEFORE the FileObject reaches the caller
 //     (audit-before-ack, SEC-79): an audit-down denies 503 and the record the
 //     caller asked about never leaves the broker.

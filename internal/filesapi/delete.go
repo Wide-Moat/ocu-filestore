@@ -31,7 +31,10 @@ import (
 //     NAMESPACE MUTATION, so the axis is write — the same class the repo's
 //     closed route-op map gives removeFile and the same intent the delete audit
 //     event stamps. A deny here is a 403 on an ALREADY-resolved record, never
-//     the keystone's absent-vs-foreign distinction.
+//     the keystone's absent-vs-foreign distinction — and under the shipped F9
+//     grant it is a shape the seam permits rather than one a deployment
+//     produces, since the evidence below satisfies the intent axis by
+//     construction (see fencedGrantedIntents).
 //   - Mandate the ALLOW audit (ObjectHandle = Record.ObjectRef) AFTER the
 //     authorization and BEFORE the tombstone (audit-before-ack, SEC-79): the
 //     durable record names the object the delete is about to remove. An audit
@@ -71,7 +74,9 @@ func (h *Handler) serveDelete(w http.ResponseWriter, r *http.Request, ps southfa
 	// The evidence ADDS write intent (writeEvidenceIntents), exactly as the
 	// create verb does: the shipped F9 ScopeSource stamps only read intent, so
 	// presenting ps.GrantedIntents verbatim would deny every live delete on the
-	// intent axis. The Resolver stays the deny-by-default decision.
+	// intent axis. The Resolver stays the deny-by-default decision — but with
+	// this evidence and this scope source it has no axis left to fail on, so the
+	// arm below is a guarded seam, not a live gate (see fencedGrantedIntents).
 	req := southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: rec.ObjectRef, Intent: southface.IntentWrite}
 	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: writeEvidenceIntents(ps)}
 	if _, rerr := h.deps.Resolver.Resolve(r.Context(), evidence, req); rerr != nil {
