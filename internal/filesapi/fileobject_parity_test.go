@@ -120,6 +120,49 @@ func TestFileObjectMatchesContract(t *testing.T) {
 	}
 }
 
+// TestListResponseMatchesContract pins the list envelope against the frozen
+// FileListEnvelope schema, with NO ledgered exceptions: unlike FileObject, this
+// shape carries nothing ahead of canon, so any divergence in either direction
+// is drift. A missing field drops a page attribute a paginating client relies
+// on (next_cursor above all — without it the walk cannot resume), and an
+// undeclared emitted field is non-conforming under additionalProperties:false.
+//
+// data and has_more are contract-required, so neither may be tagged omitempty:
+// an empty final page (data []) and a last page (has_more false) are exactly
+// the cases where the zero value would drop the property, which is when a
+// client most needs to read it.
+func TestListResponseMatchesContract(t *testing.T) {
+	structTags := jsonTagsOfStruct(t, reflect.TypeOf(ListResponse{}))
+	contractProps := contractSchemaProps(t, "FileListEnvelope:")
+
+	if len(structTags) == 0 {
+		t.Fatal("no json tags parsed from the ListResponse struct; the guard is vacuous")
+	}
+	if len(contractProps) == 0 {
+		t.Fatal("no properties parsed from the FileListEnvelope contract schema; the guard is vacuous")
+	}
+
+	structNames := slices.Sorted(maps.Keys(structTags))
+	if missing := setDifference(contractProps, structNames); len(missing) > 0 {
+		t.Errorf("ListResponse is BEHIND the contract — missing json fields for FileListEnvelope properties %v", missing)
+	}
+	if extra := setDifference(structNames, contractProps); len(extra) > 0 {
+		t.Errorf("ListResponse is AHEAD of the contract — json fields %v are not declared by FileListEnvelope "+
+			"(additionalProperties:false, so a conforming client rejects them)", extra)
+	}
+
+	for _, req := range contractSchemaRequired(t, "FileListEnvelope:") {
+		omitempty, ok := structTags[req]
+		if !ok {
+			continue // already reported by the BEHIND arm
+		}
+		if omitempty {
+			t.Errorf("ListResponse field %q is contract-required but tagged omitempty — its zero value "+
+				"(an empty page, a final page) drops a required property", req)
+		}
+	}
+}
+
 // jsonTagsOfStruct returns the json field names typ serializes, mapped to
 // whether the tag carries omitempty. An empty tag, a "-" tag, and an embedded
 // field are skipped.
