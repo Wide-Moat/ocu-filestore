@@ -163,14 +163,16 @@ The returned `Server` is wrapped in a `teardownServer` so that `Close` also
 releases the ceilings entry and the durable handle-store descriptor. It does
 not erase the scope ([§3.2](#32-close-releases-process-state-only)).
 
-### 1.5 Bounded lifecycle contexts
+### 1.5 The bounded lifecycle context
 
-The two engine lifecycle calls never run under a bare `context.Background()`.
-`provisionTimeout` (1 minute) bounds `ProvisionScope`; `teardownTimeout`
-(10 minutes) bounds `TeardownScope`. A teardown sweep on a network engine
-paginates listings and batches deletes over a whole scope, so its bound is
-generous but finite — a hung backend can never wedge startup or teardown
-indefinitely.
+The daemon makes exactly one engine lifecycle call, and it never runs under a
+bare `context.Background()`: `provisionTimeout` (1 minute) bounds the boot
+scaffold, so a hung backend cannot wedge startup indefinitely. There is no
+second bound, because there is no second call — nothing tears a scope down
+([§3.4](#34-the-erase-verb-has-no-trigger)). A bound whose call has gone is a
+number that reads as a live guarantee, so
+`cmd/ocu-filestored/timeout_consumer_test.go` reds on any duration constant the
+product declares and no product source reads.
 
 ---
 

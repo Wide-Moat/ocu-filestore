@@ -206,15 +206,14 @@ const (
 	defaultFDCeiling     = int32(256)
 )
 
-// Lifecycle deadlines: the two engine lifecycle calls run under bounded
-// contexts — never context.Background() bare — so a hung backend can never
-// wedge startup or teardown indefinitely. Teardown sweeps a whole scope on a
-// network engine (paginated listings, batched deletes), so its bound is
-// generous but finite.
-const (
-	provisionTimeout = 1 * time.Minute
-	teardownTimeout  = 10 * time.Minute
-)
+// provisionTimeout bounds the one engine lifecycle call the daemon makes. The
+// boot scaffold runs under a context carrying this deadline — never a bare
+// context.Background() — so a hung backend cannot wedge startup indefinitely.
+//
+// There is no teardown bound because there is no teardown call: erase is keyed
+// to an owner change, and no product path invokes the engine's scope-erase verb
+// (the ledger is cmd/ocu-filestored/erase_trigger_test.go).
+const provisionTimeout = 1 * time.Minute
 
 // defaultNorthBind is the loopback bind the north Files-API listener (Mount B)
 // falls back to when cfg.northBind is empty. It matches the --north-bind flag

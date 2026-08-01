@@ -1055,35 +1055,11 @@ func TestTeardownServerCloseDoesNotEraseScope(t *testing.T) {
 	}
 }
 
-// TestTeardownLifecycleCtxCarriesDeadline pins the bounded-lifecycle rollback
-// contract: the rollback latch's TeardownScope call in compose uses a context
-// bounded by teardownTimeout — never a bare context.Background(). A hung backend
-// sweep can therefore never wedge startup indefinitely. This is exercised
-// through the rollback path rather than through teardownServer.Close, which no
-// longer calls TeardownScope.
-func TestTeardownLifecycleCtxCarriesDeadline(t *testing.T) {
-	// The bounded-deadline guarantee now lives in the rollback latch defer in
-	// compose(). teardownTimeout is a named constant (not derived from a flag),
-	// so this test simply asserts it is positive and documents the contract.
-	if teardownTimeout <= 0 {
-		t.Fatalf("teardownTimeout = %v; want > 0 (rollback latch must be bounded)", teardownTimeout)
-	}
-}
-
-// TestLifecycleTimeoutsBounded pins that both lifecycle bounds are finite,
-// positive, and ordered (teardown sweeps a whole scope on a network engine,
-// so its bound is the generous one).
-func TestLifecycleTimeoutsBounded(t *testing.T) {
-	if provisionTimeout <= 0 {
-		t.Fatalf("provisionTimeout = %v; want > 0", provisionTimeout)
-	}
-	if teardownTimeout <= 0 {
-		t.Fatalf("teardownTimeout = %v; want > 0", teardownTimeout)
-	}
-	if teardownTimeout < provisionTimeout {
-		t.Fatalf("teardownTimeout %v < provisionTimeout %v; the scope sweep bound must be the generous one", teardownTimeout, provisionTimeout)
-	}
-}
+// The two lifecycle-timeout tests that stood here asserted that a constant is
+// greater than zero, and one of them documented a rollback-latch TeardownScope
+// call that no longer exists. The bound that remains has a real subject and is
+// checked against the wiring in
+// cmd/ocu-filestored/timeout_consumer_test.go:TestBootProvisionRunsUnderTheBoundedContext.
 
 // TestLogLevelFlagRefusesUnknown pins that validate refuses an unknown
 // -log-level token with errBadLogLevel BEFORE any socket is bound.
