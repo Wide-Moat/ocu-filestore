@@ -529,16 +529,6 @@ components:
           type: string
           format: date-time
           description: RFC-3339 UTC store-clock creation time from the handle record.
-        sha256:
-          type: string
-          pattern: '^[0-9a-f]{64}$'
-          description: >-
-            Lowercase-hex SHA-256 of the stored content (D6, ADR-0025 content-hash
-            manifest). Additive and OPTIONAL: omitted (never null) when the store did
-            not surface a digest, so a pre-D6 client and a store that omits it both stay
-            contract-conformant. Not in `required`, so its addition does not break the
-            frozen shape; declared here because `additionalProperties: false` would
-            otherwise reject the emitted field.
 
     # FileListEnvelope is the frozen list shape: {data, has_more, first_id, last_id,
     # next_cursor}. The forward cursor is the OPAQUE next_cursor token — the durable
