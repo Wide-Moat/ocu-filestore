@@ -55,13 +55,60 @@ import (
 // eraseVerb is the engine method whose product-side wiring this ledger tracks.
 const eraseVerb = "TeardownScope"
 
-// eraseDenialTail is the trailing half of an honest denial: the erase verb
-// followed, through at most a copula, by the word that denies it. It is what
-// lets "TeardownScope has no product caller at all" acquit a claim pattern that
-// only saw the verb preceded by "calls". The copula gap is deliberately narrow
-// — a negation further along the sentence belongs to a different clause and may
-// not launder a claim about the verb itself.
-const eraseDenialTail = `[ \t]+(?:has|had|is|are|was|were|gets?|does|do|did)?[ \t]*\b(?:never|no|not|nothing|neither)\b`
+// sentenceDenial builds the honest-denial acquittal for a claim about `subject`:
+// a SENTENCE that both names the subject and denies something, in either order.
+// The span runs to the sentence's own bounds, so a claim pattern that matched
+// inside that sentence falls inside the acquittal and is dropped.
+//
+// Sentence-wide is the calibrated width. An earlier form required the denial to
+// attach to the subject through at most a copula, and it turned honest text into
+// red: "TeardownScope is implemented by both engines but reached by no product
+// path" denies the caller in as plain a sentence as English has, and was
+// reported as a lie because the denial arrives four words late. A guard that
+// punishes a true sentence is a guard someone switches off.
+//
+// The stated limit of the wider form: a sentence that makes a claim and denies
+// something ELSE in the same breath is acquitted too — "Close runs TeardownScope,
+// so no bytes are left behind" clears the arm on the strength of a "no" that is
+// about the bytes, not about the call. Splitting clauses is beyond a regex, and
+// between the two failure modes this is the one that costs a reader nothing: it
+// under-reports a rare compound sentence rather than over-reporting every plain
+// denial.
+//
+// Not every arm can take this form, and validate() is what decides. The
+// teardown-partner arm's own claim is phrased as a never-rule, so the general
+// form would be acquitted by that arm's own lie; it keeps a bespoke acquittal
+// and validate() reds if the general form is ever pasted over it.
+//
+// It returns the pattern, not a compiled expression, so an arm can OR it
+// together with an acquittal of its own.
+func sentenceDenial(subject string) string {
+	const negation = `\b(?:never|no|not|nothing|neither|nor|none)\b`
+	return `[^.\n]*(?:` + negation + `[^.\n]*(?:` + subject + `)|(?:` + subject + `)[^.\n]*` + negation + `)[^.\n]*`
+}
+
+// eraseAttribution is what turns a lifecycle word standing near the erase verb
+// into a CLAIM that the lifecycle moment performs it: an enumeration opener —
+// a bracket, a colon, a dash, an equals — introducing the verb within at most
+// two qualifier words, the way the docstring this arm was built for enumerated
+// what a Close does: "Closes it for teardown (engine <the erase verb> +
+// registry/ceilings Release)". The verb is written as a placeholder here for the
+// same reason the stop-deadline guard writes its prose examples with one: an
+// example that spells the identifier out IS the claim, and this file is inside
+// the corpus it scans.
+//
+// Requiring the marker is the calibration. Mere co-occurrence is not a claim:
+// "Close is the lifecycle counterpart of ProvisionScope, while TeardownScope is
+// the engine's erase verb" is a definition, names no call, and was reported as a
+// lie by a pattern that asked only for a lifecycle word within sixty characters
+// of the identifier.
+//
+// The stated limit: a claim that joins the two with no connector at all
+// ("Close and TeardownScope run together") is invisible to this arm. The
+// explicit-verb shapes — runs, calls, invokes, triggers — belong to
+// product-path-runs-the-erase-verb, which is where a sentence that spells the
+// call out is caught.
+const eraseAttribution = "(?:[(\\[:=]|—|--)[ \t`*_\"']*(?:\\w+[ \t`*_\"']+){0,2}"
 
 // eraseCallSite is one syntactic call of the erase verb.
 type eraseCallSite struct {
@@ -286,8 +333,11 @@ var erasePromises = []erasePromise{
 		lie: "This is the erase-at-provision path.",
 		// Prose that names the semantics as RETIRED is the opposite of a promise:
 		// it tells the reader the erase is gone and often explains what an
-		// assertion would have looked like while it was there.
-		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:retired|removed|deleted|dropped|former(?:ly)?|old|previous(?:ly)?|superseded|no longer|never|not)\b[^.\n]*erase[-\s]at[-\s]provision`),
+		// assertion would have looked like while it was there. The retired
+		// vocabulary is not a denial, so it is spelled out here; a plain denial
+		// on either side of the phrase is acquitted by the general form.
+		except: regexp.MustCompile(`(?i)[^.\n]*\b(?:retired|removed|deleted|dropped|former(?:ly)?|old|previous(?:ly)?|superseded|no longer)\b[^.\n]*erase[-\s]at[-\s]provision|` +
+			sentenceDenial(`erase[-\s]at[-\s]provision`)),
 		acquitted: "On the retired erase-at-provision semantics the scope booted empty.",
 		truth:     "ProvisionScope is ensure-scaffold-if-absent: it creates the scope when absent and sweeps only the staging sub-directory. Owner data at the scope root survives every provision.",
 	},
@@ -333,8 +383,8 @@ var erasePromises = []erasePromise{
 		re: regexp.MustCompile(`(?i)\bscopes?\b[^.\n]{0,60}\btorn down\b|\b(?:torn|tears?|tearing)[- ]down\b[^.\n]{0,60}\bscopes?\b`),
 		lie: "If session compose fails after the scope is provisioned, the scope is torn down " +
 			"before the error returns.",
-		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing)\b[^.\n]*\b(?:torn|tears?|tearing)[- ]down\b`),
-		acquitted: "A provisioned scope is never torn down.",
+		except:    regexp.MustCompile(`(?i)` + sentenceDenial(`\b(?:torn|tears?|tearing)[- ]down\b`)),
+		acquitted: "A provisioned scope is torn down by nothing on the stop path.",
 		truth:     "The post-provision rollback latch is release-only: it closes the durable handle-store descriptor and leaves the scope exactly as provisioned. A scope outlives the composition that provisioned it and the process that served it.",
 	},
 	{
@@ -349,12 +399,11 @@ var erasePromises = []erasePromise{
 			"construction error runs `TeardownScope` before returning `nil, err`.",
 		// The denial acquits from EITHER side of the identifier: a sentence can
 		// name the verb and only then deny it a caller, and reading only up to
-		// the semicolon turns that denial into a claim. The trailing form is
-		// deliberately tight — the negation must attach to the verb through at
-		// most a copula, so a negation stranded in a later clause ("... on
-		// rollback, so nothing leaks") cannot launder a claim about the verb.
-		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb + `|[^.\n]*` + eraseVerb + eraseDenialTail),
-		acquitted: "Nothing in the product calls `TeardownScope`.",
+		// the semicolon turns that denial into a claim. The canonical instance
+		// is one the earlier, copula-tight form got wrong — the denial lands
+		// nine words after the verb and is no less a denial for it.
+		except:    regexp.MustCompile(`(?i)` + sentenceDenial(eraseVerb)),
+		acquitted: "The compose path calls ProvisionScope; " + eraseVerb + " is implemented by both engines but reached by no product path.",
 		truth:     "No product path calls the verb — not compose, not the rollback latch, not Close. The engines implement it and the tests exercise it; nothing else reaches it.",
 	},
 	{
@@ -364,13 +413,15 @@ var erasePromises = []erasePromise{
 		// `TeardownScope`, and prose that says "Close tears down (engine
 		// TeardownScope)" names the erase without ever writing "scope" as a word.
 		// This arm keys on the lifecycle moment instead: a stop, a close or a
-		// teardown said to carry the erase verb with it.
+		// teardown said to CARRY the erase verb with it, which is eraseAttribution
+		// — the enumeration marker that separates a claim from a definition.
 		id: "lifecycle-carries-the-erase-verb",
-		re: regexp.MustCompile(`(?i)\b(?:close[sd]?|closing|shut[- ]?down|shuts down|stop(?:s|ped|ping)?|teardown|tears?[- ]down|torn[- ]down|tearing[- ]down|exit(?:s|ing)?)\b[^.\n]{0,60}\b` + eraseVerb + `\b`),
+		re: regexp.MustCompile(`(?i)\b(?:close[sd]?|closing|shut[- ]?down|shuts down|stop(?:s|ped|ping)?|teardown|tears?[- ]down|torn[- ]down|tearing[- ]down|exit(?:s|ing)?)\b[^.\n]{0,60}` +
+			eraseAttribution + eraseVerb + `\b`),
 		lie: "the caller serves the returned Server and Closes it for teardown " +
 			"(engine " + eraseVerb + " + registry/ceilings Release).",
-		except:    regexp.MustCompile(`(?i)[^.\n]*\b(?:never|no|not|nothing|neither)\b[^.\n]*` + eraseVerb + `|[^.\n]*` + eraseVerb + eraseDenialTail),
-		acquitted: "Close does NOT call TeardownScope: shutdown is not an owner change.",
+		except:    regexp.MustCompile(`(?i)` + sentenceDenial(eraseVerb)),
+		acquitted: "Close is the stop path: " + eraseVerb + " is implemented by both engines but reached by no product path.",
 		truth:     "Close drains, releases the ceilings entry and closes the handle-store fd. No lifecycle moment — not close, not stop, not exit — reaches the erase verb.",
 	},
 	{
@@ -383,6 +434,32 @@ var erasePromises = []erasePromise{
 		acquitted: "There is no teardown partner.",
 		truth:     "Provisioning arms nothing. No path pairs a provisioned scope with a later teardown, because no owner-change event exists for one to hang on.",
 	},
+}
+
+// eraseHonestProse is prose that tells the reader the truth. No promise may hit
+// any of it.
+//
+// It is the ledger's third direction, and the one a ledger like this usually
+// lacks. The two arms above pin what a lie looks like; without this list nothing
+// pins what a TRUTH looks like, and every widening of a claim pattern is free to
+// buy its recall with false reds. False reds are the expensive failure here: an
+// author whose honest sentence is called a lie edits the sentence to appease the
+// regex, or deletes the guard.
+//
+// The first four are the sentences a calibration pass wrote into a daemon source
+// file to find out; two of them were reported as lies, and the two arms they hit
+// are the ones eraseAttribution and sentenceDenial now calibrate. The rest are
+// the honest denials the acquittals must cover from either side of the verb.
+var eraseHonestProse = []string{
+	"on stop the daemon drains; " + eraseVerb + " is implemented by both engines but reached by no product path.",
+	"Close is the lifecycle counterpart of ProvisionScope, while " + eraseVerb + " is the engine's erase verb.",
+	eraseVerb + " exists on both engines: the local-volume engine removes the scope directory and the S3 engine deletes the prefix.",
+	"the stop path closes both listeners and releases the ceilings entry; nothing on it reaches " + eraseVerb + ".",
+	"Nothing in the product calls `" + eraseVerb + "`.",
+	"Close does NOT call " + eraseVerb + ": shutdown is not an owner change.",
+	"A provisioned scope is never torn down.",
+	"There is no teardown partner.",
+	"On the retired erase-at-provision semantics the scope booted empty.",
 }
 
 // erasePromiseCorpus is the prose this repository SHIPS: the docs a reader
@@ -593,6 +670,19 @@ func TestDocsDoNotPromiseAnUnwiredErase(t *testing.T) {
 	// acquittal must cover its own denial without covering the claim.
 	for _, p := range erasePromises {
 		p.validate(t)
+	}
+
+	// And no arm may call an honest sentence a lie. This runs before the corpus
+	// so a widening that buys recall with false reds is reported against the
+	// sentence it misreads, not against whichever shipped file happens to carry
+	// one first.
+	for _, honest := range eraseHonestProse {
+		for _, p := range erasePromises {
+			for _, m := range p.hits(honest) {
+				t.Errorf("promise %q reports honest prose as a lie: %q\n  sentence: %s\n  a guard that reds on a true sentence is a guard an author edits the sentence to appease, or switches off",
+					p.id, honest[m[0]:m[1]], honest)
+			}
+		}
 	}
 
 	if sites := scanEraseCallSites(t, root, false); len(sites) != 0 {
