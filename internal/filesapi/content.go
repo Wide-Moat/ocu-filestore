@@ -81,7 +81,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
 	grant, rerr := h.deps.Resolver.Resolve(r.Context(), evidence, req)
 	if rerr != nil {
-		h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.IntentDenied, "authorization denied", reqID)
+		h.denyRead(w, r, reqLog, opContent, ps, rec, grant, denyclass.IntentDenied, "authorization denied", reqID)
 		return
 	}
 
@@ -89,7 +89,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 	// flag is never consulted. A non-downloadable grant denies 403 and
 	// engine.ReadRange is NEVER reached. ---
 	if !grant.Downloadable {
-		h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.NotDownloadable, "object not downloadable", reqID)
+		h.denyRead(w, r, reqLog, opContent, ps, rec, grant, denyclass.NotDownloadable, "object not downloadable", reqID)
 		return
 	}
 
@@ -97,7 +97,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 	offset, length, rangeOK := parseContentRange(r)
 	if !rangeOK {
 		// A negative offset/length is a malformed window (client request fault).
-		h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.Malformed, "negative range offset or length", reqID)
+		h.denyRead(w, r, reqLog, opContent, ps, rec, grant, denyclass.Malformed, "negative range offset or length", reqID)
 		return
 	}
 	if !hasLength(r) {
@@ -108,7 +108,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 		// single deny, never allow-then-deny.
 		info, serr := h.deps.Engine.Stat(r.Context(), ps.FilesystemID, engPath)
 		if serr != nil {
-			h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.NotFound, "not found", reqID)
+			h.denyRead(w, r, reqLog, opContent, ps, rec, grant, denyclass.NotFound, "not found", reqID)
 			return
 		}
 		// length = info.Size - offset, clamped to >= 0: an offset at or past EOF
@@ -151,11 +151,28 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 	}
 }
 
-// denyContent emits the deny audit (broker-resolved truth) then the REST deny
-// response. It is the PRE-byte refusal path: only ever called before the 200
-// header is committed, so it can always write a real HTTP status. A deny-Mandate
-// FAILURE degrades the verdict to unavailable (NFR-SEC-79): if the deny record
-// did not durably land, the verdict the caller sees must be audit-down.
+// opContent / opMetadata name the north read verb a denyRead refusal concerns.
+// They populate the log's op field so one shared deny path stays honest about
+// which verb was refused; they are LOG labels, never audit or wire values (the
+// OCSF record carries no verb axis — see denyRead).
+const (
+	opContent  = "content"
+	opMetadata = "metadata"
+)
+
+// denyRead emits the read-class deny audit (broker-resolved truth) then the REST
+// deny response, for either north verb that refuses a RESOLVED record: content
+// and metadata. Both name the same object in the same Read-class event
+// (readDenyEvent over the record's backend reference), so they share one refusal
+// path rather than two byte-identical ones; the list verb keeps its own
+// (denyList) because its event names the scope root, not a record.
+//
+// It is the PRE-ack refusal path: on the content verb it is only ever called
+// before the 200 header is committed and on the metadata verb before the
+// FileObject is written, so it can always write a real HTTP status. A
+// deny-Mandate FAILURE degrades the verdict to unavailable (NFR-SEC-79): if the
+// deny record did not durably land, the verdict the caller sees must be
+// audit-down.
 //
 // The wire verdict for a non-downloadable / intent-denied refusal is the
 // authorization status (403); for a malformed range it is 400; for a vanished
@@ -163,8 +180,9 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 // the file_id ALREADY resolved (the record exists in scope); these are
 // downstream authorization/argument/engine verdicts on a resolved object, not a
 // cross-scope-vs-absent distinction.
-func (h *Handler) denyContent(w http.ResponseWriter, r *http.Request, reqLog *slog.Logger, ps southface.PeerScope, rec handlestore.Record, grant southface.Grant, auditReason, message, reqID string) {
-	reqLog.Warn("files-api content deny",
+func (h *Handler) denyRead(w http.ResponseWriter, r *http.Request, reqLog *slog.Logger, op string, ps southface.PeerScope, rec handlestore.Record, grant southface.Grant, auditReason, message, reqID string) {
+	reqLog.Warn("files-api read deny",
+		slog.String(observ.KeyOp, op),
 		slog.String(observ.KeyDenyClass, auditReason),
 		slog.String(observ.KeyReason, message))
 	ev := readDenyEvent(ps, rec, grant, auditReason, reqID)

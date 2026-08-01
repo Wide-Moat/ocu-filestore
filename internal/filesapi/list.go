@@ -187,7 +187,7 @@ func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface
 // before the reconcile, so it can always write a real HTTP status and the
 // durable store is untouched. A deny-Mandate FAILURE degrades the verdict to
 // audit_down (NFR-SEC-79): if the deny record did not durably land, the verdict
-// the caller sees must be audit-down, mirroring denyContent.
+// the caller sees must be audit-down, mirroring denyRead.
 func (h *Handler) denyList(w http.ResponseWriter, r *http.Request, reqLog *slog.Logger, ps southface.PeerScope, grant southface.Grant, auditReason, message, reqID string) {
 	reqLog.Warn("files-api list deny",
 		slog.String(observ.KeyDenyClass, auditReason),

@@ -25,13 +25,79 @@ import (
 // incapable of returning 403/scope_mismatch on the file_id path. A store-latch
 // fault (ErrStoreUnavailable) is a broker-internal 503, never a client deny.
 //
-// downloadable is omitted from the FileObject (resolved at read only, NFR-SEC-73).
+// Order of operations (every clause load-bearing, mirroring the content verb):
+//
+//   - ops/s charge FIRST (NFR-SEC-46), before the store is read: an exhausted
+//     bucket costs no handle resolution.
+//   - Store.Get(file_id, attestedScope) -> Record | keystone 404. An unresolved
+//     file_id records NO activity: it named no object in this scope, so there is
+//     nothing honest to record — and a record of it would rebuild, in the durable
+//     chain, the absent-vs-foreign distinction the keystone erases on the wire.
+//   - enginePath normalises the stored ObjectRef as defense-in-depth; a reference
+//     that does not normalise names no in-tree object, so the metadata verb
+//     refuses it not_found rather than describing it.
+//   - Resolve(intent=read) from the attested scope: the three axes are re-derived
+//     broker-side per request, deny-by-default. The record ALREADY resolved in
+//     scope at this point, so a 403 here is a downstream authorization verdict on
+//     a resolved object, never the keystone's absent-vs-foreign distinction.
+//   - Mandate the ALLOW BEFORE the FileObject reaches the caller
+//     (audit-before-ack, SEC-79): an audit-down denies 503 and the record the
+//     caller asked about never leaves the broker.
+//
+// downloadable is NOT gated here: metadata emits no object bytes, so the
+// NFR-SEC-73 egress gate stays on the two byte-emitting north verbs (content and
+// archive). The resolved value is RECORDED on the event and stays omitted from
+// the FileObject (resolved at read, never stamped at write).
 func (h *Handler) serveMetadata(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, fileID, reqID string, reqLog *slog.Logger) {
+	// --- ops/s throttle, keyed on the CHANNEL scope (mirrors the content read
+	// path). It is charged BEFORE the store so a refused request costs no handle
+	// resolution. ---
+	sess := h.deps.Ceilings.Session(ps.FilesystemID)
+	if err := sess.TryConsumeOp(); err != nil {
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Throttle), "operation rate ceiling exceeded")
+		return
+	}
+
+	// --- file_id resolution (keystone: absent == cross-scope == ErrNotFound) ---
 	rec, err := h.deps.Store.Get(r.Context(), fileID, ps.FilesystemID)
 	if err != nil {
 		writeResolutionDeny(w, reqLog, err, reqID)
 		return
 	}
+
+	// enginePath normalises the opaque backend ObjectRef into the engine's
+	// relative convention as defense-in-depth; an ObjectRef that normalises to an
+	// empty or escaping path is a not_found-class refusal, exactly as on the
+	// content path. It is also the path the authorization question below is asked
+	// about, so the resolver is never handed a dirty reference.
+	engPath, ok := enginePath(rec.ObjectRef)
+	if !ok {
+		reqLog.Info("files-api metadata: object reference does not normalise",
+			slog.String(observ.KeyDenyClass, denyclass.NotFound))
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.NotFound), "not found")
+		return
+	}
+
+	// --- authz Resolve(intent=read) from the attested scope ---
+	req := southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: engPath, Intent: southface.IntentRead}
+	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
+	grant, rerr := h.deps.Resolver.Resolve(r.Context(), evidence, req)
+	if rerr != nil {
+		h.denyRead(w, r, reqLog, opMetadata, ps, rec, grant, denyClassForResolveErr(rerr), "authorization denied", reqID)
+		return
+	}
+
+	// --- audit ALLOW before the FileObject is acknowledged (SEC-79) ---
+	allow := readAllowEvent(ps, rec, grant, reqID)
+	if merr := h.deps.Guard.Mandate(r.Context(), allow); merr != nil {
+		// The allow Mandate itself failed (audit down). Deny before the record
+		// reaches the caller; do NOT re-Mandate a deny (the gate is unavailable).
+		reqLog.Error("files-api metadata: allow audit failed before the file object",
+			slog.String(observ.KeyDenyClass, denyclass.AuditDown))
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.AuditDown), "audit gate unavailable")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, newFileObject(rec))
 }
 
