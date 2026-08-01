@@ -39,11 +39,20 @@ import (
 // shipped number shrinks, and neither side is written down twice: the durations
 // come from the Go source by AST, the deadlines from the tree by scan.
 //
-// A deadline counts as stated whether it is spelled as a manifest key or in
-// English. An operator who reads only deploy/README.md gets the stop budget from
-// a sentence, and a sentence that quotes a superseded figure misinforms exactly
-// the same reader the keys inform. The prose dialect in deadlineDialects is what
-// holds those sentences to the same derivation.
+// A deadline counts as stated wherever it is written and in whatever dialect.
+// An operator who reads only a README gets the stop budget from a sentence, and
+// a sentence that quotes a superseded figure misinforms exactly the same reader
+// the keys inform. So the English dialect reads sentences, and the systemd
+// dialect is unanchored: the same key restated inside backticks mid-paragraph is
+// the same claim as the key in the unit file, and holding the second to a line
+// anchor let three prose sites — the front page among them — understate the
+// shipped budget by 10 s while the guard reported a clean scan.
+//
+// Recall and precision are pinned against each other. Every dialect must still
+// read its own `samples`, and no dialect may read a value out of
+// innocentDurationProse: the tree is full of honest sentences about the 25 s
+// drain, the 5 s ops close and the 30 s worst case, and a pattern that reads one
+// of those as a deadline reds the build against a true sentence.
 //
 // The model it derives is only honest while the two data-plane listeners close
 // CONCURRENTLY — that is what makes the drain term a max instead of a sum.
@@ -203,17 +212,57 @@ func worstCaseStopCost(t *testing.T, root string) (time.Duration, string) {
 	return total, derivation
 }
 
-// deadlineDialect is one way of spelling a stop deadline — four of them are a
-// service manager's key, the fifth is English. Exactly one capture group is
-// non-empty per match and it holds the whole-second value. `sample` is a
-// canonical instance the pattern must still match: a rotted pattern matches
-// nothing at all and would otherwise report a clean scan forever.
+// deadlineDialect is one way of spelling a stop deadline — three of them are a
+// service manager's manifest key, the fourth is that key restated in prose, the
+// fifth is English. Exactly one capture group is non-empty per match and it
+// holds the whole-second value.
+//
+// `samples` are canonical instances the pattern must still read: a rotted
+// pattern matches nothing at all and would otherwise report a clean scan
+// forever. Every dialect is also held against innocentDurationProse from the
+// other side, because a pattern that reads too much is as useless as one that
+// reads nothing — it reds on honest sentences until someone deletes it.
 type deadlineDialect struct {
-	kind   string
-	re     *regexp.Regexp
-	sample string
-	want   int
+	kind    string
+	re      *regexp.Regexp
+	samples []deadlineSample
 }
+
+// deadlineSample is one instance a dialect must still read, and the
+// whole-second value it carries.
+type deadlineSample struct {
+	text string
+	want int
+}
+
+// The pieces the English dialect is built from. They are named because two
+// branches share them and because each one is a decision.
+const (
+	// wordGap separates two words of one statement. Prose WRAPS, so it crosses
+	// at most one line break: the shipped sentence that states the k8s and
+	// compose budget puts "carry the" at the end of one line and "same 35 s" at
+	// the start of the next, and a gap that stopped at the newline would read
+	// neither half.
+	wordGap = `(?:[ \t]+|[ \t]*\n[ \t]*)`
+	// markupRun is the decoration that can sit between a key and the words
+	// around it — a closing code tick, an emphasis marker, a quote.
+	markupRun = "[`*_\"']*"
+	// secondsValue is a whole-second value written for a READER rather than for
+	// a parser: the digits, an optional space, and either the bare `s` suffix or
+	// the spelled-out unit. The space is what made "35 s" invisible to a pattern
+	// that demanded `(\d+)s`, and "35 s" is how the front page writes it.
+	secondsValue = `(\d+)[ \t]*(?:s\b|seconds?\b)`
+	// deadlineTail is what follows the NAME of the grace: an optional connector
+	// — a colon, a copula, a "carries the same" — and then the value. Every
+	// connector is spelled out. A gap that accepted any words at all would read
+	// "the stop grace covers the 30s drain" as a 30-second grace, and that
+	// sentence is honest: the 30 s belongs to the drain.
+	deadlineTail = markupRun + `(?:` +
+		`[ \t]*:` +
+		`|` + wordGap + `(?:of|is|are|at|was|were|set` + wordGap + `to)` +
+		`|` + wordGap + `(?:\w+` + wordGap + `)?the` + wordGap + `same` +
+		`)?` + wordGap + secondsValue
+)
 
 // seconds returns the whole-second value a match carries. An alternation spells
 // the number in a different group per branch, so the value is the first
@@ -231,48 +280,104 @@ func (d deadlineDialect) seconds(m []string) (int, error) {
 
 var deadlineDialects = []deadlineDialect{
 	{
-		kind:   "systemd TimeoutStopSec",
-		re:     regexp.MustCompile(`(?m)^TimeoutStopSec=(\d+)s?[ \t]*$`),
-		sample: "TimeoutStopSec=35s",
-		want:   35,
+		// Not line-anchored, because the unit file is not the only place this key
+		// is stated with a value. docs/operations.md restates it inside backticks
+		// mid-sentence, to tell an operator what the contrib unit sets, and a
+		// pattern anchored to the start and end of a line could not see it: the
+		// restatement understated the budget by 10 s and the guard reported a
+		// clean scan. A key is a key wherever it is written down.
+		kind: "systemd TimeoutStopSec",
+		re:   regexp.MustCompile(`\bTimeoutStopSec[ \t]*=[ \t]*(\d+)s?\b`),
+		samples: []deadlineSample{
+			{"TimeoutStopSec=35s", 35},
+			{"the contrib unit sets `TimeoutStopSec=35s`, above the worst case", 35},
+		},
 	},
 	{
-		kind:   "k8s terminationGracePeriodSeconds",
-		re:     regexp.MustCompile(`(?m)^[ \t]*terminationGracePeriodSeconds:[ \t]*(\d+)[ \t]*$`),
-		sample: "      terminationGracePeriodSeconds: 35",
-		want:   35,
+		kind: "k8s terminationGracePeriodSeconds",
+		re:   regexp.MustCompile(`(?m)^[ \t]*terminationGracePeriodSeconds:[ \t]*(\d+)[ \t]*$`),
+		samples: []deadlineSample{
+			{"      terminationGracePeriodSeconds: 35", 35},
+		},
 	},
 	{
-		kind:   "compose stop_grace_period",
-		re:     regexp.MustCompile(`(?m)^[ \t]*stop_grace_period:[ \t]*(\d+)s[ \t]*$`),
-		sample: "    stop_grace_period: 35s",
-		want:   35,
+		kind: "compose stop_grace_period",
+		re:   regexp.MustCompile(`(?m)^[ \t]*stop_grace_period:[ \t]*(\d+)s[ \t]*$`),
+		samples: []deadlineSample{
+			{"    stop_grace_period: 35s", 35},
+		},
 	},
 	{
-		// The English dialect. An operator reading deploy/README.md learns the
-		// stop budget from a sentence, not from a manifest key, and a sentence
-		// drifts on its own schedule: the four keys above were raised in one
-		// commit and a README went on quoting the superseded figure, understating
-		// the budget by the exact margin that had been added to cover the second
+		// The English dialect. An operator reading a README learns the stop budget
+		// from a sentence, not from a manifest key, and a sentence drifts on its
+		// own schedule: the manifest keys were raised in one commit and three
+		// prose sites went on quoting the superseded figure, understating the
+		// budget by the exact margin that had been added to cover the second
 		// listener. A number stated in prose is a shipped number.
 		//
-		// The pattern is deliberately narrow. It is NOT enough for a number and
-		// the word "stop" to share a sentence: the tree is full of honest prose
-		// about the 30 s worst case, the 25 s drain and the 5 s ops close, and
-		// every one of those would be a false red. The number must be ADJACENT to
-		// the phrase "stop grace" — either just before it ("the <N>s stop grace")
-		// or just after the key it names ("stop_grace_period <N>s") — because that
-		// adjacency is what makes the sentence a statement of the GRACE rather
-		// than of some other duration on the stop path. The examples are written
-		// with a placeholder on purpose: an English pattern matches English, and
-		// a real number here would enter the scan as a shipped deadline. The one
-		// instance that SHOULD is `sample`, and it is declared as such below.
+		// The pattern is built out of deadlineTail, and it is narrow by
+		// construction: it is NOT enough for a number and the word "stop" to
+		// share a sentence. The value must be ADJACENT to the name of the grace —
+		// just before it ("the <N>s stop grace"), or after it through a connector
+		// this file spells out one by one ("stop grace: <N>s", "a stop grace of
+		// <N> seconds", "the compose key and the k8s key carry the same <N> s").
+		// The third branch reads the other word order, the one the front page and
+		// the operations guide both use: "the grace period on stop is <N>s".
+		//
+		// The examples above are written with a placeholder on purpose: an English
+		// pattern matches English, and a real number in a comment would enter the
+		// scan as a shipped deadline. The instances that SHOULD are `samples`, and
+		// this file is declared in the ledger as carrying them.
+		//
+		// Stated limits. A connector the list does not name leaves the sentence
+		// unread ("the compose key and the k8s key are both <N> s" states a
+		// deadline this dialect does not see), and so does a value more than one
+		// line break from the name it belongs to. Widening either one is what
+		// would start reading honest sentences about the drain, the poll interval
+		// and the CI job as stop deadlines, which innocentDurationProse pins.
 		kind: "prose stop grace",
-		re: regexp.MustCompile(`(?i)(?:\b(\d+)s[ \t]+stop[-_ ]grace\b` +
-			`|\bstop[-_ ]grace(?:[-_ ]period)?[ \t]+(?:of[ \t]+|is[ \t]+|at[ \t]+)?(\d+)s\b)`),
-		sample: "the 35s stop grace above the daemon's worst-case stop",
-		want:   35,
+		re: regexp.MustCompile(`(?i)(?:` +
+			secondsValue + wordGap + `stop[-_ ]grace\b` +
+			`|\bstop[-_ ]grace(?:[-_ ]period)?\b` + deadlineTail +
+			`|\bgrace(?:[-_ ]period)?` + wordGap + `on` + wordGap + `stop\b` + deadlineTail +
+			`)`),
+		samples: []deadlineSample{
+			{"the 35s stop grace above the daemon's worst-case stop", 35},
+			{"a stop grace of 35 seconds", 35},
+			{"stop grace: 35s", 35},
+			{"the grace period on stop is 35s", 35},
+			{"`stop_grace_period` is 35 s, above the daemon's worst case", 35},
+			// The wrapped form. Prose puts the connector at the end of one line
+			// and the value at the start of the next; this instance is written
+			// with an escape so it exercises the wrap in the pattern check
+			// without entering the scan as a fifth number in this file. The live
+			// proof that the wrap is read is the ledger entry for
+			// docs/operations.md, which states its budget exactly this way and
+			// would report a stale entry if the wrap stopped matching.
+			{"the compose `stop_grace_period` carry the\nsame 35 s", 35},
+		},
 	},
+}
+
+// innocentDurationProse is prose that states a duration which is NOT a stop
+// deadline. No dialect may read a value out of any of it.
+//
+// It is the recall widening's counterweight and it is not optional. Every
+// sentence here was written to sit one word away from a real statement of the
+// grace: the drain and the ops close are the two terms the grace is DERIVED
+// from, "the stop grace covers the 30s drain" names the grace and a number in
+// one breath without stating the grace, and "a 30s grace" is the grace's own
+// noun with the qualifier that makes it a stop deadline missing. A dialect that
+// reads any of them reports a false deadline, and a false deadline is a red
+// build against an honest sentence.
+var innocentDurationProse = []string{
+	"the 5s poll interval",
+	"a 90s CI job",
+	"30 s in the worst case",
+	"the 25s drain plus the 5s ops close",
+	"the client retries every 10s with a 3s timeout and gives up after 60s",
+	"the stop grace covers the 30s drain",
+	"this deployment once inherited a 30s grace before the second listener landed",
 }
 
 // shippedStopDeadlines is the ledger of files that carry a stop deadline, and
@@ -291,13 +396,21 @@ var shippedStopDeadlines = map[string][]string{
 	"deploy/docker-compose.yml":              {"compose stop_grace_period", "prose stop grace"},
 	"deploy/docker-compose.fleet.yml":        {"compose stop_grace_period", "prose stop grace"},
 	"deploy/README.md":                       {"prose stop grace"},
-	// The prose dialect's own canonical instance. Unlike the four key dialects,
-	// whose patterns are line-anchored and so cannot match their own sample
-	// sitting on a `sample:` line, an English pattern matches English wherever it
-	// is written — including here. Declaring it is the honest resolution: the
-	// scan gets no self-exemption, and the sample is held to the same worst-case
-	// coverage as a shipped number, which is what makes it canonical.
-	"cmd/ocu-filestored/stop_deadline_test.go": {"prose stop grace"},
+	// The repository's front page states the compose grace in a sentence, and
+	// the operations guide states it twice more: once as the systemd key
+	// restated inside backticks, once as the k8s and compose keys carrying the
+	// same figure across a line break. All three were invisible until the
+	// dialects above were widened, and all three go stale the moment a manifest
+	// is raised without them. README.md is the first page a reader sees.
+	"README.md":          {"prose stop grace"},
+	"docs/operations.md": {"prose stop grace", "systemd TimeoutStopSec"},
+	// This guard's own canonical instances. Unlike the two YAML dialects, whose
+	// patterns are line-anchored and so cannot match a sample sitting inside a
+	// Go literal, an English sentence and an unanchored key match wherever they
+	// are written — including here. Declaring them is the honest resolution: the
+	// scan gets no self-exemption, and every sample is held to the same
+	// worst-case coverage as a shipped number, which is what makes it canonical.
+	"cmd/ocu-filestored/stop_deadline_test.go": {"prose stop grace", "systemd TimeoutStopSec"},
 }
 
 // stopDeadline is one deadline found in one shipped file.
@@ -368,13 +481,30 @@ func TestShippedStopDeadlinesCoverWorstCaseStopCost(t *testing.T) {
 	// A pattern that no longer matches its own canonical instance is dead and
 	// would report an empty scan forever.
 	for _, d := range deadlineDialects {
-		m := d.re.FindStringSubmatch(d.sample)
-		if m == nil {
-			t.Fatalf("dialect %q no longer matches its own instance %q; the pattern is dead and the scan is vacuous", d.kind, d.sample)
+		for _, s := range d.samples {
+			m := d.re.FindStringSubmatch(s.text)
+			if m == nil {
+				t.Fatalf("dialect %q no longer matches its own instance %q; the pattern is dead and the scan is vacuous", d.kind, s.text)
+			}
+			got, err := d.seconds(m)
+			if err != nil || got != s.want {
+				t.Fatalf("dialect %q read %v from %q, want %d; the pattern reads the wrong field", d.kind, m[1:], s.text, s.want)
+			}
 		}
-		got, err := d.seconds(m)
-		if err != nil || got != d.want {
-			t.Fatalf("dialect %q read %v from %q, want %d; the pattern reads the wrong field", d.kind, m[1:], d.sample, d.want)
+	}
+
+	// And the other side: no dialect may read a deadline out of a sentence that
+	// states some other duration. This runs before the scan so a widening that
+	// buys recall with false reds is reported against the sentence it misreads.
+	for _, innocent := range innocentDurationProse {
+		for _, d := range deadlineDialects {
+			m := d.re.FindStringSubmatch(innocent)
+			if m == nil {
+				continue
+			}
+			got, _ := d.seconds(m)
+			t.Errorf("dialect %q reads a %ds stop deadline out of %q, which states no stop deadline; the pattern is too wide and would red on honest prose",
+				d.kind, got, innocent)
 		}
 	}
 
