@@ -383,7 +383,12 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// is bounded in practice, but it is unbounded in principle and reclaiming it
 	// is an open question that belongs with the erase-trigger decision in
 	// docs/architecture/05-lifecycle.md §3.5 — a reclaim pass needs to know what
-	// a scope's lifecycle is before it can know what is safe to collect. ---
+	// a scope's lifecycle is before it can know what is safe to collect.
+	//
+	// This paragraph is held to the code by orphan_window_test.go: the ordering,
+	// the absence of a reclaim on the failure path below, and both citations
+	// above are asserted, so the day one of them changes this stops being a note
+	// nobody rechecked. ---
 	rec, perr := h.deps.Store.Put(r.Context(), handlestore.PutInput{
 		Scope:     ps.FilesystemID,
 		ObjectRef: engineRef,
