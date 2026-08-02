@@ -34,7 +34,7 @@ and have dedicated intake paths (see [Credential intake](#credential-intake)).
 | `-downloadable-prefixes` | `OCU_FILESTORE_DOWNLOADABLE_PREFIXES` | string | `` | No | Comma-separated broker-side prefixes that resolve `downloadable`; empty means nothing is downloadable (deny-by-default, NFR-SEC-73) |
 | `-engine` | `OCU_FILESTORE_ENGINE` | string | `local-volume` | No | Backend engine: `local-volume` or `s3` (ADR-0010) |
 | `-engine-root` | `OCU_FILESTORE_ENGINE_ROOT` | string | — | **Yes** (local-volume only) | Local-volume engine root directory (the host filesystem workspace) |
-| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | — | **Yes** | Host-attested session scope identifier; the engine enforces it against the edge-injected credential per request (foreign → 403) |
+| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | — | **Yes** | Host-attested session scope identifier; the engine enforces it against the edge-injected credential per request (foreign → 403). Must **not** end in `-<16 lowercase hex>` — see [Scope-ID shape](#scope-id-shape) |
 | `-granted-intents` | `OCU_FILESTORE_GRANTED_INTENTS` | string | `read,write` | No | Comma-separated session intent grant set; valid tokens: `read`, `write`, `preview` |
 | `-health-check` | `OCU_FILESTORE_HEALTH_CHECK` | bool | `false` | No | Self-probe mode: dial `-ops-listen /healthz` and exit 0 (alive) or non-zero (unreachable); used by container HEALTHCHECK |
 | `-log-level` | `OCU_FILESTORE_LOG_LEVEL` | string | `info` | No | Structured JSON log level: `debug`, `info`, `warn`, `error`; unknown values refuse startup |
@@ -61,6 +61,24 @@ and have dedicated intake paths (see [Credential intake](#credential-intake)).
 | `-s3-credential-file` | Set via flag directly (the path is not a secret); credential bytes via `OCU_S3_ACCESS_KEY_ID` / `OCU_S3_SECRET_ACCESS_KEY` (handled by `internal/objectstore`) |
 
 See [Credential intake](#credential-intake) for details.
+
+### Scope-ID shape
+
+Per-chat scopes are derived from the deployment scope as
+`<filesystem-id>-<16 lowercase hex>`, and the engine is confined to that
+family. `-filesystem-id` itself must therefore **not** carry that suffix: a
+base that did would place one deployment's whole family inside another
+deployment's family, and the confinement guard would admit a scope belonging to
+the neighbour. The daemon refuses such a base during startup and exits 1:
+
+```
+ocu-filestored: objectstore: invalid scope id: family base "fs-0123456789abcdef" is derived-shaped (ends in -<16 hex>, ...)
+```
+
+An `fs-<8 random bytes as hex>` naming scheme lands exactly on the refused
+shape. Any other suffix is fine — a non-hex character (`fs-prod-01`), a hex run
+that is not 16 digits long, or a separator other than `-`
+(`fs_0123456789abcdef`).
 
 ---
 

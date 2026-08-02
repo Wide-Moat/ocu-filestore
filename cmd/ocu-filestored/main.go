@@ -369,7 +369,7 @@ func runCtx(ctx context.Context, args []string) error {
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
-		"REQUIRED host-attested filesystem scope bound to the session")
+		"REQUIRED host-attested filesystem scope bound to the session; must not end in -<16 lowercase hex> (that suffix is reserved for per-chat derived scopes)")
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",

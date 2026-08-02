@@ -28,7 +28,7 @@ error as a malformed flag value.
 | `-downloadable-prefixes` | `OCU_FILESTORE_DOWNLOADABLE_PREFIXES` | string | `` | Comma-separated broker-side downloadable prefixes (NFR-SEC-73) |
 | `-engine` | `OCU_FILESTORE_ENGINE` | string | `local-volume` | Backend object-store engine: `local-volume` or `s3` (ADR-0010) |
 | `-engine-root` | `OCU_FILESTORE_ENGINE_ROOT` | string | _(required for local-volume)_ | Local-volume engine root directory |
-| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | _(required)_ | Host-attested filesystem scope ID |
+| `-filesystem-id` | `OCU_FILESTORE_FILESYSTEM_ID` | string | _(required)_ | Host-attested filesystem scope ID; must **not** end in `-<16 lowercase hex>` (see [Scope-ID shape](#scope-id-shape)) |
 | `-granted-intents` | `OCU_FILESTORE_GRANTED_INTENTS` | string | `read,write` | Comma-separated session intent grant set: `read`, `write`, `preview` |
 | `-health-check` | `OCU_FILESTORE_HEALTH_CHECK` | bool | `false` | Self-probe mode: dial `-ops-listen /healthz` and exit 0 (alive) or non-zero |
 | `-log-level` | `OCU_FILESTORE_LOG_LEVEL` | string | `info` | Structured log level: `debug`, `info`, `warn`, `error` |
@@ -47,6 +47,24 @@ error as a malformed flag value.
 | `-tls-cert` | `OCU_FILESTORE_TLS_CERT` | string | _(required)_ | South-face TLS server certificate PEM path |
 | `-tls-key` | `OCU_FILESTORE_TLS_KEY` | string | _(required)_ | South-face TLS server private-key PEM path |
 | `-version` | `OCU_FILESTORE_VERSION` | bool | `false` | Print the build identity and exit 0 |
+
+## Scope-ID shape
+
+Per-chat scopes are derived from the deployment scope as
+`<filesystem-id>-<16 lowercase hex>`, and the engine is confined to that
+family. So `-filesystem-id` itself must **not** carry that suffix: a base that
+did would place one deployment's whole family inside another deployment's
+family, and the confinement guard would admit a scope belonging to the
+neighbour. The daemon refuses such a base at startup and exits 1:
+
+```
+ocu-filestored: objectstore: invalid scope id: family base "fs-0123456789abcdef" is derived-shaped (ends in -<16 hex>, ...)
+```
+
+An `fs-<8 random bytes as hex>` naming scheme lands exactly on the refused
+shape. Any other suffix is fine — a non-hex character (`fs-prod-01`), a hex run
+that is not 16 digits long, or a separator other than `-`
+(`fs_0123456789abcdef`).
 
 ## Credential-bearing flags — excluded from the generic env map
 

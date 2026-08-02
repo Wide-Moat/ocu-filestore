@@ -146,7 +146,7 @@ The lexical/shape sentinels (`ErrInvalidPath`, `ErrInvalidScopeID`) live in
 |---|---|
 | `ErrUnknownEngine` | configured engine name is not a known kind |
 | `ErrInvalidPath` | lexical path rejection (NUL, URL scheme, absolute, `..`, empty, depth bomb) |
-| `ErrInvalidScopeID` | scope id is not a single clean path element |
+| `ErrInvalidScopeID` | scope id is not a single clean path element, or a scope-family base is itself derived-shaped (`-<16 lowercase hex>`) |
 | `ErrAlreadyExists` | destination exists and the caller did not set overwrite |
 | `ErrNotADirectory` | a scope/list path exists but is not a directory |
 | `ErrInvalidRange` | `ReadRange` got a negative offset or length |

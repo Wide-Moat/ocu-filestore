@@ -41,7 +41,7 @@ func NewScopeFamily(base ScopeID) (ScopeFamily, error) {
 		return ScopeFamily{}, fmt.Errorf("scope family base: %w", err)
 	}
 	if derivedShape.MatchString(string(base)) {
-		return ScopeFamily{}, fmt.Errorf("%w: family base %q is derived-shaped (ends in -<16 hex>)", ErrInvalidScopeID, base)
+		return ScopeFamily{}, fmt.Errorf("%w: family base %q is derived-shaped (ends in -<16 hex>, the suffix reserved for per-chat derived scopes); choose a base whose final dash-segment is not 16 hex digits", ErrInvalidScopeID, base)
 	}
 	return ScopeFamily{
 		base: string(base),

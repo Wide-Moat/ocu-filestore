@@ -100,6 +100,13 @@ spec:
         - 127.0.0.1:9464
 
       env:
+        # Sourced from the Pod name, which is operator-set and stable for a
+        # bare Pod. Keep that name off the derived-scope shape: a name ending
+        # in "-<16 lowercase hex>" (e.g. a per-session "ocu-session-<8 random
+        # bytes as hex>") is refused at startup, because per-chat scopes are
+        # derived as "<filesystem-id>-<16 hex>" and a base carrying that suffix
+        # would sit inside another deployment's scope family. See
+        # docs/configuration.md "Scope-ID shape".
         - name: OCU_FILESYSTEM_ID
           valueFrom:
             fieldRef:
