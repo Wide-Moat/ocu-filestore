@@ -213,9 +213,36 @@ const eraseAttribution = "(?:[(\\[:=]|—|--)[ \t`*_\"']*(?:\\w+[ \t`*_\"']+){0,
 type eraseCallSite struct {
 	file string // repo-relative
 	line int
+	// forwarding marks a call that sits DIRECTLY in the body of a function
+	// itself named the erase verb: an Engine decorator's own TeardownScope
+	// delegating to the engine it wraps. Such a call adds no way IN to the erase
+	// — reaching it requires an outer call of the erase verb, which this same
+	// scan reports as its own site. Any call that enters the chain from
+	// elsewhere is by construction NOT inside a same-named function, so nothing
+	// escapes the ledger through this distinction. "Directly" is load-bearing: a
+	// call inside a func literal is not counted, because a literal can be stored
+	// and invoked from anywhere.
+	forwarding bool
 }
 
 func (c eraseCallSite) String() string { return c.file + ":" + strconv.Itoa(c.line) }
+
+// eraseForwarders is the CLOSED ledger of product files allowed to carry a
+// forwarding call of the erase verb. It exists so the forwarding exemption
+// cannot grow in silence: a new decorator that delegates the erase verb must be
+// named here, in a commit whose reviewer sees the word erase.
+//
+// The ledger is self-shrinking in both directions. An unledgered forwarding
+// site is reported as a trigger and reds. A ledgered file that no longer
+// forwards is a stale entry and reds too, so the list cannot outlive the code
+// it excuses. Emptying it does not make the guard pass — scope_confined.go's
+// forward would immediately red as an unledgered site.
+var eraseForwarders = []string{
+	// The scope-confined engine decorator: its TeardownScope refuses a foreign
+	// scope and otherwise hands the call to the engine it wraps. It is a guard
+	// on the verb, not a caller of it.
+	"internal/objectstore/scope_confined.go",
+}
 
 // repoRoot resolves the module root from the test's working directory and fails
 // loudly rather than silently scanning nothing.
@@ -229,6 +256,51 @@ func repoRoot(t *testing.T) string {
 		t.Fatalf("repo root %q has no go.mod (%v); the scan would cover nothing", root, err)
 	}
 	return root
+}
+
+// classifyEraseSites splits product call sites into TRIGGERS (a way IN to the
+// erase) and ledgered decorator forwards, and reports how many forwards each
+// ledger entry accounted for. A site counts as a forward only when it is BOTH
+// structurally forwarding AND named in eraseForwarders, so neither half of the
+// exemption excuses a site on its own.
+//
+// Both ledger arms read this one function: the code arm reds on a trigger, the
+// docs arm stands down only when a trigger exists. Sharing the definition is
+// what keeps the docs arm from disarming itself on a site the code arm has
+// already ruled a non-trigger — the shape this merge produced.
+func classifyEraseSites(sites []eraseCallSite) (triggers []eraseCallSite, ledgerHits map[string]int) {
+	ledgerHits = make(map[string]int, len(eraseForwarders))
+	for _, f := range eraseForwarders {
+		ledgerHits[f] = 0
+	}
+	for _, s := range sites {
+		if n, ok := ledgerHits[s.file]; s.forwarding && ok {
+			ledgerHits[s.file] = n + 1
+			continue
+		}
+		triggers = append(triggers, s)
+	}
+	return triggers, ledgerHits
+}
+
+// eraseCallVisitor reports every call expression it walks, flagging whether the
+// call sits inside a func literal. Descending into a literal swaps in a visitor
+// whose inLit is set, so the flag stays set for every nested literal below it.
+type eraseCallVisitor struct {
+	inLit bool
+	emit  func(call *ast.CallExpr, inLit bool)
+}
+
+func (v *eraseCallVisitor) Visit(n ast.Node) ast.Visitor {
+	switch node := n.(type) {
+	case nil:
+		return nil
+	case *ast.FuncLit:
+		return &eraseCallVisitor{inLit: true, emit: v.emit}
+	case *ast.CallExpr:
+		v.emit(node, v.inLit)
+	}
+	return v
 }
 
 // scanEraseCallSites parses every Go file under the product source trees and
@@ -265,21 +337,37 @@ func scanEraseCallSites(t *testing.T, root string, withTests bool) []eraseCallSi
 			if rerr != nil {
 				rel = path
 			}
-			ast.Inspect(f, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
+			// Walk per top-level declaration so each call is attributed to the
+			// function that lexically contains it. A call outside any FuncDecl
+			// body (a package-level initializer) gets no enclosing name and can
+			// therefore never be classified as forwarding.
+			for _, decl := range f.Decls {
+				fd, isFunc := decl.(*ast.FuncDecl)
+				enclosing := ""
+				var body ast.Node = decl
+				if isFunc {
+					if fd.Name != nil {
+						enclosing = fd.Name.Name
+					}
+					if fd.Body == nil {
+						continue
+					}
+					body = fd.Body
 				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel == nil || sel.Sel.Name != eraseVerb {
-					return true
-				}
-				sites = append(sites, eraseCallSite{
-					file: filepath.ToSlash(rel),
-					line: fset.Position(call.Lparen).Line,
-				})
-				return true
-			})
+				ast.Walk(&eraseCallVisitor{
+					emit: func(call *ast.CallExpr, inLit bool) {
+						sel, ok := call.Fun.(*ast.SelectorExpr)
+						if !ok || sel.Sel == nil || sel.Sel.Name != eraseVerb {
+							return
+						}
+						sites = append(sites, eraseCallSite{
+							file:       filepath.ToSlash(rel),
+							line:       fset.Position(call.Lparen).Line,
+							forwarding: enclosing == eraseVerb && !inLit,
+						})
+					},
+				}, body)
+			}
 			return nil
 		})
 		if err != nil {
@@ -321,17 +409,31 @@ func TestNoProductPathTriggersScopeErase(t *testing.T) {
 	t.Logf("detector live: %d %s call site(s) across the tests", len(withTests), eraseVerb)
 
 	product := scanEraseCallSites(t, root, false)
-	if len(product) != 0 {
-		names := make([]string, 0, len(product))
-		for _, s := range product {
-			names = append(names, s.String())
-		}
+
+	triggerSites, ledgered := classifyEraseSites(product)
+	triggers := make([]string, 0, len(triggerSites))
+	for _, s := range triggerSites {
+		triggers = append(triggers, s.String())
+	}
+
+	if len(triggers) != 0 {
 		t.Fatalf("%s is now called from product code at %s.\n"+
 			"If this is the owner-change trigger canon finally named: retire ERASE-TRIGGER-054 in this file "+
 			"and restate what the docs may promise, because they are currently written to say no erase runs.\n"+
 			"If this wires erase to process start or stop instead: revert it. Erase is keyed to an owner change, "+
-			"never to the process lifecycle — keying it to boot or SIGTERM erases a live owner's bytes on restart.",
-			eraseVerb, strings.Join(names, ", "))
+			"never to the process lifecycle — keying it to boot or SIGTERM erases a live owner's bytes on restart.\n"+
+			"If it is a decorator forwarding the verb to the engine it wraps — adding a guard on the edge, not a way "+
+			"in — name its file in eraseForwarders in this file.",
+			eraseVerb, strings.Join(triggers, ", "))
+	}
+
+	// Stale-entry arm: the ledger may not outlive the code it excuses.
+	for _, f := range eraseForwarders {
+		if ledgered[f] == 0 {
+			t.Fatalf("eraseForwarders names %q, but no forwarding %s call was found there. "+
+				"The decorator was removed or renamed: drop the entry, so the exemption shrinks with the code.",
+				f, eraseVerb)
+		}
 	}
 }
 
@@ -845,8 +947,12 @@ func TestDocsDoNotPromiseAnUnwiredErase(t *testing.T) {
 		}
 	}
 
-	if sites := scanEraseCallSites(t, root, false); len(sites) != 0 {
-		t.Skipf("%s now has %d product call site(s); the erase claims may be true again — see TestNoProductPathTriggersScopeErase", eraseVerb, len(sites))
+	// Stand down only for a real TRIGGER. A decorator that merely forwards the
+	// verb to the engine it wraps adds no way in, so the erase still never runs
+	// and every claim below is still a lie: skipping on the raw site count would
+	// shrink this arm's corpus to nothing the moment such a decorator landed.
+	if triggers, _ := classifyEraseSites(scanEraseCallSites(t, root, false)); len(triggers) != 0 {
+		t.Skipf("%s now has %d product trigger site(s); the erase claims may be true again — see TestNoProductPathTriggersScopeErase", eraseVerb, len(triggers))
 	}
 
 	corpus := erasePromiseCorpus(t, root)

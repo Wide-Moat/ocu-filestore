@@ -7,17 +7,19 @@
 # command lines.
 #
 # Scope: the pure-logic guard sites where mutation testing has the highest
-# signal and the suite is fast — the authorization resolver, the deny-class
+# signal and the suite is fast: the authorization resolver, the deny-class
 # vocabulary, the per-session ceilings, AND the two highest-stakes containment
 # guards: the credential-scope derivation (credscope.go, "never a signing key")
 # and the path-containment resolver (pathresolver.go, "never a path outside the
 # attested prefix"). The S3 / socket / streaming source FILES in southface and
 # objectstore are NOT mutated (the loop in mutation.yml / the Makefile passes
-# each package path with those rig-heavy files named in --exclude-files — a
-# subtraction from the package, not a whitelist of the guard file) because they
-# need the live MinIO rig and the peer-credential socket, which would make a
-# mutation run enormous for little added signal over their own conformance and
-# e2e suites — coverpkg merely widens coverage collection so the two guard
+# each package path with those rig-heavy files named in --exclude-files, a
+# SUBTRACTION from the package and not a whitelist of the guard file: a source
+# file added to one of those packages later is mutated unless it is named too,
+# which is why scope_confined.go had to join the objectstore exclusion) because
+# they need the live MinIO rig and the peer-credential socket, which would make
+# a mutation run enormous for little added signal over their own conformance
+# and e2e suites; coverpkg merely widens coverage collection so the two guard
 # files are attributed.
 #
 # coverpkg restricts coverage collection to those packages; the path argument
@@ -27,30 +29,38 @@
 # Schema reference: https://github.com/go-gremlins/gremlins
 unleash:
   coverpkg: ./internal/authz/...,./internal/denyclass/...,./internal/ceilings/...,./internal/southface/...,./internal/objectstore/...
-  # Thresholds STAY 0 (advisory) — NOT a green-washed ratchet. The blocker is
-  # gremlins-side and version-independent of the Go toolchain: go-gremlins
-  # v0.6.0 derives the module path by reading ONLY THE FIRST LINE of go.mod and
-  # calling TrimPrefix("module ") on it (its modPkg() helper — it does not use a
-  # real go.mod parser). This repo's go.mod is comment-led: a 3-line SPDX /
-  # dependency-policy comment precedes the directive, so `module ...` is on
-  # line 4. gremlins therefore captures the COMMENT text as the module name, so
-  # its coverage filename keys never match the real package paths and EVERY
-  # mutant is reported "Not covered" (a phantom 0 killed / 0 lived) across ALL
-  # in-scope packages — authz, ceilings, denyclass, AND the containment guards
-  # (credscope, pathresolver) — despite their mandatory property-tests. Go
-  # 1.26.4 native coverage is correct; this is purely the gremlins first-line
-  # parse, not a Go toolchain break and not an unmeasured-baseline problem.
-  # With only a phantom number to read, any non-zero threshold would pass or
-  # fail on a lie, so arming the gate would be a FALSE ratchet — an honest
-  # advisory beats a green-looking lie. Ratchet condition: the gate can arm
-  # once the mutation tool resolves the module path correctly for a comment-led
-  # go.mod (a fixed gremlins release, a different tool such as go-mutesting
-  # which resolves packages via `go list`, OR moving the module directive to
-  # line 1 — note the trade-off: that would drop the SPDX/policy preamble, so
-  # do NOT do it lightly) AND reports a stable, correct efficacy figure; then
-  # set threshold.efficacy / threshold.mutant-coverage to floor(baseline) and
-  # drop continue-on-error in mutation.yml. Tracked: docs/ROADMAP.md "mutation
-  # gate arm" follow-up.
+  # Thresholds STAY 0 here (gremlins is ADVISORY). The ARMED mutation floor is
+  # go-mutesting, in scripts/mutation-floor.sh; see mutation.yml. Two facts
+  # decide this split:
+  #
+  # 1. The phantom-0 parse blocker is FIXED. go-gremlins v0.6.0 derives the
+  #    module path from the FIRST LINE of go.mod (its modPkg() TrimPrefix(
+  #    "module ") helper, not a real go.mod parser). go.mod's `module` directive
+  #    now sits on line 1 (see the comment there), so gremlins captures the real
+  #    module path, coverage keys match the package paths, and mutants are
+  #    attributed ("Not covered: 0") instead of the former phantom 0/0. The
+  #    advisory summary is therefore meaningful. Baselines measured this way
+  #    (module on line 1, --timeout-coefficient 8, quiet runner): authz 100,
+  #    denyclass 100, ceilings 100, objectstore/pathresolver guard 83.33,
+  #    southface/credscope guard 94.85 mutant-coverage.
+  #
+  # 2. gremlins still cannot be ARMED here. It kills a mutant on a timeout it
+  #    calibrates from one clean run, and every in-scope package carries
+  #    pgregory.net/rapid property tests that gremlins re-runs per mutant. On a
+  #    normally-loaded runner those re-runs blow the timeout budget, so real
+  #    mutants land in the TIMED-OUT bucket, which counts toward NEITHER
+  #    coverage nor kills, and BOTH dimensions collapse to 0 (observed
+  #    repeatedly: authz / ceilings / denyclass reading 0% mutant-coverage under
+  #    load even at --timeout-coefficient 50). A positive threshold here would
+  #    red every run: a flaky-required gate, the regulated-auditor anti-pattern.
+  #
+  # The armed lens is go-mutesting instead: it resolves packages via `go list`
+  # (immune to the first-line parse) and kills on real test PASS/FAIL with no
+  # timeout calibration, so its score is stable (authz 0.9375, broker 0.849
+  # measured locally). Ratchet: raise the go-mutesting floor toward the canon
+  # 60 and extend it to the guards once a rig-free slice is carved; arm gremlins
+  # only if a de-flaked measurement path appears. Tracked: docs/ROADMAP.md
+  # "mutation gate arm".
   threshold:
     efficacy: 0
     mutant-coverage: 0

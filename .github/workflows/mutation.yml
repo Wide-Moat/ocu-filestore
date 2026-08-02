@@ -5,53 +5,79 @@ name: mutation
 # Mutation testing measures assertion strength: it rewrites covered source
 # (a `+` becomes a `-`, a `>` becomes a `>=`, a condition is negated) and
 # re-runs the suite. A mutant the tests still pass on ("LIVED") is a line the
-# suite executes but does not actually assert on — a gap line coverage cannot
+# suite executes but does not actually assert on  -  a gap line coverage cannot
 # see. This gate runs go-gremlins (https://github.com/go-gremlins/gremlins)
 # scoped to the pure-logic leaf packages where the signal is highest and the
 # suite is fast: the authorization resolver, the deny-class vocabulary, and the
 # per-session ceilings. The S3 / socket / streaming packages are excluded on
-# purpose — they need the live MinIO rig and the peer-credential socket, which
+# purpose  -  they need the live MinIO rig and the peer-credential socket, which
 # would make a mutation run enormous for little added signal over their own
 # conformance and e2e suites. The scope lives in .gremlins.yaml at the repo
 # root (coverpkg) so it is declared once.
 #
-# ADVISORY (continue-on-error: true) for now, for two reasons. gremlins is
-# slow. And it misattributes coverage here — it reports covered lines as "NOT
-# COVERED", which would make a blocking threshold meaningless. That second
-# reason is diagnosed ONCE, in .gremlins.yaml beside the thresholds it holds at
-# 0; the cause is gremlins-side, and that file also records what would fix it.
-# Read it there rather than re-deriving a cause here. Running the job advisory
-# surfaces the efficacy summary in the job log without gating merges.
+# Two jobs, split by whether the tool can be honestly armed here:
 #
-# Ratchet plan: the threshold can become meaningful once the coverage
-# misattribution is resolved by one of the remedies .gremlins.yaml names — not
-# by anything about the Go toolchain, which measures this repo correctly. Once
-# it is resolved and gremlins reports a stable, correct efficacy figure, set
-# unleash.threshold.efficacy / unleash.threshold.mutant-coverage in
-# .gremlins.yaml to floor(baseline) and drop continue-on-error below so a
-# regression in assertion strength fails the gate.
+#   gremlins (ADVISORY): the go-gremlins lens over the pure-logic packages and
+#     the two containment guards. It surfaces the per-package efficacy/coverage
+#     summary. It stays advisory (continue-on-error)  -  NOT armed  -  because it
+#     kills a mutant on a timeout it calibrates from one clean run, and the
+#     in-scope suites carry pgregory.net/rapid property tests that gremlins
+#     re-runs per mutant. Real mutants land in the timed-out bucket, so BOTH
+#     gremlins dimensions collapse to a load-driven number; a threshold there
+#     would red on runner timing, not on a real regression. The go.mod parse
+#     fix (module directive on line 1) still matters: gremlins now attributes
+#     coverage to the real package paths instead of the former phantom 0/0, so
+#     the advisory summary is meaningful even though it cannot gate.
+#
+#   mutation-floor (ARMED): scripts/mutation-floor.sh runs go-mutesting over the
+#     custody-relevant packages (the authorization resolver and the
+#     downloadable/credential-scope broker). go-mutesting resolves packages via
+#     `go list` and kills on real test PASS/FAIL with no timeout calibration, so
+#     its score is stable and armable. A score below the floor fails the job.
+#
+# Ratchet target: raise the mutation-floor floor toward the canon >=60 (the
+# guards already read well above it) as the score stabilises, extend it to the
+# path-containment guard once a rig-free slice is carved, and arm gremlins only
+# if a de-flaked measurement path appears. See docs/ROADMAP.md "mutation gate
+# arm".
 
 on:
   pull_request:
     branches: [main]
   schedule:
-    # Weekly, Monday 03:00 UTC — keeps a baseline visible even when no PR has
-    # run it recently, without putting a slow job on the hot push-to-main path.
-    - cron: '0 3 * * 1'
+    # Nightly, 03:00 UTC. The armed go-mutesting floor runs here, NOT per-PR:
+    # the tool bounds no mutant run by itself (its custom-exec path carries an
+    # unenforced timeout TODO), so scripts/mutation-exec.sh hard-bounds every
+    # mutant at MUTATE_TIMEOUT+30s, timeout-as-killed. That bound is the WORST
+    # case per mutant - one source edit minting several slow or hanging
+    # mutants balloons the runtime unpredictably - tolerable nightly, hostile
+    # on the PR hot path. The per-PR path carries the advisory gremlins
+    # summary plus a freshness gate (below) that reds a PR if no green armed
+    # floor exists within the freshness window - so the nightly floor cannot
+    # rot into a vacuous armed claim while PRs merge green.
+    - cron: '0 3 * * *'
+  # Manual dispatch runs the SAME armed floor job as the schedule. It exists to
+  # bootstrap the freshness gate (a fresh repo or an aged-out history has no
+  # green scheduled run yet - dispatch one instead of merging blind) and to
+  # re-arm after a red nightly is fixed without waiting a day.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # Advisory job — safe to cancel a superseded run on the same ref.
+  # Cancel a superseded run on the same ref: a newer push obsoletes the older
+  # run's result, and the armed floor is re-measured from scratch each time, so
+  # cancelling the in-flight one wastes no signal.
   group: mutation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   gremlins:
     runs-on: ubuntu-latest
-    # ADVISORY: never blocks merge. See the ratchet plan in the header before
-    # removing this line.
+    # ADVISORY: never blocks merge. gremlins' timeout-based kill is flaky on the
+    # rapid property suites (see the header), so it surfaces the summary but the
+    # armed floor lives in the mutation-floor job below.
     continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -64,25 +90,25 @@ jobs:
         # acceptable here because go install resolves it to that immutable commit
         # via the checksum database; the comment records the SHA for auditors.
         run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
-      - name: gremlins unleash (pure-logic packages — advisory)
-        # gremlins unleash takes a single path argument (the files to mutate),
-        # so the scoped packages are run in a loop. The coverpkg scope is read
-        # from .gremlins.yaml at the repo root. The job is advisory
-        # (continue-on-error above), so this step emits the per-package
-        # efficacy/coverage summary and never fails the run.
-        #
-        # The two highest-stakes containment guards live in rig-heavy packages,
-        # so each is run as WHOLE PACKAGE MINUS the sources named in that
-        # invocation's --exclude-files. The rule for what gets excluded is
-        # rig-heaviness: engine_s3.go, the streaming/socket handlers and their
-        # neighbours want the live MinIO rig and the peer-credential socket,
-        # which their own conformance and e2e suites already exercise, so
-        # mutating them buys a much longer run for little added signal.
-        # RE2 has no negative lookahead, so an exclusion cannot be spelled
-        # "everything except the guard": each excluded file is named positively
-        # and anchored, in whichever form that package's gremlins invocation
-        # matches against (see each block below), so the directory name itself
-        # is not matched.
+      - name: gremlins unleash (advisory summary)
+        # Advisory only (continue-on-error above): each unleash emits a
+        # per-package efficacy/coverage summary and never fails the run. The
+        # coverpkg scope and the exclude sets isolate the guard source files;
+        # the two containment guards live in rig-heavy packages, so each
+        # --exclude-files enumerates the rig-heavy sources POSITIVELY (RE2 has
+        # no negative lookahead, so "everything except the guard" cannot be
+        # spelled). Each enumeration is a SUBTRACTION from the package, not a
+        # whitelist of one guard file, and the two fail in opposite directions
+        # as a package grows - neither a red build on this advisory job.
+        # objectstore's list is written out, so a source file added later is
+        # MUTATED unless it is named too (scope_confined.go was named for that
+        # reason; engine_lazyprovision.go is mutated today alongside
+        # pathresolver.go, which costs run time). southface's is computed from
+        # `ls` at run time, so a file added there is EXCLUDED silently and
+        # costs signal instead (jwtverify.go is unmutated today). The
+        # objectstore regexp matches the file BASENAME and the southface one
+        # the package-relative PATH, hence the (^|/) anchors in one and the
+        # southface/ prefix the `sed` leaves in the other.
         run: |
           set -u
           for pkg in ./internal/authz/ ./internal/denyclass/ ./internal/ceilings/; do
@@ -90,35 +116,98 @@ jobs:
             gremlins unleash "$pkg" || echo "::warning::gremlins reported a non-zero exit for $pkg (advisory)"
             echo "::endgroup::"
           done
-          # pathresolver.go guard (objectstore): the rule is the whole package
-          # MINUS the files named in --exclude-files below — the S3 engine, the
-          # local-volume engine, credentials and the package-root source are the
-          # rig-heavy ones. Everything else in the package is mutated, INCLUDING
-          # any file added after this comment was written; that costs run time,
-          # never a red build, because this job is advisory at two levels
-          # (continue-on-error on the job above, plus the `|| echo ::warning` on
-          # every gremlins invocation), so no mutation threshold is enforced
-          # here. gremlins matches this package's exclude regexp against the
-          # file BASENAME, so each token is anchored with (^|/).
           echo "::group::gremlins unleash internal/objectstore/pathresolver.go"
           gremlins unleash \
-            --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go' \
+            --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go|(^|/)scope_confined\.go' \
             ./internal/objectstore/ \
             || echo "::warning::gremlins reported a non-zero exit for pathresolver.go (advisory)"
           echo "::endgroup::"
-          # credscope.go guard (southface): the exclusion is COMPUTED from `ls`
-          # at run time rather than written out, so it is every other source
-          # file in the package by construction — rig / streaming / socket
-          # handlers at the time of writing. The trade-off of computing it: a
-          # file added to this package is excluded by DEFAULT and silently, so
-          # the cost of a new file here is lost signal on an advisory job rather
-          # than a longer run. gremlins matches this package's exclude regexp
-          # against the package-relative PATH, so each token is prefixed with
-          # the package dir (southface/...). The southface/ prefix also
-          # disambiguates scope.go from credscope.go.
           echo "::group::gremlins unleash internal/southface/credscope.go"
           SF_EXC=$(ls internal/southface/*.go | grep -v _test | grep -v 'credscope.go' \
             | sed 's#internal/##; s/\./\\./g' | paste -sd'|' -)
           gremlins unleash --exclude-files "$SF_EXC" ./internal/southface/ \
             || echo "::warning::gremlins reported a non-zero exit for credscope.go (advisory)"
           echo "::endgroup::"
+
+  mutation-floor:
+    runs-on: ubuntu-latest
+    # ARMED, NIGHTLY (or manually dispatched). A mutation score below the
+    # floor in scripts/mutation-floor.sh fails this job, as does any of its
+    # fail-closed guards (errored mutants, a verdict collapse, a timeout
+    # storm, an unparsable summary). Not per-PR: a slow or hanging mutant
+    # costs a full hard-timeout window (see the `on:` comment), so the
+    # runtime is nightly-shaped. The per-PR freshness gate below enforces
+    # that a recent run of THIS job stayed green.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Job-level backstop: even if a hang defeats both the per-mutant kill in
+    # mutation-exec.sh and the per-invocation timeout in mutation-floor.sh, the
+    # whole job is bounded well under the 6h cap, so a hang becomes a bounded
+    # red, never a run-to-cap.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - name: install go-mutesting (pinned)
+        # The avito-tech fork carries no semver tag, so pin the module pseudo-
+        # version (its immutable commit). go install verifies it against the
+        # checksum database.
+        run: go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@v0.0.0-20251226130216-48d0401f00fb
+      - name: mutation-floor (go-mutesting, armed)
+        run: bash scripts/mutation-floor.sh
+
+  mutation-floor-freshness:
+    runs-on: ubuntu-latest
+    # Per-PR gate. The armed floor runs nightly (above), so this gate keeps the
+    # nightly result from rotting into a vacuous armed claim: it reds a PR if no
+    # SUCCESSFUL schedule- or dispatch-triggered mutation-floor run exists within
+    # the freshness window. One flaky night is absorbed (yesterday's green still
+    # satisfies the window); a week of hangs/reds hardens into a fleet-wide PR
+    # blocker - the honest meaning of "armed". A workflow_dispatch green counts:
+    # it runs the IDENTICAL armed job, and it is the bootstrap remedy for the
+    # no-green-yet state this gate otherwise cannot escape. Non-vacuity holds
+    # because a run only concludes success if the armed floor job itself passed
+    # (gremlins is continue-on-error and cannot green a run on its own), and the
+    # floor's fail-closed guards mean a killed/hung run is never green.
+    #
+    # RATCHET (two-step, owner-gated): this check must NOT enter the
+    # branch-protection required set until the FIRST green scheduled/dispatched
+    # floor run exists - added earlier, it reds every PR from birth with no
+    # in-PR remedy. Step 1: merge this workflow, dispatch the floor, see it
+    # green. Step 2: add mutation-floor-freshness to the required set.
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: require a green armed mutation-floor within the window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FRESHNESS_DAYS: '7'
+        run: |
+          set -euo pipefail
+          # Newest successful runs of THIS workflow on the events that execute
+          # the armed floor job (one gh call per event: gh takes one --event).
+          runs_sched="$(gh run list --workflow mutation.yml --event schedule \
+            --status success --limit 10 \
+            --json conclusion,event,createdAt 2>/dev/null || echo '[]')"
+          runs_disp="$(gh run list --workflow mutation.yml --event workflow_dispatch \
+            --status success --limit 10 \
+            --json conclusion,event,createdAt 2>/dev/null || echo '[]')"
+          latest="$(printf '%s\n%s' "$runs_sched" "$runs_disp" \
+            | jq -rs 'add | [.[] | select(.conclusion=="success")] | sort_by(.createdAt) | last | .createdAt // empty')"
+          if [ -z "$latest" ]; then
+            echo "::error::no successful armed mutation-floor run found (schedule or workflow_dispatch). The armed floor has never gone green, or its history aged out. Bootstrap: dispatch the mutation workflow (Actions -> mutation -> Run workflow) and let the floor pass." >&2
+            exit 1
+          fi
+          # Age in days, computed without date-diff portability traps.
+          now_epoch="$(date -u +%s)"
+          run_epoch="$(date -u -d "$latest" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$latest" +%s)"
+          age_days=$(( (now_epoch - run_epoch) / 86400 ))
+          echo "latest green armed mutation-floor: ${latest} (${age_days}d ago; window ${FRESHNESS_DAYS}d)"
+          if [ "$age_days" -gt "$FRESHNESS_DAYS" ]; then
+            echo "::error::the newest green armed mutation-floor run is ${age_days}d old, older than the ${FRESHNESS_DAYS}d freshness window. The armed floor has gone stale - triage the red nightlies, fix, then dispatch the workflow to re-arm." >&2
+            exit 1
+          fi
+          echo "mutation-floor freshness: OK"

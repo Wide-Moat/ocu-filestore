@@ -301,6 +301,16 @@ func mapEngineErr(err error) error {
 		return fmt.Errorf("%w (%v)", southface.ErrBackendThrottled, err)
 	case errors.Is(err, objectstore.ErrTransient):
 		return fmt.Errorf("%w (%v)", southface.ErrBackendTransient, err)
+	case errors.Is(err, objectstore.ErrForeignScope):
+		// The scope-confined engine refused a verb naming a scope other than its
+		// provisioned one (GA Wave 1 engine confinement). Remap to the southface
+		// mirror so the spine classifies it as denyScopeMismatch
+		// (permission_denied/403): a scope the request holds no title to, caught
+		// at the engine's authority over the backend prefix. Replaced, not
+		// wrapped: unlike the two backend-detail sentinels above, the engine's
+		// message names the provisioned scope, which is deployment state and not
+		// operator-actionable detail about a failing backend call.
+		return southface.ErrForeignScope
 	default:
 		return err
 	}
