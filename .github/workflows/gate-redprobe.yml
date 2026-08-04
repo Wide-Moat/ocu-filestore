@@ -99,7 +99,7 @@ jobs:
   redprobe-secrets-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Both scanners walk commits, not the checkout. The probe clones this
           # checkout and hands the clone to gitleaks and to trufflehog in git
@@ -135,7 +135,7 @@ jobs:
   redprobe-sast-sca-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -149,7 +149,7 @@ jobs:
   redprobe-release-signing:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The subject is a file in the tree, not the commit history: this
           # probe parses .github/workflows/release.yml and mutates copies of it
