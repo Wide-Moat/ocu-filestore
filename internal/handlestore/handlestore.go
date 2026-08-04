@@ -157,7 +157,28 @@ type ListInput struct {
 	// Limit is the maximum number of records to return in this page; zero means
 	// the store's default page size.
 	Limit int
+	// Order is the page direction. The zero value (ListOrderAsc) is the historical
+	// ascending (CreatedAt, FileID) walk -- every current caller leaves it unset, so
+	// its behaviour and its cursor bytes are unchanged. ListOrderDesc walks the
+	// reverse (descending CreatedAt, then descending FileID) so a caller that wants
+	// newest-first (the file pane) sees a just-created record on its first page. A
+	// cursor minted under one direction is rejected under the other (the token
+	// carries a version byte); see encodeCursor/decodeCursor.
+	Order ListOrder
 }
+
+// ListOrder is the page direction for List. The zero value is ascending, so a
+// caller that never sets Order gets the historical walk unchanged.
+type ListOrder int
+
+const (
+	// ListOrderAsc walks ascending (CreatedAt, FileID) -- the historical default and
+	// the safe direction for a full-walk consumer (a concurrent create lands at the
+	// tail, strictly after any prior cursor, so it is picked up, never skipped).
+	ListOrderAsc ListOrder = iota
+	// ListOrderDesc walks descending (CreatedAt, FileID) -- newest first.
+	ListOrderDesc
+)
 
 // ListPage is one scope-bound page of records plus the continuation cursor and
 // the page bounds. Records is in the store's STABLE total order (CreatedAt,

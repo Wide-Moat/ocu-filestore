@@ -254,6 +254,13 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 			class := denyclass.Internal
 			reason := "internal error"
 			switch {
+			case errors.Is(eerr, southface.ErrForeignScope):
+				// A foreign-scope refusal on the ensure-parent MakeDir is a
+				// client authorization denial (403), not an internal fault --
+				// same class as the north attestation check and the WriteStream
+				// backstop (denyClassForEngineErr). The wire reason mirrors the
+				// attestation deny string so the two catches are indistinguishable.
+				class, reason = denyclass.ScopeMismatch, "request scope does not match the attested scope"
 			case errors.Is(eerr, southface.ErrBackendTransient):
 				class, reason = denyclass.BackendUnavailable, "storage backend unavailable"
 			case errors.Is(eerr, southface.ErrBackendThrottled):
@@ -730,6 +737,15 @@ func denyClassForEngineErr(err error) string {
 		return denyclass.AlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyclass.NotFound
+	case errors.Is(err, southface.ErrForeignScope):
+		// The engine refused a scope the caller holds no title to: a
+		// client-attributable authorization denial (403 permission_denied),
+		// NOT an internal fault. Anti-enumeration is inapplicable on the scope
+		// axis (the engine is scope-confined and refuses every foreign name
+		// identically), and the north attestation check already denies
+		// ScopeMismatch for the same boundary, so reusing that class keeps the
+		// attestation catch and this engine backstop wire-indistinguishable.
+		return denyclass.ScopeMismatch
 	case errors.Is(err, southface.ErrBackendThrottled):
 		return denyclass.Throttle
 	case errors.Is(err, southface.ErrBackendTransient):
