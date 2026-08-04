@@ -425,8 +425,8 @@ func (e *partialThenErrorEngine) CopyFile(context.Context, string, string, strin
 func (e *partialThenErrorEngine) MoveFile(context.Context, string, string, string, bool) error {
 	return errMidStream
 }
-func (e *partialThenErrorEngine) WriteStream(context.Context, string, string, io.Reader, bool) error {
-	return errMidStream
+func (e *partialThenErrorEngine) WriteStream(context.Context, string, string, io.Reader, bool) (string, error) {
+	return "", errMidStream
 }
 
 // Compile-time proof the partial-then-error engine satisfies the Engine seam.

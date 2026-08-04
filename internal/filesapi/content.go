@@ -119,6 +119,19 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, ps southf
 		}
 	}
 
+	// --- response-size ceiling (SEC-46 egress symmetry) ---
+	// The resolved read window is bounded by the SAME whole-object ceiling
+	// create's pre-assembly reject enforces, BEFORE the ALLOW Mandate and the
+	// 200 commit (one deny, never allow-then-abort), mirroring the south
+	// download bound. Door-written objects sit at or under the ceiling, so
+	// this refuses only a window no legitimate object can satisfy: an
+	// out-of-band oversized backend object, or a runaway explicit length.
+	// Strict `>`: a window exactly at the ceiling is admitted.
+	if length > h.deps.MaxFileSize {
+		h.denyContent(w, r, reqLog, ps, rec, grant, denyclass.SizeExceeded, "requested window exceeds whole-object ceiling", reqID)
+		return
+	}
+
 	// --- audit ALLOW before any byte (audit-before-ack, SEC-79) ---
 	allow := readAllowEvent(ps, rec, grant, reqID)
 	if merr := h.deps.Guard.Mandate(r.Context(), allow); merr != nil {

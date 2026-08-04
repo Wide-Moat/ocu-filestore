@@ -3,7 +3,13 @@
 
 package filesapi
 
-import "github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+import (
+	"mime"
+	"path/filepath"
+	"strings"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+)
 
 // FileObject is the Files-API JSON representation of a stored file handle
 // (ADR-0023, the Anthropic Files dialect). It is built from a handlestore.Record
@@ -31,6 +37,17 @@ type FileObject struct {
 	SizeBytes int64 `json:"size_bytes"`
 	// CreatedAt is the store-stamped durable RFC-3339 UTC creation time.
 	CreatedAt string `json:"created_at"`
+	// Sha256 is the lowercase-hex SHA-256 of the stored content (D6,
+	// PARITY-LEDGER-147). It is an ADDITIVE OPTIONAL response field: the engine
+	// already computes this digest in its single write pass, so the north list
+	// standardises on it (NOT md5) for content dedup - an edited same-size file
+	// carries a new digest and is re-uploaded. omitempty keeps the field ABSENT
+	// for a record with no recorded digest (a pre-D6 handle, or a reconcile-minted
+	// whole-tree object), so a client falls back to name+size - the designed
+	// back-compat window. ADR-0028 froze the six-field body and DEFERRED a
+	// checksum field; this addition is the deferred field, standardised on sha256
+	// (canon ADR in flight: content-hash manifest, D6, PARITY-LEDGER-147).
+	Sha256 string `json:"sha256,omitempty"`
 }
 
 // fileObjectType is the constant Files-API object tag.
@@ -46,10 +63,38 @@ func newFileObject(r handlestore.Record) FileObject {
 		ID:        r.FileID,
 		Type:      fileObjectType,
 		Filename:  r.Filename,
-		MimeType:  r.Mime,
+		MimeType:  resolveMime(r.Mime, r.Filename),
 		SizeBytes: r.Size,
 		CreatedAt: r.CreatedAt,
+		Sha256:    r.Sha256,
 	}
+}
+
+// resolveMime returns the stored content type, or derives one from the filename
+// extension when the record carries none. A guest FUSE write PUTs an S3 object
+// with no Content-Type, so the durable record's Mime is "" for every agent-
+// written file; without this, a client (the File Pane preview, any F9 reader)
+// cannot classify an image the model produced. Read-time derivation at this one
+// projection choke-point covers already-stored objects and any writer, and it is
+// consistent with the content endpoint serving the same type. A stored Mime
+// always wins; the fallback runs only when it is absent.
+func resolveMime(stored, filename string) string {
+	if stored != "" {
+		return stored
+	}
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		return ""
+	}
+	if t := mime.TypeByExtension(ext); t != "" {
+		// TypeByExtension may append "; charset=utf-8"; keep only the media type
+		// so the wire carries a bare "image/png" like a stored content type.
+		if i := strings.IndexByte(t, ';'); i >= 0 {
+			return strings.TrimSpace(t[:i])
+		}
+		return t
+	}
+	return ""
 }
 
 // ListResponse is the Files-API list envelope (ADR-0028): the page of

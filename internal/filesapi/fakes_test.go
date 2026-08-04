@@ -163,8 +163,12 @@ func (e *fakeEngine) ReadRange(_ context.Context, _ string, path string, offset,
 	return err
 }
 
-func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) error {
-	return nil
+func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) (string, error) {
+	// The base fake is a read/delete-plane double: its WriteStream is a no-op that
+	// ignores the reader, so it computes no content digest (D6). The create-plane
+	// doubles (createEngine / recordingEngine) that consume the reader return a
+	// real single-pass digest.
+	return "", nil
 }
 
 // fakeSession is a programmable ceilings session: each Try* call consults its
@@ -225,6 +229,9 @@ type fakeStore struct {
 	ensureMints int
 	// mintSeq mints deterministic, unique file_ids for the fake ensure/put.
 	mintSeq int
+	// getCalls counts every Get so a north-shape-guard test can prove a refused
+	// request never reached the store (the guard moves the refusal to the edge).
+	getCalls int
 }
 
 func newFakeStore() *fakeStore {
@@ -304,6 +311,7 @@ func (s *fakeStore) EnsureObject(_ context.Context, in handlestore.EnsureInput) 
 }
 
 func (s *fakeStore) Get(_ context.Context, fileID, attestedScope string) (handlestore.Record, error) {
+	s.getCalls++
 	if s.getErr != nil {
 		return handlestore.Record{}, s.getErr
 	}

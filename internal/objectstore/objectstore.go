@@ -205,6 +205,9 @@ type Engine interface {
 	// WriteStream consumes r into the named file without whole-object
 	// buffering; a partial write is never visible at the destination path.
 	// With overwrite false an existing destination refuses with
-	// ErrAlreadyExists.
-	WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error
+	// ErrAlreadyExists. On success it returns the lowercase-hex SHA-256 of the
+	// bytes written (D6, PARITY-LEDGER-147), computed in the SAME single pass
+	// (never a second read of the object); on any error the returned digest is
+	// empty.
+	WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) (string, error)
 }
