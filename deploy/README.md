@@ -135,7 +135,7 @@ the variant stands up a filestore + MinIO north smoke standalone. In the
 assembled fleet the shared object store and the `ocu-edge-backend` network are
 wired by the app; point `-s3-endpoint` at the shared store and drop the local
 MinIO if so. The hardening posture (read-only root, `cap_drop: ALL`,
-`no-new-privileges`, the default-deny seccomp profile, the 30s stop grace, the
+`no-new-privileges`, the default-deny seccomp profile, the 35s stop grace, the
 loopback ops listener as the real readiness source) is identical to the
 component-test baseline — the variant adds the north plane, never a posture
 change.

@@ -38,14 +38,16 @@ metadata:
     app.kubernetes.io/component: storage-session
     app.kubernetes.io/part-of: open-computer-use
 spec:
-  # Two-phase graceful stop: 25 s connection drain THEN a separate
-  # TeardownScope erase-before-reuse (NFR-SEC-54) bounded by the daemon's
-  # teardownTimeout (10 min = 600 s). The grace period must cover BOTH or the
-  # kubelet SIGKILLs mid-erase and orphans customer bytes on the persistent
-  # PVC. 625 s = 25 s drain + 600 s teardown. To shorten it, lower the
-  # daemon's teardownTimeout and keep this at drain + that bound. Must match
-  # the systemd unit's TimeoutStopSec and broker-deployment.yaml.
-  terminationGracePeriodSeconds: 625
+  # A graceful stop costs at most 30 s: the data-plane listeners drain
+  # CONCURRENTLY under a 25 s per-plane bound, then the loopback ops listener
+  # shuts down under a 5 s bound. 35 s leaves margin over that sum.
+  # Nothing sweeps the scope on the way out, so this value does not scale with
+  # how much data the PVC holds, and the PVC keeps every stored object after
+  # the pod goes away. Keep it in step with the systemd unit's TimeoutStopSec
+  # and broker-deployment.yaml; cmd/ocu-filestored/stop_deadline_test.go
+  # derives the worst case from the drain constants and fails if this number
+  # stops clearing it.
+  terminationGracePeriodSeconds: 35
 
   securityContext:
     runAsNonRoot: true
@@ -98,6 +100,13 @@ spec:
         - 127.0.0.1:9464
 
       env:
+        # Sourced from the Pod name, which is operator-set and stable for a
+        # bare Pod. Keep that name off the derived-scope shape: a name ending
+        # in "-<16 lowercase hex>" (e.g. a per-session "ocu-session-<8 random
+        # bytes as hex>") is refused at startup, because per-chat scopes are
+        # derived as "<filesystem-id>-<16 hex>" and a base carrying that suffix
+        # would sit inside another deployment's scope family. See
+        # docs/configuration.md "Scope-ID shape".
         - name: OCU_FILESYSTEM_ID
           valueFrom:
             fieldRef:

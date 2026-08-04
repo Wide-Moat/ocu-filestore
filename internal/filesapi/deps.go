@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // Copyright (c) 2025 Open Computer Use Contributors
 
-// Package filesapi is the north Files-API handler (ADR-0023): the five-endpoint
-// /v1/files surface a host-leg (F9) caller reaches over a SEPARATE TLS listener
-// (Mount B), never through the south guest-mount RPC spine. It resolves a
-// broker-minted file_id through the durable handle store (internal/handlestore),
-// re-derives the read authorization broker-side per request, audits before it
-// acknowledges (NFR-SEC-79), and resolves downloadable AT READ (NFR-SEC-73).
+// Package filesapi is the north Files-API handler (ADR-0023): the /v1/files
+// surface a host-leg (F9) caller reaches over a SEPARATE TLS listener (Mount B),
+// never through the south guest-mount RPC spine. It serves the five ADR-0023
+// endpoints — create, list, metadata, content, delete — plus the additive
+// archive OCU-extension route. It resolves a broker-minted file_id through the
+// durable handle store (internal/handlestore), re-derives the authorization
+// broker-side per request (read for the four read-class verbs, WRITE for create
+// and delete), audits before it acknowledges (NFR-SEC-79), and resolves
+// downloadable AT READ (NFR-SEC-73).
 //
 // Two structural invariants are baked into this package's shape:
 //
@@ -117,7 +120,7 @@ type Deps struct {
 }
 
 // Handler is the north Files-API HTTP handler. It is constructed once by Mount B
-// from a fully-wired Deps and serves the five /v1/files endpoints. It holds no
+// from a fully-wired Deps and serves the /v1/files endpoints. It holds no
 // per-request state; the per-request scope is derived from the ScopeSource on
 // every call.
 type Handler struct {

@@ -21,7 +21,7 @@ Questions or issues: developer@widemoat.ai
 | **Single-host only?** | Yes — the directory must be on the local volume | No — the bucket is remote |
 | **Backend credential** | Host filesystem permission (daemon's uid) | Static host-local access key (the engine's own backend credential, NFR-SEC-25) |
 | **Versioned bucket** | n/a | Versioned buckets are supported; unversioned are the simpler path |
-| **Erase-before-reuse (NFR-SEC-54)** | Recursive directory removal | Object deletion (+ version sweep if bucket is versioned) |
+| **Scope erase (NFR-SEC-54, no trigger yet)** | Recursive directory removal | Object deletion (+ version sweep if bucket is versioned) |
 | **Typical use** | Solo deployment, development, single-host container | Multi-host, managed object storage, cloud |
 
 ---
@@ -42,18 +42,18 @@ contained by the Go `os.Root` API — traversal, symlink escape, and
 absolute-path handles are rejected before any syscall. No network connection is
 opened.
 
-**Erase-before-reuse:** on `TeardownScope` (which runs unconditionally on every
-clean or signalled stop — see the signal contract in
-[docs/operations.md](operations.md)) the engine recursively removes the scope
-directory and all its contents. After teardown, no bytes from the prior session
-are readable under that scope.
+**Scope erase:** `TeardownScope` recursively removes the scope directory and
+all its contents, then recreates it empty. After it returns, no byte written
+under that scope is readable. Nothing in the product calls it — see
+[the erase verb and its missing trigger](#the-erase-verb-and-its-missing-trigger).
 
-**Crash sweep:** on `ProvisionScope`, if the scope directory already exists from
-a prior crashed session, the engine removes it first and creates a fresh
-directory. This is the erase-at-provision path: a crashed predecessor never
-leaves bytes visible to the next session.
+**Provision:** `ProvisionScope` ensures the scaffold exists — it creates the
+scope directory when absent and sweeps only the guest-invisible staging
+sub-directory, discarding partial writes a crashed daemon left behind. Owner
+data at the scope root is never removed, so a restart re-serves exactly what
+the previous run stored.
 
-### Erase-before-reuse and the staging area
+### The staging area
 
 Writes are staged in a guest-invisible `.ocu-staging/` subdirectory inside the
 scope and promoted atomically. A partial write is never visible at the
@@ -98,7 +98,7 @@ trailers that the SDK appends for AWS can confuse S3-compatible backends and
 cause request failures that look like data corruption. This switch is applied
 automatically; no operator action is needed.
 
-### Versioned buckets and erase-before-reuse
+### Versioned buckets and the scope erase
 
 An S3 bucket may be versioned (object versions retained on delete) or
 unversioned (deletes remove the object immediately).
@@ -122,8 +122,8 @@ objectstore: bucket is versioned but version listing is denied; erase refused (b
 ```
 
 This is fail-closed behaviour (NFR-SEC-54): the engine never reports a
-successful erase when it cannot verify that bytes are gone. Fix the IAM policy
-to include `s3:ListBucketVersions` on the bucket, then restart.
+successful erase when it cannot verify that bytes are gone. Grant
+`s3:ListBucketVersions` on the bucket before an erase is expected to succeed.
 
 ### Backend dial (NFR-SEC-25)
 
@@ -209,14 +209,51 @@ multipart uploads before reporting clean.
 
 ---
 
-## Erase-before-reuse guarantee (NFR-SEC-54)
+## The erase verb and its missing trigger
 
-Both engines implement the erase-before-reuse guarantee: `TeardownScope` runs
-unconditionally on every clean shutdown (SIGTERM/SIGINT → bounded drain →
-teardown), and on crash recovery (`ProvisionScope` erases an existing scope
-before creating a fresh one). After `TeardownScope` returns, no byte from the
-prior session is readable under that scope.
+Both engines implement a scope erase. `TeardownScope` removes every byte under
+the scope — a recursive directory removal on the local-volume engine, a
+paginated object sweep on S3 that also clears every non-current version, every
+delete marker, and every orphaned multipart upload. It refuses rather than
+reporting clean when it cannot prove the bytes are gone. After it returns, no
+path written under that scope is readable.
 
-The teardown runs under a bounded context (10-minute timeout for the s3 engine,
-1-minute for the local-volume engine) so a hung backend cannot wedge teardown
-indefinitely.
+**Nothing in the product calls it.** There is no flag, no administrative route
+and no signal path that reaches the verb; the two whole-filesystem operations
+that could carry one (`removeFilesystem`, `migrateFilesystem`) are unimplemented
+because the frozen wire contract leaves their bodies unspecified. Today the verb
+is exercised only by tests.
+
+That is half deliberate and half a gap, and the two halves are worth separating.
+
+The deliberate half: **erase is keyed to a change of owner, never to the process
+lifecycle.** Once it was keyed to the process — erase at boot, erase at SIGTERM —
+and an ordinary restart destroyed every object a live owner held. Provision is
+now ensure-scaffold-if-absent and shutdown touches nothing on disk, so a restart
+is safe. An operator can stop, upgrade and start this daemon without losing a
+byte, and that property is guarded by a test.
+
+The gap: **no owner-change trigger was ever built to take the verb's other end.**
+This service cannot invent one. The architecture canon re-homes erase-before-reuse
+to the session-sandbox component, states that erase and residue-drop are that
+component's invariants rather than this service's, and gives this service no
+erase or scope-lifecycle invariant of its own. It also names no event on any
+surface this service can observe that would mean "the owner has changed". Until
+canon names such an event and the surface it arrives on, building a trigger here
+would be inventing a security behaviour, so the verb stays wired to nothing and
+this document says so rather than describing a sweep that does not run.
+
+**The consequence to hold in mind:** a scope outlives every process that served
+it. Bytes are removed when a caller deletes them and at no other time. On the
+local-volume engine that is disk that never reclaims itself; on S3 it is storage
+that keeps billing. An operator who needs a scope gone must remove it out of
+band — `rm -rf` the scope directory, or delete the prefix with the backend's own
+tooling — while the daemon for that `filesystem_id` is stopped.
+
+**Open question for the owner.** See
+[§3.5 of the lifecycle document](architecture/05-lifecycle.md#35-open-question--the-erase-trigger)
+for the trigger shapes on the table.
+
+When the trigger does land, the erase runs under a bounded context (10 minutes
+for the s3 engine, 1 minute for the local-volume engine) so a hung backend
+cannot wedge the caller indefinitely.

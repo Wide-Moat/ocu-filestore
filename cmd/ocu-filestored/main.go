@@ -206,15 +206,14 @@ const (
 	defaultFDCeiling     = int32(256)
 )
 
-// Lifecycle deadlines: the two engine lifecycle calls run under bounded
-// contexts — never context.Background() bare — so a hung backend can never
-// wedge startup or teardown indefinitely. Teardown sweeps a whole scope on a
-// network engine (paginated listings, batched deletes), so its bound is
-// generous but finite.
-const (
-	provisionTimeout = 1 * time.Minute
-	teardownTimeout  = 10 * time.Minute
-)
+// provisionTimeout bounds the one engine lifecycle call the daemon makes. The
+// boot scaffold runs under a context carrying this deadline — never a bare
+// context.Background() — so a hung backend cannot wedge startup indefinitely.
+//
+// There is no teardown bound because there is no teardown call: erase is keyed
+// to an owner change, and no product path invokes the engine's scope-erase verb
+// (the ledger is cmd/ocu-filestored/erase_trigger_test.go).
+const provisionTimeout = 1 * time.Minute
 
 // defaultNorthBind is the loopback bind the north Files-API listener (Mount B)
 // falls back to when cfg.northBind is empty. It matches the --north-bind flag
@@ -370,7 +369,7 @@ func runCtx(ctx context.Context, args []string) error {
 	maxFileSize := fs.Int64("broker-max-file-size", 0,
 		"REQUIRED whole-object upload ceiling in bytes (>0); the fileUpload pre-buffer reject (NFR-SEC-46/78)")
 	filesystemID := fs.String("filesystem-id", "",
-		"REQUIRED host-attested filesystem scope bound to the session")
+		"REQUIRED host-attested filesystem scope bound to the session; must not end in -<16 lowercase hex> (that suffix is reserved for per-chat derived scopes)")
 	grantedIntents := fs.String("granted-intents", "read,write",
 		"comma-separated session intent grant set from read,write,preview")
 	downloadablePrefixes := fs.String("downloadable-prefixes", "",
@@ -1073,6 +1072,28 @@ func buildSubtreeMap(rw, ro, preview string) (southface.SubtreeMap, error) {
 	return southface.NewSubtreeMap(rw, ro, preview)
 }
 
+// distinctSubtrees returns the distinct non-empty subtree markers across the
+// three intent axes, preserving first-seen order (write, read, preview). It is
+// the single source the boot scaffold and the lazy per-chat scaffold both seed,
+// so a derived chat scope's markers match the base scope's. A zero-value map
+// yields an empty slice (provision-only scaffold, no markers).
+func distinctSubtrees(sm southface.SubtreeMap) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 2)
+	for _, intent := range []southface.Intent{southface.IntentWrite, southface.IntentRead, southface.IntentPreview} {
+		sub := sm.For(intent)
+		if sub == "" {
+			continue
+		}
+		if _, dup := seen[sub]; dup {
+			continue
+		}
+		seen[sub] = struct{}{}
+		out = append(out, sub)
+	}
+	return out
+}
+
 // rejectWildcardDownloadable enforces the ADR-0029 exfil-bar: the whole-scope
 // "*" downloadable token is refused for the single-tenant trusted_operator fleet
 // posture. A "*" token anywhere in the comma-separated -downloadable-prefixes
@@ -1397,8 +1418,10 @@ func newBackendTLSClient() *http.Client {
 // wraps them in the broker adapters, provisions the engine scope, and returns
 // the per-session south-face Server. A non-admitted triple returns the
 // admission refusal BEFORE any socket is bound (NFR-SEC-60); the caller serves
-// the returned Server and Closes it for teardown (engine TeardownScope +
-// registry/ceilings Release).
+// the returned Server and Closes it to stop. That Close drains in-flight
+// requests, releases the per-session ceilings entry and closes the handle-store
+// descriptor — process state only. It leaves every stored byte where it is; see
+// teardownServer.Close for why a stop is not an owner change.
 //
 // l is threaded into the southface.Config so the session's dispatcher, the
 // accept gate, and the http.Server ErrorLog all emit structured JSON via the
@@ -1481,13 +1504,24 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 			return nil, err
 		}
 	}
+	// The deployment scope family (ADR-0030): the -filesystem-id base plus its
+	// legitimately-derived per-chat scopes "<base>-<16 hex>". Built ONCE and
+	// shared by the confinement guard and the lazy-provision scaffolder below,
+	// so what the scaffolder legitimizes and what the guard admits is the same
+	// predicate by construction. NewScopeFamily also refuses a derived-shaped
+	// base outright, keeping distinct deployments' families disjoint.
+	scopeFamily, err := objectstore.NewScopeFamily(objectstore.ScopeID(cfg.filesystemID))
+	if err != nil {
+		return nil, err
+	}
+
 	// GA Wave 1 engine confinement (ADR-0013/0029): wrap the backend engine so
-	// EVERY verb is confined to the daemon's single provisioned scope
-	// (-filesystem-id). A verb naming any other scope is refused at the engine
-	// with ErrForeignScope -> denyScopeMismatch (403), independent of the
-	// credential-scope path: the engine holds its own authority over the backend
-	// prefix and never keys an object under a scope it holds no title to.
-	confined, err := objectstore.NewScopeConfinedEngine(eng, objectstore.ScopeID(cfg.filesystemID))
+	// EVERY verb is confined to the daemon's provisioned scope family. A verb
+	// naming a scope outside it is refused at the engine with ErrForeignScope
+	// -> denyScopeMismatch (403), independent of the credential-scope path: the
+	// engine holds its own authority over the backend prefix and never keys an
+	// object under a scope it holds no title to.
+	confined, err := objectstore.NewScopeConfinedEngine(eng, scopeFamily)
 	if err != nil {
 		return nil, err
 	}
@@ -1537,42 +1571,64 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		Clock:                time.Now,
 	})
 
-	// Provision = ensure-scaffold-if-absent, idempotent, does NOT erase;
-	// erase is owner-change-driven (TeardownScope), never boot-driven.
+	// Provision = ensure-scaffold-if-absent, idempotent, does NOT erase. Boot
+	// is not an owner change, and a boot that erased would destroy a live
+	// owner's workspace on every ordinary restart.
 	scope := objectstore.ScopeID(cfg.filesystemID)
 	provisionCtx, cancelProvision := context.WithTimeout(context.Background(), provisionTimeout)
 	defer cancelProvision()
-	if err := eng.ProvisionScope(provisionCtx, scope); err != nil {
+
+	// The distinct subtree markers the scaffold seeds (the boot scope at startup,
+	// and every derived chat scope lazily on first touch). Collected ONCE from the
+	// three intent axes so the boot path and the lazy decorator seed the identical
+	// set. A zero-value SubtreeMap yields an empty list and scaffoldScope seeds no
+	// marker (provision-only).
+	scaffoldMarkers := distinctSubtrees(cfg.subtrees)
+
+	// scaffoldScope provisions a scope and seeds its subtree dir-markers
+	// (idempotent, ErrExist == success). Boot calls it for the base scope
+	// (behavior unchanged); the lazy-provision decorator calls it for a derived
+	// chat scope on that scope's first data verb (D5, ADR-0030), reusing the
+	// SAME provisioning verbs so a derived scope's markers match the base's.
+	scaffoldScope := func(ctx context.Context, e objectstore.Engine, s objectstore.ScopeID) error {
+		if err := e.ProvisionScope(ctx, s); err != nil {
+			return err
+		}
+		for _, sub := range scaffoldMarkers {
+			if err := e.MakeDir(ctx, s, sub); err != nil && !errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("scaffold subtree %q: %w", sub, err)
+			}
+		}
+		return nil
+	}
+
+	// bareEng is the un-decorated engine. The lazy decorator scaffolds THROUGH
+	// it (not through itself) so the scaffold's own ProvisionScope/MakeDir never
+	// re-enter the decorator's first-touch guard.
+	bareEng := eng
+
+	// Boot-scaffold the base scope up front (behavior unchanged: provision +
+	// seed the base's markers). The engine stays subtree-agnostic; compose
+	// supplies the marker list. Approach (a): engine.MakeDir is the tested path;
+	// no engine-interface change.
+	if err := scaffoldScope(provisionCtx, bareEng, scope); err != nil {
 		return nil, err
 	}
 
-	// Seed subtree dir-markers after provision (idempotent scaffold). The engine
-	// stays subtree-agnostic; compose supplies the list via the SubtreeMap. The
-	// loop collects the distinct non-empty For() values across the three intent
-	// axes, then calls MakeDir for each, treating ErrExist as success (idempotent:
-	// a restart re-provisions without erasing and this loop is a no-op).
-	// Approach (a): engine.MakeDir is the tested path; no engine-interface change.
-	{
-		// Collect distinct non-empty subtree values from the three intent axes and
-		// seed a dir-marker for each (idempotent: ErrExist is treated as success).
-		// A zero-value SubtreeMap has no non-empty For() values and the loop is a
-		// no-op; a configured map yields at most two distinct subtrees (read and
-		// preview share "uploads" under the default). The engine stays subtree-
-		// agnostic; compose supplies the subtree list via the SubtreeMap (approach a).
-		seen := make(map[string]struct{})
-		for _, intent := range []southface.Intent{southface.IntentWrite, southface.IntentRead, southface.IntentPreview} {
-			sub := cfg.subtrees.For(intent)
-			if sub == "" {
-				continue
-			}
-			if _, dup := seen[sub]; dup {
-				continue
-			}
-			seen[sub] = struct{}{}
-			if err := eng.MakeDir(provisionCtx, scope, sub); err != nil && !errors.Is(err, fs.ErrExist) {
-				return nil, fmt.Errorf("scaffold subtree %q: %w", sub, err)
-			}
-		}
+	// Lazy per-chat scaffold (D5, ADR-0030): wrap the engine ONCE so BOTH the
+	// north filesapi plane and the south southface plane share the decorator,
+	// killing the uploads-first/writes-first asymmetry. On the first data verb
+	// per UNSEEN, legitimately-derived scope ("<base>" or "<base>-<16hex>") the
+	// decorator scaffolds that scope's markers via scaffoldScope before
+	// delegating; a scope that is not derived-legal is passed straight through
+	// and refused exactly as today (fail-closed preserved). Applied to eng here,
+	// before the shared broker.NewEngine seam below, so both listeners inherit it.
+	eng, err = objectstore.NewLazyProvisionEngine(bareEng, scopeFamily,
+		func(ctx context.Context, s objectstore.ScopeID) error {
+			return scaffoldScope(ctx, bareEng, s)
+		})
+	if err != nil {
+		return nil, err
 	}
 
 	// Rollback latch (FILESTORED-11): the scope is now provisioned. If ANY
@@ -1580,10 +1636,9 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	// compose returns nil,err WITHOUT a closer for that scope. This deferred
 	// rollback releases the durable handle-store fd on every post-provision
 	// error path so a failed compose never leaks an open log fd. It does NOT
-	// erase the scope — a composition failure is not an owner-change event;
-	// erase-before-reuse is TeardownScope's responsibility, called only on an
-	// explicit owner-change grant. Disarmed (committed = true) once the
-	// teardownServer takes ownership.
+	// erase the scope — a composition failure is not an owner change, and the
+	// scope may already hold a live owner's data. Disarmed (committed = true)
+	// once the teardownServer takes ownership.
 	committed := false
 	defer func() {
 		if committed {
@@ -1735,8 +1790,8 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 
 	// Wrap the server so Close drains the session, releases the per-session
 	// ceilings, and closes the handle-store fd — all without touching the scope
-	// on disk. TeardownScope is the owner-change verb (callers: explicit grant
-	// only, never process lifecycle); Close does NOT call it.
+	// on disk. Close does NOT call TeardownScope: shutdown is not an owner
+	// change. Nothing else calls it either — see teardownServer below.
 	return &teardownServer{
 		Server:      fanned,
 		ceiling:     reg,
@@ -1747,10 +1802,16 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 
 // teardownServer wraps the per-session south-face Server so Close also drains
 // in-flight requests, releases the per-session ceilings entry, and closes the
-// durable handle-store descriptor. It does NOT erase the scope on Close —
-// erase-before-reuse (TeardownScope) is owner-change-driven, never triggered
-// by process shutdown. The southface session's own Close releases the registry
-// binding and unlinks the socket.
+// durable handle-store descriptor. The southface session's own Close releases
+// the registry binding and unlinks the socket.
+//
+// The name is a historical misnomer worth keeping in mind: it tears down
+// PROCESS state, not storage. It does not erase the scope, and neither does
+// anything else — the engines implement TeardownScope but no product path
+// invokes it, because the architecture canon defines no owner-change event this
+// service can observe. cmd/ocu-filestored/erase_trigger_test.go holds that gap
+// named in both directions and docs/architecture/05-lifecycle.md §3.4 states it
+// for readers.
 type teardownServer struct {
 	southface.Server
 	ceiling *ceilings.Registry

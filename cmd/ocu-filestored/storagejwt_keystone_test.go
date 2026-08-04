@@ -209,7 +209,11 @@ func TestStorageJWTKeystone_SignedAccepted(t *testing.T) {
 // interface the daemon composes at -filesystem-id.
 func TestStorageJWTKeystone_ForeignFSIDEngineScope(t *testing.T) {
 	inner := objectstore.NewLocalVolumeEngine(t.TempDir())
-	eng, err := objectstore.NewScopeConfinedEngine(inner, objectstore.ScopeID(keystoneConfiguredFSID))
+	fam, err := objectstore.NewScopeFamily(objectstore.ScopeID(keystoneConfiguredFSID))
+	if err != nil {
+		t.Fatalf("build scope family: %v", err)
+	}
+	eng, err := objectstore.NewScopeConfinedEngine(inner, fam)
 	if err != nil {
 		t.Fatalf("build scope-confined engine: %v", err)
 	}

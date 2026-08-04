@@ -25,8 +25,7 @@ neither the guest nor any upstream component ever holds a backend key.
   through the Egress trust-edge (guest → edge → service), the edge-injected
   filestore credential the engine verifies and scopes, the locked dispatch
   pipeline, three-axis authorization, the fail-closed hash-chained audit sink,
-  per-session ceilings, the engine seam, and graceful erase-before-reuse
-  shutdown.
+  per-session ceilings, the engine seam, and graceful bounded-drain shutdown.
 - **North face** — the external data-plane HTTP API (file/artifact API, SPA,
   preview). It is **deferred** per the roadmap: the contract is parsed but the
   face is inert and bound in no release. Where this document speaks of "both
@@ -39,10 +38,13 @@ wire faces, the authorization spine, the audit emitter — calls a single
 internal Go interface (`objectstore.Engine`). No second component holds the
 credential, and no path above the seam joins a backend address.
 
-**Ephemeral workspace.** The broker never takes on durable retention of
-customer bytes. A scope is provisioned at session grant and erased at session
-end on every exit path (clean stop, listener fault, crash). Long-term retention
-belongs to the customer's own store; OCU keeps the audit record, not the files.
+**Ephemeral workspace.** The broker never takes on durable custody of customer
+bytes: long-term retention belongs to the customer's own store, and OCU keeps
+the audit record, not the files. That is a statement about whose data it is.
+Mechanically, a scope outlives the process — the engines implement a scope
+erase, but nothing triggers it yet, and
+[05-lifecycle.md §3.4](05-lifecycle.md#34-the-erase-verb-has-no-trigger) carries
+the gap and the open question rather than papering over it.
 
 ---
 
@@ -155,9 +157,9 @@ radius change between them.
 |---|----------|----------------|
 | 1 | [01-dispatch-pipeline.md](01-dispatch-pipeline.md) | The locked STAGE 0→4 south-face request spine: why the ordering is the security property, every stage, the deny vocabulary, the streaming framed-trailer path, and panic containment. |
 | 2 | [02-authz.md](02-authz.md) | The three-axis authorization model (scope × intent × downloadable), the route-op→intent binding, the segment-boundary downloadable policy, and the property tests that pin deny-by-default. |
-| 3 | [03-engine-seam.md](03-engine-seam.md) | The pluggable `objectstore.Engine` seam (ADR-0010): the 13-verb interface, the local-volume and S3 engines, path containment, atomic commit, erase-before-reuse, and the conformance suite proving parity. |
+| 3 | [03-engine-seam.md](03-engine-seam.md) | The pluggable `objectstore.Engine` seam (ADR-0010): the 13-verb interface, the local-volume and S3 engines, path containment, atomic commit, the scope-erase verb, and the conformance suite proving parity. |
 | 4 | [04-audit.md](04-audit.md) | The fail-closed, hash-chained OCSF audit subsystem: the `Mandate` seam, audit-before-ack, the OCSF event shape, the tamper-evident chain, the permanent latch, and the audit-truth-vs-wire-reason (D8) split. |
-| 5 | [05-lifecycle.md](05-lifecycle.md) | Daemon and scope lifecycle: startup composition order, admission-before-bind, the accept loop, single-instance flock, per-session ceilings, graceful shutdown, and erase-before-reuse on every exit. |
+| 5 | [05-lifecycle.md](05-lifecycle.md) | Daemon and scope lifecycle: startup composition order, admission-before-bind, the accept loop, single-instance flock, per-session ceilings, graceful shutdown, and the scope erase that has no trigger yet. |
 | 6 | [06-transport.md](06-transport.md) | The south-face transport and wire surface: REST-JSON over HTTPS/HTTP-2 reached guest→edge→service, the edge-injected filestore credential, the 16 unary + 2 streaming operations, chunked-multipart large transfers, and the error mapping. |
 | 7 | [07-observability.md](07-observability.md) | Logging, metrics, health, and correlation: structured slog JSON with redaction, the hand-rolled Prometheus registry with closed label enums, the loopback ops listener, the health probes, and the single request correlation id. |
 
@@ -190,8 +192,10 @@ and CI actually back today:
 - **Audit is fail-closed and tamper-evident.** The hash chain is verified from
   genesis at startup; a write or sync failure latches the broker into 100%-deny
   until restart, surfaced through `/readyz`, a binary gauge, and an ERROR log.
-- **Erase-before-reuse holds on every exit**, including the crash path
-  (erase-at-provision), on both engines (version-aware on S3).
+- **A restart never destroys owner data.** Provision ensures the scaffold and
+  sweeps only staging; no exit path erases. The scope-erase verb is built on
+  both engines (version-aware on S3) but is deliberately not wired to the
+  process lifecycle, and no owner-change trigger exists for it yet.
 - **Strict CI from commit 1.** Secrets scan, naming denylist, SAST, SCA, the
   race detector, conventional-commits, and an 86% coverage floor gate every PR.
 - **Supply chain.** SHA-pinned actions, SBOM, keyless `cosign` signing and SLSA

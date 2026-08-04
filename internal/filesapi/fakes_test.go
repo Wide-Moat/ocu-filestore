@@ -34,6 +34,40 @@ func (f *fakeResolver) Resolve(_ context.Context, _ any, _ southface.ResolveRequ
 	return f.grant, f.err
 }
 
+// recordingResolver is a fakeResolver that also CAPTURES the question it was
+// asked: the ResolveRequest (scope, path, intent axes) and the CallerEvidence
+// the handler built. It exists so a test can assert WHICH question the broker
+// re-derived per request — a handler that resolves the wrong intent, or asks
+// about the wrong path, is invisible to a resolver that only reports a verdict.
+type recordingResolver struct {
+	grant southface.Grant
+	err   error
+	// calls counts every Resolve so a test can prove the handler asked exactly
+	// once (or, on a refused request, not at all).
+	calls        int
+	lastReq      southface.ResolveRequest
+	lastEvidence southface.CallerEvidence
+}
+
+func (f *recordingResolver) Resolve(_ context.Context, caller any, req southface.ResolveRequest) (southface.Grant, error) {
+	f.calls++
+	f.lastReq = req
+	if ev, ok := caller.(southface.CallerEvidence); ok {
+		f.lastEvidence = ev
+	}
+	return f.grant, f.err
+}
+
+// hasIntent reports whether intents contains want.
+func hasIntent(intents []southface.Intent, want southface.Intent) bool {
+	for _, in := range intents {
+		if in == want {
+			return true
+		}
+	}
+	return false
+}
+
 // fakeGuard records every Mandated event and can be programmed to fail (deny)
 // via err (applied to every Mandate call).
 type fakeGuard struct {
@@ -163,8 +197,12 @@ func (e *fakeEngine) ReadRange(_ context.Context, _ string, path string, offset,
 	return err
 }
 
-func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) error {
-	return nil
+func (e *fakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) (string, error) {
+	// The base fake is a read/delete-plane double: its WriteStream is a no-op that
+	// ignores the reader, so it computes no content digest (D6). The create-plane
+	// doubles (createEngine / recordingEngine) that consume the reader return a
+	// real single-pass digest.
+	return "", nil
 }
 
 // fakeSession is a programmable ceilings session: each Try* call consults its
@@ -225,6 +263,9 @@ type fakeStore struct {
 	ensureMints int
 	// mintSeq mints deterministic, unique file_ids for the fake ensure/put.
 	mintSeq int
+	// getCalls counts every Get so a north-shape-guard test can prove a refused
+	// request never reached the store (the guard moves the refusal to the edge).
+	getCalls int
 }
 
 func newFakeStore() *fakeStore {
@@ -304,6 +345,7 @@ func (s *fakeStore) EnsureObject(_ context.Context, in handlestore.EnsureInput) 
 }
 
 func (s *fakeStore) Get(_ context.Context, fileID, attestedScope string) (handlestore.Record, error) {
+	s.getCalls++
 	if s.getErr != nil {
 		return handlestore.Record{}, s.getErr
 	}
@@ -426,6 +468,7 @@ func newTestHandler(d Deps) *Handler {
 // compile-time proofs the fakes honour the seams.
 var (
 	_ southface.Resolver         = (*fakeResolver)(nil)
+	_ southface.Resolver         = (*recordingResolver)(nil)
 	_ southface.Guard            = (*fakeGuard)(nil)
 	_ southface.Engine           = (*fakeEngine)(nil)
 	_ southface.CeilingsSession  = (*fakeSession)(nil)

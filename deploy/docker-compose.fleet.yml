@@ -50,8 +50,10 @@
 # Posture is UNCHANGED from the hardened component-test baseline — this variant
 # only activates the north plane and its writable handle volume, never the
 # security posture (read-only root, cap_drop ALL, no-new-privileges, the
-# default-deny seccomp profile, the 30s stop grace above the daemon's bounded
-# in-flight drain, the loopback ops listener as the real readiness source).
+# default-deny seccomp profile, the 35s stop grace above the daemon's worst-case
+# stop, the loopback ops listener as the real readiness source). The stop grace
+# covers the north plane too: both data-plane listeners drain concurrently, so
+# activating north adds no wall-clock time to a graceful stop.
 
 services:
   ocu-filestore:
@@ -79,7 +81,7 @@ services:
       # ./seccomp/ocu-filestored.json — that is what makes the default-deny
       # hardening (NFR-SEC-02) actually load at container create.
       - seccomp:./seccomp/ocu-filestored.json
-    stop_grace_period: 30s
+    stop_grace_period: 35s
     environment:
       # The s3 engine's OWN backend credential (one credential, one client —
       # NFR-SEC-25). These reach the engine through objectstore's dedicated env

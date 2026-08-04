@@ -275,16 +275,15 @@ jobs:
       # actually enforces in CI; without this the script's skip branch would
       # make the gate dead on every runner.
       #
-      # PIN the canon to the immutable commit SHA whose contracts/storage/
-      # tree is byte-identical to our vendored copies (file-ops.schema.json
-      # and file-artifact-api.schema.json; we do not vendor mount-config).
-      # We vendor only those two files — mount-config belongs to the guest.
-      #
       # The pin below is an immutable next/v1 SHA whose contracts/ tree is
       # byte-identical to our vendored copies: contracts/storage/
       # (file-ops.schema.json + file-artifact-api.schema.json; mount-config
       # belongs to the guest and is not vendored) AND contracts/openapi/
       # files-api.openapi.yaml (the frozen Files-API body surface, ADR-0028).
+      # That list is what the vendored set held at this pin; the set itself is
+      # declared in ONE place — the CONTRACTS array in
+      # scripts/check-contract-identity.sh — so a contract vendored later is
+      # added there, not here.
       # Bumped 62f5eeb -> 8fe7e94 to pick up the frozen Files-API bodies
       # (ADR-0028, #323) plus the deny-status-code alignment (#330, which corrects
       # the create/list deny statuses to the shipped deny classes and the list

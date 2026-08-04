@@ -1,0 +1,193 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: gate-redprobe
+
+# Red-probe the Layer-0 security gates: prove they still redden on a planted
+# defect. A gate that has never been shown to fail is indistinguishable from a
+# gate that cannot fail, and the ways a scanner goes quietly blind — a widened
+# allowlist, a retired rule, a config file that stops being loaded, a scan that
+# walks zero bytes — all leave the job green.
+#
+# Each probe drives the real scanner (the same image, the same ruleset, the
+# same flags as the job it measures) against two trees: the committed tree,
+# asserted to pass, and that tree plus one planted defect, asserted to fail AND
+# to name the planted artefact. Both directions have to hold; asserting only
+# the red one passes a scanner that fails on everything.
+#
+# WHY A PATHS TRIGGER AND NOT ONLY A SCHEDULE
+# A purely scheduled probe breaks quietly. Its redness surfaces a day after the
+# edit that caused it, on a run nobody is watching, attributed to no author and
+# attached to no diff — by then the weakening has merged and the connection is
+# gone. The paths filter below puts "you weakened the allowlist" and "the probe
+# reddened" in the same pull request, with the same author, at review time.
+# Three minutes on a PR that edits the gate configuration is a fair price;
+# three minutes on every PR is not, which is why the filter is narrow. The
+# daily schedule stays as the backstop for the drift these probes cannot
+# attribute to any local edit: an upstream ruleset that retires a rule, or a
+# vulnerability database that changes what a clean tree looks like.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # The gate definitions themselves, and the probes that measure them.
+      - '.github/workflows/security.yml'
+      - '.github/workflows/gate-redprobe.yml'
+      - 'scripts/*-redprobe.sh'
+      # The release pipeline is the SUBJECT of the release-signing probe, not
+      # merely a neighbour of it: an edit to release.yml changes what that probe
+      # measures, so it must run in the same pull request as the edit. The
+      # exceptions ledger is listed for the same reason from the other side —
+      # adding an entry is the one change that can turn that probe green, so it
+      # arrives with the verdict it produced.
+      - '.github/workflows/release.yml'
+      - '.github/signing-order-exceptions'
+      # Scanner suppression surfaces. .gitleaks.toml exists; .semgrepignore and
+      # .trivyignore deliberately do NOT exist in this tree today. They are
+      # listed anyway as tripwires: the commit that first introduces a
+      # suppression file for semgrep or trivy is exactly the commit that must
+      # arrive with proof the gate it suppresses still reddens, and a path
+      # filter fires on file creation just as it fires on edits.
+      - '.gitleaks.toml'
+      - '.semgrepignore'
+      - '.trivyignore'
+  schedule:
+    # Daily at 04:41 UTC. Deliberately off the top of the hour (the scheduler
+    # surge there delays and occasionally drops runs) and clear of the 07:13
+    # nightly and the 02:00/03:00 weekly scans, so the probes do not contend
+    # with the gates they measure for a runner.
+    - cron: '41 4 * * *'
+
+permissions:
+  # The probes read the tree and shell out to docker. They publish nothing,
+  # comment on nothing, and need no token beyond the checkout.
+  contents: read
+
+concurrency:
+  # Safe to cancel a superseded run: a new push replaces the tree the probe was
+  # asked about, so the in-flight verdict is about a commit nobody will merge.
+  group: gate-redprobe-${{ github.ref }}
+  cancel-in-progress: true
+
+# THE RELEASE-SIGNING PROBE AND ITS EXCEPTIONS LEDGER
+# scripts/release-signing-redprobe.sh is wired below as a blocking job, and it
+# reports a REAL pre-existing violation in release.yml: SIGN-AFTER-PUBLISH on
+# job `ghcr-image`, which pushes the image to the registry before anything signs
+# it. Closing that restructures the release pipeline, which is the owner's call
+# on the release process rather than a CI-wiring decision, so it is not fixed
+# here — and neither of the two ways to land the job around it is acceptable.
+# Leaving a blocking job permanently red is not: within a week "filestore checks
+# is always red" becomes the expected state and a real regression rides through
+# unnoticed, which is the same failure as switching the gate off. Marking the
+# job continue-on-error is not either: that is the exact false-green pattern the
+# probe was written to detect, so using it here would defeat the thing being
+# wired.
+#
+# The third path: a finding the change in hand can close gets FIXED; a finding
+# that needs work elsewhere gets NAMED. This one is named in
+# .github/signing-order-exceptions, keyed on FILE PLUS JOB — a file-keyed entry
+# would have blanketed every future signing-order violation anywhere in
+# release.yml, including a second publishing job added later. The probe prints
+# every admitted gap on every run, so "found nothing" and "found something we
+# agreed to carry" never look alike; it refuses to run at all on a ledger entry
+# it cannot parse; and it FAILS on an entry whose file+job no longer violates,
+# so the list is forced to shrink rather than asked to. Growth in that file is
+# visible in a diff a reviewer has to approve; shrinkage would not be, which is
+# why the probe enforces it.
+
+jobs:
+  redprobe-secrets-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Both scanners walk commits, not the checkout. The probe clones this
+          # checkout and hands the clone to gitleaks and to trufflehog in git
+          # mode, and it cross-checks gitleaks' scanned-commit count against
+          # `git rev-list --count` and trufflehog's scanned-byte count against
+          # zero. A shallow checkout would shrink the history under test and the
+          # probe would report a smaller scan as a pass.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: red-probe the secrets gate (secrets-gitleaks, secrets-trufflehog)
+        # Roughly three minutes: three full-history trufflehog passes, one
+        # pull-request-range pass, plus the gitleaks legs. Docker is
+        # preinstalled on ubuntu-latest.
+        #
+        # The probe DERIVES both scanner invocations from security.yml at the
+        # ref under test rather than carrying its own copy of them, and it
+        # proves the derivation reads the file by mutating a copy. That is not
+        # tidiness: the hand-copied version ran an image that exists in no
+        # registry (`v3.95.7` is the ACTION's git tag, and the action is a
+        # composite that docker-runs ghcr.io/trufflesecurity/trufflehog at its
+        # `version` input, defaulting to `latest`), so this job reported NOT RUN
+        # and exited 2 here while reporting a PASS on any laptop with some
+        # trufflehog image cached.
+        #
+        # The probe therefore pulls what each context pulls: the pinned gitleaks
+        # image, and whatever the trufflehog action's moving default tag
+        # resolves to. It refuses to run — it never substitutes a near-enough
+        # build — when either is unavailable, and it refuses when security.yml
+        # moves the action to a revision whose entrypoint it has not been
+        # checked against.
+        run: bash scripts/secrets-gate-redprobe.sh
+
+  redprobe-sast-sca-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: red-probe the SAST/SCA gates (sast-semgrep, sca-trivy-fs)
+        # The clean legs assert the committed tree passes, so this job reddens
+        # on a real new finding as well as on a blinded gate — that is the
+        # intent. It also measures, advisory-only, the coverage gap between the
+        # required `trivy fs` context and the unscanned builder base image.
+        run: bash scripts/sast-sca-gate-redprobe.sh
+
+  redprobe-release-signing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The subject is a file in the tree, not the commit history: this
+          # probe parses .github/workflows/release.yml and mutates copies of it
+          # in a temp directory. A shallow checkout is the whole subject.
+          persist-credentials: false
+      # PyYAML IS A HARD DEPENDENCY OF THIS JOB, SO IT IS INSTALLED UNCONDITIONALLY
+      # The probe PARSES the workflow rather than grepping it, and refuses to run
+      # (exit 2) without PyYAML. This step used to install it only when `import
+      # yaml` had already failed, which left the dependency implicit on the path
+      # that matters: in the GREEN case the job depends on whatever Python
+      # packages the runner image happens to ship, and nothing in this repository
+      # pins or records that. An explicit install removes the dependency on the
+      # image entirely and makes the version visible in the diff. The canon
+      # repository runs exactly this shape and it has passed on ubuntu-latest
+      # repeatedly.
+      #
+      # THE setup-python PIN IS DELIBERATELY NOT THE NEWEST MAJOR
+      # v5.6.0 is the version with an observed green run on ubuntu-latest in
+      # this fleet: the canon repository pins this exact SHA and has run it
+      # repeatedly. v6.0.0 and v7.0.0 exist and are almost certainly fine
+      # functionally, but neither has been observed running anywhere in this
+      # fleet. This repository's rule is that a measured version beats a fresher
+      # one, so the pin follows the measurement. Move it forward when a newer
+      # major has actually been observed, not merely released.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # The pip pin is a VERSION pin, not a hash pin. A hash pin is what the
+      # dependency policy calls for; an unverified invented digest would be worse
+      # than naming its absence. The hash pin lands when the digest is actually
+      # obtained, not guessed.
+      - run: pip install pyyaml==6.0.2
+      - name: red-probe the release signing gate (sbom-and-sign in release.yml)
+        # BLOCKING, with no continue-on-error: this probe exists to detect a
+        # signing job whose failure is recorded as a success, so suppressing its
+        # own failure the same way would be self-defeating. It exits non-zero on
+        # a broken probe (1), an unparseable ledger (2), a signing-order
+        # violation no ledger entry admits (3), and a ledger entry that has
+        # outlived the violation it names (4) — that last one is what stops the
+        # exceptions ledger from quietly becoming a permanent allow-list.
+        run: bash scripts/release-signing-redprobe.sh

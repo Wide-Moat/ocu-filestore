@@ -123,10 +123,10 @@ func (s *tlsServer) Serve() error {
 
 // tlsShutdownDrainTimeout bounds the graceful drain in Close: in-flight
 // operations get this long to finish before stragglers are force-closed. The
-// caller's teardown (erase-before-reuse, NFR-SEC-54) runs AFTER Close returns,
-// so an unbounded drain would be an unbounded teardown delay; the bound stays
-// under typical service-manager stop grace periods so the drain, the
-// force-close, AND the scope erase all fit before a SIGKILL.
+// caller's post-Close work releases process state and touches no storage, so
+// the drain is the whole stop cost; the bound stays under typical
+// service-manager stop grace periods so the drain and the force-close both fit
+// before a SIGKILL.
 const tlsShutdownDrainTimeout = 25 * time.Second
 
 // Close shuts the server down with a BOUNDED drain. In-flight operations get up

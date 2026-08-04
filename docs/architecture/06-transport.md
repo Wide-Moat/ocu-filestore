@@ -199,11 +199,13 @@ built by `tlsserver.go:newTLSServer` and wired in `serve.go:Serve`:
 
 `tlsserver.go:Close` performs a **bounded** graceful drain: in-flight operations
 get up to `tlsShutdownDrainTimeout` (25 s) to finish, after which stragglers are
-force-closed (`srv.Close()`); both errors surface via `errors.Join`. The bound
-is deliberately under typical service-manager stop grace (30 s) so the drain, the
-force-close, *and* the caller's erase-before-reuse teardown (NFR-SEC-54, which
-runs after `Close` returns) all fit before a SIGKILL. A wedged peer can never
-hold the daemon open indefinitely.
+force-closed (`srv.Close()`); both errors surface via `errors.Join`. This is one
+of two data-plane drains — the north Files-API listener runs the same shape under
+`mountDrainTimeout` — and `dualServer.Close` starts them concurrently, so the
+drain phase costs 25 s whether one plane is live or both. A wedged peer can never
+hold the daemon open indefinitely. What the shipped stop-grace periods have to
+cover, and the guard that keeps them covering it, is in
+[`05-lifecycle.md` §6](05-lifecycle.md).
 
 The exported constructor is `serve.go:Serve(Config) (Server, error)`. It
 validates wiring fail-loud — a positive whole-object ceiling, non-nil seams, and

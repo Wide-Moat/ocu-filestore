@@ -22,6 +22,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
@@ -185,9 +186,9 @@ func mapCeilingsErr(err error) error {
 
 // engineAdapter narrows the string scope to the named objectstore.ScopeID per
 // call over the 10 data verbs the southface consumer seam declares. It does
-// NOT wrap Kind/ProvisionScope/TeardownScope — those lifecycle verbs are
-// called by main on the real engine directly (scope provision and
-// erase-before-reuse, NFR-SEC-54), not through the consumer seam.
+// NOT wrap Kind/ProvisionScope/TeardownScope — those lifecycle verbs belong to
+// main on the real engine, not to the consumer seam. (main calls ProvisionScope;
+// TeardownScope has no product caller at all, see objectstore.Engine.)
 //
 // Engine errors pass through with a narrow remap: the four objectstore typed
 // sentinels are translated to the southface mirrors (ErrAlreadyExists,
@@ -253,8 +254,9 @@ func (a engineAdapter) ReadRange(ctx context.Context, scope, path string, offset
 	return mapEngineErr(a.e.ReadRange(ctx, objectstore.ScopeID(scope), path, offset, length, w))
 }
 
-func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) error {
-	return mapEngineErr(a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite))
+func (a engineAdapter) WriteStream(ctx context.Context, scope, path string, r io.Reader, overwrite bool) (string, error) {
+	digest, err := a.e.WriteStream(ctx, objectstore.ScopeID(scope), path, r, overwrite)
+	return digest, mapEngineErr(err)
 }
 
 func toSouthfaceFileInfo(fi objectstore.FileInfo) southface.FileInfo {
@@ -293,15 +295,21 @@ func mapEngineErr(err error) error {
 		// denyMalformed (invalid_argument/400) — a client request fault.
 		return southface.ErrInvalidRange
 	case errors.Is(err, objectstore.ErrThrottled):
-		return southface.ErrBackendThrottled
+		// WRAP, never replace: the mirror stays the errors.Is target while the
+		// message keeps the engine's verb and backend detail (status/code) for
+		// the daemon log — a bare sentinel is not operator-actionable.
+		return fmt.Errorf("%w (%v)", southface.ErrBackendThrottled, err)
 	case errors.Is(err, objectstore.ErrTransient):
-		return southface.ErrBackendTransient
+		return fmt.Errorf("%w (%v)", southface.ErrBackendTransient, err)
 	case errors.Is(err, objectstore.ErrForeignScope):
 		// The scope-confined engine refused a verb naming a scope other than its
 		// provisioned one (GA Wave 1 engine confinement). Remap to the southface
 		// mirror so the spine classifies it as denyScopeMismatch
 		// (permission_denied/403): a scope the request holds no title to, caught
-		// at the engine's authority over the backend prefix.
+		// at the engine's authority over the backend prefix. Replaced, not
+		// wrapped: unlike the two backend-detail sentinels above, the engine's
+		// message names the provisioned scope, which is deployment state and not
+		// operator-actionable detail about a failing backend call.
 		return southface.ErrForeignScope
 	default:
 		return err

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Wide-Moat/ocu-filestore/internal/auditgate"
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 	"github.com/Wide-Moat/ocu-filestore/internal/southface"
 )
@@ -151,5 +152,105 @@ func TestListMalformedCursorIs400(t *testing.T) {
 	w := doReq(h, http.MethodGet, "/v1/files?after=not-a-real-cursor")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for a malformed cursor (client fault, not retryable)", w.Code)
+	}
+}
+
+// listAxisHandler wires a list handler over a seeded engine namespace (so the
+// reconcile really walks and really mints) plus the programmable guard,
+// resolver and ceilings the three-axis tests drive.
+func listAxisHandler(guard *fakeGuard, resolver southface.Resolver, ceilings southface.CeilingsRegistry) (*Handler, *fakeStore, *fakeEngine) {
+	store := newFakeStore()
+	eng := newFakeEngine()
+	eng.seedObject("outputs/report.pdf", []byte("pdf"))
+	h := newTestHandler(Deps{
+		Store:    store,
+		Engine:   eng,
+		Guard:    guard,
+		Resolver: resolver,
+		Ceilings: ceilings,
+		Scope:    fakeScope{ps: southface.PeerScope{FilesystemID: "fs-alpha", GrantedIntents: []southface.Intent{southface.IntentRead}}, ok: true},
+	})
+	return h, store, eng
+}
+
+// TestListChargesOpsBucket pins that GET /v1/files charges the per-session ops
+// ceiling (NFR-SEC-46) BEFORE it touches the engine or the store: an exhausted
+// bucket is a 429 with the reconcile walk never started and no handle minted.
+// Asserting the zero side effect — not merely the status — is what proves the
+// charge PRECEDES the work rather than merely happening somewhere.
+func TestListChargesOpsBucket(t *testing.T) {
+	ceilings := newFakeCeilings()
+	ceilings.sess.opErr = southface.ErrThrottleExceeded
+	h, store, eng := listAxisHandler(&fakeGuard{}, &fakeResolver{}, ceilings)
+
+	w := doReq(h, http.MethodGet, "/v1/files")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (ops ceiling exhausted); body %s", w.Code, w.Body.String())
+	}
+	if eng.listCalls != 0 {
+		t.Fatalf("engine walked %d levels after a refused op charge; want 0", eng.listCalls)
+	}
+	if store.ensureMints != 0 {
+		t.Fatalf("the reconcile minted %d handles after a refused op charge; want 0", store.ensureMints)
+	}
+}
+
+// TestListResolverDenyRefusesPage pins that the three axes are re-derived
+// broker-side for the list verb: a resolver deny refuses the whole page (403),
+// records exactly one DENY audit, and leaves ZERO side effect — the engine
+// namespace is never walked and no durable handle is minted.
+func TestListResolverDenyRefusesPage(t *testing.T) {
+	guard := &fakeGuard{}
+	h, store, eng := listAxisHandler(guard, &fakeResolver{err: southface.ErrIntentDenied}, newFakeCeilings())
+
+	w := doReq(h, http.MethodGet, "/v1/files")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (resolver intent deny); body %s", w.Code, w.Body.String())
+	}
+	if len(guard.events) != 1 || guard.events[0].Outcome.DispositionID != auditgate.DispositionDeny {
+		t.Fatalf("expected exactly one DENY audit, got %+v", guard.events)
+	}
+	if eng.listCalls != 0 {
+		t.Fatalf("engine walked %d levels after an authorization deny; want 0", eng.listCalls)
+	}
+	if store.ensureMints != 0 {
+		t.Fatalf("the reconcile minted %d handles after an authorization deny; want 0", store.ensureMints)
+	}
+}
+
+// TestListEmitsReadClassAllowAudit pins the two audit fields the frozen wire
+// contract constrains for a list: activity_id is Read(2) (the contract's
+// "list maps to Read(2)") and object_handle is the non-empty scope-root
+// RelativePath the listing names (RelativePath carries minLength 1, so an empty
+// handle would be off-contract). Intent is the read axis.
+func TestListEmitsReadClassAllowAudit(t *testing.T) {
+	guard := &fakeGuard{}
+	h, _, _ := listAxisHandler(guard, &fakeResolver{}, newFakeCeilings())
+
+	w := doReq(h, http.MethodGet, "/v1/files")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	if len(guard.events) != 1 {
+		t.Fatalf("expected exactly one ALLOW audit for a list, got %d: %+v", len(guard.events), guard.events)
+	}
+	ev := guard.events[0]
+	if ev.Outcome.DispositionID != auditgate.DispositionAllow {
+		t.Fatalf("disposition = %q, want allow", ev.Outcome.DispositionID)
+	}
+	if ev.ActivityID != auditgate.ActivityRead {
+		t.Fatalf("activity_id = %d, want %d (Read: the contract maps list to Read(2))", ev.ActivityID, auditgate.ActivityRead)
+	}
+	if ev.ObjectHandle == "" {
+		t.Fatal("object_handle is empty; the contract's RelativePath has minLength 1")
+	}
+	if ev.ObjectHandle != "." {
+		t.Fatalf("object_handle = %q, want %q (the scope root the listing walks)", ev.ObjectHandle, ".")
+	}
+	if ev.Intent != string(southface.IntentRead) {
+		t.Fatalf("intent = %q, want %q", ev.Intent, southface.IntentRead)
+	}
+	if ev.FilesystemID != "fs-alpha" {
+		t.Fatalf("filesystem_id = %q, want fs-alpha", ev.FilesystemID)
 	}
 }

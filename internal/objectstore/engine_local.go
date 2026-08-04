@@ -6,7 +6,9 @@ package objectstore
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,9 +24,9 @@ import (
 // every write streams into a temp name under it before committing into
 // place. It is GUEST-INVISIBLE — never surfaced in a listing of the scope
 // root, and unaddressable through any data verb (a reserved name) — and it
-// is removed wholesale by the Provision/Teardown sweeps, so a partial write
-// left by a crashed daemon never survives into a later session (SEC-54
-// crash path).
+// is removed wholesale at every Provision, so a partial write left by a
+// crashed daemon is discarded at the next start while the completed writes
+// around it survive (SEC-54 crash path).
 const stagingDirName = ".ocu-staging"
 
 // guestPath validates a caller-supplied data path (ValidatePath, lexical
@@ -158,11 +160,11 @@ func toFileInfo(fi os.FileInfo) FileInfo {
 // (T-03-05). OpenScopeRoot refuses an absent directory, so this must run
 // before any data verb on a fresh scope.
 //
-// Owner data already in the scope is never erased here. Erase-before-reuse
-// is the responsibility of the caller that holds an explicit owner-change
-// grant (TeardownScope, called on an owner-change signal, never on process
-// lifecycle). Sweeping only staging preserves the SEC-54 orphan-clearance
-// invariant without evicting a live owner on restart.
+// Owner data already in the scope is never erased here. Erasing a scope is
+// TeardownScope's job and is keyed to a change of owner, not to the process
+// lifecycle; sweeping only staging clears a crash's orphaned partial writes
+// without evicting a live owner on restart. TeardownScope currently has no
+// product caller at all — see cmd/ocu-filestored/erase_trigger_test.go.
 func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -203,7 +205,12 @@ func (e *localVolumeEngine) ProvisionScope(ctx context.Context, scope ScopeID) e
 // TeardownScope erases ALL contents of the scope directory and recreates it
 // empty — erase-before-reuse (NFR-SEC-54): after it returns, a re-grant of
 // the same filesystem_id reads fs.ErrNotExist for every prior path.
-// Callers: explicit owner-change grant only, never process lifecycle.
+//
+// No product path calls this. The erase belongs to a change of owner and never
+// to the process lifecycle, but canon names no owner-change event this service
+// can observe, so the trigger does not exist yet and the verb is reachable only
+// from tests. cmd/ocu-filestored/erase_trigger_test.go pins that in both
+// directions; do not wire this to boot or shutdown to close the gap.
 //
 // SEC-54 boundary: this is an OS-level remove+recreate, NOT a cryptographic
 // erase — the substrate is operator disk and freed blocks may persist until
@@ -620,27 +627,40 @@ func (e *localVolumeEngine) ReadRange(ctx context.Context, scope ScopeID, path s
 // stat-then-rename TOCTOU: of two concurrent overwrite=false writers
 // exactly one wins); the early Stat is a fast-path reject only, sparing the
 // stream consumption.
-func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error {
+func (e *localVolumeEngine) WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) (string, error) {
 	sr, err := e.openScope(scope)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer sr.Close()
 
 	cleanPath, err := guestPath(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if !overwrite {
 		if _, err := sr.root.Stat(cleanPath); err == nil {
-			return ErrAlreadyExists
+			return "", ErrAlreadyExists
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("objectstore: stat destination: %w", err)
+			return "", fmt.Errorf("objectstore: stat destination: %w", err)
 		}
 	}
 
-	return writeTempAndCommit(sr, cleanPath, ctxReader{ctx: ctx, r: r}, overwrite)
+	// Compute the content SHA-256 (D6, PARITY-LEDGER-147) in the SAME single pass
+	// that streams the bytes to disk - an io.TeeReader feeds the hasher exactly the
+	// bytes writeTempAndCommit copies, so the digest never triggers a second read
+	// of the committed object. The digest is finalised only after a SUCCESSFUL
+	// commit: an aborted stream (read error, size abort) returns "" alongside its
+	// error, matching the s3 engine's empty-digest-on-error contract. CopyFile
+	// keeps calling writeTempAndCommit directly (no digest - it is not a
+	// content-recording verb).
+	hasher := sha256.New()
+	src := io.TeeReader(ctxReader{ctx: ctx, r: r}, hasher)
+	if err := writeTempAndCommit(sr, cleanPath, src, overwrite); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // writeTempAndCommit is the shared atomic-write tail for WriteStream and

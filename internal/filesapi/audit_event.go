@@ -79,6 +79,63 @@ func readDenyEvent(ps southface.PeerScope, rec handlestore.Record, grant southfa
 	}
 }
 
+// listAllowEvent builds the ALLOW audit event for a directory listing.
+// ActivityID is a Read — the frozen wire contract pins list to Read(2)
+// explicitly ("list maps to Read(2)"), alongside download. ObjectHandle is the
+// scope root (listScopeRootPath): a listing names the whole scope subtree, not
+// one object, and the contract's RelativePath is minLength 1 so the handle must
+// still be a real non-empty path. ByteCount is zero (a listing streams no object
+// bytes). Downloadable carries the broker-resolved grant for the RECORD only —
+// the list verb never gates on it (no bytes leave), so the durable record is
+// honest about what was resolved without turning into a third egress gate.
+//
+// It is Mandated BEFORE the engine-namespace reconcile mutates the durable
+// handle store (audit-before-ack, SEC-79).
+func listAllowEvent(ps southface.PeerScope, grant southface.Grant, reqID string) auditgate.FileActivityEvent {
+	return auditgate.FileActivityEvent{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  auditgate.ActivityRead,
+		Actor: auditgate.ActorSubject{
+			UserUID:    strconv.FormatUint(uint64(ps.UID), 10),
+			SessionUID: ps.FilesystemID,
+			ProcessPID: ps.PID,
+		},
+		FilesystemID:   ps.FilesystemID,
+		ObjectHandle:   listScopeRootPath,
+		ByteCount:      0,
+		Intent:         string(southface.IntentRead),
+		Downloadable:   grant.Downloadable,
+		Outcome:        auditgate.Outcome{DispositionID: auditgate.DispositionAllow},
+		CorrelationUID: reqID,
+	}
+}
+
+// listDenyEvent builds the DENY audit event for a refused listing: an
+// authorization deny before the reconcile, or a store fault after the ALLOW
+// landed. It names the same scope root the ALLOW would have named so the durable
+// record is honest about the subtree the refused listing concerned, and carries
+// the broker-resolved truth in XDenyReason.
+func listDenyEvent(ps southface.PeerScope, grant southface.Grant, auditReason, reqID string) auditgate.FileActivityEvent {
+	return auditgate.FileActivityEvent{
+		ClassUID:    1001,
+		CategoryUID: 1,
+		ActivityID:  auditgate.ActivityRead,
+		Actor: auditgate.ActorSubject{
+			UserUID:    strconv.FormatUint(uint64(ps.UID), 10),
+			SessionUID: ps.FilesystemID,
+			ProcessPID: ps.PID,
+		},
+		FilesystemID:   ps.FilesystemID,
+		ObjectHandle:   listScopeRootPath,
+		ByteCount:      0,
+		Intent:         string(southface.IntentRead),
+		Downloadable:   grant.Downloadable,
+		Outcome:        auditgate.Outcome{DispositionID: auditgate.DispositionDeny, XDenyReason: auditReason},
+		CorrelationUID: reqID,
+	}
+}
+
 // createAllowEvent builds the ALLOW audit event for a create/upload. ActivityID
 // is a Create; ByteCount carries the DECLARED size (the record names the bytes
 // the create is about to stage, mirroring the south upload's streamAuditEvent

@@ -60,12 +60,14 @@ type Engine interface {
 	// WriteStream consumes r into the object at path WITHOUT whole-object
 	// buffering. A partial or aborted write is NEVER visible at the
 	// destination path (temp+rename invisibility); overwrite=false against an
-	// existing destination refuses errAlreadyExists without consuming r. It
-	// mirrors the like-named verb on
+	// existing destination refuses errAlreadyExists without consuming r. On
+	// success it returns the lowercase-hex SHA-256 of the bytes written (D6,
+	// PARITY-LEDGER-147), computed in the engine's single write pass; on any
+	// error the digest is empty. It mirrors the like-named verb on
 	// feat/local-volume-engine:internal/objectstore/objectstore.go (the Engine
 	// interface there), with the named ScopeID narrowed to a plain string per
 	// the consumer-seam discipline.
-	WriteStream(ctx context.Context, scope string, path string, r io.Reader, overwrite bool) error
+	WriteStream(ctx context.Context, scope string, path string, r io.Reader, overwrite bool) (string, error)
 }
 
 // FileInfo mirrors objectstore.FileInfo: the one-level listing/stat record

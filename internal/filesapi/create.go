@@ -166,12 +166,14 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// for write on its OWN filesystem (component-08 has already done the upstream
 	// three-axis authorization before the F9 call), exactly as the south upload
 	// grants write from the channel scope. The placeholder ScopeSource stamps only
-	// read intent on ps.GrantedIntents (the read/delete plane's need), so the write
-	// verb ADDS write intent here rather than widening the scope-source grant for
-	// every plane — see createEvidenceIntents. The broker-side Resolver is still
-	// the deny-by-default decision; this evidence is only an input to it. ---
+	// read intent on ps.GrantedIntents (what the four read-class verbs need), so a
+	// write-class verb ADDS write intent here rather than widening the scope-source
+	// grant for every plane — see writeEvidenceIntents. The broker-side Resolver is
+	// still the deny-by-default decision and this evidence is only an input to it,
+	// but with the shipped scope source it has no axis left to fail on, so the arm
+	// below is a guarded seam rather than a live gate (see fencedGrantedIntents). ---
 	req = southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: engineRef, Intent: southface.IntentWrite}
-	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: createEvidenceIntents(ps)}
+	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: writeEvidenceIntents(ps)}
 	grant, err = h.deps.Resolver.Resolve(r.Context(), evidence, req)
 	if err != nil {
 		denyCreate(denyClassForResolveErr(err), "authorization denied")
@@ -245,9 +247,22 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 			return
 		}
 		if eerr := southface.EnsureDir(r.Context(), h.deps.Engine, ps.FilesystemID, ensureDir); eerr != nil {
+			// A backend refusal on the marker write is the BACKEND's condition,
+			// not this service's fault: transient (e.g. a full backend refusing
+			// the PUT with a 5xx) is backend_unavailable, load-shed is throttle.
+			// Anything else stays the fail-closed internal.
+			class := denyclass.Internal
+			reason := "internal error"
+			switch {
+			case errors.Is(eerr, southface.ErrBackendTransient):
+				class, reason = denyclass.BackendUnavailable, "storage backend unavailable"
+			case errors.Is(eerr, southface.ErrBackendThrottled):
+				class, reason = denyclass.Throttle, "storage backend throttled"
+			}
 			reqLog.Error("files-api create: ensure join-subtree parent failed",
-				slog.String(observ.KeyReason, eerr.Error()))
-			denyCreate(denyclass.Internal, "internal error")
+				slog.String(observ.KeyReason, eerr.Error()),
+				slog.String(observ.KeyDenyClass, class))
+			denyCreate(class, reason)
 			return
 		}
 	}
@@ -256,20 +271,25 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// overwrite_existing defaults to false when absent (JSON zero value),
 	// preserving create-new behaviour for any sender that omits it. ---
 	pr, pw := io.Pipe()
-	writeErrCh := make(chan error, 1)
+	// writeErrCh carries the engine's WriteStream outcome: the error AND, on
+	// success, the content SHA-256 the engine computed in its single write pass
+	// (D6, PARITY-LEDGER-147). The digest is read ONLY on the success path (after
+	// the half-close), so the abort receives discard it; the record Put threads it
+	// northward.
+	writeErrCh := make(chan writeResult, 1)
 	go func() {
 		// Panic containment: on a panic in WriteStream, recoverCreateWriteStream
 		// closes pr with the internal sentinel (unblocking any producer pw.Write)
 		// and sends on writeErrCh. The engine's temp+rename atomicity guarantees no
 		// torn object is visible.
 		defer recoverCreateWriteStream(pr, writeErrCh)
-		werr := h.deps.Engine.WriteStream(r.Context(), ps.FilesystemID, engineRef, pr, params.OverwriteExisting)
+		digest, werr := h.deps.Engine.WriteStream(r.Context(), ps.FilesystemID, engineRef, pr, params.OverwriteExisting)
 		// Close the read end with the engine's error so a producer pw.Write blocked
 		// on a reader that returned early (e.g. WriteStream refused already_exists
 		// WITHOUT consuming r) unblocks immediately with that error instead of
 		// deadlocking on the unread pipe.
 		pr.CloseWithError(werr)
-		writeErrCh <- werr
+		writeErrCh <- writeResult{digest: digest, err: werr}
 	}()
 
 	// Stream the raw file part into the engine pipe in ceiling-bounded reads,
@@ -303,8 +323,8 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 			if _, werr := pw.Write(chunk); werr != nil {
 				// The pipe write failed: the engine rejected (e.g. already_exists)
 				// WITHOUT consuming r. Drain the engine error and map it.
-				engErr := <-writeErrCh
-				denyCreate(denyClassForEngineErr(engErr), "upload refused")
+				engRes := <-writeErrCh
+				denyCreate(denyClassForEngineErr(engRes.err), "upload refused")
 				return
 			}
 		}
@@ -335,9 +355,9 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// Commit: closing the pipe writer signals EOF; WriteStream's temp+rename makes
 	// the object visible only now.
 	pw.Close()
-	werr := <-writeErrCh
-	if werr != nil {
-		denyCreate(denyClassForEngineErr(werr), "upload refused")
+	writeRes := <-writeErrCh
+	if writeRes.err != nil {
+		denyCreate(denyClassForEngineErr(writeRes.err), "upload refused")
 		return
 	}
 
@@ -345,21 +365,42 @@ func (h *Handler) serveCreate(w http.ResponseWriter, r *http.Request, ps southfa
 	// object. DownloadablePolicyRef is deliberately left empty (Q2 deferred —
 	// downloadable resolves at read, never stamped at write).
 	//
-	// DESIGN-ACCEPTED ORPHAN WINDOW: the bytes are committed to the engine
-	// namespace BEFORE the handle is Put, so a Put failure below leaves a
-	// fully-written object with NO file_id — orphan bytes reachable by no
-	// Files-API verb (List/Get/content/delete all resolve through the handle
-	// store). This is accepted, not a leak: the ALLOW was already audited, the
-	// caller gets a 503 and no id, and the orphan is reclaimed by the engine's
-	// workspace Provision/Teardown sweep (the ephemeral-workspace model — the
-	// broker takes on no durable retention). The alternative (handle-before-bytes)
-	// would mint a file_id that resolves to absent bytes — a worse contract. ---
+	// ORPHAN WINDOW, accepted on ordering grounds and NOT reclaimed: the bytes
+	// are committed to the engine namespace BEFORE the handle is Put, so a Put
+	// failure below leaves a fully-written object with NO file_id — orphan bytes
+	// reachable by no Files-API verb (List/Get/content/delete all resolve
+	// through the handle store).
+	//
+	// The ordering is still right: handle-before-bytes would mint a file_id that
+	// resolves to absent bytes, and a dangling id is a worse contract than an
+	// unreferenced object. The ALLOW is already audited and the caller gets a
+	// 503 with no id, so nothing downstream is misled.
+	//
+	// What does NOT happen is reclamation. Nothing sweeps these bytes: provision
+	// only clears the staging area, shutdown erases nothing, and the engine's
+	// scope-erase verb has no product caller (cmd/ocu-filestored/erase_trigger_test.go).
+	// An orphan therefore persists for the life of the scope — disk on the
+	// local-volume engine, billed storage on S3. The window is narrow (a
+	// handle-store write failure after a successful upload) so the accumulation
+	// is bounded in practice, but it is unbounded in principle and reclaiming it
+	// is an open question that belongs with the erase-trigger decision in
+	// docs/architecture/05-lifecycle.md §3.5 — a reclaim pass needs to know what
+	// a scope's lifecycle is before it can know what is safe to collect.
+	//
+	// This paragraph is held to the code by orphan_window_test.go: the ordering,
+	// the absence of a reclaim on the failure path below, and both citations
+	// above are asserted, so the day one of them changes this stops being a note
+	// nobody rechecked. ---
 	rec, perr := h.deps.Store.Put(r.Context(), handlestore.PutInput{
 		Scope:     ps.FilesystemID,
 		ObjectRef: engineRef,
 		Filename:  createFilename(params, engineRef),
 		Mime:      params.MediaType,
 		Size:      declared,
+		// Sha256 is the engine's single-pass content digest (D6): the record
+		// carries it so the north list surfaces it for upload-client content
+		// dedup. Empty when the engine returned no digest - the compat window.
+		Sha256: writeRes.digest,
 	})
 	if perr != nil {
 		// The bytes are durable but the handle did not land. A latched store is a
@@ -512,15 +553,16 @@ func (h *Handler) openCreateFilePart(mr *multipart.Reader, denyReject func(audit
 	return part, true
 }
 
-// createEvidenceIntents returns the intent grant the create verb presents to the
-// Resolver: the scope's own granted intents PLUS write. The placeholder
-// ScopeSource stamps only read intent on ps.GrantedIntents (the read/delete
-// plane's need); the write verb adds IntentWrite so the Resolver's intentGranted
-// gate passes, MIRRORING how the south upload resolves write from the attested
-// channel scope. It de-duplicates so a scope source that already grants write is
-// not double-listed. The broker-side Resolver remains the deny-by-default
-// decision; this is only an input to that re-derivation.
-func createEvidenceIntents(ps southface.PeerScope) []southface.Intent {
+// writeEvidenceIntents returns the intent grant a WRITE-CLASS north verb (create
+// and delete) presents to the Resolver: the scope's own granted intents PLUS
+// write. The placeholder ScopeSource stamps only read intent on
+// ps.GrantedIntents (what the four read-class verbs need); a write verb adds
+// IntentWrite so the Resolver's intentGranted gate passes, MIRRORING how the
+// south upload resolves write from the attested channel scope. It de-duplicates
+// so a scope source that already grants write is not double-listed. The
+// broker-side Resolver remains the deny-by-default decision; this is only an
+// input to that re-derivation.
+func writeEvidenceIntents(ps southface.PeerScope) []southface.Intent {
 	out := make([]southface.Intent, 0, len(ps.GrantedIntents)+1)
 	hasWrite := false
 	for _, in := range ps.GrantedIntents {
@@ -618,18 +660,29 @@ func hasURLScheme(s string) bool {
 	return i+2 < len(s) && s[i] == ':' && s[i+1] == '/' && s[i+2] == '/'
 }
 
+// writeResult is the outcome the WriteStream pipe goroutine sends on writeErrCh:
+// the engine error and, on success, the content SHA-256 the engine computed in
+// its single write pass (D6, PARITY-LEDGER-147). On any error path (engine
+// refusal, abort, panic) the digest is empty and only err is consumed; the
+// success path threads the digest into the durable handle record.
+type writeResult struct {
+	digest string
+	err    error
+}
+
 // recoverCreateWriteStream is the panic-containment wrapper for the WriteStream
 // pipe goroutine. On a panic it closes the pipe reader with the internal
 // sentinel (unblocking a producer pw.Write blocked on the reader) and sends the
 // sentinel on writeErrCh so the handler drains and aborts. The engine's
 // temp+rename atomicity guarantees an aborted WriteStream writes nothing to the
-// namespace. It is a north-local mirror of the south recoverWriteStream.
-func recoverCreateWriteStream(pr *io.PipeReader, writeErrCh chan<- error) {
+// namespace. It is a north-local mirror of the south recoverWriteStream. The
+// digest is empty on a panic (no successful write occurred).
+func recoverCreateWriteStream(pr *io.PipeReader, writeErrCh chan<- writeResult) {
 	if v := recover(); v == nil {
 		return
 	}
 	pr.CloseWithError(errCreateInternalPanic)
-	writeErrCh <- errCreateInternalPanic
+	writeErrCh <- writeResult{err: errCreateInternalPanic}
 }
 
 // denyClassForResolveErr names the deny class for a Resolver seam sentinel,
@@ -662,9 +715,12 @@ func denyClassForResolveErr(err error) string {
 // the create path: an already-exists refusal (overwrite_existing=false against an
 // existing object) is the 409 already_exists class; a missing-parent write (the
 // client named a path whose parent directory does not exist) is a
-// client-attributable 404 not_found, NOT an internal fault; anything else fails
-// closed to internal. It mirrors the south spine engine-error classifier
-// (internal/southface: fs.ErrNotExist -> not_found, fs.ErrExist -> already_exists)
+// client-attributable 404 not_found, NOT an internal fault; a throttled or
+// transient backend refusal is the backend's condition (429 throttle / 503
+// backend_unavailable), matching the south spine's rows for the same mirrors;
+// anything else fails closed to internal. It mirrors the south spine
+// engine-error classifier (internal/southface: fs.ErrNotExist -> not_found,
+// fs.ErrExist -> already_exists, throttled/transient -> throttle/unavailable)
 // for the subset a create WriteStream can surface. The engine surfaces a
 // missing-parent as a raw *fs.PathError wrapping fs.ErrNotExist, so the match is
 // on the standard-library sentinel, exactly as the south classifier does.
@@ -674,6 +730,10 @@ func denyClassForEngineErr(err error) string {
 		return denyclass.AlreadyExists
 	case errors.Is(err, fs.ErrNotExist):
 		return denyclass.NotFound
+	case errors.Is(err, southface.ErrBackendThrottled):
+		return denyclass.Throttle
+	case errors.Is(err, southface.ErrBackendTransient):
+		return denyclass.BackendUnavailable
 	default:
 		return denyclass.Internal
 	}

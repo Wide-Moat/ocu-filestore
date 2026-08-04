@@ -17,8 +17,8 @@ import (
 //
 // Serve runs both listeners concurrently and returns the FIRST listener error
 // (whichever fails first) — a fault on either plane stops the daemon, exactly as
-// a single-listener fault does today. Close shuts BOTH down and joins their
-// errors so neither teardown is dropped behind the other.
+// a single-listener fault does today. Close shuts BOTH down concurrently and
+// joins their errors so neither teardown is dropped behind the other.
 //
 // A nil north listener degrades to south-only: Serve/Close act on the south
 // listener alone (the --handle-store-disabled phase, where Mount B is not
@@ -58,13 +58,33 @@ func (d *dualServer) Serve() error {
 	return <-errCh
 }
 
-// Close shuts both listeners down and joins their errors so a teardown fault on
-// either plane is never silently dropped. A nil north closes the south alone.
+// Close shuts both listeners down CONCURRENTLY and joins their errors so a
+// teardown fault on either plane is never silently dropped. A nil north closes
+// the south alone.
+//
+// The two closes overlap deliberately. Each listener's Close is a bounded drain,
+// and running them one after the other would cost their SUM — every shipped
+// stop-grace period is sized on the concurrent model, so a sequential close puts
+// a graceful stop over the deadline and the service manager SIGKILLs the daemon
+// mid-drain. Worse, a listener keeps ACCEPTING new connections until its own
+// Close runs (http.Server.Shutdown closes only its own listener), so a
+// sequential close leaves the second plane admitting fresh work for the whole of
+// the first plane's drain — after the operator asked the daemon to stop.
+//
+// Overlapping is safe because the two listeners are physically distinct binds
+// over the SAME stateless adapters, which already serve both planes at once
+// while running; a concurrent drain adds no sharing that Serve does not have.
+// Neither drain depends on the other having finished.
+//
+// TestDualServerClosesBothListenersConcurrently pins the overlap;
+// TestShippedStopDeadlinesCoverWorstCaseStopCost sizes the deadlines on it.
 func (d *dualServer) Close() error {
-	southErr := d.south.Close()
 	if d.north == nil {
-		return southErr
+		return d.south.Close()
 	}
-	northErr := d.north.Close()
-	return errors.Join(southErr, northErr)
+
+	northErr := make(chan error, 1)
+	go func() { northErr <- d.north.Close() }()
+	southErr := d.south.Close()
+	return errors.Join(southErr, <-northErr)
 }

@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Known gaps in the release signing-order invariant, measured by
+# scripts/release-signing-redprobe.sh. Override the path with
+# $SIGNING_ORDER_EXCEPTIONS (which is how the probe proves this file is not a
+# blanket: emptied, the probe goes red again).
+#
+# WHY THIS FILE EXISTS
+# A finding the change in hand can close gets FIXED. A finding that needs work
+# elsewhere gets NAMED here, together with the condition that deletes the entry.
+# Neither gets switched off. The two obvious alternatives are both worse than
+# the disease: a blocking gate left permanently red teaches every reader that
+# "filestore checks is always red" is the normal state, and a real regression
+# then rides through unnoticed; and marking the probe's job continue-on-error is
+# the exact false-green pattern that probe was written to detect.
+#
+# FORMAT — one entry per line, everything after `#` is a comment:
+#
+#     <workflow path, relative to the repository root>::<job id>
+#
+# The key is FILE PLUS JOB, deliberately, not a file. A file-keyed entry would
+# admit every present and future signing-order violation anywhere in that
+# workflow — including one raised against a second publishing job somebody adds
+# months from now — which is an allow-list, not an admission. This format admits
+# exactly the one job it names.
+#
+# A line that is not exactly one path, one `::` and one job id is a HARD ERROR
+# and the probe refuses to run at all. It is never a skipped line: a typo that
+# quietly matched nothing would leave the gate red for a finding this file
+# claims to have named, and the reader would have no way to see why. An entry
+# naming a workflow that is not in the tree is refused for the same reason —
+# it could never match, and so could never be reported stale either.
+#
+# A violation that is not attributable to a single job — a workflow with no tag
+# trigger, a workflow in which no publishing step is recognised at all — has no
+# job to name and therefore cannot be written here at all. Those must be fixed.
+#
+# THIS LIST SHRINKS, AND AN EMPTY FILE IS THE TARGET STATE. An entry whose
+# file+job no longer violates is a HARD ERROR telling the reader to delete it.
+# Without that the list would stop shrinking by itself and become a permanent
+# allow-list wearing a temporary label: growth shows up in a diff a reviewer has
+# to agree to, shrinkage does not, so the probe forces it. Every admitted gap
+# also prints on every run, so a reader can tell "the gate found nothing" from
+# "the gate found something we agreed to carry".
+#
+# The reason an entry is here, and the condition that deletes it, go in a
+# comment IMMEDIATELY ABOVE that entry.
+#
+# ---------------------------------------------------------------------------
+# .github/workflows/release.yml :: ghcr-image
+#
+# Reason: SIGN-AFTER-PUBLISH. `ghcr-image` runs docker/build-push-action with
+# push: true and needs only [tag-format, security-gates, verify], while
+# `sbom-and-sign` needs [..., ghcr-image, image-scan]. The pullable image
+# reference therefore exists before any signature does. If sbom-and-sign fails —
+# expired OIDC, Rekor unavailable, the SBOM action down — the image stays
+# published under its release tag, pulls unsigned, and the red run retracts
+# nothing. The probe is not misreporting: the ordering really is that way.
+#
+# Why not fixed here: closing it restructures the release pipeline — build
+# without pushing, sign the digest, and apply the release tags only from a job
+# downstream of signing — and which of those shapes to adopt is the owner's
+# call on the release process, not a CI-wiring decision. The probe's own green
+# control constructs one such shape, but that is a control proving the analyzer
+# can return zero violations; it is not a proposed remedy.
+#
+# Removal condition: DELETE THIS ENTRY in the same commit that puts the
+# publishing job downstream of `sbom-and-sign` (or otherwise stops it publishing
+# before signing). The probe fails on a stale entry, so this is enforced rather
+# than requested.
+.github/workflows/release.yml::ghcr-image

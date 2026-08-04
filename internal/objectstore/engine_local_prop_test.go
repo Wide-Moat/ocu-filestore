@@ -98,13 +98,13 @@ func TestPropVerbContainment(t *testing.T) {
 			rt.Fatalf("symlink: %v", err)
 		}
 		// A legitimate source the move/copy verbs can consume.
-		if err := eng.WriteStream(ctx, scope, "seed", bytes.NewReader([]byte("inside")), false); err != nil {
+		if _, err := eng.WriteStream(ctx, scope, "seed", bytes.NewReader([]byte("inside")), false); err != nil {
 			rt.Fatalf("WriteStream seed: %v", err)
 		}
 
 		// Unconditional vacuity guard: drive a write THROUGH the planted
 		// escape symlink — must refuse with the os.Root escape class.
-		err = eng.WriteStream(ctx, scope, "escape/pwn", bytes.NewReader([]byte("x")), true)
+		_, err = eng.WriteStream(ctx, scope, "escape/pwn", bytes.NewReader([]byte("x")), true)
 		switch {
 		case err == nil:
 			rt.Fatalf("WriteStream(escape/pwn): planted escape must be refused, got nil error")
@@ -127,7 +127,7 @@ func TestPropVerbContainment(t *testing.T) {
 		var verbErr error
 		switch verb {
 		case 0:
-			verbErr = eng.WriteStream(ctx, scope, p, bytes.NewReader([]byte("payload")), true)
+			_, verbErr = eng.WriteStream(ctx, scope, p, bytes.NewReader([]byte("payload")), true)
 		case 1:
 			verbErr = eng.MoveFile(ctx, scope, "seed", p, true)
 		case 2:
@@ -207,7 +207,7 @@ func TestPropEraseBeforeReuse(t *testing.T) {
 			}
 		}
 
-		if err := eng.WriteStream(ctx, id, clean, bytes.NewReader(data), true); err != nil {
+		if _, err := eng.WriteStream(ctx, id, clean, bytes.NewReader(data), true); err != nil {
 			return // unwritable draw (e.g. component is a file) — skip
 		}
 		// Session one can read its own marker.
@@ -251,7 +251,7 @@ func TestLocalEngine_ConcurrentDistinctScopes(t *testing.T) {
 					errCh <- fmt.Errorf("%s round %d provision: %w", scope, r, err)
 					return
 				}
-				if err := eng.WriteStream(ctx, scope, "obj", bytes.NewReader(data), false); err != nil {
+				if _, err := eng.WriteStream(ctx, scope, "obj", bytes.NewReader(data), false); err != nil {
 					errCh <- fmt.Errorf("%s round %d write: %w", scope, r, err)
 					return
 				}

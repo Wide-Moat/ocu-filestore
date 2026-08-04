@@ -94,9 +94,21 @@ jobs:
         # Advisory only (continue-on-error above): each unleash emits a
         # per-package efficacy/coverage summary and never fails the run. The
         # coverpkg scope and the exclude sets isolate the guard source files;
-        # the two containment guards live in rig-heavy packages, so the
-        # --exclude-files positive enumeration trims each package down to its
-        # single guard file (RE2 has no negative lookahead).
+        # the two containment guards live in rig-heavy packages, so each
+        # --exclude-files enumerates the rig-heavy sources POSITIVELY (RE2 has
+        # no negative lookahead, so "everything except the guard" cannot be
+        # spelled). Each enumeration is a SUBTRACTION from the package, not a
+        # whitelist of one guard file, and the two fail in opposite directions
+        # as a package grows - neither a red build on this advisory job.
+        # objectstore's list is written out, so a source file added later is
+        # MUTATED unless it is named too (scope_confined.go was named for that
+        # reason; engine_lazyprovision.go is mutated today alongside
+        # pathresolver.go, which costs run time). southface's is computed from
+        # `ls` at run time, so a file added there is EXCLUDED silently and
+        # costs signal instead (jwtverify.go is unmutated today). The
+        # objectstore regexp matches the file BASENAME and the southface one
+        # the package-relative PATH, hence the (^|/) anchors in one and the
+        # southface/ prefix the `sed` leaves in the other.
         run: |
           set -u
           for pkg in ./internal/authz/ ./internal/denyclass/ ./internal/ceilings/; do

@@ -40,16 +40,66 @@ const (
 	listAfterParam = "after"
 )
 
+// listScopeRootPath is the engine-relative path the list verb authorizes and
+// records. A listing is a read of the WHOLE scope subtree, not of one object, so
+// the scope root is the honest handle for it: it is the exact token
+// reconcileEngineNamespace hands Engine.List to start the walk, and it is a
+// legal non-empty RelativePath under the frozen wire contract (RelativePath
+// carries minLength 1, so an empty object_handle would be off-contract).
+//
+// A page may span many subtrees, so the resolver is asked ONE scope-root
+// question rather than one question per record: the scope axis is the
+// load-bearing one for a listing, and it is exercised here. Per-record filtering
+// of a page is a different design with its own contract question (whether a
+// filtered record leaks by absence) and is deliberately not smuggled in.
+const listScopeRootPath = "."
+
 // serveList serves GET /v1/files: a scope-bound page of FileObjects paged by
 // ?after=<next_cursor>. The page is bound to the host-attested scope — List
 // returns ONLY records in that scope, so a caller never sees another scope's
 // handles (the same scope binding the keystone enforces on Get). A malformed
 // limit is a client request fault (400); a store error is a broker-internal 503.
 //
+// Order of operations (every clause load-bearing, mirroring the content verb):
+//
+//   - ops/s charge FIRST (NFR-SEC-46), before any store or engine touch: an
+//     exhausted bucket costs a listing walk of nothing.
+//   - parse the limit / cursor (a malformed limit is a client fault; no object
+//     has been named and no authorization resolved yet, so it records no
+//     activity).
+//   - Resolve(intent=read) at the scope root from the attested scope: the three
+//     axes are re-derived broker-side per request, deny-by-default. Under the
+//     shipped F9 grant that re-derivation has no axis left to fail on, so
+//     denyList's resolver-error arm is defence in depth against a future scope
+//     source, not a refusal a deployment produces today — see
+//     fencedGrantedIntents.
+//   - Mandate the ALLOW BEFORE the reconcile (audit-before-ack, SEC-79). The
+//     reconcile MUTATES the durable handle store (EnsureObject mints handles),
+//     so no durable state may change ahead of its record; an audit failure
+//     denies 503 with zero mints.
+//   - only then the reconcile + the paged Store.List.
+//
+// downloadable is NOT gated here: a listing emits no object bytes, so the
+// NFR-SEC-73 egress gate stays on the two byte-emitting north verbs (content and
+// archive). The resolved value is RECORDED on the event, never enforced.
+//
 // downloadable is omitted from every FileObject in the page (Default 1).
-func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqLog *slog.Logger) {
+func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface.PeerScope, reqID string, reqLog *slog.Logger) {
+	// --- ops/s throttle, keyed on the CHANNEL scope (mirrors the content read
+	// path and the create verb). It is charged BEFORE the store and the engine so
+	// a refused request costs neither a walk nor a page. ---
+	sess := h.deps.Ceilings.Session(ps.FilesystemID)
+	if err := sess.TryConsumeOp(); err != nil {
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Throttle), "operation rate ceiling exceeded")
+		return
+	}
+
 	limit, ok := parseLimit(r.URL.Query().Get(listLimitParam))
 	if !ok {
+		// A malformed limit is refused BEFORE authorization is resolved: no object
+		// has been named and no grant exists, so there is no honest file activity
+		// to record (a DENY here would have to invent a downloadable value that was
+		// never resolved). It is a request-shape fault, not a storage access.
 		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Malformed), "invalid limit parameter")
 		return
 	}
@@ -58,6 +108,29 @@ func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface
 	// token surfaces as a store error -> 503); the wire never carries the bare
 	// boundary id as a cursor.
 	after := r.URL.Query().Get(listAfterParam)
+
+	// --- authz Resolve(intent=read) at the scope root from the attested scope ---
+	req := southface.ResolveRequest{Filesystem: ps.FilesystemID, Path: listScopeRootPath, Intent: southface.IntentRead}
+	evidence := southface.CallerEvidence{Scope: ps.FilesystemID, GrantedIntents: ps.GrantedIntents}
+	grant, rerr := h.deps.Resolver.Resolve(r.Context(), evidence, req)
+	if rerr != nil {
+		h.denyList(w, r, reqLog, ps, grant, denyClassForResolveErr(rerr), "authorization denied", reqID)
+		return
+	}
+
+	// --- audit ALLOW BEFORE the reconcile mutates the durable store (SEC-79) ---
+	// The reconcile below mints durable handles (Store.EnsureObject). The ALLOW
+	// must land first so no durable state change ever precedes its record; an
+	// audit-down denies 503 with zero mints and zero page.
+	allow := listAllowEvent(ps, grant, reqID)
+	if merr := h.deps.Guard.Mandate(r.Context(), allow); merr != nil {
+		// The allow Mandate itself failed (audit down). Deny before any store
+		// mutation; do NOT re-Mandate a deny (the gate is unavailable).
+		reqLog.Error("files-api list: allow audit failed before the namespace reconcile",
+			slog.String(observ.KeyDenyClass, denyclass.AuditDown))
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.AuditDown), "audit gate unavailable")
+		return
+	}
 
 	// WHOLE-TREE BRIDGE (ADR-0029:46, "the scope's owner sees the whole tree"). On
 	// the CURSORLESS FIRST PAGE, reconcile the engine namespace into the north
@@ -69,6 +142,13 @@ func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface
 	// (EnsureObject is a mutation; a write-fault store must not attempt one). A
 	// reconcile error is an HONEST DEGRADE: the pane still sees north-created
 	// handles, so a transient engine hiccup must not 503 the list.
+	//
+	// The mint carries NO event of its own: it materialises the north handle index
+	// over objects the engine ALREADY holds — it creates no backend object and
+	// moves no byte, so a per-object Create(1) would be a dishonest durable
+	// record. The engine-namespace walk it performs IS the read the ALLOW above
+	// names at the scope root; the obligation the invariant places on it is
+	// ORDERING, discharged by Mandating that ALLOW first.
 	if after == "" && !h.deps.Store.Latched() {
 		h.reconcileEngineNamespace(r.Context(), ps.FilesystemID, reqLog)
 	}
@@ -85,20 +165,43 @@ func (h *Handler) serveList(w http.ResponseWriter, r *http.Request, ps southface
 		// cursor is a client rejection), matching the invalid-limit branch above
 		// and the south leg's malformed-cursor mapping. A retryable 503 here would
 		// invite an infinite retry loop on a permanently bad token.
+		//
+		// Both branches land AFTER the ALLOW audit, so each emits a BEST-EFFORT
+		// DENY naming the refused listing (mirroring denyDeleteAfterAudit): the
+		// chain's last record must not assert an allow for a listing the caller
+		// never received. A failed deny-Mandate cannot make the verdict worse (the
+		// operation acked nothing), so the original verdict stands.
+		class, message := denyclass.BackendUnavailable, "list failed"
 		if errors.Is(err, handlestore.ErrMalformedCursor) {
-			denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.Malformed), "malformed cursor")
-			return
+			class, message = denyclass.Malformed, "malformed cursor"
+		} else {
+			reqLog.Error("files-api list error",
+				slog.String(observ.KeyReason, err.Error()))
 		}
-		// Any other list failure is a transient broker-internal state (the store
-		// carries no client-attributable deny for a read listing); fail closed to
-		// 503 (unavailable, retryable).
-		reqLog.Error("files-api list error",
-			slog.String(observ.KeyReason, err.Error()))
-		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.BackendUnavailable), "list failed")
+		_ = h.deps.Guard.Mandate(r.Context(), listDenyEvent(ps, grant, class, reqID))
+		denywire.WriteRESTDeny(w, denywire.MapDeny(class), message)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, newListResponse(page))
+}
+
+// denyList emits the list DENY audit (the broker-resolved truth) then the REST
+// deny response. It is the PRE-mutation refusal path: it is only ever reached
+// before the reconcile, so it can always write a real HTTP status and the
+// durable store is untouched. A deny-Mandate FAILURE degrades the verdict to
+// audit_down (NFR-SEC-79): if the deny record did not durably land, the verdict
+// the caller sees must be audit-down, mirroring denyRead.
+func (h *Handler) denyList(w http.ResponseWriter, r *http.Request, reqLog *slog.Logger, ps southface.PeerScope, grant southface.Grant, auditReason, message, reqID string) {
+	reqLog.Warn("files-api list deny",
+		slog.String(observ.KeyDenyClass, auditReason),
+		slog.String(observ.KeyReason, message))
+	ev := listDenyEvent(ps, grant, auditReason, reqID)
+	if merr := h.deps.Guard.Mandate(r.Context(), ev); merr != nil {
+		denywire.WriteRESTDeny(w, denywire.MapDeny(denyclass.AuditDown), "audit gate unavailable")
+		return
+	}
+	denywire.WriteRESTDeny(w, denywire.MapDeny(auditReason), message)
 }
 
 // reconcileEngineNamespace walks the engine namespace of scope and mints a

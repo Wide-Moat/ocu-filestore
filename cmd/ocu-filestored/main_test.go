@@ -140,7 +140,9 @@ func validBrokerConfig(t *testing.T) brokerConfig {
 
 // TestComposeAdmittedServesAndCloses pins WIRE-MAIN: the admitted triple
 // composes the stack, provisions a session, and serves on a real socket; Close
-// tears down cleanly (engine TeardownScope + registry/ceilings release).
+// then returns cleanly, having drained the session and released the
+// registry/ceilings entry and the handle-store descriptor. It erases nothing —
+// TestTeardownServerCloseDoesNotEraseScope is the arm that pins that.
 func TestComposeAdmittedServesAndCloses(t *testing.T) {
 	cfg := validBrokerConfig(t)
 	srv, err := compose(cfg, testLogger(), telemetry.NewBrokerMetrics("test"))
@@ -987,11 +989,14 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 	}
 }
 
-// TestServeUntilSignalSigtermRunsTeardown pins T1-9/SEC-54 stop path: a real
-// SIGTERM delivered to the process makes serveUntilSignal close the server
-// (teardown runs) and SURFACES the close error — a teardown failure on a
-// clean signal stop is never silently dropped.
-func TestServeUntilSignalSigtermRunsTeardown(t *testing.T) {
+// TestServeUntilSignalSigtermClosesServer pins the T1-9 stop path: a real
+// SIGTERM delivered to the process makes serveUntilSignal close the server and
+// SURFACES the close error — a close failure on a clean signal stop is never
+// silently dropped.
+//
+// Close releases process state only; no scope erase is involved on this path or
+// any other (see erase_trigger_test.go).
+func TestServeUntilSignalSigtermClosesServer(t *testing.T) {
 	teardownErr := errors.New("teardown failed loudly")
 	srv := &fakeLifecycleServer{
 		serveStarted: make(chan struct{}),
@@ -1101,7 +1106,7 @@ func TestTeardownServerCloseDoesNotEraseScope(t *testing.T) {
 	if err := eng.ProvisionScope(ctx, scope); err != nil {
 		t.Fatalf("ProvisionScope: %v", err)
 	}
-	if err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
+	if _, err := eng.WriteStream(ctx, scope, "owner.bin", strings.NewReader("OWNER"), false); err != nil {
 		t.Fatalf("WriteStream: %v", err)
 	}
 
@@ -1127,35 +1132,11 @@ func TestTeardownServerCloseDoesNotEraseScope(t *testing.T) {
 	}
 }
 
-// TestTeardownLifecycleCtxCarriesDeadline pins the bounded-lifecycle rollback
-// contract: the rollback latch's TeardownScope call in compose uses a context
-// bounded by teardownTimeout — never a bare context.Background(). A hung backend
-// sweep can therefore never wedge startup indefinitely. This is exercised
-// through the rollback path rather than through teardownServer.Close, which no
-// longer calls TeardownScope.
-func TestTeardownLifecycleCtxCarriesDeadline(t *testing.T) {
-	// The bounded-deadline guarantee now lives in the rollback latch defer in
-	// compose(). teardownTimeout is a named constant (not derived from a flag),
-	// so this test simply asserts it is positive and documents the contract.
-	if teardownTimeout <= 0 {
-		t.Fatalf("teardownTimeout = %v; want > 0 (rollback latch must be bounded)", teardownTimeout)
-	}
-}
-
-// TestLifecycleTimeoutsBounded pins that both lifecycle bounds are finite,
-// positive, and ordered (teardown sweeps a whole scope on a network engine,
-// so its bound is the generous one).
-func TestLifecycleTimeoutsBounded(t *testing.T) {
-	if provisionTimeout <= 0 {
-		t.Fatalf("provisionTimeout = %v; want > 0", provisionTimeout)
-	}
-	if teardownTimeout <= 0 {
-		t.Fatalf("teardownTimeout = %v; want > 0", teardownTimeout)
-	}
-	if teardownTimeout < provisionTimeout {
-		t.Fatalf("teardownTimeout %v < provisionTimeout %v; the scope sweep bound must be the generous one", teardownTimeout, provisionTimeout)
-	}
-}
+// The two lifecycle-timeout tests that stood here asserted that a constant is
+// greater than zero, and one of them documented a rollback-latch TeardownScope
+// call that no longer exists. The bound that remains has a real subject and is
+// checked against the wiring in
+// cmd/ocu-filestored/timeout_consumer_test.go:TestBootProvisionRunsUnderTheBoundedContext.
 
 // TestLogLevelFlagRefusesUnknown pins that validate refuses an unknown
 // -log-level token with errBadLogLevel BEFORE any socket is bound.

@@ -56,8 +56,8 @@ func (serveFakeEngine) RemoveFile(context.Context, string, string) error        
 func (serveFakeEngine) ReadRange(context.Context, string, string, int64, int64, io.Writer) error {
 	return nil
 }
-func (serveFakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) error {
-	return nil
+func (serveFakeEngine) WriteStream(context.Context, string, string, io.Reader, bool) (string, error) {
+	return "", nil
 }
 
 // serveFakeExtractor binds every presented bearer to a fixed scope. The

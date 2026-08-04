@@ -173,8 +173,11 @@ type Engine interface {
 	ProvisionScope(ctx context.Context, scope ScopeID) error
 	// TeardownScope erases ALL contents of the named scope — erase-before-reuse
 	// (NFR-SEC-54). After it returns, no path written in the prior session is
-	// readable. Callers: explicit owner-change grant only, never process
-	// lifecycle (shutdown, restart, or composition failure).
+	// readable. The erase belongs to a change of owner and never to the process
+	// lifecycle (shutdown, restart, or composition failure). It has no product
+	// caller today: canon names no owner-change event this service can observe,
+	// so the trigger was never built and the verb is reachable only from tests
+	// (cmd/ocu-filestored/erase_trigger_test.go).
 	TeardownScope(ctx context.Context, scope ScopeID) error
 
 	// List returns the entries of the named directory, ONE level only
@@ -205,6 +208,9 @@ type Engine interface {
 	// WriteStream consumes r into the named file without whole-object
 	// buffering; a partial write is never visible at the destination path.
 	// With overwrite false an existing destination refuses with
-	// ErrAlreadyExists.
-	WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) error
+	// ErrAlreadyExists. On success it returns the lowercase-hex SHA-256 of the
+	// bytes written (D6, PARITY-LEDGER-147), computed in the SAME single pass
+	// (never a second read of the object); on any error the returned digest is
+	// empty.
+	WriteStream(ctx context.Context, scope ScopeID, path string, r io.Reader, overwrite bool) (string, error)
 }

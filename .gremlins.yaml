@@ -12,11 +12,15 @@
 # guards: the credential-scope derivation (credscope.go, "never a signing key")
 # and the path-containment resolver (pathresolver.go, "never a path outside the
 # attested prefix"). The S3 / socket / streaming source FILES in southface and
-# objectstore are NOT mutated (the loop in mutation.yml / the Makefile mutates
-# only the guard source paths) because they need the live MinIO rig and the
-# peer-credential socket, which would make a mutation run enormous for little
-# added signal over their own conformance and e2e suites; coverpkg merely
-# widens coverage collection so the two guard files are attributed.
+# objectstore are NOT mutated (the loop in mutation.yml / the Makefile passes
+# each package path with those rig-heavy files named in --exclude-files, a
+# SUBTRACTION from the package and not a whitelist of the guard file: a source
+# file added to one of those packages later is mutated unless it is named too,
+# which is why scope_confined.go had to join the objectstore exclusion) because
+# they need the live MinIO rig and the peer-credential socket, which would make
+# a mutation run enormous for little added signal over their own conformance
+# and e2e suites; coverpkg merely widens coverage collection so the two guard
+# files are attributed.
 #
 # coverpkg restricts coverage collection to those packages; the path argument
 # passed on the command line restricts which source files are mutated. Keep

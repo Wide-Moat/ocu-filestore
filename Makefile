@@ -33,10 +33,14 @@ GOLANGCI_LINT_VERSION := v2.12.2
 # go-gremlins mutation tester version pinned in CI (mutation.yml install step).
 GREMLINS_VERSION := v0.6.0
 
-# go-mutesting: a second, advisory mutation lens for local runs only (not in CI,
-# not in `make check`). It resolves packages via `go list`, so unlike gremlins
-# it is immune to the comment-led go.mod first-line parse issue.
-GO_MUTESTING_VERSION := v1.2.0
+# go-mutesting: the tool the ARMED mutation floor runs (scripts/mutation-floor.sh,
+# the mutation-floor job in mutation.yml). The local target below is a fast
+# single-package lens on the same tool; neither is part of `make check`.
+#
+# The avito-tech fork carries no semver tag, so this is the module pseudo-
+# version, and it must stay byte-identical to the pin in the mutation.yml
+# install step: one tool, one pin.
+GO_MUTESTING_VERSION := v0.0.0-20251226130216-48d0401f00fb
 
 # Coverage floor (matches the awk assertion in go.yml).
 COVERAGE_FLOOR := 86.0
@@ -81,12 +85,12 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' bin         "Build the daemon into build/ocu-filestored (gitignored)"
 	@printf '  %-20s  %s\n' test        "go test ./...  (live-S3/e2e legs loud-skip without rig env vars)"
 	@printf '  %-20s  %s\n' test-race   "go test -race ./..."
-	@printf '  %-20s  %s\n' cover       "Coverage floor ($(COVERAGE_FLOOR)%%) over ./internal/..."
+	@printf '  %-20s  %s\n' cover       "Coverage floor ($(COVERAGE_FLOOR)%) over ./internal/..."
 	@printf '  %-20s  %s\n' fmt         "gofmt -l . (fails if any file is unformatted)"
 	@printf '  %-20s  %s\n' vet         "go vet ./..."
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
 	@printf '  %-20s  %s\n' lint        "golangci-lint run (structural meta-linter, .golangci.yml)"
-	@printf '  %-20s  %s\n' mutation    "go-gremlins mutation test (advisory) on the pure-logic packages"
+	@printf '  %-20s  %s\n' mutation    "go-gremlins mutation test (advisory) over the mutation.yml CI job scope"
 	@printf '  %-20s  %s\n' deadcode    "whole-program deadcode -test ./... (advisory; exits 1 on any finding)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
@@ -195,19 +199,23 @@ deadcode: ## whole-program deadcode (advisory; exits 1 on any finding — exit-0
 
 # ── mutation (advisory — NOT part of `make check`) ────────────────────────────
 #
-# Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
-# (authz, denyclass, ceilings). Mutation testing measures assertion strength —
-# it rewrites covered source and re-runs the suite; a mutant the tests still
-# pass on is a line executed but not asserted on, which line coverage cannot
-# see. The coverpkg scope is read from .gremlins.yaml at the repo root.
+# Mirrors the mutation.yml CI job invocation for invocation: the same path
+# arguments, the same --exclude-files rules. Whatever that job mutates, this
+# target mutates; a package added to one belongs in the other, and neither
+# list is restated outside those two recipes. Mutation testing measures
+# assertion strength — it rewrites covered source and re-runs the suite; a
+# mutant the tests still pass on is a line executed but not asserted on, which
+# line coverage cannot see. The coverpkg scope is read from .gremlins.yaml at
+# the repo root.
 #
 # gremlins unleash takes a single path argument, so the packages are run in a
 # loop. Advisory and deliberately excluded from `make check`: gremlins is slow,
-# and on a comment-led go.mod it mis-derives the module path (it reads only the
-# first line of go.mod; see .gremlins.yaml for the full rationale), so it is a
-# standalone advisory target, not a pre-push gate.
+# and it kills on a timeout it calibrates from one clean run, which the rapid
+# property suites in scope make flaky (see .gremlins.yaml for the full
+# rationale). So it is a standalone advisory target, not a pre-push gate; the
+# ARMED floor is go-mutesting, in CI.
 
-mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings — pinned to $(GREMLINS_VERSION)
+mutation: ## go-gremlins mutation test (advisory) over the same scope as the mutation.yml CI job — pinned to $(GREMLINS_VERSION)
 	@if ! command -v gremlins >/dev/null 2>&1; then \
 	  echo "gremlins not found — install with:"; \
 	  echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
@@ -219,7 +227,7 @@ mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings �
 	done
 	@echo "--- gremlins unleash internal/objectstore/pathresolver.go (guard) ---"
 	@gremlins unleash \
-	  --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go' \
+	  --exclude-files '(^|/)credentials\.go|(^|/)engine_local\.go|(^|/)engine_s3\.go|(^|/)objectstore\.go|(^|/)scope_confined\.go' \
 	  ./internal/objectstore/ \
 	  || echo "gremlins reported a non-zero exit for pathresolver.go (advisory)"
 	@echo "--- gremlins unleash internal/southface/credscope.go (guard) ---"
@@ -228,14 +236,18 @@ mutation: ## go-gremlins mutation test (advisory) on authz/denyclass/ceilings �
 	gremlins unleash --exclude-files "$$SF_EXC" ./internal/southface/ \
 	  || echo "gremlins reported a non-zero exit for credscope.go (advisory)"
 
-# go-mutesting is a SECOND, independent mutation lens — local and advisory only.
-# It is NOT in CI and NOT in `make check`. Because it resolves packages through
-# `go list`, it is immune to the comment-led go.mod first-line parse issue that
-# makes gremlins report phantom 0-killed here, so it gives a real efficacy read
-# on the authz resolver while the gremlins gate stays advisory. It never fails
-# the build: a non-zero exit is reported and swallowed, exactly like `mutation`.
-mutation-go-mutesting: ## go-mutesting mutation test (advisory, local only) on internal/authz — pinned to $(GO_MUTESTING_VERSION)
-	@echo "--- advisory: go-mutesting is a local second lens; it never fails the build ---"
+# go-mutesting is the ARMED lens in CI (the mutation-floor job, nightly, via
+# scripts/mutation-floor.sh). This target is the LOCAL preview of that tool: one
+# package, no floor, no bounded exec script, and it never fails the build — a
+# non-zero exit is reported and swallowed, exactly like `mutation`. It is not in
+# `make check`, and passing it is NOT evidence the armed floor passes; the floor
+# scores more packages and fails closed on anomalies this target does not check.
+# Because go-mutesting resolves packages through `go list` and kills on real
+# test PASS/FAIL rather than on a calibrated timeout, its score is stable enough
+# to arm, which is why the floor rides on it and the gremlins gate stays
+# advisory.
+mutation-go-mutesting: ## go-mutesting mutation test (advisory, local preview of the armed CI floor) on internal/authz — pinned to $(GO_MUTESTING_VERSION)
+	@echo "--- advisory: local preview of the armed CI floor; it never fails the build ---"
 	@if ! command -v go-mutesting >/dev/null 2>&1; then \
 	  echo "go-mutesting not found — install with:"; \
 	  echo "  go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@$(GO_MUTESTING_VERSION)"; \
