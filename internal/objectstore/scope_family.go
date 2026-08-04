@@ -11,7 +11,7 @@ import (
 // derivedShape matches any scope id ENDING in the fixed derived-scope suffix
 // ("-" + 16 lowercase hex). It is the structural complement of a family's
 // member shape: a BASE carrying this suffix is refused at construction, so the
-// families of two distinct deployments are disjoint by construction — with a
+// families of two distinct deployments are disjoint by construction -- with a
 // fixed 17-byte suffix, base1+"-"+h1 == base2+"-"+h2 forces base1 == base2,
 // and base1 == base2+"-"+h would make base1 derived-shaped, which no family
 // admits as a base. Without this refusal a deployment whose base happened to
@@ -26,7 +26,7 @@ var derivedShape = regexp.MustCompile(`-[0-9a-f]{16}$`)
 // "<base>-<16 lowercase hex>". Both the scope-confined guard and the
 // lazy-provision scaffolder decide membership through ONE ScopeFamily built at
 // compose, so the admitting predicate and the scaffolding predicate can never
-// drift apart — two private copies of this rule are exactly how the D5
+// drift apart -- two private copies of this rule are exactly how the D5
 // composition defect arose. The zero value contains nothing (fail-closed).
 type ScopeFamily struct {
 	base string
@@ -34,7 +34,7 @@ type ScopeFamily struct {
 }
 
 // NewScopeFamily builds the family rooted at base. It refuses a base that
-// fails the scope-id shape guard, and — load-bearing, see derivedShape — a
+// fails the scope-id shape guard, and -- load-bearing, see derivedShape -- a
 // base that is itself derived-shaped.
 func NewScopeFamily(base ScopeID) (ScopeFamily, error) {
 	if err := validateScopeID(base); err != nil {

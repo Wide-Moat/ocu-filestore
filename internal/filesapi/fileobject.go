@@ -3,7 +3,13 @@
 
 package filesapi
 
-import "github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+import (
+	"mime"
+	"path/filepath"
+	"strings"
+
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
+)
 
 // FileObject is the Files-API JSON representation of a stored file handle
 // (ADR-0023, the Anthropic Files dialect). It is built from a handlestore.Record
@@ -57,11 +63,38 @@ func newFileObject(r handlestore.Record) FileObject {
 		ID:        r.FileID,
 		Type:      fileObjectType,
 		Filename:  r.Filename,
-		MimeType:  r.Mime,
+		MimeType:  resolveMime(r.Mime, r.Filename),
 		SizeBytes: r.Size,
 		CreatedAt: r.CreatedAt,
 		Sha256:    r.Sha256,
 	}
+}
+
+// resolveMime returns the stored content type, or derives one from the filename
+// extension when the record carries none. A guest FUSE write PUTs an S3 object
+// with no Content-Type, so the durable record's Mime is "" for every agent-
+// written file; without this, a client (the File Pane preview, any F9 reader)
+// cannot classify an image the model produced. Read-time derivation at this one
+// projection choke-point covers already-stored objects and any writer, and it is
+// consistent with the content endpoint serving the same type. A stored Mime
+// always wins; the fallback runs only when it is absent.
+func resolveMime(stored, filename string) string {
+	if stored != "" {
+		return stored
+	}
+	ext := filepath.Ext(filename)
+	if ext == "" {
+		return ""
+	}
+	if t := mime.TypeByExtension(ext); t != "" {
+		// TypeByExtension may append "; charset=utf-8"; keep only the media type
+		// so the wire carries a bare "image/png" like a stored content type.
+		if i := strings.IndexByte(t, ';'); i >= 0 {
+			return strings.TrimSpace(t[:i])
+		}
+		return t
+	}
+	return ""
 }
 
 // ListResponse is the Files-API list envelope (ADR-0028): the page of

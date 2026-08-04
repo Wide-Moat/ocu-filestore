@@ -16,7 +16,7 @@ import (
 // fileObjectLedgeredAheadOfContract is the EXPLICIT exception set: response
 // fields the FileObject struct deliberately emits ahead of the frozen contract,
 // keyed by json name, valued by the ruling that admits each one. It is a named
-// exception list, NOT a blanket allow-extra — an ahead-of-contract field that is
+// exception list, NOT a blanket allow-extra -- an ahead-of-contract field that is
 // not listed here reds the guard.
 //
 // The ledger cannot rot into a silent lie, because it is asserted in both
@@ -32,18 +32,19 @@ var fileObjectLedgeredAheadOfContract = map[string]string{
 	// ADR-0023 Open Question 5 names the content-hash manifest for dedup sync;
 	// the D6 dedup consumer built here IS that named re-open trigger, and it
 	// standardises on sha256 because the engine already computes that digest in
-	// its single write pass.
+	// its single write pass. It is additive and omitempty, so a pre-digest
+	// record simply lacks it (canon ADR in flight).
 	//
 	// This is a CARRIED VIOLATION, not a blessed extension: the contract at the
 	// CI-pinned canon SHA declares no checksum property, and FileObject is
 	// additionalProperties:false, so a strict client is entitled to reject the
 	// emitted field. We carry it knowingly until canon re-opens the checksum,
 	// rather than editing a frozen upstream artifact to match our code.
-	"sha256": "PARITY-LEDGER-147: D6 dedup consumer, the ADR-0028:56 re-open trigger for the checksum deferred at ADR-0028:42 (ADR-0023 Open Question 5); carried ahead of the frozen contract, additive and omitempty",
+	"sha256": "PARITY-LEDGER-147: D6 dedup consumer, the ADR-0028:56 re-open trigger for the checksum deferred at ADR-0028:42 (ADR-0023 Open Question 5); carried ahead of the frozen contract, additive and omitempty, canon ADR in flight",
 }
 
 // TestFileObjectMatchesContract is the read-plane drift-guard: the FileObject
-// struct — the shape create, metadata, and every list item serialize — must
+// struct -- the shape create, metadata, and every list item serialize -- must
 // carry EXACTLY the property set the frozen contract's FileObject schema
 // declares, except for the explicitly ledgered fields above. Both directions
 // are drift: a contract property with no struct field silently drops data a
@@ -51,7 +52,7 @@ var fileObjectLedgeredAheadOfContract = map[string]string{
 // declare is a non-conforming response under additionalProperties:false.
 //
 // The guard's oracle is the VENDORED contract copy, which is a file this repo
-// can edit — so this guard alone cannot stop someone making it green by editing
+// can edit -- so this guard alone cannot stop someone making it green by editing
 // the schema instead of the struct. What closes that loop is the separate
 // byte-identity gate (scripts/check-contract-identity.sh, CI job `checks`, canon
 // checked out at the workflow-pinned SHA). This guard's job is to make the
@@ -75,21 +76,21 @@ func TestFileObjectMatchesContract(t *testing.T) {
 	// Always show what is being carried, so a passing run still reports the
 	// divergence instead of hiding it.
 	for _, name := range slices.Sorted(maps.Keys(fileObjectLedgeredAheadOfContract)) {
-		t.Logf("ledgered ahead of the frozen contract: %q — %s", name, fileObjectLedgeredAheadOfContract[name])
+		t.Logf("ledgered ahead of the frozen contract: %q -- %s", name, fileObjectLedgeredAheadOfContract[name])
 	}
 
 	// BEHIND: a contract property the struct never emits is a field the server
 	// promises and never populates.
 	structNames := slices.Sorted(maps.Keys(structTags))
 	if missing := setDifference(contractProps, structNames); len(missing) > 0 {
-		t.Errorf("FileObject is BEHIND the contract — missing json fields for FileObject properties %v", missing)
+		t.Errorf("FileObject is BEHIND the contract -- missing json fields for FileObject properties %v", missing)
 	}
 
 	// AHEAD: an emitted field the schema does not declare, admitted only by an
 	// explicit ledger entry.
 	for _, extra := range setDifference(structNames, contractProps) {
 		if _, ledgered := fileObjectLedgeredAheadOfContract[extra]; !ledgered {
-			t.Errorf("FileObject is AHEAD of the contract — json field %q is not declared by the FileObject schema "+
+			t.Errorf("FileObject is AHEAD of the contract -- json field %q is not declared by the FileObject schema "+
 				"(additionalProperties:false, so a conforming client rejects it) and is not ledgered in "+
 				"fileObjectLedgeredAheadOfContract; either drop the field or record the ruling that admits it", extra)
 		}
@@ -99,10 +100,10 @@ func TestFileObjectMatchesContract(t *testing.T) {
 	for _, name := range slices.Sorted(maps.Keys(fileObjectLedgeredAheadOfContract)) {
 		ruling := fileObjectLedgeredAheadOfContract[name]
 		if _, inStruct := structTags[name]; !inStruct {
-			t.Errorf("ledger entry %q (%s) names no FileObject json field — stale entry, drop it", name, ruling)
+			t.Errorf("ledger entry %q (%s) names no FileObject json field -- stale entry, drop it", name, ruling)
 		}
 		if slices.Contains(contractProps, name) {
-			t.Errorf("ledger entry %q (%s) is now declared by the contract — the exception is stale, drop it", name, ruling)
+			t.Errorf("ledger entry %q (%s) is now declared by the contract -- the exception is stale, drop it", name, ruling)
 		}
 	}
 
@@ -115,7 +116,7 @@ func TestFileObjectMatchesContract(t *testing.T) {
 			continue // already reported by the BEHIND arm
 		}
 		if omitempty {
-			t.Errorf("FileObject field %q is contract-required but tagged omitempty — its zero value drops a required property", req)
+			t.Errorf("FileObject field %q is contract-required but tagged omitempty -- its zero value drops a required property", req)
 		}
 	}
 }
@@ -124,7 +125,7 @@ func TestFileObjectMatchesContract(t *testing.T) {
 // FileListEnvelope schema, with NO ledgered exceptions: unlike FileObject, this
 // shape carries nothing ahead of canon, so any divergence in either direction
 // is drift. A missing field drops a page attribute a paginating client relies
-// on (next_cursor above all — without it the walk cannot resume), and an
+// on (next_cursor above all -- without it the walk cannot resume), and an
 // undeclared emitted field is non-conforming under additionalProperties:false.
 //
 // data and has_more are contract-required, so neither may be tagged omitempty:
@@ -144,10 +145,10 @@ func TestListResponseMatchesContract(t *testing.T) {
 
 	structNames := slices.Sorted(maps.Keys(structTags))
 	if missing := setDifference(contractProps, structNames); len(missing) > 0 {
-		t.Errorf("ListResponse is BEHIND the contract — missing json fields for FileListEnvelope properties %v", missing)
+		t.Errorf("ListResponse is BEHIND the contract -- missing json fields for FileListEnvelope properties %v", missing)
 	}
 	if extra := setDifference(structNames, contractProps); len(extra) > 0 {
-		t.Errorf("ListResponse is AHEAD of the contract — json fields %v are not declared by FileListEnvelope "+
+		t.Errorf("ListResponse is AHEAD of the contract -- json fields %v are not declared by FileListEnvelope "+
 			"(additionalProperties:false, so a conforming client rejects them)", extra)
 	}
 
@@ -157,7 +158,7 @@ func TestListResponseMatchesContract(t *testing.T) {
 			continue // already reported by the BEHIND arm
 		}
 		if omitempty {
-			t.Errorf("ListResponse field %q is contract-required but tagged omitempty — its zero value "+
+			t.Errorf("ListResponse field %q is contract-required but tagged omitempty -- its zero value "+
 				"(an empty page, a final page) drops a required property", req)
 		}
 	}
@@ -247,7 +248,7 @@ func contractSchemaProps(t *testing.T, schemaKey string) []string {
 }
 
 // contractSchemaRequired returns the named schema's inline `required: [...]`
-// list. A schema with no required list is a parse failure, not an empty set —
+// list. A schema with no required list is a parse failure, not an empty set --
 // the frozen schemas this guard reads all declare one, so a silent empty return
 // would make the required/omitempty arm vacuous.
 func contractSchemaRequired(t *testing.T, schemaKey string) []string {

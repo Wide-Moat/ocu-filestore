@@ -317,6 +317,21 @@ func (d *dispatcher) handleDownloadOctetStream(w http.ResponseWriter, r *http.Re
 		length = size
 	}
 
+	// --- response-size ceiling (SEC-46 egress symmetry) ---
+	// The resolved read window is bounded by the SAME whole-object ceiling the
+	// upload's pre-assembly reject enforces, BEFORE the ALLOW audit is
+	// mandated and the 200 is committed (one deny, never allow-then-abort).
+	// Door-written objects sit at or under the ceiling, so this refuses only a
+	// window no legitimate object can satisfy: an out-of-band oversized
+	// backend object, or a runaway explicit range (the bound is on the
+	// REQUESTED window, so naming the huge range explicitly does not evade the
+	// whole-object arm). Same strict `>` boundary and the same fail-closed
+	// zero-ceiling behavior as the upload reject.
+	if err := checkDeclaredSize(length, d.maxFileSize); err != nil {
+		denyDownload(denySizeExceeded, "requested window exceeds whole-object ceiling")
+		return
+	}
+
 	// --- audit ALLOW before any byte (audit-before-ack, SEC-79) ---
 	allow := d.streamDownloadAuditEvent(ps, req, grant, reqID)
 	if err := d.guard.Mandate(r.Context(), mapAuditEvent(allow)); err != nil {
