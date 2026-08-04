@@ -118,11 +118,11 @@ jobs:
         # ref under test rather than carrying its own copy of them, and it
         # proves the derivation reads the file by mutating a copy. That is not
         # tidiness: the hand-copied version ran an image that exists in no
-        # registry (`v3.95.7` is the ACTION's git tag, and the action is a
-        # composite that docker-runs ghcr.io/trufflesecurity/trufflehog at its
-        # `version` input, defaulting to `latest`), so this job reported NOT RUN
-        # and exited 2 here while reporting a PASS on any laptop with some
-        # trufflehog image cached.
+        # registry (`v3.95.7` is the ACTION's git tag, while the action is a
+        # composite that docker-runs `<image>:<version>` from its own inputs,
+        # defaulting to ghcr.io/trufflesecurity/trufflehog:latest), so this job
+        # reported NOT RUN and exited 2 here while reporting a PASS on any
+        # laptop with some trufflehog image cached.
         #
         # The probe therefore pulls what each context pulls: the pinned gitleaks
         # image, and whatever the trufflehog action's moving default tag

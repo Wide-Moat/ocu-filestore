@@ -39,18 +39,21 @@
 # `docker run`, and that is the mechanism this probe mirrors:
 #
 #   docker run --rm -v .:/tmp -w /tmp \
-#     ghcr.io/trufflesecurity/trufflehog:${VERSION} \
+#     "${IMAGE}:${VERSION}" \
 #     git file:///tmp/ --since-commit ${BASE:-''} --branch ${HEAD:-''} \
 #     --fail --no-update --github-actions ${ARGS:-''}
 #
 # Three consequences, each of which the probe now honours:
 #
-#   REGISTRY AND TAG. The image is ghcr.io/trufflesecurity/trufflehog, tagged
-#   with the action's `version` input, which DEFAULTS TO `latest`. security.yml
-#   does not set `version`, so the 40-hex action pin fixes the wrapper and
-#   leaves the scanner build floating on a moving tag. That is reported on every
-#   run, not asserted against: pinning it is a change to the gate, and this
-#   script measures the gate rather than editing it.
+#   REGISTRY AND TAG. Both halves of the image reference come from action
+#   inputs: `image`, which DEFAULTS TO `ghcr.io/trufflesecurity/trufflehog`,
+#   and `version`, which DEFAULTS TO `latest`. Neither is set in security.yml,
+#   so both are derived below the same way -- read the input from the workflow,
+#   fall back to the action's default -- rather than being typed in as a
+#   constant. The 40-hex action pin therefore fixes the wrapper and leaves the
+#   scanner build floating on a moving tag. That is reported on every run, not
+#   asserted against: pinning it is a change to the gate, and this script
+#   measures the gate rather than editing it.
 #
 #   MOUNT. The checkout is mounted READ-WRITE at /tmp, because trufflehog's git
 #   source clones the repository into a temp directory INSIDE that mount. The
@@ -178,13 +181,13 @@ WORKFLOW_REL='.github/workflows/security.yml'
 # scanner: it records WHICH action source was read to learn the command shape.
 # security.yml pointing anywhere else means the mirror is unverified, and an
 # unverified mirror asserting "the gate reddens" is a guess.
-MIRRORED_ACTION_SHA='f446421baf832d6356c42c1743d99abff52ff334'
+MIRRORED_ACTION_SHA='6f3c981e7b77f235fd2702dd74af25fc4b72bf11'
 
-# The registry the action hard-codes. It is NOT configurable through the
-# action's inputs, so it is the one part of the command that cannot be derived
-# from security.yml.
-TRUFFLEHOG_REGISTRY='ghcr.io/trufflesecurity/trufflehog'
-# The action's default when its `version` input is unset.
+# The action's defaults for the two inputs that compose the image reference,
+# used only when security.yml leaves the input unset. They are defaults, not
+# preferences: a workflow that sets either one overrides them, and the value the
+# probe runs is read from the workflow in both cases.
+TRUFFLEHOG_DEFAULT_IMAGE='ghcr.io/trufflesecurity/trufflehog'
 TRUFFLEHOG_DEFAULT_VERSION='latest'
 
 command -v docker >/dev/null 2>&1 || { echo "NOT RUN: docker is required; the probe cannot run the real scanners" >&2; exit 2; }
@@ -265,6 +268,7 @@ git show "$REF:$WORKFLOW_REL" > "$WORK/security.yml"
 GITLEAKS_IMAGE="$(gitleaks_image_of "$WORK/security.yml")"
 TH_ACTION_SHA="$(th_action_sha_of "$WORK/security.yml")"
 TH_VERSION="$(th_with_value "$WORK/security.yml" version)"
+TH_IMAGE="$(th_with_value "$WORK/security.yml" image)"
 TH_EXTRA_ARGS="$(th_with_value "$WORK/security.yml" extra_args)"
 GL_REFS="$(count_gitleaks_refs "$WORK/security.yml")"
 TH_STEPS="$(count_th_steps "$WORK/security.yml")"
@@ -303,7 +307,8 @@ if [ "$TH_ACTION_SHA" != "$MIRRORED_ACTION_SHA" ]; then
 fi
 
 [ -n "$TH_VERSION" ] || TH_VERSION="$TRUFFLEHOG_DEFAULT_VERSION"
-TRUFFLEHOG_IMAGE="${TRUFFLEHOG_REGISTRY}:${TH_VERSION}"
+[ -n "$TH_IMAGE" ] || TH_IMAGE="$TRUFFLEHOG_DEFAULT_IMAGE"
+TRUFFLEHOG_IMAGE="${TH_IMAGE}:${TH_VERSION}"
 
 # The action word-splits ${ARGS:-''} unquoted, so the probe does too. When
 # extra_args is unset the action still passes one empty word; reproducing that
@@ -337,9 +342,17 @@ sed 's|zricethezav/gitleaks:v8.30.1|zricethezav/gitleaks:v9.99.9-probe|' "$WORK/
 st_expect "gitleaks image follows the workflow" \
   "zricethezav/gitleaks:v9.99.9-probe" "$(gitleaks_image_of "$ST")"
 
-sed 's|^\([[:space:]]*\)path: \./|\1version: 3.95.7-probe|' "$WORK/security.yml" > "$ST"
+sed 's|^\([[:space:]]*\)path: \./|\1version: 3.96.0-probe|' "$WORK/security.yml" > "$ST"
 st_expect "trufflehog version follows the workflow" \
-  "3.95.7-probe" "$(th_with_value "$ST" version)"
+  "3.96.0-probe" "$(th_with_value "$ST" version)"
+
+# The registry stopped being hard-coded in the action's entrypoint: it is the
+# `image` input, so a workflow can point the gate at a mirror. Derived like the
+# rest, and probed like the rest -- a fallback that silently ignored the input
+# would scan a registry the gate does not use.
+sed 's|^\([[:space:]]*\)path: \./|\1image: ghcr.io/probe/mirror|' "$WORK/security.yml" > "$ST"
+st_expect "trufflehog image follows the workflow" \
+  "ghcr.io/probe/mirror" "$(th_with_value "$ST" image)"
 
 sed 's|^\([[:space:]]*\)extra_args: .*|\1extra_args: --no-verification --exclude-detectors=AWS|' \
   "$WORK/security.yml" > "$ST"
