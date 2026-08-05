@@ -50,17 +50,46 @@ func (s *FileSink) SetPublisher(p Publisher) {
 // local chain, which is intact by construction whenever this counter moves.
 func (s *FileSink) DroppedFanOut() int64 { return s.droppedFanOut.Load() }
 
+// fanOutQueueDepth bounds the in-memory hand-off between the commit path and
+// the fan-out worker. It is deliberately finite: an unbounded queue would trade
+// the stall NFR-REL-12 forbids for unbounded memory growth under a sink that
+// never drains, which fails later and worse. At the bound the commit path drops
+// rather than waits — the local record already holds the event, and a counted
+// drop is the outcome NFR-SEC-79 prescribes.
+const fanOutQueueDepth = 1024
+
 // fanOut hands a COMMITTED event to the publisher off the caller's path. It is
-// called after the durable write and the chain advance, so the event it
-// forwards is byte-for-byte the record the local chain holds.
+// called under the sink mutex, after the durable write and the chain advance,
+// so the event it forwards is byte-for-byte the record the local chain holds
+// and the enqueue order IS the chain order.
 //
-// The goroutine is deliberate: a customer collector is an arbitrary network
-// peer, and letting it block the mutex the next Mandate needs would make a slow
-// sink into a stall of the file plane — the outcome NFR-REL-12 forbids.
+// The work happens on ONE long-lived worker, not a goroutine per event. A
+// goroutine per event loses ordering the moment two commits are in flight, and
+// canon specifies the record as durable, ORDERED and tamper-evident — a
+// downstream stream whose order cannot be recovered is not that record. A
+// single worker also keeps the original reason for going async: a customer
+// collector is an arbitrary network peer, and letting it block the mutex the
+// next Mandate needs would turn a slow sink into a stall of the file plane.
 func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
-	go func() {
+	s.fanOutOnce.Do(func() {
+		s.fanOutQ = make(chan FileActivityEvent, fanOutQueueDepth)
+		go s.fanOutWorker(p)
+	})
+	select {
+	case s.fanOutQ <- ev:
+	default:
+		// The queue is full: the collector is not draining. Drop and count,
+		// never block — the caller holds the sink mutex, so waiting here would
+		// stall every other file operation behind a sink OCU does not control.
+		s.droppedFanOut.Add(1)
+	}
+}
+
+// fanOutWorker drains the queue in enqueue order, which is commit order.
+func (s *FileSink) fanOutWorker(p Publisher) {
+	for ev := range s.fanOutQ {
 		if err := p.Publish(context.Background(), ev); err != nil {
 			s.droppedFanOut.Add(1)
 		}
-	}()
+	}
 }

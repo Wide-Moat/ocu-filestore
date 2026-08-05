@@ -83,9 +83,16 @@ type FileSink struct {
 	// deployment fans out nowhere.
 	publisher Publisher
 	// droppedFanOut counts committed events the publisher refused. It is
-	// atomic because fanOut increments it from its own goroutine, outside the
-	// mutex that guards the chain.
+	// atomic because the fan-out worker increments it from its own goroutine,
+	// outside the mutex that guards the chain.
 	droppedFanOut atomic.Int64
+	// fanOutQ carries committed events to the single fan-out worker in commit
+	// order; fanOutOnce starts that worker on the first published event.
+	fanOutQ    chan FileActivityEvent
+	fanOutOnce sync.Once
+	// commitSeq numbers committed records so a consumer can prove it observed
+	// them in chain order. It advances under the same mutex as the chain.
+	commitSeq uint64
 }
 
 var _ Guard = (*FileSink)(nil)
@@ -320,6 +327,11 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	// local commit above is the no-loss point, so a downstream sink can fail
 	// or stall without denying the operation (NFR-SEC-79 fail-open).
 	if s.publisher != nil {
+		// Stamp the commit number AFTER the line is written and hashed, so the
+		// number never enters the chain input — it is a fan-out ordering
+		// witness, not part of the record.
+		s.commitSeq++
+		ev.commitSeq = s.commitSeq
 		s.fanOut(s.publisher, ev)
 	}
 	return nil

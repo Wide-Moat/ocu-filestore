@@ -289,3 +289,81 @@ func TestPublisher_NotCalledWhenTheDurableWriteFails(t *testing.T) {
 		t.Fatalf("DroppedFanOut for a record that never committed = %d, want 0", got)
 	}
 }
+
+// TestPublisher_FanOutPreservesCommitOrder pins the ordering the pipeline is
+// specified to carry: canon calls the record "durable, ordered, tamper-evident"
+// and the bus "ordered, append-only". A fan-out that spawned one goroutine per
+// event would satisfy every other test here — nothing is lost and nothing
+// blocks — while delivering a stream the chain order cannot be recovered from.
+//
+// Non-vacuous: the producers run CONCURRENTLY, which is how the daemon drives
+// the sink. A sequential producer cannot expose the defect, because there is
+// only ever one goroutine in flight.
+func TestPublisher_FanOutPreservesCommitOrder(t *testing.T) {
+	s, _ := newSinkForPublisher(t)
+	p := &orderRecordingPublisher{}
+	s.SetPublisher(p)
+
+	const n = 200
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ev := sampleEvent()
+			ev.ByteCount = int64(i)
+			if err := s.Mandate(context.Background(), ev); err != nil {
+				t.Errorf("Mandate(%d): %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	waitFor(t, "every committed event to be published", func() bool { return p.count() == n })
+
+	// The chain order is the order Mandate committed under the mutex. The
+	// published sequence must be a prefix-preserving replay of it: the
+	// sequence numbers the sink assigned must arrive ascending.
+	seq := p.sequence()
+	for i := 1; i < len(seq); i++ {
+		if seq[i] < seq[i-1] {
+			t.Fatalf("fan-out delivered commit %d after %d: the ordered record is "+
+				"not ordered downstream", seq[i], seq[i-1])
+		}
+	}
+}
+
+// orderRecordingPublisher records the commit sequence of what it receives.
+type orderRecordingPublisher struct {
+	mu  sync.Mutex
+	got []uint64
+}
+
+func (p *orderRecordingPublisher) Publish(_ context.Context, ev FileActivityEvent) error {
+	// A publish costs real time — a network collector always does. With a
+	// goroutine per event this is what lets two in-flight publishes overtake
+	// each other; with one worker draining a queue it changes nothing but the
+	// wall clock. Without it the race is too narrow to observe reliably and
+	// this test would pass against the unordered fan-out.
+	// Sleep OUTSIDE the lock. Inside it, the recorder's own mutex would
+	// serialise the publishes and hand them out in arrival order, masking the
+	// very reordering this test exists to catch.
+	time.Sleep(time.Duration(ev.commitSeq%7) * time.Millisecond)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.got = append(p.got, ev.commitSeq)
+	return nil
+}
+
+func (p *orderRecordingPublisher) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.got)
+}
+
+func (p *orderRecordingPublisher) sequence() []uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]uint64, len(p.got))
+	copy(out, p.got)
+	return out
+}
