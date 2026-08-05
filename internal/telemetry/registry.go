@@ -206,6 +206,19 @@ type metric struct {
 type Registry struct {
 	mu      sync.RWMutex
 	metrics []metric // ordered by registration; WriteTo preserves that order
+	// beforeCollect, when set, runs at the start of every WriteTo so a value
+	// the daemon samples rather than pushes is current in the rendered
+	// exposition. It is called OUTSIDE the registry lock: it exists to call
+	// Set on these very metrics, and holding the lock would deadlock.
+	beforeCollect func()
+}
+
+// SetBeforeCollect registers a hook run at the start of each WriteTo. A nil fn
+// clears it; a second call replaces the first.
+func (r *Registry) SetBeforeCollect(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.beforeCollect = fn
 }
 
 // NewRegistry creates an empty Registry.
@@ -315,6 +328,15 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // the per-family read locks; callers must not register new metrics
 // concurrently (registration is startup-only).
 func (r *Registry) WriteTo(w io.Writer) (int64, error) {
+	// Sample-at-scrape values first, outside the lock the hook's own Set calls
+	// need (see beforeCollect).
+	r.mu.RLock()
+	hook := r.beforeCollect
+	r.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+
 	r.mu.RLock()
 	metrics := make([]metric, len(r.metrics))
 	copy(metrics, r.metrics)

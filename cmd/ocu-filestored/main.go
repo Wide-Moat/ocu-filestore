@@ -1544,6 +1544,21 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		m.SetAuditSinkLatched(1)
 	})
 
+	// Publish the dropped-fan-out count, and keep it current by sampling the
+	// sink at each scrape. Two reasons this is a sample rather than a push:
+	// the counter is incremented on a fan-out goroutine that holds no
+	// reference to the metric set, and priming it here makes the healthy
+	// reading a real zero. The gauges above are written only on their failure
+	// transition, so their healthy series is absent from the exposition until
+	// something goes wrong — survivable for a latch an operator alerts on with
+	// `== 1`, but not for a drop count alerted on with `> 0`, where an absent
+	// series makes the rule silently vacuous. A silently vacuous drop alarm is
+	// exactly the silent loss NFR-SEC-79 forbids.
+	m.SetAuditFanOutDropped(float64(sink.DroppedFanOut()))
+	m.BeforeScrape(func() {
+		m.SetAuditFanOutDropped(float64(sink.DroppedFanOut()))
+	})
+
 	// Durable file_id handle store (ADR-0023). OPTIONAL this phase: an empty
 	// --handle-store leaves hStore nil (the north listener is inert, so the
 	// index is unused). When set, NewDiskStore opens/replays the log under the
