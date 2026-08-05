@@ -38,6 +38,7 @@ readonly -a CONTRACTS=(
   'storage/file-ops.schema.json'
   'storage/file-artifact-api.schema.json'
   'openapi/files-api.openapi.yaml'
+  'audit/audit-fanin.asyncapi.yaml'
 )
 
 # Locate the canon pin: exactly one full-SHA `ref:` line must exist in the CI

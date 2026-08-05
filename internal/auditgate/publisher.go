@@ -5,6 +5,16 @@ package auditgate
 
 import "context"
 
+// ObjectStoreFanInChannel is the audit fan-in channel this component publishes
+// to, fixed by the fan-in contract
+// (contracts/audit/audit-fanin.asyncapi.yaml, channel objectStoreAudit). The
+// contract leaves the PROTOCOL binding open pending the per-seam transport
+// decision, so a Publisher implementation chooses its own transport — but not
+// its own channel: the pipeline binds the OCSF source to the channel identity,
+// so publishing elsewhere would file this component's events under another
+// source. TestObjectStoreFanInChannelIsTheContractAddress pins the value.
+const ObjectStoreFanInChannel = "audit.ingest.object-store"
+
 // Publisher is the fan-in seam: the contract a customer-supplied collector
 // fills to receive the events this daemon has already committed locally
 // (ADR-0009 — OCU owns the chain of custody and the local durable commit;
