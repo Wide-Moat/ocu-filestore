@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -77,6 +78,14 @@ type FileSink struct {
 	// prevLineHash is the SHA-256 of the exact bytes of the last written
 	// line, including its trailing newline; genesis when no line exists.
 	prevLineHash [sha256.Size]byte
+	// publisher is the optional fan-in seam (ADR-0009). It is read under the
+	// mutex and invoked OFF it, after the durable commit; nil means the
+	// deployment fans out nowhere.
+	publisher Publisher
+	// droppedFanOut counts committed events the publisher refused. It is
+	// atomic because fanOut increments it from its own goroutine, outside the
+	// mutex that guards the chain.
+	droppedFanOut atomic.Int64
 }
 
 var _ Guard = (*FileSink)(nil)
@@ -306,6 +315,13 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	// Chain state advances only after the durable write: the hash input is
 	// the exact written line bytes including the trailing newline.
 	s.prevLineHash = sha256.Sum256(line)
+
+	// Fan out only what the chain now holds, and only off this path: the
+	// local commit above is the no-loss point, so a downstream sink can fail
+	// or stall without denying the operation (NFR-SEC-79 fail-open).
+	if s.publisher != nil {
+		s.fanOut(s.publisher, ev)
+	}
 	return nil
 }
 
