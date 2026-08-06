@@ -100,9 +100,13 @@ func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
 		go s.fanOutWorker(p, q)
 	})
 	if s.fanOutQ == nil {
-		// Closed: the worker is gone and nothing will drain a send. A record
-		// committed at this point is already durable, so this is a counted
-		// drop, never a blocked send on a nil channel.
+		// Unreachable while Mandate holds the sink mutex across this call:
+		// Close sets `closed` under that same mutex and Mandate refuses a
+		// closed sink before reaching here, so a nil queue and a live fanOut
+		// cannot coexist. Kept as a belt against a future caller that reaches
+		// fanOut by another path — a send on a nil channel blocks forever,
+		// which would hang the file plane rather than fail it. Counted as a
+		// drop because the record is already durable.
 		s.droppedFanOut.Add(1)
 		return
 	}

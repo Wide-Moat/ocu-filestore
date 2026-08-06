@@ -128,9 +128,12 @@ func (s *FileSink) Close() error {
 		close(s.fanOutQ)
 		s.fanOutQ = nil
 		done := s.fanOutDone
-		// Wait for the drain OUTSIDE the mutex: the worker's Publish may take
-		// arbitrarily long, and holding the lock across it would block a
-		// concurrent Mandate that has already been admitted.
+		// Wait for the drain OUTSIDE the mutex. The worker's Publish runs
+		// against a customer collector and may take arbitrarily long, so
+		// holding the lock across it would make every other mutex user — the
+		// Latched and SetOnLatch readers a shutdown path still calls — wait on
+		// a third party. Mandate is not among them: it refuses a closed sink,
+		// which `closed` above has already made true.
 		s.mu.Unlock()
 		<-done
 		s.mu.Lock()
