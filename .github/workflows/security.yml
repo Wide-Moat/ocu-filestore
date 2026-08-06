@@ -75,6 +75,14 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
             detect --source=/repo --redact --no-banner
+      # Inline rather than a separate workflow: the probe rides this required
+      # context, so a gate that stops detecting blocks the merge instead of
+      # reporting green on a scheduled run nobody reads. It costs seconds and
+      # asserts only that the scanner fires; the deep two-scanner probe
+      # (scripts/secrets-gate-redprobe.sh, run from gate-redprobe.yml) keeps
+      # answering the slower questions about ruleset and allowlist shape.
+      - name: gitleaks red-probe (gate-fires proof)
+        run: bash scripts/gitleaks-inline-redprobe.sh
 
   secrets-trufflehog:
     runs-on: ubuntu-latest
