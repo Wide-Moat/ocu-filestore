@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -366,4 +367,87 @@ func (p *orderRecordingPublisher) sequence() []uint64 {
 	out := make([]uint64, len(p.got))
 	copy(out, p.got)
 	return out
+}
+
+// TestPublisher_CloseStopsTheFanOutWorker pins the worker's lifetime to the
+// sink's. The worker blocks on a channel range, so a sink that never closes the
+// queue leaks one goroutine per sink for the life of the process — invisible in
+// a daemon that builds one sink, and a steady leak in anything that builds many
+// (tests, a restart loop, a future multi-scope host).
+func TestPublisher_CloseStopsTheFanOutWorker(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	const sinks = 20
+	for i := 0; i < sinks; i++ {
+		s, err := NewFileSink(filepath.Join(t.TempDir(), "audit.jsonl"))
+		if err != nil {
+			t.Fatalf("NewFileSink: %v", err)
+		}
+		s.SetPublisher(&recordingPublisher{})
+		// One event is what starts the worker: the sink spawns it lazily on
+		// the first published record.
+		if err := s.Mandate(context.Background(), sampleEvent()); err != nil {
+			t.Fatalf("Mandate: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+
+	// The workers exit asynchronously once the queue closes; poll rather than
+	// assert on the first read, which would race the scheduler.
+	deadline := time.Now().Add(2 * time.Second)
+	var after int
+	for time.Now().Before(deadline) {
+		after = runtime.NumGoroutine()
+		if after-before < sinks {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%d of %d fan-out workers survived Close(): the worker outlives its sink",
+		after-before, sinks)
+}
+
+// TestPublisher_FullQueueDropsAndCounts pins the bounded-queue branch. The queue
+// is finite so a collector that never drains cannot grow memory without bound;
+// at the bound the commit path must DROP and count, never wait — it holds the
+// sink mutex, so blocking there would stall every other file operation behind a
+// sink OCU does not control.
+func TestPublisher_FullQueueDropsAndCounts(t *testing.T) {
+	s, _ := newSinkForPublisher(t)
+	block := make(chan struct{})
+	p := &blockingPublisher{release: block, entered: make(chan struct{}, 1)}
+	s.SetPublisher(p)
+	defer close(block)
+
+	// Overrun the queue. Every Mandate is a real fsync, so the count is kept
+	// just past the bound rather than a multiple of it: the invariant under
+	// test is "the caller never waits", which one dropped event proves as well
+	// as a thousand, and a bigger run only buys a slower test that reds under
+	// parallel package load for lack of CPU rather than for lack of the fix.
+	const overrun = 8
+	total := fanOutQueueDepth + overrun + 1
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < total; i++ {
+			if err := s.Mandate(context.Background(), sampleEvent()); err != nil {
+				t.Errorf("Mandate(%d): %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// The deadline covers a blocked send, not a slow machine: a send that is
+	// going to block never completes, so any finite wait distinguishes the two
+	// — this one is generous enough to survive a saturated CI runner.
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the commit path blocked on a full fan-out queue: a stalled collector " +
+			"stalls the file plane")
+	}
+
+	waitFor(t, "the overrun to be counted as drops", func() bool { return s.DroppedFanOut() > 0 })
 }

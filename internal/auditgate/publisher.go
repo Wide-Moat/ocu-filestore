@@ -72,9 +72,20 @@ const fanOutQueueDepth = 1024
 // next Mandate needs would turn a slow sink into a stall of the file plane.
 func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
 	s.fanOutOnce.Do(func() {
-		s.fanOutQ = make(chan FileActivityEvent, fanOutQueueDepth)
-		go s.fanOutWorker(p)
+		q := make(chan FileActivityEvent, fanOutQueueDepth)
+		s.fanOutQ = q
+		// The worker holds its OWN reference to the channel. Close sets the
+		// field to nil, and a worker ranging over the field would then range
+		// over nil and block forever instead of draining and exiting.
+		go s.fanOutWorker(p, q)
 	})
+	if s.fanOutQ == nil {
+		// Closed: the worker is gone and nothing will drain a send. A record
+		// committed at this point is already durable, so this is a counted
+		// drop, never a blocked send on a nil channel.
+		s.droppedFanOut.Add(1)
+		return
+	}
 	select {
 	case s.fanOutQ <- ev:
 	default:
@@ -85,9 +96,11 @@ func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
 	}
 }
 
-// fanOutWorker drains the queue in enqueue order, which is commit order.
-func (s *FileSink) fanOutWorker(p Publisher) {
-	for ev := range s.fanOutQ {
+// fanOutWorker drains q in enqueue order, which is commit order, and exits when
+// Close closes it. Draining rather than abandoning means records committed
+// before Close still reach the collector.
+func (s *FileSink) fanOutWorker(p Publisher, q <-chan FileActivityEvent) {
+	for ev := range q {
 		if err := p.Publish(context.Background(), ev); err != nil {
 			s.droppedFanOut.Add(1)
 		}
