@@ -284,16 +284,16 @@ jobs:
       # declared in ONE place — the CONTRACTS array in
       # scripts/check-contract-identity.sh — so a contract vendored later is
       # added there, not here.
-      # Bumped 62f5eeb -> 8fe7e94 to pick up the frozen Files-API bodies
-      # (ADR-0028, #323) plus the deny-status-code alignment (#330, which corrects
-      # the create/list deny statuses to the shipped deny classes and the list
-      # cursor form); the two storage schemas are unchanged at 8fe7e94, verified
-      # byte-identical alongside the openapi spec. Bump this SHA deliberately when
+      # Bumped 8fe7e94 -> dda2480 to pick up the four object-verb bodies ADR-0036
+      # sourced from the frozen north dialect (FileObject, ListFilesResponse,
+      # GetFileMetadataRequest, FileDeleteRequest in file-ops.schema.json). The
+      # file-artifact-api schema and the openapi spec are unchanged at dda2480,
+      # verified byte-identical alongside it. Bump this SHA deliberately when
       # re-vendoring; verify byte-identity before bumping.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Wide-Moat/open-computer-use
-          ref: 8fe7e94890364a79a9d9cc4eb1b8167e9d394e47
+          ref: dda2480ff8d8140df8d3ee6c6038bbba0baf464c
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
