@@ -5,6 +5,7 @@ package southface
 
 import (
 	"errors"
+	"path"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 )
@@ -155,4 +156,27 @@ func listOrderFromWire(order string) handlestore.ListOrder {
 		return handlestore.ListOrderDesc
 	}
 	return handlestore.ListOrderAsc
+}
+
+// createFilenameFromParams derives the record's display name. The south params
+// frame carries no filename field, so it is always the path leaf -- the same
+// fallback the north create applies when its optional filename is absent, which
+// keeps one record readable identically through either door.
+func createFilenameFromParams(params uploadParamsFrame) string {
+	leaf := path.Base(enginePath(params.Path))
+	if leaf == "" || leaf == "." || leaf == "/" {
+		return enginePath(params.Path)
+	}
+	return leaf
+}
+
+// createObjectRef derives the ObjectRef a south create records. It is a named
+// function rather than an inline expression so a test can bind to the value the
+// handler actually records: the rule it encodes is invisible on this face --
+// the create succeeds and returns a valid FileObject whatever is stored here --
+// and only surfaces on the north list, whose EnsureObject reconcile keys on
+// (Scope, ObjectRef) and mints a SECOND handle for the same object when this
+// disagrees with what the engine wrote under.
+func createObjectRef(params uploadParamsFrame) string {
+	return enginePath(params.Path)
 }

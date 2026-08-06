@@ -23,12 +23,15 @@ import (
 //
 // It is narrower than handlestore.Store on purpose. Close is main's, Latched is
 // the ops listener's, and EnsureObject is the north list's reconcile verb; a
-// south handler must be unable to reach any of them. Put is absent until
-// createFile lands, because a port method with no caller is dead weight.
+// south handler must be unable to reach any of them.
 type HandleStore interface {
 	Get(ctx context.Context, fileID, attestedScope string) (handlestore.Record, error)
 	List(ctx context.Context, in handlestore.ListInput) (handlestore.ListPage, error)
 	Delete(ctx context.Context, fileID, attestedScope string) error
+	// Put mints the durable handle createFile returns. It is the only mutating
+	// method on this port: every other south write lands bytes in the guest
+	// mount and mints nothing.
+	Put(ctx context.Context, in handlestore.PutInput) (handlestore.Record, error)
 }
 
 // requireHandles answers the by-handle verbs when the deployment configured no
