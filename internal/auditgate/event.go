@@ -104,4 +104,11 @@ type FileActivityEvent struct {
 	// It is omitempty so a zero value (no request context, e.g. a
 	// synthesised event in a test) does not alter the hash-chain input.
 	CorrelationUID string `json:"correlation_uid,omitempty"`
+
+	// commitSeq is the sink's monotonic commit number for this record,
+	// assigned under the chain mutex. It is UNEXPORTED and carries no JSON
+	// tag: the fan-in contract does not define such a field, so it must never
+	// reach the wire or the hash-chain input. It exists so a fan-out consumer
+	// can prove it observed records in chain order.
+	commitSeq uint64
 }

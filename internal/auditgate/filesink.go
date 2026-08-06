@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -77,6 +78,27 @@ type FileSink struct {
 	// prevLineHash is the SHA-256 of the exact bytes of the last written
 	// line, including its trailing newline; genesis when no line exists.
 	prevLineHash [sha256.Size]byte
+	// publisher is the optional fan-in seam (ADR-0009). It is read under the
+	// mutex and invoked OFF it, after the durable commit; nil means the
+	// deployment fans out nowhere.
+	publisher Publisher
+	// droppedFanOut counts committed events the publisher refused. It is
+	// atomic because the fan-out worker increments it from its own goroutine,
+	// outside the mutex that guards the chain.
+	droppedFanOut atomic.Int64
+	// fanOutQ carries committed events to the single fan-out worker in commit
+	// order; fanOutOnce starts that worker on the first published event.
+	fanOutQ    chan FileActivityEvent
+	fanOutOnce sync.Once
+	// fanOutDone closes when the worker has drained the queue and exited, so
+	// Close can wait for the drain before closing a publisher it owns.
+	fanOutDone chan struct{}
+	// ownedPublisher is set by SetPublisherOwned when the sink is responsible
+	// for closing the publisher; nil when the caller keeps that responsibility.
+	ownedPublisher interface{ Close() error }
+	// commitSeq numbers committed records so a consumer can prove it observed
+	// them in chain order. It advances under the same mutex as the chain.
+	commitSeq uint64
 }
 
 var _ Guard = (*FileSink)(nil)
@@ -95,6 +117,34 @@ func (s *FileSink) Close() error {
 		return nil
 	}
 	s.closed = true
+
+	// Stop the fan-out worker. It blocks on a range over this channel, so a
+	// sink that closed its file but not its queue would leave one goroutine
+	// alive per sink for the life of the process. Closing drains what is
+	// already queued before the range ends, so records committed before Close
+	// still reach the collector. The nil check keeps Close working on a sink
+	// that never published (the worker is started lazily).
+	if s.fanOutQ != nil {
+		close(s.fanOutQ)
+		s.fanOutQ = nil
+		done := s.fanOutDone
+		// Wait for the drain OUTSIDE the mutex. The worker's Publish runs
+		// against a customer collector and may take arbitrarily long, so
+		// holding the lock across it would make every other mutex user — the
+		// Latched and SetOnLatch readers a shutdown path still calls — wait on
+		// a third party. Mandate is not among them: it refuses a closed sink,
+		// which `closed` above has already made true.
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+	if s.ownedPublisher != nil {
+		// Closed after the drain, so the records the queue still held reached
+		// the publisher while it was open.
+		_ = s.ownedPublisher.Close()
+		s.ownedPublisher = nil
+	}
+
 	if s.f == nil {
 		return nil
 	}
@@ -306,6 +356,18 @@ func (s *FileSink) Mandate(ctx context.Context, event any) error {
 	// Chain state advances only after the durable write: the hash input is
 	// the exact written line bytes including the trailing newline.
 	s.prevLineHash = sha256.Sum256(line)
+
+	// Fan out only what the chain now holds, and only off this path: the
+	// local commit above is the no-loss point, so a downstream sink can fail
+	// or stall without denying the operation (NFR-SEC-79 fail-open).
+	if s.publisher != nil {
+		// Stamp the commit number AFTER the line is written and hashed, so the
+		// number never enters the chain input — it is a fan-out ordering
+		// witness, not part of the record.
+		s.commitSeq++
+		ev.commitSeq = s.commitSeq
+		s.fanOut(s.publisher, ev)
+	}
 	return nil
 }
 
