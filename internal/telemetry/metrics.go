@@ -39,6 +39,7 @@ var knownOps = []string{
 	"importZip",
 	"migrateFilesystem",
 	"removeFilesystem",
+	"fileDelete",
 }
 
 // knownDenyClasses is the closed set of deny-class audit-reason values used as
@@ -79,6 +80,7 @@ type BrokerMetrics struct {
 	opsTokens          *Gauge
 	auditSinkLatched   *Gauge
 	handleStoreLatched *Gauge
+	auditFanOutDropped *Gauge
 }
 
 // NewBrokerMetrics creates and registers the full broker metric set.
@@ -127,6 +129,20 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		LabelSet{},
 	)
 
+	// audit_fanout_dropped_total counts committed events the downstream
+	// collector refused. It is NOT an audit failure: the local chain holds
+	// every one of them, and the file plane was never stalled or denied
+	// (NFR-SEC-79 durable-first, fail-open). A non-zero value means the
+	// customer's collector is behind the authoritative local record by exactly
+	// that many events — the "counted and reconciled, never silently lost"
+	// half of the same NFR. It is a gauge mirroring the sink's own monotonic
+	// counter, so a daemon restart re-reads from the sink rather than double
+	// counting.
+	auditFanOutDropped := reg.NewGauge("audit_fanout_dropped_total",
+		"Committed audit events the downstream collector refused; the local durable record holds all of them.",
+		LabelSet{},
+	)
+
 	// handle_store_latched is a binary gauge: 0 when the durable file_id handle
 	// store is healthy, 1 after its fail-closed write/sync latch trips (ADR-0023).
 	// The composition layer flips it via SetHandleStoreLatched from the store's
@@ -147,6 +163,7 @@ func NewBrokerMetrics(version string) *BrokerMetrics {
 		opsTokens:          opsTokens,
 		auditSinkLatched:   auditSinkLatched,
 		handleStoreLatched: handleStoreLatched,
+		auditFanOutDropped: auditFanOutDropped,
 	}
 }
 
@@ -190,4 +207,23 @@ func (m *BrokerMetrics) SetAuditSinkLatched(v float64) {
 // A value of 0 indicates a healthy store.
 func (m *BrokerMetrics) SetHandleStoreLatched(v float64) {
 	m.handleStoreLatched.Set(Labels{}, v)
+}
+
+// SetAuditFanOutDropped publishes the audit sink's dropped-fan-out count. The
+// composition layer mirrors FileSink.DroppedFanOut() here, so the operator sees
+// how far the downstream collector trails the authoritative local record
+// (NFR-SEC-79). Zero is the healthy reading and is exposed as a real series,
+// not an absent one.
+func (m *BrokerMetrics) SetAuditFanOutDropped(v float64) {
+	m.auditFanOutDropped.Set(Labels{}, v)
+}
+
+// BeforeScrape registers a hook run immediately before each exposition render.
+// It exists for values the daemon owns elsewhere and does not push on every
+// change — the audit sink's drop counter is incremented on a fan-out goroutine
+// that holds no reference to the metric set, so sampling it at scrape keeps the
+// series current without a background ticker whose period would decide the
+// staleness. A nil fn clears the hook; a second call replaces the first.
+func (m *BrokerMetrics) BeforeScrape(fn func()) {
+	m.reg.SetBeforeCollect(fn)
 }

@@ -57,13 +57,17 @@ var (
 	errRouteOpMismatch = errors.New("southface: route op disagrees with envelope op")
 )
 
-// knownOps is the closed set of ROUTABLE operations: the 18 frozen-enum ops
-// whose bodies are pinned (or pinned-and-streamed) enough to route. The frozen
-// OperationName enum carries three further members (fileDelete,
-// readFileMetadata, releaseQuarantinedFiles) whose bodies are x-ocu-tbd; they
-// have Op constants for full-enum coverage but are deliberately NOT routable
-// here, so a route naming one of them is unknown (404) until the contract pins
-// its body. A route op outside this set is unknown.
+// knownOps is the closed set of ROUTABLE operations: the frozen-enum ops whose
+// bodies are pinned (or pinned-and-streamed) enough to route. The frozen
+// OperationName enum carries two further members (readFileMetadata,
+// releaseQuarantinedFiles) whose bodies are x-ocu-tbd; they have Op constants
+// for full-enum coverage but are deliberately NOT routable here, so a route
+// naming one of them is unknown (404) until the contract pins its body. A route
+// op outside this set is unknown.
+//
+// fileDelete joined this set with ADR-0036: it was held out for the same
+// missing-body reason, and that ADR sourced its body from the frozen north
+// DELETE /v1/files/{file_id}.
 var knownOps = map[Op]struct{}{
 	OpListDirectory:     {},
 	OpMakeDirectory:     {},
@@ -83,6 +87,7 @@ var knownOps = map[Op]struct{}{
 	OpImportZip:         {},
 	OpMigrateFilesystem: {},
 	OpRemoveFilesystem:  {},
+	OpFileDelete:        {},
 }
 
 // opRequiredIntent is the CLOSED route-op -> required-intent map (NFR-SEC-49,
@@ -116,6 +121,7 @@ var opRequiredIntent = map[Op]Intent{
 	OpImportZip:         IntentWrite,
 	OpMigrateFilesystem: IntentWrite,
 	OpRemoveFilesystem:  IntentWrite,
+	OpFileDelete:        IntentWrite,
 }
 
 // requiredIntentForOp returns the authoritative intent for a routed op.

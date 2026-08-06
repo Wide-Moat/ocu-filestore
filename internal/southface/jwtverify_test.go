@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -211,5 +212,60 @@ func TestStorageJWTVerifier_ES256Supported(t *testing.T) {
 	}
 	if scope.FilesystemID != "fs-ec" || len(scope.GrantedIntents) != 1 || scope.GrantedIntents[0] != IntentRead {
 		t.Fatalf("ES256 scope = %+v, want fs-ec/read", scope)
+	}
+}
+
+// TestStorageJWTVerifier_RejectsAlgConfusion pins the PER-KID alg check, which is
+// the only thing standing between a published key and a token signed under a
+// different algorithm. WithValidMethods admits BOTH EdDSA and ES256 for the
+// verifier as a whole, so it cannot tell that THIS kid was published as EdDSA
+// only: without the keyFunc's `alg != vk.alg` pin, an ES256-signed token naming
+// an EdDSA kid reaches the signature check and is rejected only incidentally, by
+// the key type mismatch inside golang-jwt.
+//
+// Non-vacuous: the two arms below assert the REASON, not just the refusal.
+// keyFunc is called directly so the returned sentinel is observable —
+// VerifyScope collapses every failure to errCredentialRejected, which is what
+// let the deleted pin stay green across the whole suite. Deleting the pin makes
+// both arms red.
+func TestStorageJWTVerifier_RejectsAlgConfusion(t *testing.T) {
+	ed := newEdSigner(t, "k1")
+	v, err := NewStorageJWTVerifier(ed.jwks, vtIssuer, vtAudience, fixedNow(1000))
+	if err != nil {
+		t.Fatalf("NewStorageJWTVerifier: %v", err)
+	}
+
+	// An ES256 header naming the EdDSA-published kid: the alg the token declares
+	// is not the alg the kid was published under.
+	esToken := jwt.NewWithClaims(jwt.SigningMethodES256, baseClaims("fs-a", "write", 2000))
+	esToken.Header["kid"] = ed.kid
+	if _, err := v.keyFunc(esToken); !errors.Is(err, errAlgMismatch) {
+		t.Fatalf("keyFunc(ES256 header on an EdDSA kid) error = %v, want errAlgMismatch", err)
+	}
+
+	// The same pin is what makes "none" unreachable at the key level, independent
+	// of WithValidMethods: no published key is registered under alg "none".
+	noneToken := jwt.NewWithClaims(jwt.SigningMethodNone, baseClaims("fs-a", "write", 2000))
+	noneToken.Header["kid"] = ed.kid
+	if _, err := v.keyFunc(noneToken); !errors.Is(err, errAlgMismatch) {
+		t.Fatalf("keyFunc(alg=none on an EdDSA kid) error = %v, want errAlgMismatch", err)
+	}
+
+	// End to end, the same token is refused with the 401-mapped sentinel.
+	esCompact := esToken.Raw
+	if esCompact == "" {
+		// Not yet serialized: sign with an unrelated P-256 key so the compact form
+		// exists. The signature is irrelevant — the alg pin fires before it.
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		esCompact, err = esToken.SignedString(priv)
+		if err != nil {
+			t.Fatalf("SignedString ES256: %v", err)
+		}
+	}
+	if _, err := v.VerifyScope(esCompact); !errors.Is(err, errCredentialRejected) {
+		t.Fatalf("VerifyScope(alg-confused token) error = %v, want errCredentialRejected", err)
 	}
 }

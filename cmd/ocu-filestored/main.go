@@ -281,8 +281,13 @@ type brokerConfig struct {
 	// Both are required when verifyStorageJWT is set.
 	storageJWTIssuer   string
 	storageJWTAudience string
-	profile            admission.WorkloadTrustProfile
-	tenancy            admission.Tenancy
+	// auditFanOutPath is the one-click-solo reference fan-out sink (ADR-0009).
+	// Empty means the deployment fans out nowhere, which is the minimal-shelf
+	// default: the hash-chained local record is the whole tamper-evidence story
+	// and a customer wiring their own collector fills the Publisher contract.
+	auditFanOutPath string
+	profile         admission.WorkloadTrustProfile
+	tenancy         admission.Tenancy
 	// logLevel is the validated slog.Level for the daemon's JSON logger.
 	logLevel slog.Level
 	// opsListen is the bind address for the loopback-only ops listener
@@ -348,6 +353,14 @@ func runCtx(ctx context.Context, args []string) error {
 		"per-RPC-message inbound body ceiling, rejected pre-buffer (NFR-SEC-78); default 50 MiB")
 	auditSink := fs.String("audit-sink", "",
 		"REQUIRED audit gate file-sink path; an audit-write failure denies the operation (NFR-SEC-79)")
+	// The fan-out sink is OPTIONAL and deliberately not a network client: the
+	// fan-in contract leaves its protocol binding open, so this ships the
+	// one-click-solo reference (an append-only file) and a customer wiring a
+	// real bus or SIEM fills the Publisher contract with their own transport.
+	// A fan-out failure never denies the operation — it counts a drop
+	// (audit_fanout_dropped_total) while the local record stays authoritative.
+	auditFanOut := fs.String("audit-fanout-sink", "",
+		"optional append-only audit fan-out path (ADR-0009 solo reference); empty fans out nowhere; a fan-out failure counts a drop and never denies the operation")
 	handleStore := fs.String("handle-store", "",
 		"durable file_id->handle store path (Files-API north face, ADR-0023); empty disables the index this phase")
 	profile := fs.String("profile", "trusted_operator",
@@ -500,6 +513,7 @@ func runCtx(ctx context.Context, args []string) error {
 	// -claims-bind is a pass-through bool (no validation): set it on the config
 	// after validate so the credential extractor picks the claims-parsing mode.
 	cfg.claimsBind = *claimsBind
+	cfg.auditFanOutPath = *auditFanOut
 
 	// GA Wave 1 storage credential custody: when -verify-storage-jwt is set, the
 	// three companion flags are REQUIRED and the JWKS artifact is read once at
@@ -1542,6 +1556,38 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		l.Error("audit sink latched; broker serving 100% denies until restart",
 			slog.String(observ.KeyReason, "audit_latch"))
 		m.SetAuditSinkLatched(1)
+	})
+
+	// Optional fan-out to the solo-reference sink. Construction is fail-closed
+	// on a bad path so a misconfigured deployment aborts rather than running
+	// with a fan-out that silently goes nowhere; an EMPTY path is not a
+	// misconfiguration but the minimal-shelf default (file-system sink only),
+	// so it wires no publisher at all and drops nothing.
+	if cfg.auditFanOutPath != "" {
+		fanOut, err := auditgate.NewFilePublisher(cfg.auditFanOutPath)
+		if err != nil {
+			return nil, fmt.Errorf("audit fan-out sink: %w", err)
+		}
+		// The sink owns the publisher's lifetime. A `defer fanOut.Close()` here
+		// would close it the moment compose returns — before the daemon serves
+		// a single request — and every event would then be a counted drop while
+		// the flag, the created file and the boot log all still looked correct.
+		sink.SetPublisherOwned(fanOut)
+	}
+
+	// Publish the dropped-fan-out count, and keep it current by sampling the
+	// sink at each scrape. Two reasons this is a sample rather than a push:
+	// the counter is incremented on a fan-out goroutine that holds no
+	// reference to the metric set, and priming it here makes the healthy
+	// reading a real zero. The gauges above are written only on their failure
+	// transition, so their healthy series is absent from the exposition until
+	// something goes wrong — survivable for a latch an operator alerts on with
+	// `== 1`, but not for a drop count alerted on with `> 0`, where an absent
+	// series makes the rule silently vacuous. A silently vacuous drop alarm is
+	// exactly the silent loss NFR-SEC-79 forbids.
+	m.SetAuditFanOutDropped(float64(sink.DroppedFanOut()))
+	m.BeforeScrape(func() {
+		m.SetAuditFanOutDropped(float64(sink.DroppedFanOut()))
 	})
 
 	// Durable file_id handle store (ADR-0023). OPTIONAL this phase: an empty

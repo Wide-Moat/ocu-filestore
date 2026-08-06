@@ -332,3 +332,40 @@ func TestMutationHandlersAssertWriteGrant(t *testing.T) {
 		})
 	}
 }
+
+// TestFileDeleteIsRoutableWithWriteIntent pins the ADR-0036 binding of
+// fileDelete. It was held out of knownOps for one reason — its body was
+// x-ocu-tbd — and ADR-0036 spends that reason by sourcing the body from the
+// frozen north DELETE /v1/files/{file_id}.
+//
+// Two arms, because either alone would be a half-wired op: routable but with no
+// intent row is a fail-closed wiring fault the spine refuses, and an intent row
+// on an unroutable op is dead configuration. The intent is write — a delete
+// mutates, and a session granted only read must never reach it.
+func TestFileDeleteIsRoutableWithWriteIntent(t *testing.T) {
+	if _, routable := knownOps[OpFileDelete]; !routable {
+		t.Fatal("fileDelete is not in knownOps: ADR-0036 sourced its body, so the " +
+			"hold-out reason is spent and the route must resolve")
+	}
+	intent, ok := requiredIntentForOp(OpFileDelete)
+	if !ok {
+		t.Fatal("fileDelete has no required-intent row; the dispatch spine fails " +
+			"closed on an absent row, so the op would be routable and unusable")
+	}
+	if intent != IntentWrite {
+		t.Fatalf("fileDelete required intent = %q, want write: a delete mutates, and "+
+			"a read-only grant must not reach it", intent)
+	}
+}
+
+// TestUnsourcedOpsStayUnroutable is the other side of the same ADR: the verbs
+// whose bodies ADR-0036 left x-ocu-tbd must NOT become routable. A route that
+// resolved to one of them would have to invent the body it serves, which is the
+// failure the contract rule exists to prevent.
+func TestUnsourcedOpsStayUnroutable(t *testing.T) {
+	for _, op := range []Op{OpReadFileMetadata, OpReleaseQuarantinedFiles} {
+		if _, routable := knownOps[op]; routable {
+			t.Errorf("%q is routable but its body is still x-ocu-tbd", op)
+		}
+	}
+}
