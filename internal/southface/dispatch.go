@@ -130,6 +130,10 @@ type dispatcher struct {
 	// engine is the consumer-side storage seam the engine-plane handlers
 	// call; the wiring phase binds the real local-volume engine.
 	engine Engine
+	// handles is the durable file_id index the ADR-0036 by-handle verbs read.
+	// Nil when the deployment configured no store, which those verbs answer
+	// 503 rather than 501 (see requireHandles).
+	handles HandleStore
 	// logger is the structured logger for deny WARNs and other diagnostic
 	// events. Defaults to slog.DiscardHandler so tests that do not supply
 	// one are unaffected. Every call site uses logger.With to carry a
@@ -255,6 +259,14 @@ func newDispatcherWithEngine(resolver Resolver, guard Guard, ceilings CeilingsRe
 		// read plane returns 501 and no object round-trips back through the mount.
 		reg[OpReadMetadata] = handleReadMetadata
 	}
+	// The ADR-0036 by-handle verbs read the durable file_id index, not the
+	// engine's path namespace, so they register independently of the engine.
+	// Each answers 503 when no store is configured (requireHandles) rather
+	// than 501: the body is contract-pinned and the verb is implemented, so
+	// "not implemented" would misreport the build.
+	reg[OpGetFileMetadata] = handleGetFileMetadata
+	reg[OpListFiles] = handleListFiles
+	reg[OpFileDelete] = handleFileDelete
 	return &dispatcher{
 		resolver:    resolver,
 		guard:       guard,
@@ -825,7 +837,7 @@ func (d *dispatcher) denyAuditEvent(op Op, ps PeerScope, req ResolveRequest, gra
 // store). The dispatcher carries them so the wiring phase binds the real
 // engine and a session-scoped store.
 func (d *dispatcher) handlerDeps() *handlerDeps {
-	return &handlerDeps{engine: d.engine, ids: d.ids}
+	return &handlerDeps{engine: d.engine, ids: d.ids, handles: d.handles}
 }
 
 // auditEvent is the spine's broker-resolved-truth record passed to the audit

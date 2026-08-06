@@ -75,6 +75,10 @@ type Config struct {
 	Ceilings CeilingsRegistry
 	// Engine is the storage backend seam (consumer view of objectstore).
 	Engine Engine
+	// Handles is the durable file_id index the ADR-0036 by-handle verbs read.
+	// OPTIONAL: a deployment with no -handle-store leaves it nil and those
+	// verbs answer 503, while every path-addressed verb is unaffected.
+	Handles HandleStore
 	// CredExtractor is the A5 credential-scope source: it derives the
 	// credential-bound filesystem scope from the edge-injected Authorization:
 	// Bearer the service receives on every admitted request. It is the
@@ -152,6 +156,10 @@ func Serve(cfg Config) (Server, error) {
 	}
 
 	d := newDispatcherWithEngine(cfg.Resolver, cfg.Guard, cfg.Ceilings, cfg.SizeCeiling, cfg.Engine)
+	// Bound after construction rather than as a sixth positional argument: the
+	// store is optional, and widening the constructor would force every caller
+	// that has no store to say so explicitly.
+	d.handles = cfg.Handles
 	// Finding #2: the whole-object upload ceiling is the control plane's
 	// BrokerMaxFileSizeBytes, distinct from the per-message SizeCeiling. This
 	// is the one place a flag value reaches the unexported maxFileSize field.

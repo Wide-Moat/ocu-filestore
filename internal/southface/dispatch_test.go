@@ -283,15 +283,19 @@ func TestPropChannelScope(t *testing.T) {
 // data-plane path (upload_multipart_test.go / download_octetstream_test.go),
 // not here.
 func TestRegistryUnimplemented(t *testing.T) {
+	// getFileMetadata, listFiles and fileDelete are ABSENT: ADR-0036 sourced
+	// their bodies, so they bind real handlers on the registry the engine-less
+	// dispatcher builds. They answer 503 without a store, never 501 -- the verb
+	// is implemented and only its backing resource is missing.
 	unaryUnimplemented := []Op{
 		OpListDirectory, OpMakeDirectory, OpMoveDirectory, OpRemoveDirectory,
-		OpCreateFile, OpReadFile, OpReadMetadata, OpGetFileMetadata,
-		OpListFiles, OpCopyFile, OpMoveFile, OpRemoveFile,
+		OpCreateFile, OpReadFile, OpReadMetadata,
+		OpCopyFile, OpMoveFile, OpRemoveFile,
 		OpImportFiles, OpImportZip,
 		OpMigrateFilesystem, OpRemoveFilesystem,
 	}
-	if len(unaryUnimplemented) != 16 {
-		t.Fatalf("unary op list has %d entries, want 16", len(unaryUnimplemented))
+	if len(unaryUnimplemented) != 14 {
+		t.Fatalf("unary op list has %d entries, want 14", len(unaryUnimplemented))
 	}
 	for _, op := range unaryUnimplemented {
 		t.Run(string(op), func(t *testing.T) {

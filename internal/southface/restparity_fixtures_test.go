@@ -150,6 +150,26 @@ type rangeFixture struct {
 
 // pathReadReq is the request shape for path-axis read ops: listDirectory,
 // readMetadata. filesystem_id top-level + path + read authorization_metadata.
+// byHandleReq is the ADR-0036 by-handle request shape (getFileMetadata,
+// fileDelete). It is a FIXTURE type, independent of the production struct, so a
+// field renamed in the handler shows up here as a wire mismatch rather than
+// silently following along.
+type byHandleReq struct {
+	FilesystemID          string           `json:"filesystem_id"`
+	FileID                string           `json:"file_id"`
+	AuthorizationMetadata authzMetaFixture `json:"authorization_metadata"`
+}
+
+// listFilesReq is the scope-wide enumeration request; every field beyond the
+// scope and the authz metadata is optional.
+type listFilesReq struct {
+	FilesystemID          string           `json:"filesystem_id"`
+	AuthorizationMetadata authzMetaFixture `json:"authorization_metadata"`
+	After                 string           `json:"after,omitempty"`
+	Limit                 int              `json:"limit,omitempty"`
+	Order                 string           `json:"order,omitempty"`
+}
+
 type pathReadReq struct {
 	FilesystemID          string           `json:"filesystem_id"`
 	Path                  string           `json:"path"`

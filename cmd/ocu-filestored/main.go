@@ -1709,11 +1709,22 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 	ceilingsSeam := broker.NewCeilings(reg)
 	engineSeam := broker.NewEngine(eng)
 
+	// The south by-handle verbs (ADR-0036) read the durable file_id index. The
+	// nil check is load-bearing: assigning a nil *DiskStore straight into the
+	// interface field would yield a NON-nil interface holding a nil pointer, so
+	// requireHandles would pass and the first call would nil-dereference
+	// instead of answering 503.
+	var handleSeam southface.HandleStore
+	if hStore != nil {
+		handleSeam = hStore
+	}
+
 	srv, err := southface.Serve(southface.Config{
 		Resolver:          resolverSeam,
 		Guard:             guardSeam,
 		Ceilings:          ceilingsSeam,
 		Engine:            engineSeam,
+		Handles:           handleSeam,
 		CredExtractor:     newCredentialScopeExtractor(cfg),
 		Subtrees:          cfg.subtrees,
 		GrantedIntents:    cfg.grantedIntents,

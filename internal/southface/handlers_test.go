@@ -867,16 +867,27 @@ func TestReadFileEngineErrors(t *testing.T) {
 	})
 }
 
-// TestReadFileDeferredOpsUnimplemented pins that the deferred uuid-axis read
-// ops stay unimplemented even with an engine wired.
-func TestReadFileDeferredOpsUnimplemented(t *testing.T) {
+// TestHandleOpsAnswerUnavailableWithoutAStore pins the nil-store answer for the
+// ADR-0036 by-handle verbs. They were 501 while their bodies were x-ocu-tbd;
+// now the bodies are pinned and the verbs are implemented, so a deployment
+// without -handle-store gets 503 -- the resource is missing, not the code.
+//
+// A 501 here would misreport the build, and ADR-0036 makes the 501 set exactly
+// the set with no frozen body.
+func TestHandleOpsAnswerUnavailableWithoutAStore(t *testing.T) {
 	eng := newFakeEngine()
 	d := newEngineDispatcher(&fakeResolver{grant: Grant{Downloadable: true}}, &fakeGuard{}, okCeilings(), eng)
-	for _, op := range []Op{OpGetFileMetadata, OpListFiles} {
-		body := fmt.Sprintf(`{"filesystem_id":%q,"path":"/x","authorization_metadata":{"intent":"read","downloadable":false}}`, opScope)
-		w := serveOp(d, op, body, opScope, okIntents())
-		if w.Code != http.StatusNotImplemented {
-			t.Fatalf("%s status = %d, want 501 (deferred)", op, w.Code)
+	for _, tc := range []struct {
+		op   Op
+		body string
+	}{
+		{OpGetFileMetadata, fmt.Sprintf(`{"filesystem_id":%q,"file_id":"abc","authorization_metadata":{"intent":"read","downloadable":false}}`, opScope)},
+		{OpListFiles, fmt.Sprintf(`{"filesystem_id":%q,"authorization_metadata":{"intent":"read","downloadable":false}}`, opScope)},
+		{OpFileDelete, fmt.Sprintf(`{"filesystem_id":%q,"file_id":"abc","authorization_metadata":{"intent":"write","downloadable":false}}`, opScope)},
+	} {
+		w := serveOp(d, tc.op, tc.body, opScope, okIntents())
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s status = %d, want 503 (implemented, no store configured)", tc.op, w.Code)
 		}
 	}
 }

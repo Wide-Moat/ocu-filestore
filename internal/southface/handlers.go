@@ -22,6 +22,11 @@ import (
 type handlerDeps struct {
 	engine Engine
 	ids    *objectIDStore
+	// handles is the durable file_id index the ADR-0036 by-handle verbs read.
+	// It is OPTIONAL: a deployment with no -handle-store leaves it nil and
+	// those verbs answer 503 (see requireHandles), while every path-addressed
+	// verb is unaffected.
+	handles HandleStore
 }
 
 // defaultPageSize is the server-side listing page size when the request omits

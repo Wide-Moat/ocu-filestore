@@ -217,3 +217,61 @@ type fileDownloadRequest struct {
 	Range                 *fileRange            `json:"range"`
 	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
 }
+
+// --- ADR-0036 by-handle object verbs -----------------------------------------
+
+// getFileMetadataRequest is the by-handle metadata read. The handle is the
+// DURABLE file_id the store minted, never the session-scoped transfer uuid the
+// streaming ops mint for their own frames — ADR-0036 pins the id space, and the
+// two are not interchangeable.
+type getFileMetadataRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	FileID                string                `json:"file_id"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+}
+
+// fileDeleteRequest is the by-handle delete, distinct from removeFile which is
+// path-addressed.
+type fileDeleteRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	FileID                string                `json:"file_id"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+}
+
+// listFilesRequest enumerates the scope's objects. Scope is the credential-bound
+// authority; filesystem_id is the cross-check hint the spine already validated.
+// Order mirrors the north ?order= selector (ADR-0037) and is tolerant by
+// design: "desc" walks newest-first, absence or any other value the ascending
+// default, because a direction is a rendering preference rather than an
+// authorization input and a typo must not refuse a listing.
+type listFilesRequest struct {
+	FilesystemID          string                `json:"filesystem_id"`
+	AuthorizationMetadata authorizationMetadata `json:"authorization_metadata"`
+	After                 string                `json:"after"`
+	Limit                 int                   `json:"limit"`
+	Order                 string                `json:"order"`
+}
+
+// fileObject is the ADR-0028 six-field read shape, reused verbatim for the
+// by-handle read and each list entry. Server-built from the durable record; no
+// field is caller-supplied. downloadable is deliberately absent: it resolves at
+// read from the prefix grant (NFR-SEC-73) and is never stamped onto a record.
+type fileObject struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Filename  string `json:"filename"`
+	MimeType  string `json:"mime_type"`
+	SizeBytes int64  `json:"size_bytes"`
+	CreatedAt string `json:"created_at"`
+}
+
+// listFilesResponse is one page of the enumeration. next_cursor is opaque and
+// binds its direction; first_id/last_id are informational boundary markers and
+// never resume keys.
+type listFilesResponse struct {
+	Data       []fileObject `json:"data"`
+	HasMore    bool         `json:"has_more"`
+	FirstID    string       `json:"first_id,omitempty"`
+	LastID     string       `json:"last_id,omitempty"`
+	NextCursor string       `json:"next_cursor,omitempty"`
+}
