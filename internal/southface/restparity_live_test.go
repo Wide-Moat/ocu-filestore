@@ -297,6 +297,12 @@ func testLiveUnaryRoutesAndShapes(t *testing.T) {
 				// Unimplemented-but-routed: the deny envelope is the BoundedReason
 				// REST shape, and the 501 is the authoritative status.
 				assertBoundedReasonBody(t, resp)
+			case http.StatusServiceUnavailable:
+				// Implemented-but-unbacked: the ADR-0036 by-handle verbs route to
+				// real handlers, and this rig wires no durable handle store, so
+				// they answer 503. It proves the route boundary exactly as a 501
+				// does -- the request reached a handler.
+				assertBoundedReasonBody(t, resp)
 			default:
 				t.Fatalf("op %s: unexpected status %d; body %q", op, resp.StatusCode, drainBody(t, resp))
 			}
@@ -327,6 +333,15 @@ func liveBodyForSeeded(op Op) any {
 		return srcDstOverwriteReq{FilesystemID: liveFS, Source: "/cp-src", Destination: "/cp-dst", AuthorizationMetadata: writeMetaWire()}
 	case OpMoveFile:
 		return srcDstOverwriteReq{FilesystemID: liveFS, Source: "/mv-src", Destination: "/mv-dst", AuthorizationMetadata: writeMetaWire()}
+	// The ADR-0036 by-handle verbs are addressed by the durable file_id, not a
+	// path, so a path-shaped body would be refused as malformed before the
+	// handler and this fixture would assert nothing about the route.
+	case OpGetFileMetadata:
+		return byHandleReq{FilesystemID: liveFS, FileID: "live-parity-absent", AuthorizationMetadata: readMetaWire()}
+	case OpFileDelete:
+		return byHandleReq{FilesystemID: liveFS, FileID: "live-parity-absent", AuthorizationMetadata: writeMetaWire()}
+	case OpListFiles:
+		return listFilesReq{FilesystemID: liveFS, AuthorizationMetadata: readMetaWire()}
 	default:
 		return liveBodyFor(op)
 	}

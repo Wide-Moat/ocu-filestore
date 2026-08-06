@@ -284,6 +284,9 @@ jobs:
       # declared in ONE place — the CONTRACTS array in
       # scripts/check-contract-identity.sh — so a contract vendored later is
       # added there, not here.
+      # Bumped 2bee2f7 -> e8ec181 to pick up the ListFilesResponse correction (the
+      # ADR-0037 vendoring left a stale sentence denying the order selector one
+      # $def away from the field that refutes it).
       # Bumped dda2480 -> 2bee2f7 to pick up ADR-0037: the list order selector the
       # north face has served since #182 but the frozen surface never declared
       # (OrderQuery in files-api.openapi.yaml, ListFilesRequest in
@@ -293,7 +296,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Wide-Moat/open-computer-use
-          ref: 2bee2f7871b571cc230bc9fc6ced7c2ad31c9f8a
+          ref: e8ec181ac5f472cd65a8689f15af19f0b2e30846
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
