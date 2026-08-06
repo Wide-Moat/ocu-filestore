@@ -40,6 +40,25 @@ func (s *FileSink) SetPublisher(p Publisher) {
 	s.publisher = p
 }
 
+// SetPublisherOwned installs the publisher AND transfers its lifetime to the
+// sink: Close closes the publisher after the queue has drained. It is what a
+// composition root wants, because the publisher must outlive the function that
+// built it — a `defer p.Close()` in a constructor closes it the moment
+// construction returns, and every later event becomes a silent drop while the
+// flag, the created file and the boot log all still look correct.
+//
+// The publisher is closed AFTER the drain, so records committed before Close
+// still reach it.
+func (s *FileSink) SetPublisherOwned(p interface {
+	Publisher
+	Close() error
+}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publisher = p
+	s.ownedPublisher = p
+}
+
 // DroppedFanOut reports how many committed events this sink failed to hand to
 // the publisher. It counts drops, never attempts, so a healthy deployment reads
 // zero for the daemon's lifetime and a non-zero value means the downstream
@@ -74,6 +93,7 @@ func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
 	s.fanOutOnce.Do(func() {
 		q := make(chan FileActivityEvent, fanOutQueueDepth)
 		s.fanOutQ = q
+		s.fanOutDone = make(chan struct{})
 		// The worker holds its OWN reference to the channel. Close sets the
 		// field to nil, and a worker ranging over the field would then range
 		// over nil and block forever instead of draining and exiting.
@@ -98,8 +118,10 @@ func (s *FileSink) fanOut(p Publisher, ev FileActivityEvent) {
 
 // fanOutWorker drains q in enqueue order, which is commit order, and exits when
 // Close closes it. Draining rather than abandoning means records committed
-// before Close still reach the collector.
+// before Close still reach the collector; closing fanOutDone last is what lets
+// Close wait for that drain before closing a publisher it owns.
 func (s *FileSink) fanOutWorker(p Publisher, q <-chan FileActivityEvent) {
+	defer close(s.fanOutDone)
 	for ev := range q {
 		if err := p.Publish(context.Background(), ev); err != nil {
 			s.droppedFanOut.Add(1)

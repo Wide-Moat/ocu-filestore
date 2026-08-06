@@ -1568,8 +1568,11 @@ func compose(cfg brokerConfig, l *slog.Logger, m *telemetry.BrokerMetrics, ol ..
 		if err != nil {
 			return nil, fmt.Errorf("audit fan-out sink: %w", err)
 		}
-		defer func() { _ = fanOut.Close() }()
-		sink.SetPublisher(fanOut)
+		// The sink owns the publisher's lifetime. A `defer fanOut.Close()` here
+		// would close it the moment compose returns — before the daemon serves
+		// a single request — and every event would then be a counted drop while
+		// the flag, the created file and the boot log all still looked correct.
+		sink.SetPublisherOwned(fanOut)
 	}
 
 	// Publish the dropped-fan-out count, and keep it current by sampling the

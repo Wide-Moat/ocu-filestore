@@ -90,6 +90,12 @@ type FileSink struct {
 	// order; fanOutOnce starts that worker on the first published event.
 	fanOutQ    chan FileActivityEvent
 	fanOutOnce sync.Once
+	// fanOutDone closes when the worker has drained the queue and exited, so
+	// Close can wait for the drain before closing a publisher it owns.
+	fanOutDone chan struct{}
+	// ownedPublisher is set by SetPublisherOwned when the sink is responsible
+	// for closing the publisher; nil when the caller keeps that responsibility.
+	ownedPublisher interface{ Close() error }
 	// commitSeq numbers committed records so a consumer can prove it observed
 	// them in chain order. It advances under the same mutex as the chain.
 	commitSeq uint64
@@ -121,6 +127,19 @@ func (s *FileSink) Close() error {
 	if s.fanOutQ != nil {
 		close(s.fanOutQ)
 		s.fanOutQ = nil
+		done := s.fanOutDone
+		// Wait for the drain OUTSIDE the mutex: the worker's Publish may take
+		// arbitrarily long, and holding the lock across it would block a
+		// concurrent Mandate that has already been admitted.
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+	if s.ownedPublisher != nil {
+		// Closed after the drain, so the records the queue still held reached
+		// the publisher while it was open.
+		_ = s.ownedPublisher.Close()
+		s.ownedPublisher = nil
 	}
 
 	if s.f == nil {

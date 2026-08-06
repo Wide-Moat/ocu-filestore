@@ -182,3 +182,52 @@ func TestFilePublisher_RefusesAnEmptyPath(t *testing.T) {
 		t.Fatal("NewFilePublisher(\"\") returned no error")
 	}
 }
+
+// TestSetPublisherOwned_ClosesAfterTheDrain pins the lifetime transfer. A
+// composition root builds the publisher and returns; whoever holds the sink
+// must close it, or the publisher outlives nothing and every event after the
+// constructor returns is a silent drop.
+//
+// Non-vacuous on both sides: it asserts the record committed BEFORE Close still
+// lands (the drain), and that the publisher is closed AFTER Close (the
+// transfer). A sink that closed the publisher before draining would fail the
+// first; one that never closed it would fail the second.
+func TestSetPublisherOwned_ClosesAfterTheDrain(t *testing.T) {
+	path := tempPath(t, "fanout.jsonl")
+	p, err := NewFilePublisher(path)
+	if err != nil {
+		t.Fatalf("NewFilePublisher: %v", err)
+	}
+
+	sinkPath := tempPath(t, "audit.jsonl")
+	s, err := NewFileSink(sinkPath)
+	if err != nil {
+		t.Fatalf("NewFileSink: %v", err)
+	}
+	s.SetPublisherOwned(p)
+
+	if err := s.Mandate(context.Background(), FileActivityEvent{FilesystemID: "fs-before-close"}); err != nil {
+		t.Fatalf("Mandate: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(body), "fs-before-close") {
+		t.Fatalf("the record committed before Close did not reach the publisher; "+
+			"the sink closed it before draining:\n%s", body)
+	}
+	if s.DroppedFanOut() != 0 {
+		t.Fatalf("DroppedFanOut = %d for a record that should have drained cleanly", s.DroppedFanOut())
+	}
+
+	// The sink owns it, so Close must have closed it: a further Publish fails.
+	if err := p.Publish(context.Background(), FileActivityEvent{FilesystemID: "after"}); err == nil {
+		t.Fatal("the publisher is still open after the sink closed: the sink did not " +
+			"take ownership, so nothing closes it in a real deployment")
+	}
+}
