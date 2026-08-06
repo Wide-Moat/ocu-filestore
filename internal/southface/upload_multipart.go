@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -80,7 +81,10 @@ var errUploadOverDeclared = errors.New("southface: upload body exceeds declared 
 // Unlike the Connect streaming entry, NO HTTP 200 is committed here: a STAGE-0
 // refusal is a real writeRESTDeny status, and the handler commits 200 only on a
 // fully reassembled, size-matched success.
-func (d *dispatcher) serveUploadMultipart(w http.ResponseWriter, r *http.Request) {
+// serveUploadMultipart is the multipart entrypoint for both write ops. The op
+// selects the audit label, the required params, and the success tail; every
+// gate before that is identical.
+func (d *dispatcher) serveUploadMultipart(op Op, w http.ResponseWriter, r *http.Request) {
 	reqID := newCorrelationID()
 	w.Header().Set(requestIDHeader, reqID)
 	reqLog := d.logger.With(slog.String(observ.KeyRequestID, reqID))
@@ -94,7 +98,7 @@ func (d *dispatcher) serveUploadMultipart(w http.ResponseWriter, r *http.Request
 		var ok bool
 		ps, v, ok = peerScopeFromCredential(r, d.credExtractor)
 		if !ok {
-			d.recordOp(string(OpFileUpload), "deny", v.AuditReason)
+			d.recordOp(string(op), "deny", v.AuditReason)
 			d.denyWithLog(w, reqLog, v, "credential rejected")
 			return
 		}
@@ -102,7 +106,7 @@ func (d *dispatcher) serveUploadMultipart(w http.ResponseWriter, r *http.Request
 		var ok bool
 		ps, ok = peerScopeFromContext(r.Context())
 		if !ok {
-			d.recordOp(string(OpFileUpload), "deny", denyInternal)
+			d.recordOp(string(op), "deny", denyInternal)
 			d.denyWithLog(w, reqLog, mapDeny(denyInternal), "no channel scope on connection")
 			return
 		}
@@ -113,12 +117,12 @@ func (d *dispatcher) serveUploadMultipart(w http.ResponseWriter, r *http.Request
 	// scope cross-check.
 	sess := d.ceilings.Session(ps.FilesystemID)
 	if err := sess.TryConsumeOp(); err != nil {
-		d.recordOp(string(OpFileUpload), "deny", denyClassForErr(err))
+		d.recordOp(string(op), "deny", denyClassForErr(err))
 		d.denyWithLog(w, reqLog, mapDeny(denyClassForErr(err)), "operation rate ceiling exceeded")
 		return
 	}
 
-	d.handleFileUploadMultipart(w, r, ps, sess, reqID, reqLog)
+	d.handleFileUploadMultipart(op, w, r, ps, sess, reqID, reqLog)
 }
 
 // handleFileUploadMultipart reassembles a multipart/form-data upload (OPS-05)
@@ -146,7 +150,15 @@ func (d *dispatcher) serveUploadMultipart(w http.ResponseWriter, r *http.Request
 //     nothing (temp+rename atomicity).
 //   - EVERY refusal writes writeRESTDeny (HTTP status + BoundedReason); success
 //     writes a single HTTP 200 with no body the client reads.
-func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Request, ps PeerScope, sess CeilingsSession, reqID string, reqLog *slog.Logger) {
+//
+// handleFileUploadMultipart serves BOTH multipart write ops. They share every
+// stage of the spine -- scope cross-check, subtree join, authz Resolve, the
+// allow Mandate, the ceiling-metered streaming write -- and differ only at the
+// tail: fileUpload writes bytes into the guest mount and mints nothing, while
+// createFile (ADR-0036) additionally mints the durable handle record and
+// returns the minted FileObject. Passing the op through keeps one spine rather
+// than a copy that drifts on the next security fix.
+func (d *dispatcher) handleFileUploadMultipart(op Op, w http.ResponseWriter, r *http.Request, ps PeerScope, sess CeilingsSession, reqID string, reqLog *slog.Logger) {
 	var (
 		req      ResolveRequest
 		grant    Grant
@@ -166,16 +178,16 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 			slog.String(observ.KeyDenyClass, auditReason),
 			slog.String(observ.KeyReason, message),
 		)
-		ev := d.denyAuditEvent(OpFileUpload, ps, req, grant, "", auditReason)
+		ev := d.denyAuditEvent(op, ps, req, grant, "", auditReason)
 		ev.RequestID = reqID
 		if err := d.guard.Mandate(r.Context(), mapAuditEvent(ev)); err != nil {
 			// Deny-Mandate failure degrades the verdict to audit_down; book the
 			// metric as audit_down too so ops_total matches the wire verdict.
-			d.recordOp(string(OpFileUpload), "deny", denyAuditDown)
+			d.recordOp(string(op), "deny", denyAuditDown)
 			writeRESTDeny(w, mapDeny(denyAuditDown), "audit gate unavailable")
 			return
 		}
-		d.recordOp(string(OpFileUpload), "deny", auditReason)
+		d.recordOp(string(op), "deny", auditReason)
 		writeRESTDeny(w, mapDeny(auditReason), message)
 	}
 
@@ -199,6 +211,16 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	declared = params.DeclaredSizeBytes
 	if declared <= 0 {
 		denyUpload(denyMalformed, "declared_size_bytes required")
+		return
+	}
+
+	// --- createFile needs the durable index it mints into ---
+	// Refused here, before a single byte is streamed: discovering the missing
+	// store after the write would leave the object on disk with no handle
+	// naming it, which is the orphan the north reconcile then has to clean up.
+	// The verb is implemented and its body pinned, so this is 503, not 501.
+	if op == OpCreateFile && d.handles == nil {
+		denyUpload(denyBackendUnavailable, "handle store not configured")
 		return
 	}
 
@@ -248,7 +270,7 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	if err := d.guard.Mandate(r.Context(), mapAuditEvent(allow)); err != nil {
 		// The allow Mandate itself failed (audit down). Deny before any byte; do
 		// NOT re-Mandate a deny (the gate is unavailable) — just write it.
-		d.recordOp(string(OpFileUpload), "deny", denyAuditDown)
+		d.recordOp(string(op), "deny", denyAuditDown)
 		writeRESTDeny(w, mapDeny(denyAuditDown), "audit gate unavailable")
 		return
 	}
@@ -398,7 +420,38 @@ func (d *dispatcher) handleFileUploadMultipart(w http.ResponseWriter, r *http.Re
 	// client-ignores-it tolerated form — an empty 200. The contract also tolerates
 	// an optional {"file":FilesystemFile} body the client discards; emitting that
 	// shape is deferred until the success-body pin lands.
-	d.recordOp(string(OpFileUpload), "allow", denyclassNone)
+	// createFile mints the durable handle the caller is owed; fileUpload writes
+	// bytes into the guest mount and mints nothing (the north Files-API create
+	// is that leg). The Put runs strictly AFTER the engine write committed with
+	// a byte count equal to the declared size, so the no-partial-window rule
+	// travels with the body it protects: a handle never names an object whose
+	// bytes did not all land.
+	if op == OpCreateFile {
+		rec, perr := d.handles.Put(r.Context(), handlestore.PutInput{
+			Scope: ps.FilesystemID,
+			// The engine-relative path, matching the convention the north create
+			// records. A different ObjectRef would make the north list's
+			// EnsureObject reconcile mint a SECOND handle for every object this
+			// face creates.
+			ObjectRef: createObjectRef(params),
+			Filename:  createFilenameFromParams(params),
+			Mime:      params.MediaType,
+			Size:      declared,
+		})
+		if perr != nil {
+			// The bytes are durable but the handle did not land. That is a
+			// broker-internal fault, not a refusal of the caller's request, so it
+			// is written directly: the ALLOW already recorded the durable create.
+			d.recordOp(string(op), "deny", denyBackendUnavailable)
+			writeRESTDeny(w, mapDeny(denyBackendUnavailable), "handle store unavailable")
+			return
+		}
+		d.recordOp(string(op), "allow", denyclassNone)
+		writeJSON(w, recordToFileObject(rec))
+		return
+	}
+
+	d.recordOp(string(op), "allow", denyclassNone)
 	w.WriteHeader(http.StatusOK)
 }
 

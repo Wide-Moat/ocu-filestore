@@ -91,7 +91,7 @@ func (rt *restRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//     serveDownloadOctetStream. With this, BOTH data-plane ops are REST-routed
 	//     and NO op rides the retired Connect streaming branch.
 	if negotiatedRequestClass(op, r) == multipartContentType {
-		rt.dispatcher.serveUploadMultipart(w, r)
+		rt.dispatcher.serveUploadMultipart(op, w, r)
 		return
 	}
 	if op == OpFileDownload {
@@ -109,7 +109,10 @@ func (rt *restRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // dispatch will key on; this wave it is observational and the dispatcher owns
 // every media-type refusal.
 func negotiatedRequestClass(op Op, r *http.Request) string {
-	if op == OpFileUpload && isMultipartRequest(r) {
+	// createFile joins fileUpload as a multipart write (ADR-0036): its body is
+	// the ADR-0028 create whole -- params then file -- and a create's bytes
+	// cannot ride the unary JSON envelope under the RPC message ceiling.
+	if (op == OpFileUpload || op == OpCreateFile) && isMultipartRequest(r) {
 		return multipartContentType
 	}
 	return contentTypeJSON

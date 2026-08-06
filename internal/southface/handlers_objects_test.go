@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-filestore/internal/handlestore"
@@ -184,6 +187,10 @@ func (stubHandleStore) Delete(context.Context, string, string) error {
 	panic("stubHandleStore.Delete called: this stub exists to be non-nil, not to serve")
 }
 
+func (stubHandleStore) Put(context.Context, handlestore.PutInput) (handlestore.Record, error) {
+	panic("stubHandleStore.Put called: this stub exists to be non-nil, not to serve")
+}
+
 // errSentinelForTest stands in for a store error outside the classified set, so
 // the default branch is exercised by something that is not a known sentinel.
 var errSentinelForTest = errors.New("southface: unclassified store fault")
@@ -194,4 +201,75 @@ func keysOfWire(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestCreateFilenameFromParamsUsesThePathLeaf pins the display name the record
+// carries. The south params frame has no filename field, so the leaf is the
+// only source — and it must match the fallback the north create applies, or one
+// record reads under two names depending on which door minted it.
+func TestCreateFilenameFromParamsUsesThePathLeaf(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/outputs/report.pdf", "report.pdf"},
+		{"outputs/nested/deep/a.txt", "a.txt"},
+		{"/single.bin", "single.bin"},
+	} {
+		if got := createFilenameFromParams(uploadParamsFrame{Path: tc.in}); got != tc.want {
+			t.Errorf("createFilenameFromParams(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestCreateFileIsAMultipartRoute pins the transport class. ADR-0036 makes south
+// createFile the ADR-0028 create whole — params then file — and a create's bytes
+// cannot ride the unary JSON envelope under the RPC message ceiling. A
+// createFile that fell through to the unary registry would try to decode a
+// multipart body as JSON and refuse every real create.
+func TestCreateFileIsAMultipartRoute(t *testing.T) {
+	multipartReq := httptest.NewRequest(http.MethodPost, restBase+"createFile", nil)
+	multipartReq.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	if got := negotiatedRequestClass(OpCreateFile, multipartReq); got != multipartContentType {
+		t.Fatalf("createFile with a multipart body classified as %q, want the multipart class", got)
+	}
+
+	// A non-multipart createFile stays on the JSON class, where the dispatcher's
+	// own media-type gate refuses it — the route boundary stays a classifier and
+	// never becomes a second place that decides media types.
+	jsonReq := httptest.NewRequest(http.MethodPost, restBase+"createFile", nil)
+	jsonReq.Header.Set("Content-Type", contentTypeJSON)
+	if got := negotiatedRequestClass(OpCreateFile, jsonReq); got != contentTypeJSON {
+		t.Fatalf("createFile with a JSON body classified as %q, want the JSON class", got)
+	}
+}
+
+// TestCreateFileObjectRefIsTheEnginePath pins the coherence rule between the
+// two faces. The north list's reconcile keys on (Scope, ObjectRef), so a south
+// create recording anything other than the canonical engine-relative path makes
+// that reconcile mint a SECOND handle for the same object — one file, two
+// file_ids, and a list that shows a duplicate the caller cannot delete.
+//
+// The rule is invisible on this face: the south create succeeds and returns a
+// valid FileObject either way, and the damage only surfaces on the north list.
+// A build-time constant match is what pins it, since no south-side response
+// distinguishes the two.
+func TestCreateFileObjectRefIsTheEnginePath(t *testing.T) {
+	params := uploadParamsFrame{Path: "/outputs/deliverable.bin"}
+
+	// enginePath is the exact expression the streaming write passes to
+	// Engine.WriteStream, so it is the value the object is stored under.
+	wantRef := enginePath(params.Path)
+	if wantRef == params.Path {
+		t.Fatalf("enginePath is an identity on %q, so this test cannot tell the "+
+			"engine-relative form from the wire form", params.Path)
+	}
+	if strings.HasPrefix(wantRef, "/") {
+		t.Errorf("the engine-relative ObjectRef %q carries a leading slash; the "+
+			"north records it without one, so the reconcile would not match", wantRef)
+	}
+	// The binding assertion: what the handler RECORDS must equal what the engine
+	// WROTE UNDER. Recording the wire path instead reds here.
+	if got := createObjectRef(params); got != wantRef {
+		t.Fatalf("createFile records ObjectRef %q but the engine wrote under %q: "+
+			"the north reconcile keys on (Scope, ObjectRef) and would mint a "+
+			"second handle for this object", got, wantRef)
+	}
 }
