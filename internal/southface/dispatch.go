@@ -236,7 +236,7 @@ func newDispatcher(resolver Resolver, guard Guard, ceilings CeilingsRegistry, si
 
 // newDispatcherWithEngine builds a dispatcher binding the storage engine seam
 // and a fresh session-scoped uuid store. When engine is non-nil it registers
-// the engine-plane handlers (the seven phase-9 verbs plus readFile and the
+// the engine-plane handlers (the path-axis verbs plus readFile and the
 // readMetadata resolve), replacing their unimplemented entries; the remaining
 // ops stay unimplemented. The phase-8 spine ordering/registry tests use
 // newDispatcher (engine nil) and continue to see every op unimplemented.

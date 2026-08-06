@@ -127,15 +127,17 @@ func outcomeDenyRecorded() opOutcome { return opOutcome{} }
 // from class.
 func outcomeDeny(class string) opOutcome { return opOutcome{denyClass: class} }
 
-// opHandler is the per-operation handler signature. The seven phase-9 ops bind
-// real handlers; the other eleven stay unimplemented in this build. The
+// opHandler is the per-operation handler signature. Which ops bind a real
+// handler is not restated here — the count moved four times as verbs landed,
+// and a stale one reads as a gap that no longer exists.
+// TestEveryFrozenOpIsServedOrContractBlocked holds the current partition. The
 // returned opOutcome tells the spine whether — and how — to record ops_total
 // for the dispatched op (southface-01).
 type opHandler func(d *handlerDeps, hc handlerCtx) opOutcome
 
 // unimplemented writes the REST unimplemented deny (501) with no x-deny-reason
-// header. Every op the seven phase-9 handlers do not replace resolves to this —
-// the registry is complete, those bodies are not. It writes the wire error
+// header. Every op that no real handler replaces resolves to this — the
+// registry is complete, those bodies are not. It writes the wire error
 // directly (no mandateDeny hook), so it returns the deny class for the spine to
 // record the single ops_total entry.
 //
