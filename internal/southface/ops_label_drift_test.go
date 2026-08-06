@@ -21,6 +21,8 @@ var allOps = []Op{
 	OpListFiles, OpCopyFile, OpMoveFile, OpRemoveFile,
 	OpFileUpload, OpFileDownload, OpImportFiles, OpImportZip,
 	OpMigrateFilesystem, OpRemoveFilesystem,
+	// Routable since ADR-0036 sourced its body from the frozen north delete.
+	OpFileDelete,
 }
 
 // TestTelemetryKnownOpsMatchesSouthfaceOps is the drift guard for telemetry-12:

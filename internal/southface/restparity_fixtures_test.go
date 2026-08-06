@@ -99,6 +99,8 @@ var routeFixtures = []routeFixture{
 	{OpImportZip, "importZip", ctJSON, ctJSON, IntentWrite},
 	{OpMigrateFilesystem, "migrateFilesystem", ctJSON, ctJSON, IntentWrite},
 	{OpRemoveFilesystem, "removeFilesystem", ctJSON, ctJSON, IntentWrite},
+	// By-handle delete (ADR-0036), distinct from the path-addressed removeFile.
+	{OpFileDelete, "fileDelete", ctJSON, ctJSON, IntentWrite},
 	// Data-plane ops with distinct transport classes.
 	{OpFileUpload, "fileUpload", ctMultipart, ctJSON, IntentWrite},
 	{OpFileDownload, "fileDownload", ctJSON, ctOctetStream, IntentRead},

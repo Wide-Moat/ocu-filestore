@@ -39,6 +39,7 @@ var knownOps = []string{
 	"importZip",
 	"migrateFilesystem",
 	"removeFilesystem",
+	"fileDelete",
 }
 
 // knownDenyClasses is the closed set of deny-class audit-reason values used as
