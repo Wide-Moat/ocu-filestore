@@ -1193,9 +1193,16 @@ var credentialBearingFlags = map[string]struct{}{
 // flags that were explicitly set by the caller.
 var envFallbackMap = func() map[string]string {
 	// The daemon's full flag surface. Mirroring this slice here is intentional:
-	// the authoritative list of env-mappable flags is explicit and testable
-	// (the test asserts that each entry resolves to a live *flag.Flag at
-	// parse time, so a renamed flag breaks the test loudly).
+	// the authoritative list of env-mappable flags is explicit rather than
+	// derived, so adding a flag is a deliberate decision about whether it may
+	// be set from the environment.
+	//
+	// A mirror drifts, and both directions of drift are live faults: a stale
+	// entry makes a populated env var a boot refusal (applyEnvFallbacks calls
+	// fs.Set on a name the FlagSet does not have), and a missing entry drops
+	// the env fallback silently. env_fallback_surface_test.go pins both against
+	// the flags runCtx actually registers, read from the daemon's own usage
+	// output.
 	names := []string{
 		"version",
 		"health-check",
@@ -1224,11 +1231,12 @@ var envFallbackMap = func() map[string]string {
 		"subtree-rw",
 		"subtree-ro",
 		"subtree-preview",
-		"claims-bind",
-		"verify-storage-jwt",
-		"storage-jwks-path",
-		"storage-jwt-issuer",
-		"storage-jwt-audience",
+		"verify-credential",
+		"credential-jwks-path",
+		"credential-issuer",
+		"credential-audience",
+		"insecure-static-scope-bind",
+		"audit-fanout-sink",
 		"ops-per-second",
 		"ops-burst",
 	}
