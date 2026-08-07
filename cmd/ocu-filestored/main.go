@@ -272,12 +272,27 @@ type brokerConfig struct {
 	// (GA Wave 1, ADR-0013/0019/0025). It is the fail-closed replacement for the
 	// unverified claimsBind seam: a forged/unsigned bearer binds no scope (401).
 	verifyStorageJWT bool
-	// storageJWKS is Control's rendered JWKS artifact, read once at boot from
-	// storageJWKSPath (the SAME document Control writes at its -jwks-path,
-	// mounted read-only into filestore). Non-empty only when verifyStorageJWT.
+	// storageJWKS is the CREDENTIAL AUTHORITY's rendered JWKS artifact, read once
+	// at boot from storageJWKSPath and mounted read-only into filestore.
+	//
+	// NOT Control's JWKS. Two issuers sit on this path (ADR-0019): Control mints
+	// the weak session JWT the EDGE validates, and a separate credential
+	// authority issues the real filestore credential the edge injects. The engine
+	// verifies the injected credential "against the Credential-issuer's public
+	// key" (NFR-SEC-31) and never accepts the weak session JWT, which canon calls
+	// an edge-only assertion ocu-filestore does not accept.
+	//
+	// Anchoring here on Control's JWKS would invert the trust anchor in both
+	// directions at once: the engine would accept a guest's own weak JWT
+	// presented straight at the south face — the edge bypass ADR-0013/0019 exist
+	// to close — while rejecting every legitimate injected credential 401.
+	// Non-empty only when verifyStorageJWT.
 	storageJWKS []byte
-	// storageJWTIssuer/storageJWTAudience are the iss/aud filestore requires of a
-	// verified Storage-JWT (must equal Control's -storage-issuer/-storage-audience).
+	// storageJWTIssuer/storageJWTAudience are the iss/aud filestore requires of
+	// the verified injected credential: the CREDENTIAL AUTHORITY's announced
+	// identity and this engine's service identity — never Control's
+	// -storage-issuer/-storage-audience, which name the weak session JWT the edge
+	// validates and the engine must not accept.
 	// Both are required when verifyStorageJWT is set.
 	storageJWTIssuer   string
 	storageJWTAudience string
@@ -417,17 +432,18 @@ func runCtx(ctx context.Context, args []string) error {
 	// before trusting its filesystem_id/intent claims. It is the fail-closed
 	// replacement for the unverified -claims-bind seam: a forged/unsigned bearer
 	// binds no scope (401). The JWKS is a PINNED FILE (-storage-jwks-path) mounted
-	// read-only from the SAME artifact Control renders at its -jwks-path; a URL/
+	// read-only from the credential authority's published artifact — NOT the
+	// document Control renders at its -jwks-path, which the edge consumes; a URL/
 	// remote_jwks refresh path is Wave 3. When set, all three companion flags are
 	// required and boot FAILS CLOSED if the JWKS path is empty/unreadable/key-less.
 	verifyStorageJWT := fs.Bool("verify-storage-jwt", false,
 		"JWKS-verify the weak Storage-JWT signature before trusting its filesystem_id/intent claims (GA Wave 1, ADR-0013/0019/0025); requires -storage-jwks-path/-storage-jwt-issuer/-storage-jwt-audience")
 	storageJWKSPath := fs.String("storage-jwks-path", "",
-		"filesystem path to Control's rendered JWKS artifact (the SAME file Control writes at -jwks-path), read once at boot; required when -verify-storage-jwt is set")
+		"filesystem path to the CREDENTIAL AUTHORITY's rendered JWKS artifact (the exchange counterparty of ADR-0019 — NOT Control's -jwks-path document, which belongs to the edge), read once at boot; required when -verify-storage-jwt is set")
 	storageJWTIssuer := fs.String("storage-jwt-issuer", "",
-		"the iss a verified Storage-JWT must carry (must equal Control's -storage-issuer); required when -verify-storage-jwt is set")
+		"the iss the verified injected credential must carry: the credential authority's announced identity, NOT Control's -storage-issuer; required when -verify-storage-jwt is set")
 	storageJWTAudience := fs.String("storage-jwt-audience", "",
-		"the aud a verified Storage-JWT must carry (must equal Control's -storage-audience); required when -verify-storage-jwt is set")
+		"the aud the verified injected credential must carry: this engine's service identity, NOT Control's -storage-audience; required when -verify-storage-jwt is set")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
