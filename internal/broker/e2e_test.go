@@ -218,6 +218,11 @@ func startDaemon(t *testing.T, extraArgs ...string) *daemon {
 		"-broker-max-file-size", fmt.Sprintf("%d", 1<<20),
 		"-filesystem-id", e2eScope,
 		"-granted-intents", "read,write",
+		// Verification is on by default (ADR-0042) and this rig stands up the
+		// daemon alone, with no credential authority to verify against. It
+		// declares the insecure static bind rather than failing on the gate, so
+		// the fixture states the posture it actually runs.
+		"-insecure-static-scope-bind",
 		"-downloadable-prefixes", downloadablePrefix,
 		// The ops listener is unused here; an empty value disables it so two
 		// concurrent live cases never collide on the default 127.0.0.1:9464.

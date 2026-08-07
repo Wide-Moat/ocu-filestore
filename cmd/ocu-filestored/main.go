@@ -29,8 +29,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -1333,7 +1331,8 @@ func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtr
 	// JWKS-VERIFIES the weak Storage-JWT signature and reads filesystem_id/intent
 	// FROM THE VERIFIED CLAIMS ONLY. A forged/unsigned bearer binds no scope
 	// (VerifyScope -> errCredentialRejected -> the extractor rejects -> 401). This
-	// is the fail-closed replacement for the unverified bearerClaimsScope seam. The
+	// is the fail-closed replacement for the unverified claims-parse seam ADR-0042
+	// removed. The
 	// verifier construction is fail-closed on a bad JWKS; a construction failure
 	// here binds NOTHING (every credential rejected), never a silent fall-through.
 	if cfg.verifyCredential {
@@ -1365,47 +1364,6 @@ func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtr
 			GrantedIntents: intents,
 		}, nil
 	})
-}
-
-// bearerClaimsScope parses the CLAIMS of an edge-validated bearer (a JWT-shaped
-// token) into a CredentialScope WITHOUT verifying the signature. It reads the
-// payload's filesystem_id and intent claims: filesystem_id binds the scope, and
-// a present intent claim maps to the single-element GrantedIntents grant set the
-// per-mount credential carries (ADR-0029 — the edge exchanges per {filesystem_id,
-// intent}). A token that is not three dot-separated segments, an undecodable
-// payload, or a claim carrying no filesystem_id is a rejection (empty
-// FilesystemID -> the extractor rejects). The service verifies no signature and
-// mints nothing (inv3).
-//
-// PRE-VERIFICATION INTERIM SEAM: this path is reachable ONLY when
-// -verify-storage-jwt is OFF (the demo/harness posture). GA Wave 1
-// (ADR-0013/0019/0025) supersedes it with the JWKS-verifying bind above; a
-// production deployment sets -verify-storage-jwt so a forged/unsigned bearer is
-// denied, and this unverified reader is never on the request path.
-func bearerClaimsScope(bearer string) (southface.CredentialScope, error) {
-	parts := strings.Split(bearer, ".")
-	if len(parts) != 3 {
-		return southface.CredentialScope{}, nil
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return southface.CredentialScope{}, nil
-	}
-	var claims struct {
-		FilesystemID string `json:"filesystem_id"`
-		Intent       string `json:"intent"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return southface.CredentialScope{}, nil
-	}
-	var grants []southface.Intent
-	if intent, ok := intentVocabulary[claims.Intent]; ok {
-		grants = []southface.Intent{intent}
-	}
-	return southface.CredentialScope{
-		FilesystemID:   claims.FilesystemID,
-		GrantedIntents: grants,
-	}, nil
 }
 
 // newBackendTLSClient builds the s3 engine's backend HTTP client: a strict

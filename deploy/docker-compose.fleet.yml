@@ -89,6 +89,10 @@ services:
       OCU_S3_ACCESS_KEY_ID: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
       OCU_S3_SECRET_ACCESS_KEY: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
     command:
+      # Declared for the same reason as the base compose: verification is on by
+      # default (ADR-0042) and no credential authority is wired here yet, so the
+      # posture is stated rather than left to a flag's absence.
+      - -insecure-static-scope-bind
       - -engine
       - s3
       - -s3-endpoint

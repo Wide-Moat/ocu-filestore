@@ -93,6 +93,11 @@ services:
       OCU_S3_ACCESS_KEY_ID: ${OCU_S3_TEST_ACCESS_KEY:-ocu-test-root}
       OCU_S3_SECRET_ACCESS_KEY: ${OCU_S3_TEST_SECRET_KEY:-ocu-test-secret-key}
     command:
+      # No credential authority stands beside this rig, and verification is on
+      # by default (ADR-0042). The insecure static bind is declared here so the
+      # posture is readable in the command line rather than inferred from a
+      # flag's absence — which is what let B1 ship dark.
+      - -insecure-static-scope-bind
       - -engine
       - s3
       - -s3-endpoint
