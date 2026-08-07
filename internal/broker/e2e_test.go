@@ -218,6 +218,11 @@ func startDaemon(t *testing.T, extraArgs ...string) *daemon {
 		"-broker-max-file-size", fmt.Sprintf("%d", 1<<20),
 		"-filesystem-id", e2eScope,
 		"-granted-intents", "read,write",
+		// Verification is on by default (ADR-0042) and this rig stands up the
+		// daemon alone, with no credential authority to verify against. It
+		// declares the insecure static bind rather than failing on the gate, so
+		// the fixture states the posture it actually runs.
+		"-insecure-static-scope-bind",
 		"-downloadable-prefixes", downloadablePrefix,
 		// The ops listener is unused here; an empty value disables it so two
 		// concurrent live cases never collide on the default 127.0.0.1:9464.
@@ -436,13 +441,11 @@ func (d *daemon) listingContains(t *testing.T, dir, guestPath string) (uuid stri
 // human-supplied input is readable in-session yet cannot be pulled out of the
 // sandbox — the exfil-bar.
 func TestE2ELifecycleOverTLS(t *testing.T) {
-	// The subtree join is wired by the -subtree-* flags directly (buildSubtreeMap
-	// reads them independently of -claims-bind), so this lifecycle test runs the
-	// split under the default present-bearer bind — it exercises the mount
-	// round-trip and the symmetric strip, NOT the per-mount intent claim (the
-	// mirage test covers -claims-bind). Adding -claims-bind here would require a
-	// JWT-shaped bearer on every request; the fixed e2eBearer is not one, so it
-	// would 401 before any op. Keep the split flags, drop -claims-bind.
+	// The subtree join is wired by the -subtree-* flags directly, independently
+	// of how scope reaches the daemon, so this lifecycle test exercises the
+	// mount round-trip and the symmetric strip under the rig's static scope
+	// bind. It does not exercise a per-mount intent claim, which since ADR-0042
+	// arrives only on a verified credential.
 	d := startDaemon(t,
 		"-subtree-rw", "outputs",
 		"-subtree-ro", "uploads",
@@ -623,11 +626,10 @@ func TestE2EMissingBearerDeny(t *testing.T) {
 }
 
 // mintUnsignedBearer builds an unsigned (alg=none) JWT carrying the given
-// filesystem_id and intent claim. Under -claims-bind the daemon's extractor
-// parses the edge-validated bearer's claims WITHOUT re-verifying the signature
-// (the edge owns weak-JWT validation; the service JWKS-verifies nothing —
-// inv3), so an unsigned token stands in for an edge-validated one. A random
-// nonce per call keeps two mints distinct.
+// filesystem_id and intent claim. The rig runs under a static scope bind, so
+// the daemon does not read these claims — the token is a well-formed bearer the
+// south face accepts, and the subtree-join property under test is independent
+// of where scope came from. A random nonce per call keeps two mints distinct.
 func mintUnsignedBearer(t *testing.T, fsid, intent, nonce string) string {
 	t.Helper()
 	b64 := func(v any) string {
@@ -716,8 +718,9 @@ func TestE2EMirageSubtreeJoin(t *testing.T) {
 	}
 
 	t.Run("join_enabled_write_lands_under_outputs_ro_unreachable", func(t *testing.T) {
+		// Scope binding comes from startDaemon's -insecure-static-scope-bind; the
+		// -claims-bind seam ADR-0042 removed used to supply it here.
 		d := startDaemon(t,
-			"-claims-bind",
 			"-subtree-rw", "outputs",
 			"-subtree-ro", "uploads",
 			"-subtree-preview", "uploads",

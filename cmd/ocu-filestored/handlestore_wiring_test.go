@@ -38,6 +38,12 @@ func handleStoreArgs(t *testing.T, hsPath, opsAddr string) []string {
 		"--tls-cert", certFile,
 		"--tls-key", keyFile,
 		"--ops-listen", opsAddr,
+		// These tests stand up a bare daemon to exercise handle-store locking;
+		// there is no credential authority to verify against, and verification is
+		// on by default (ADR-0042). The insecure static bind is the admitted
+		// posture for exactly this shape of rig, and naming it here keeps the
+		// fixture honest about what it runs.
+		"--insecure-static-scope-bind",
 	}
 	if hsPath != "" {
 		args = append(args, "--handle-store", hsPath)

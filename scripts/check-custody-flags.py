@@ -41,11 +41,16 @@ EXEMPT = {
 # here: it is the unverified predecessor seam, and requiring it would bless a
 # configuration that binds a scope from an unverified bearer.
 REQUIRED = [
-    "-verify-storage-jwt",
-    "-storage-jwks-path",
-    "-storage-jwt-issuer",
-    "-storage-jwt-audience",
+    "-credential-jwks-path",
+    "-credential-issuer",
+    "-credential-audience",
 ]
+
+# The posture a manifest declares when it runs WITHOUT verification. Since
+# ADR-0042 verification is the default, so a manifest is either verifying or it
+# names this flag -- there is no third state, and a manifest that names neither
+# fails to boot rather than running dark.
+INSECURE = "-insecure-static-scope-bind"
 
 
 def fail(msg):
@@ -102,7 +107,13 @@ def main():
             continue
 
         checked += 1
+        # A manifest that declares the insecure posture is not silently
+        # unverified: it says so in its command line, which is the property this
+        # gate exists to make readable. It is still reported below.
+        declared_insecure = INSECURE in body
         missing = [flag for flag in REQUIRED if flag not in body]
+        if declared_insecure and missing:
+            note(f"{name}: declares {INSECURE}; unverified BY DECLARATION")
         if name in KNOWN_UNVERIFIED:
             if missing:
                 note(f"{name}: KNOWN GAP, custody verification not wired "
