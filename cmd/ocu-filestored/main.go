@@ -263,17 +263,18 @@ type brokerConfig struct {
 	// (join disabled, static-path mode) unless a deployment sets the -subtree-*
 	// override flags; validate builds it from those flags fail-closed.
 	subtrees southface.SubtreeMap
-	// claimsBind, when true, makes the credential extractor parse the
-	// edge-validated bearer's filesystem_id/intent claims (ADR-0029 interim seam)
-	// instead of binding every present bearer to the static configured scope.
-	claimsBind bool
+	// insecureStaticScopeBind selects the ONLY unverified posture (ADR-0042):
+	// every present bearer binds to the statically configured scope with no
+	// signature check. It is named for its danger so the posture is readable in
+	// the process argv rather than inferred from a boolean that is false.
+	insecureStaticScopeBind bool
 	// verifyStorageJWT, when true, makes the credential extractor JWKS-VERIFY the
 	// weak Storage-JWT signature before trusting its filesystem_id/intent claims
 	// (GA Wave 1, ADR-0013/0019/0025). It is the fail-closed replacement for the
 	// unverified claimsBind seam: a forged/unsigned bearer binds no scope (401).
-	verifyStorageJWT bool
+	verifyCredential bool
 	// storageJWKS is the CREDENTIAL AUTHORITY's rendered JWKS artifact, read once
-	// at boot from storageJWKSPath and mounted read-only into filestore.
+	// at boot from -credential-jwks-path and mounted read-only into filestore.
 	//
 	// NOT Control's JWKS. Two issuers sit on this path (ADR-0019): Control mints
 	// the weak session JWT the EDGE validates, and a separate credential
@@ -288,14 +289,14 @@ type brokerConfig struct {
 	// to close — while rejecting every legitimate injected credential 401.
 	// Non-empty only when verifyStorageJWT.
 	storageJWKS []byte
-	// storageJWTIssuer/storageJWTAudience are the iss/aud filestore requires of
+	// credentialIssuer/credentialAudience are the iss/aud filestore requires of
 	// the verified injected credential: the CREDENTIAL AUTHORITY's announced
 	// identity and this engine's service identity — never Control's
 	// -storage-issuer/-storage-audience, which name the weak session JWT the edge
 	// validates and the engine must not accept.
 	// Both are required when verifyStorageJWT is set.
-	storageJWTIssuer   string
-	storageJWTAudience string
+	credentialIssuer   string
+	credentialAudience string
 	// auditFanOutPath is the one-click-solo reference fan-out sink (ADR-0009).
 	// Empty means the deployment fans out nowhere, which is the minimal-shelf
 	// default: the hash-chained local record is the whole tamper-evidence story
@@ -417,16 +418,8 @@ func runCtx(ctx context.Context, args []string) error {
 		"per-session file-ops token-bucket refill rate in ops/s (>0); the throttle ceiling (NFR-SEC-46)")
 	opsBurst := fs.Float64("ops-burst", defaultOpsBurst,
 		"per-session file-ops token-bucket capacity in tokens (>=1); a session starts with a full bucket")
-	// -claims-bind (ADR-0029, PR-B test seam): when set, the credential extractor
-	// parses the EDGE-VALIDATED bearer's filesystem_id and intent CLAIMS instead of
-	// binding every present bearer to the static configured scope. It JWKS-verifies
-	// NOTHING (the edge owns weak-JWT validation; the service mints/signs nothing —
-	// inv3). This is the interim seam that lets the per-mount intent claim reach the
-	// engine before the PR-C control mint + ADR-0019 intent-keyed exchange land; the
-	// per-request filesystem_id cross-check still rejects a claim that disagrees with
-	// -filesystem-id.
-	claimsBind := fs.Bool("claims-bind", false,
-		"parse the edge-validated bearer's filesystem_id/intent claims (ADR-0029 interim seam); JWKS-verifies nothing")
+	insecureStaticScopeBind := fs.Bool("insecure-static-scope-bind", false,
+		"INSECURE: bind every present bearer to the statically configured scope WITHOUT verifying it (ADR-0042). The only unverified posture, admitted solely in rigs that stand up the engine with no credential authority to verify against. Named for its danger so the posture is readable in the process argv, in a drift gate, and in a container inspection")
 	// GA Wave 1 storage credential custody (ADR-0013/0019/0025): -verify-storage-jwt
 	// makes the credential extractor JWKS-VERIFY the weak Storage-JWT signature
 	// before trusting its filesystem_id/intent claims. It is the fail-closed
@@ -436,14 +429,14 @@ func runCtx(ctx context.Context, args []string) error {
 	// document Control renders at its -jwks-path, which the edge consumes; a URL/
 	// remote_jwks refresh path is Wave 3. When set, all three companion flags are
 	// required and boot FAILS CLOSED if the JWKS path is empty/unreadable/key-less.
-	verifyStorageJWT := fs.Bool("verify-storage-jwt", false,
-		"JWKS-verify the weak Storage-JWT signature before trusting its filesystem_id/intent claims (GA Wave 1, ADR-0013/0019/0025); requires -storage-jwks-path/-storage-jwt-issuer/-storage-jwt-audience")
-	storageJWKSPath := fs.String("storage-jwks-path", "",
-		"filesystem path to the CREDENTIAL AUTHORITY's rendered JWKS artifact (the exchange counterparty of ADR-0019 — NOT Control's -jwks-path document, which belongs to the edge), read once at boot; required when -verify-storage-jwt is set")
-	storageJWTIssuer := fs.String("storage-jwt-issuer", "",
-		"the iss the verified injected credential must carry: the credential authority's announced identity, NOT Control's -storage-issuer; required when -verify-storage-jwt is set")
-	storageJWTAudience := fs.String("storage-jwt-audience", "",
-		"the aud the verified injected credential must carry: this engine's service identity, NOT Control's -storage-audience; required when -verify-storage-jwt is set")
+	verifyCredential := fs.Bool("verify-credential", true,
+		"JWKS-verify the edge-injected credential before trusting its filesystem_id/intent claims (ADR-0013/0019/0042). ON BY DEFAULT; requires -credential-jwks-path/-credential-issuer/-credential-audience. Turn it off only with -insecure-static-scope-bind, which names the posture it selects")
+	credentialJWKSPath := fs.String("credential-jwks-path", "",
+		"filesystem path to the CREDENTIAL AUTHORITY's rendered JWKS artifact (the exchange counterparty of ADR-0019 — NOT Control's -jwks-path document, which belongs to the edge), read once at boot; required unless -insecure-static-scope-bind is set")
+	credentialIssuer := fs.String("credential-issuer", "",
+		"the iss the verified injected credential must carry: the credential authority's announced identity, NOT Control's -storage-issuer; required unless -insecure-static-scope-bind is set")
+	credentialAudience := fs.String("credential-audience", "",
+		"the aud the verified injected credential must carry: this engine's service identity, NOT Control's -storage-audience; required unless -insecure-static-scope-bind is set")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -526,35 +519,43 @@ func runCtx(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	// -claims-bind is a pass-through bool (no validation): set it on the config
-	// after validate so the credential extractor picks the claims-parsing mode.
-	cfg.claimsBind = *claimsBind
+	// The insecure bind is a pass-through bool: set it after validate so the
+	// credential extractor can select the unverified posture.
+	cfg.insecureStaticScopeBind = *insecureStaticScopeBind
 	cfg.auditFanOutPath = *auditFanOut
 
-	// GA Wave 1 storage credential custody: when -verify-storage-jwt is set, the
+	// Credential custody (ADR-0013/0019/0042). Verification is ON by default; the
 	// three companion flags are REQUIRED and the JWKS artifact is read once at
-	// boot. This is a FAIL-CLOSED gate: an empty/unreadable/key-less JWKS, or a
-	// missing issuer/audience, aborts boot BEFORE any socket is bound, so a
-	// misconfigured deployment can never silently fall back to the unverified path.
-	cfg.verifyStorageJWT = *verifyStorageJWT
-	cfg.storageJWTIssuer = *storageJWTIssuer
-	cfg.storageJWTAudience = *storageJWTAudience
-	if cfg.verifyStorageJWT {
-		if *storageJWKSPath == "" {
-			return fmt.Errorf("%w: -storage-jwks-path is required when -verify-storage-jwt is set", errMissingRequiredFlag)
+	// boot. FAIL-CLOSED: an empty/unreadable/key-less JWKS, or a missing
+	// issuer/audience, aborts boot BEFORE any socket is bound, so a misconfigured
+	// deployment can never silently fall back to the unverified path.
+	//
+	// Asking for both postures is refused rather than resolved. Preferring one
+	// silently would leave an operator believing the other took effect, and which
+	// one they believe decides whether the deployment verifies anything at all.
+	if *insecureStaticScopeBind && *credentialJWKSPath != "" {
+		return fmt.Errorf("%w: -insecure-static-scope-bind and -credential-jwks-path are mutually exclusive; "+
+			"a config asking for both leaves the running posture ambiguous", errMissingRequiredFlag)
+	}
+	cfg.verifyCredential = *verifyCredential && !*insecureStaticScopeBind
+	cfg.credentialIssuer = *credentialIssuer
+	cfg.credentialAudience = *credentialAudience
+	if cfg.verifyCredential {
+		if *credentialJWKSPath == "" {
+			return fmt.Errorf("%w: -credential-jwks-path is required unless -insecure-static-scope-bind is set", errMissingRequiredFlag)
 		}
-		if cfg.storageJWTIssuer == "" {
-			return fmt.Errorf("%w: -storage-jwt-issuer is required when -verify-storage-jwt is set", errMissingRequiredFlag)
+		if cfg.credentialIssuer == "" {
+			return fmt.Errorf("%w: -credential-issuer is required unless -insecure-static-scope-bind is set", errMissingRequiredFlag)
 		}
-		if cfg.storageJWTAudience == "" {
-			return fmt.Errorf("%w: -storage-jwt-audience is required when -verify-storage-jwt is set", errMissingRequiredFlag)
+		if cfg.credentialAudience == "" {
+			return fmt.Errorf("%w: -credential-audience is required unless -insecure-static-scope-bind is set", errMissingRequiredFlag)
 		}
-		jwksBytes, err := os.ReadFile(*storageJWKSPath)
+		jwksBytes, err := os.ReadFile(*credentialJWKSPath)
 		if err != nil {
-			return fmt.Errorf("%w: -storage-jwks-path %q unreadable: %v", errMissingRequiredFlag, *storageJWKSPath, err)
+			return fmt.Errorf("%w: -storage-jwks-path %q unreadable: %v", errMissingRequiredFlag, *credentialJWKSPath, err)
 		}
 		if len(jwksBytes) == 0 {
-			return fmt.Errorf("%w: -storage-jwks-path %q is empty", errMissingRequiredFlag, *storageJWKSPath)
+			return fmt.Errorf("%w: -storage-jwks-path %q is empty", errMissingRequiredFlag, *credentialJWKSPath)
 		}
 		cfg.storageJWKS = jwksBytes
 		// FAIL-FAST at boot: construct the verifier NOW so a structurally-invalid
@@ -567,8 +568,8 @@ func runCtx(ctx context.Context, args []string) error {
 		// the exact "can never silently fall back" outcome this gate promises to
 		// prevent. The verifier is rebuilt (identically) in the extractor; this is
 		// the cheap boot-time validation, not the serving instance.
-		if _, err := southface.NewStorageJWTVerifier(cfg.storageJWKS, cfg.storageJWTIssuer, cfg.storageJWTAudience, nil); err != nil {
-			return fmt.Errorf("%w: -storage-jwks-path %q is not a usable JWKS: %v", errMissingRequiredFlag, *storageJWKSPath, err)
+		if _, err := southface.NewStorageJWTVerifier(cfg.storageJWKS, cfg.credentialIssuer, cfg.credentialAudience, nil); err != nil {
+			return fmt.Errorf("%w: -storage-jwks-path %q is not a usable JWKS: %v", errMissingRequiredFlag, *credentialJWKSPath, err)
 		}
 	}
 
@@ -1327,7 +1328,6 @@ const (
 func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtractor {
 	fsid := cfg.filesystemID
 	intents := cfg.grantedIntents
-	claimsBind := cfg.claimsBind
 
 	// GA Wave 1 (ADR-0013/0019/0025): when -verify-storage-jwt is set, the bind
 	// JWKS-VERIFIES the weak Storage-JWT signature and reads filesystem_id/intent
@@ -1336,8 +1336,8 @@ func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtr
 	// is the fail-closed replacement for the unverified bearerClaimsScope seam. The
 	// verifier construction is fail-closed on a bad JWKS; a construction failure
 	// here binds NOTHING (every credential rejected), never a silent fall-through.
-	if cfg.verifyStorageJWT {
-		verifier, err := southface.NewStorageJWTVerifier(cfg.storageJWKS, cfg.storageJWTIssuer, cfg.storageJWTAudience, nil)
+	if cfg.verifyCredential {
+		verifier, err := southface.NewStorageJWTVerifier(cfg.storageJWKS, cfg.credentialIssuer, cfg.credentialAudience, nil)
 		if err != nil {
 			return southface.NewCredentialScopeExtractor(func(string) (southface.CredentialScope, error) {
 				return southface.CredentialScope{}, err
@@ -1357,14 +1357,6 @@ func newCredentialScopeExtractor(cfg brokerConfig) southface.CredentialScopeExtr
 		// rejection by the extractor.
 		if bearer == "" {
 			return southface.CredentialScope{}, nil
-		}
-		if claimsBind {
-			// ADR-0029 interim seam: parse the edge-validated bearer's
-			// filesystem_id/intent CLAIMS. The service JWKS-verifies NOTHING (the
-			// edge owns weak-JWT validation; the service mints/signs nothing —
-			// inv3). A claim carrying no filesystem_id is a rejection (empty
-			// FilesystemID); an unparseable token is a rejection too.
-			return bearerClaimsScope(bearer)
 		}
 		// Default interim bind: bind a present bearer to the single-tenant
 		// configured scope (filesystem-id + granted-intents).

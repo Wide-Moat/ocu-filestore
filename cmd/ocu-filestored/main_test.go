@@ -411,6 +411,10 @@ func TestRunS3EngineRequiresCredential(t *testing.T) {
 		"--tls-key", keyFile,
 		"--filesystem-id", "fs1",
 		"--broker-max-file-size", "1",
+
+		// Verification is on by default (ADR-0042); this rig has no credential
+		// authority, so it declares the insecure posture rather than failing on it.
+		"--insecure-static-scope-bind",
 	}
 	if err := run(full); !errors.Is(err, objectstore.ErrCredentialMissing) {
 		t.Fatalf("run(-engine s3, no creds): got %v, want ErrCredentialMissing", err)
@@ -652,8 +656,8 @@ func TestRunMissingRequiredFlags(t *testing.T) {
 }
 
 // TestRunVerifyStorageJWTGate pins the GA Wave 1 fail-closed gate: setting
-// -verify-storage-jwt REQUIRES -storage-jwks-path/-storage-jwt-issuer/
-// -storage-jwt-audience and a readable non-empty JWKS file; any absent companion
+// -verify-credential (ON by default, ADR-0042) REQUIRES -credential-jwks-path/-credential-issuer/
+// -credential-audience and a readable non-empty JWKS file; any absent companion
 // or unreadable JWKS refuses at run BEFORE any socket is bound. A complete set
 // with a real JWKS is accepted through the gate (it fails later on the fake TLS
 // cert, NOT on the gate: proving the gate itself admits a well-formed config).
@@ -685,18 +689,18 @@ func TestRunVerifyStorageJWTGate(t *testing.T) {
 	if err := os.WriteFile(keylessJWKS, []byte(`{"keys":[]}`), 0o600); err != nil {
 		t.Fatalf("write keyless jwks: %v", err)
 	}
-	full := []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}
+	full := []string{"--verify-credential", "--credential-jwks-path", jwksPath, "--credential-issuer", "iss", "--credential-audience", "aud"}
 
 	for _, tc := range []struct {
 		name string
 		args []string
 	}{
-		{"missing_jwks_path", []string{"--verify-storage-jwt", "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
-		{"missing_issuer", []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-audience", "aud"}},
-		{"missing_audience", []string{"--verify-storage-jwt", "--storage-jwks-path", jwksPath, "--storage-jwt-issuer", "iss"}},
-		{"unreadable_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", filepath.Join(root, "nope.json"), "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
-		{"empty_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", emptyJWKS, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
-		{"keyless_jwks", []string{"--verify-storage-jwt", "--storage-jwks-path", keylessJWKS, "--storage-jwt-issuer", "iss", "--storage-jwt-audience", "aud"}},
+		{"missing_jwks_path", []string{"--verify-credential", "--credential-issuer", "iss", "--credential-audience", "aud"}},
+		{"missing_issuer", []string{"--verify-credential", "--credential-jwks-path", jwksPath, "--credential-audience", "aud"}},
+		{"missing_audience", []string{"--verify-credential", "--credential-jwks-path", jwksPath, "--credential-issuer", "iss"}},
+		{"unreadable_jwks", []string{"--verify-credential", "--credential-jwks-path", filepath.Join(root, "nope.json"), "--credential-issuer", "iss", "--credential-audience", "aud"}},
+		{"empty_jwks", []string{"--verify-credential", "--credential-jwks-path", emptyJWKS, "--credential-issuer", "iss", "--credential-audience", "aud"}},
+		{"keyless_jwks", []string{"--verify-credential", "--credential-jwks-path", keylessJWKS, "--credential-issuer", "iss", "--credential-audience", "aud"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := run(append(append([]string{}, base...), tc.args...))
@@ -856,6 +860,10 @@ func TestRunOpsListenerServesHealthRoutes(t *testing.T) {
 		"--tls-cert", certFile,
 		"--tls-key", keyFile,
 		"--ops-listen", opsAddr,
+
+		// Verification is on by default (ADR-0042); this rig has no credential
+		// authority, so it declares the insecure posture rather than failing on it.
+		"--insecure-static-scope-bind",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -948,6 +956,10 @@ func TestRunPinsAuditSinkDirTo0700(t *testing.T) {
 		"--tls-cert", certFile,
 		"--tls-key", keyFile,
 		"--ops-listen", opsAddr,
+
+		// Verification is on by default (ADR-0042); this rig has no credential
+		// authority, so it declares the insecure posture rather than failing on it.
+		"--insecure-static-scope-bind",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

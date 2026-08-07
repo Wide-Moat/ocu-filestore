@@ -122,45 +122,49 @@ func (s keystoneSigner) mint(t *testing.T, fsid, intent string, exp time.Time) s
 	return compact
 }
 
-// keystoneConfig builds the daemon config the extractor reads. verify toggles the
-// new -verify-storage-jwt posture; jwks/issuer/audience feed the verifier.
+// keystoneConfig builds the daemon config the extractor reads. verify selects the
+// verified posture; jwks/issuer/audience feed the verifier. verify=false is now
+// the INSECURE static bind (ADR-0042) -- the unverified claims-parse seam it used
+// to select no longer exists.
 func keystoneConfig(verify bool, jwks []byte) brokerConfig {
 	return brokerConfig{
-		filesystemID:       keystoneConfiguredFSID,
-		grantedIntents:     []southface.Intent{southface.IntentRead, southface.IntentWrite},
-		claimsBind:         true,
-		verifyStorageJWT:   verify,
-		storageJWKS:        jwks,
-		storageJWTIssuer:   keystoneIssuer,
-		storageJWTAudience: keystoneAudience,
+		filesystemID:            keystoneConfiguredFSID,
+		grantedIntents:          []southface.Intent{southface.IntentRead, southface.IntentWrite},
+		verifyCredential:        verify,
+		insecureStaticScopeBind: !verify,
+		storageJWKS:             jwks,
+		credentialIssuer:        keystoneIssuer,
+		credentialAudience:      keystoneAudience,
 	}
 }
 
-// TestStorageJWTKeystone_HoleLive is the RED probe: it proves TODAY's shipped
-// claims-bind path (verify OFF) binds a forged UNSIGNED bearer's scope claims
-// with NO signature check. A forged payload naming a victim filesystem_id is
-// accepted verbatim  -  the attacker steers the credential-bound scope (and thus
-// the engine prefix) to a scope it never proved title to. This test PASSES on the
-// unfixed binary; after the fix the verified path (the other keystone) reds the
-// same forged token.
-func TestStorageJWTKeystone_HoleLive(t *testing.T) {
+// TestStorageJWTKeystone_HoleClosedEvenUnverified is what the HOLE-LIVE probe
+// became. That probe proved the shipped claims-bind path trusted a forged
+// UNSIGNED bearer's scope claims verbatim, letting an attacker steer the bound
+// scope to a filesystem it never proved title to.
+//
+// ADR-0042 removes that path. The remaining unverified posture is the INSECURE
+// STATIC bind, which reads no claims at all: a forged bearer gets the
+// operator-configured scope, never the one it asked for. The distinction is the
+// whole point of keeping an unverified posture at all -- the scope stays
+// something the operator chose.
+func TestStorageJWTKeystone_HoleClosedEvenUnverified(t *testing.T) {
 	ext := newCredentialScopeExtractor(keystoneConfig(false, nil))
 	forged := forgeUnsignedBearer(t, keystoneVictimFSID, "write")
 
 	scope, err := ext.Extract(forged)
 	if err != nil {
-		t.Fatalf("HOLE-LIVE probe: unfixed shipped path rejected a forged bearer (err=%v); "+
-			"the hole is expected LIVE here  -  a signature check must NOT yet exist", err)
+		t.Fatalf("the insecure static bind rejected a present bearer (err=%v); it is "+
+			"meant to bind the configured scope, not to refuse", err)
 	}
-	if scope.FilesystemID != keystoneVictimFSID {
-		t.Fatalf("HOLE-LIVE probe: expected the forged victim fsid %q to be trusted verbatim, got %q",
-			keystoneVictimFSID, scope.FilesystemID)
+	if scope.FilesystemID == keystoneVictimFSID {
+		t.Fatalf("a forged bearer steered the bound scope to the victim fsid %q; the "+
+			"unverified claims-parse path is back", keystoneVictimFSID)
 	}
-	if len(scope.GrantedIntents) != 1 || scope.GrantedIntents[0] != southface.IntentWrite {
-		t.Fatalf("HOLE-LIVE probe: expected the forged write intent trusted verbatim, got %v", scope.GrantedIntents)
+	if scope.FilesystemID != keystoneConfiguredFSID {
+		t.Fatalf("the insecure bind produced %q, want the operator-configured %q",
+			scope.FilesystemID, keystoneConfiguredFSID)
 	}
-	t.Logf("HOLE LIVE: unsigned forged bearer accepted verbatim -> scope %q intents %v (no signature verified)",
-		scope.FilesystemID, scope.GrantedIntents)
 }
 
 // TestStorageJWTKeystone_ForgedDenied is the GREEN probe: with verification ON, a
