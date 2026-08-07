@@ -165,3 +165,17 @@ jobs:
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  custody-flags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gate ships ENFORCING with the two shipped manifests recorded as a
+      # known gap, so a NEW manifest omitting the custody flags reds immediately
+      # and a recorded gap that starts passing reds as a stale record. A gate
+      # that simply passed today would be indistinguishable from one that had
+      # nothing to check.
+      - name: storage-custody config-drift gate (ADR-0013/0019)
+        run: python3 scripts/check-custody-flags.py
