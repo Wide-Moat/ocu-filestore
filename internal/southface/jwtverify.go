@@ -19,11 +19,14 @@ import (
 )
 
 // StorageJWTVerifier closes the storage-credential-custody hole: it JWKS-verifies
-// the weak Storage-JWT's signature before any filesystem_id/intent claim is
+// the injected credential's signature before any filesystem_id/intent claim is
 // trusted (ADR-0013/0019/0025). It holds ONLY the published public keys read from
-// Control's rendered JWKS artifact (the same document Control writes at its
-// -jwks-path); it holds no private material, mints nothing, and speaks no network
-// protocol. The verification MIRRORS the Control-side stand-in verifier: kid
+// the CREDENTIAL AUTHORITY's rendered JWKS artifact — the RFC 8693 exchange
+// counterparty of ADR-0019, NOT Control, whose JWKS belongs to the edge. Canon is
+// explicit: the engine verifies "against the Credential-issuer's public key"
+// (NFR-SEC-31), and the Control-minted weak session JWT is an edge-only assertion
+// this service does not accept. It holds no private material, mints nothing, and
+// speaks no network protocol. The verification shape: kid
 // match, per-kid alg pin (EdDSA/ES256, never "none"), signature, iss/aud, and a
 // required exp against an injected clock.
 //
@@ -57,8 +60,8 @@ type verifierKey struct {
 // keyFunc can hand the concrete key to golang-jwt.
 type publicKey = any
 
-// storageJWK is one key in Control's rendered JWKS document. The member set
-// mirrors the artifact Control writes: kty/crv/kid/use/alg and the unpadded
+// storageJWK is one key in the credential authority's rendered JWKS document.
+// The member set mirrors the published artifact: kty/crv/kid/use/alg and the unpadded
 // base64url coordinates (y is EC-only).
 type storageJWK struct {
 	Kty string `json:"kty"`
@@ -70,7 +73,7 @@ type storageJWK struct {
 	Y   string `json:"y"`
 }
 
-// storageJWKSet is the JWKS document shape ({"keys":[...]}) Control renders.
+// storageJWKSet is the JWKS document shape ({"keys":[...]}) the issuer renders.
 type storageJWKSet struct {
 	Keys []storageJWK `json:"keys"`
 }
@@ -81,7 +84,7 @@ type storageJWKSet struct {
 // that can never admit a legitimate credential.
 var errEmptyStorageJWKS = errors.New("southface: storage JWKS document has no keys")
 
-// NewStorageJWTVerifier parses Control's rendered JWKS document and builds a
+// NewStorageJWTVerifier parses the credential authority's rendered JWKS document and builds a
 // verifier over its public keys. issuer/audience are the iss/aud filestore
 // requires (both must be non-empty). now injects the exp clock; nil selects the
 // wall clock. It is FAIL-CLOSED: an empty/garbage JWKS, a key-less set, an empty
